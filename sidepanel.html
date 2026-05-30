@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <link rel="stylesheet" href="vendor/katex/katex.min.css">
+  <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+  <!-- 顶部导航栏 -->
+  <div class="tabs">
+    <button class="tab-btn active" data-target="chat">💬 聊天</button>
+    <button class="tab-btn" data-target="imageTool">🖼️图片工具</button>
+    <button class="tab-btn" data-target="settings">⚙️设置</button>
+  </div>
+
+<!-- 聊天 Tab -->
+  <div id="chat" class="tab-content active">
+    <!-- 新增：聊天头部工具栏 -->
+    <div class="chat-header">
+      <span class="chat-title">当前对话</span>
+      <button id="clearChatBtn" class="clear-btn" title="清空对话记录">🗑️ 清空</button>
+    </div>
+    
+    <!-- 在 sidepanel.html 中，替换掉原有的 <div class="input-area"> 前后的代码 -->
+  
+    <div class="chat-history" id="chatHistory"></div>
+    
+    <!-- 新增：快捷功能指令栏 -->
+    <div class="quick-prompts">
+      <button class="pill-btn highlight" id="btnSummarizePage">📄 总结当前网页</button>
+      <button class="pill-btn prompt-btn" data-prompt="请帮我翻译以下文本为中文（结合当前的语境，给出合理、文艺且正式翻译即可）：">🌐 翻译</button>
+      <button class="pill-btn prompt-btn" data-prompt="请帮我专业、详细解释以下代码或概念：">💻 解释</button>
+      <button class="pill-btn prompt-btn" data-prompt="请帮我提取图片中的公式，并把它转换为严格的 LaTeX 代码">✍️ 公式提取</button>
+    </div>
+
+    <div class="input-area">
+      <div class="composer">
+        <textarea id="chatInput" placeholder="输入问题 (Enter发送, Shift+Enter换行)..."></textarea>
+        <div class="attachment-toolbar">
+          <button id="uploadImageBtn" class="tool-btn" type="button" title="上传图片">🖼️ 图片</button>
+          <button id="captureVisibleTabBtn" class="tool-btn" type="button" title="框选当前标签页区域截图">📸 框选截图</button>
+          <button id="clearImageBtn" class="tool-btn secondary" type="button" hidden>移除图片</button>
+          <span class="upload-hint">支持 PNG / JPG / WebP，截图会作为图片附件</span>
+          <input type="file" id="imageInput" accept="image/png,image/jpeg,image/webp,image/gif" hidden>
+        </div>
+        <div id="imagePreview" class="image-preview hidden">
+          <img id="imagePreviewImg" alt="图片预览">
+          <div class="image-preview-meta">
+            <div class="image-preview-name" id="imagePreviewName"></div>
+            <div class="image-preview-size" id="imagePreviewSize"></div>
+          </div>
+        </div>
+      </div>
+      <button id="sendBtn">发送</button>
+    </div>
+  </div> <!-- 聊天 Tab 结束 -->
+
+  <!-- 图片工具 Tab -->
+  <div id="imageTool" class="tab-content image-tool-tab">
+    <div class="tool-stack">
+      <section class="tool-hero">
+        <div>
+          <p class="tool-eyebrow">Image Base64 Tool</p>
+          <h1>下载图片，转成 Base64</h1>
+          <p class="subtitle">支持 HTTP/HTTPS 图片 URL 和本地文件。远程、内网或本机图片会在加载前请求确认和站点授权。</p>
+        </div>
+        <div class="status-pill" id="imageToolStatus">等待输入</div>
+      </section>
+
+      <section class="tool-card">
+        <label for="imageSourceUrl">图片 URL</label>
+        <input id="imageSourceUrl" type="url" placeholder="https://example.com/image.png">
+
+        <label for="imagePageUrl">来源页面 URL（可选，不会作为 Referrer 发送）</label>
+        <input id="imagePageUrl" type="url" placeholder="https://example.com/page.html">
+
+        <label for="imageFileInput">本地图片文件</label>
+        <input id="imageFileInput" type="file" accept="image/png,image/jpeg,image/webp,image/gif">
+
+        <div class="tool-actions">
+          <button id="imageLoadBtn" class="primary-btn">下载并转 Base64</button>
+          <button id="imageCopyBtn" class="secondary-btn" disabled>复制 Base64</button>
+          <a id="imageDownloadLink" class="download-link is-disabled" href="#" download>下载图片</a>
+          <button id="imageClearBtn" class="ghost-btn" type="button">清空</button>
+        </div>
+
+        <p class="tool-hint">复制会把 base64 写入剪贴板，下载链接会直接保存转换后的 PNG。</p>
+      </section>
+
+      <section class="tool-card tool-preview-card">
+        <div class="tool-preview-head">
+          <div>
+            <h2>预览</h2>
+            <p id="imageMetaText" class="meta-text">尚未加载图片</p>
+          </div>
+        </div>
+        <div class="tool-preview-box">
+          <img id="imageToolPreviewImg" alt="">
+          <div id="imageToolEmptyState" class="empty-state">Base64 预览会显示在这里</div>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <!-- 设置 Tab (删除了 hidden) -->
+  <div id="settings" class="tab-content">
+    <label>API Base URL:</label>
+    <input type="text" id="apiUrl" placeholder="https://api.openai.com/v1">
+    <div class="settings-hint">默认使用 OpenAI。也可以填写可信的 HTTPS OpenAI-compatible API，例如 https://example.com/v1；首次保存会请求该域名权限。</div>
+    
+    <label>API Key:</label>
+    <input type="password" id="apiKey" placeholder="sk-...">
+    <div id="apiKeyStatus" class="settings-hint"></div>
+    <div class="settings-hint">切换 API 地址时需要重新输入该服务对应的 API Key，避免把旧 Key 发到错误服务。</div>
+    
+    <label>模型 (Model):</label>
+    <input type="text" id="modelName" placeholder="gpt-3.5-turbo">
+    
+    <button id="saveSettingsBtn">保存配置</button>
+    <button id="clearApiKeyBtn" type="button">清除 API Key</button>
+    <div id="saveMsg"></div>
+  </div>
+
+  <script src="vendor/katex/katex.min.js"></script>
+  <script src="vendor/katex/contrib/auto-render.min.js"></script>
+  <script src="vendor/marked.umd.js"></script>
+  <script src="sidepanel.js"></script>
+</body>
+</html>

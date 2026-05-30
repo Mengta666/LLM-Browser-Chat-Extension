@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label=" LLM Copilot icon">
+  <defs>
+    <linearGradient id="bg" x1="16" y1="16" x2="112" y2="112" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0f172a"/>
+      <stop offset="1" stop-color="#1e293b"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="76" y1="28" x2="100" y2="52" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#38bdf8"/>
+      <stop offset="1" stop-color="#22c55e"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="112" height="112" rx="26" fill="url(#bg)"/>
+  <path d="M34 34h46a14 14 0 0 1 14 14v24a14 14 0 0 1-14 14H58l-18 14v-14H34a14 14 0 0 1-14-14V48a14 14 0 0 1 14-14z" fill="#f8fafc"/>
+  <path d="M51 52h24M51 64h34M51 76h18" stroke="#0f172a" stroke-width="6" stroke-linecap="round"/>
+  <path d="M88 28l3.8 8.2L100 40l-8.2 3.8L88 52l-3.8-8.2L76 40l8.2-3.8L88 28z" fill="url(#accent)"/>
+  <circle cx="34" cy="92" r="6" fill="#38bdf8"/>
+</svg>

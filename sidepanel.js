@@ -57,8 +57,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
 
+  function normalizeImageMimeType(type) {
+    const value = String(type || '').trim().toLowerCase();
+    if (value === 'image/jpg') return 'image/jpeg';
+    return value;
+  }
+
   function isAllowedImageMime(type) {
-    return ALLOWED_IMAGE_MIME_TYPES.has(String(type || '').toLowerCase());
+    return ALLOWED_IMAGE_MIME_TYPES.has(normalizeImageMimeType(type));
   }
 
   function assertImageDimensionsSafe(width, height) {
@@ -73,7 +79,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   async function normalizeDataUrlToPng(dataUrl) {
     if (!isAllowedDataImageUrl(dataUrl)) {
-      throw new Error('仅允许 10MB 以内的 PNG、JPEG、WebP 或 GIF 图片');
+      throw new Error('仅允许 10MB 以内的 PNG、JPG/JPEG、WebP 或 GIF 图片');
     }
 
     const image = await loadImageElement(dataUrl);
@@ -427,7 +433,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   function isAllowedDataImageUrl(value) {
     const text = String(value || '').trim();
-    const match = text.match(/^data:(image\/(?:png|jpeg|webp|gif));base64,([A-Za-z0-9+/=]+)$/i);
+    const match = text.match(/^data:(image\/(?:png|jpe?g|webp|gif));base64,([A-Za-z0-9+/=]+)$/i);
     if (!match) return false;
     if (!isAllowedImageMime(match[1])) return false;
 
@@ -585,7 +591,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     if (image.dataUrl) {
       if (!isAllowedDataImageUrl(image.dataUrl)) {
-        throw new Error('仅支持 10MB 以内的 PNG、JPEG、WebP 或 GIF 图片');
+        throw new Error('仅支持 10MB 以内的 PNG、JPG/JPEG、WebP 或 GIF 图片');
       }
 
       const normalizedDataUrl = await normalizeDataUrlToPng(image.dataUrl);
@@ -630,7 +636,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   async function setAttachedImage(file) {
     if (!file) return;
     if (!isAllowedImageMime(file.type)) {
-      alert('请选择 PNG、JPEG、WebP 或 GIF 图片。');
+      alert('请选择 PNG、JPG/JPEG、WebP 或 GIF 图片。');
       return;
     }
 
@@ -994,7 +1000,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     if (value.startsWith('data:')) {
       if (!isAllowedDataImageUrl(value)) {
-        throw new Error('仅允许 10MB 以内的 PNG、JPEG、WebP 或 GIF Data URL');
+        throw new Error('仅允许 10MB 以内的 PNG、JPG/JPEG、WebP 或 GIF Data URL');
       }
       return normalizeDataUrlToPng(value);
     }
@@ -1148,7 +1154,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   async function loadImageToolFromFile(file) {
     if (!file) return;
     if (!isAllowedImageMime(file.type)) {
-      setImageToolStatus('请选择 PNG、JPEG、WebP 或 GIF 图片', 'warn');
+      setImageToolStatus('请选择 PNG、JPG/JPEG、WebP 或 GIF 图片', 'warn');
       return;
     }
 

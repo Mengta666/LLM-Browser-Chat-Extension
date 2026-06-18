@@ -38,7 +38,7 @@ python -m venv .venv
 .\.venv\Scripts\pip install fastapi uvicorn openai python-dotenv qdrant-client
 ```
 
-在 `backend/config/.env` 中配置环境变量。不要提交这个文件。
+在 `backend/config/.env` 中配置环境变量。
 
 ```env
 MODEL_BASE_URL=https://api.openai.com/v1

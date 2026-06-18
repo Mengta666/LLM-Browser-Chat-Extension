@@ -3,6 +3,7 @@ chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(consol
 const MAX_PROMPT_LENGTH = 8000;
 const MAX_LLM_BODY_BYTES = 25 * 1024 * 1024;
 const CUSTOM_API_BASE_URLS_KEY = 'customApiBaseUrls';
+const PAGE_REFRESH_ENDPOINT_PATH = '/api/pages/refresh_snapshot';
 const DEFAULT_ALLOWED_CHAT_URLS = new Set([
   'https://api.openai.com/v1/chat/completions'
 ]);
@@ -36,9 +37,52 @@ function normalizeChatUrl(value) {
   return `${url.origin}${url.pathname.replace(/\/$/, '')}`;
 }
 
+function buildBackendRootFromApiBase(apiBaseUrl) {
+  const normalizedApiBaseUrl = normalizeApiBaseUrl(apiBaseUrl);
+  const url = new URL(normalizedApiBaseUrl);
+  let pathname = url.pathname.replace(/\/$/, '');
+  if (pathname.endsWith('/v1')) {
+    pathname = pathname.slice(0, -3);
+  }
+  return `${url.origin}${pathname}`;
+}
+
+function isPrivateIpv4Host(host) {
+  return /^127\./.test(host)
+    || /^10\./.test(host)
+    || /^192\.168\./.test(host)
+    || /^0\.0\.0\.0$/.test(host)
+    || /^172\.(1[6-9]|2\d|3[01])\./.test(host)
+    || /^169\.254\./.test(host)
+    || /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(host);
+}
+
+function isPrivateOrLocalHost(hostname) {
+  const rawHost = String(hostname || '').trim().toLowerCase();
+  if (!rawHost) return false;
+
+  const host = rawHost.startsWith('[') && rawHost.endsWith(']')
+    ? rawHost.slice(1, -1)
+    : rawHost;
+
+  if (!host) return false;
+  if (host === 'localhost' || host === '::1' || host === '::') return true;
+  if (isPrivateIpv4Host(host)) return true;
+  if (/^(?:fc|fd)[0-9a-f:]*$/i.test(host)) return true;
+  if (/^fe80:/i.test(host)) return true;
+
+  const ipv4MappedMatch = host.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i);
+  if (ipv4MappedMatch) {
+    return isPrivateIpv4Host(ipv4MappedMatch[1]);
+  }
+
+  return false;
+}
+
 function normalizeApiBaseUrl(value) {
   const url = new URL(String(value || ''));
-  if (url.protocol !== 'https:' || url.search || url.hash || url.username || url.password) return '';
+  const allowLocalHttp = url.protocol === 'http:' && isPrivateOrLocalHost(url.hostname);
+  if ((url.protocol !== 'https:' && !allowLocalHttp) || url.search || url.hash || url.username || url.password) return '';
   return `${url.origin}${url.pathname.replace(/\/$/, '')}`;
 }
 
@@ -59,10 +103,37 @@ async function getAllowedChatUrls() {
   ]);
 }
 
+async function getAllowedPageRefreshUrls() {
+  const { [CUSTOM_API_BASE_URLS_KEY]: customUrls = [] } = await chrome.storage.local.get([CUSTOM_API_BASE_URLS_KEY]);
+  return new Set(
+    customUrls
+      .map((url) => {
+        try {
+          return `${buildBackendRootFromApiBase(url)}${PAGE_REFRESH_ENDPOINT_PATH}`;
+        } catch {
+          return '';
+        }
+      })
+      .filter(Boolean)
+  );
+}
+
 async function isAllowedChatUrl(value) {
   try {
     const url = new URL(String(value || ''));
     const allowedUrls = await getAllowedChatUrls();
+    return allowedUrls.has(normalizeChatUrl(url.href))
+      && !url.search
+      && !url.hash;
+  } catch {
+    return false;
+  }
+}
+
+async function isAllowedPageRefreshUrl(value) {
+  try {
+    const url = new URL(String(value || ''));
+    const allowedUrls = await getAllowedPageRefreshUrls();
     return allowedUrls.has(normalizeChatUrl(url.href))
       && !url.search
       && !url.hash;
@@ -83,6 +154,14 @@ function sendLlmChunk(msgId, chunk) {
   if (chunk) {
     chrome.runtime.sendMessage({ type: 'LLM_CHUNK', msgId, chunk });
   }
+}
+
+function sendLlmSources(msgId, sources) {
+  chrome.runtime.sendMessage({
+    type: 'LLM_SOURCES',
+    msgId,
+    sources: Array.isArray(sources) ? sources : []
+  });
 }
 
 function extractChunkText(dataObj) {
@@ -131,9 +210,11 @@ function openSidePanelWithAction(windowId, action) {
   return openPromise;
 }
 
-function queueAutoSendPrompt(windowId, text) {
+function queueAutoTask(windowId, taskType, focusText) {
   const action = createContextMenuAction('AUTO_SEND_PROMPT', {
-    text: sanitizeActionText(text)
+    taskType,
+    focusText: sanitizeActionText(focusText),
+    autoSend: false
   });
 
   return openSidePanelWithAction(windowId, action);
@@ -157,14 +238,12 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
   if (info.menuItemId === 'send-to-copilot') {
     if (!tab?.windowId) return;
 
-    const explainPrompt = `请帮我解释以下名词，要求给出通俗、准确、适合快速理解的说明，并补充必要的背景信息：\n\n${info.selectionText}`;
-    queueAutoSendPrompt(tab.windowId, explainPrompt).catch(console.error);
+    queueAutoTask(tab.windowId, 'explain', info.selectionText || '').catch(console.error);
     return;
   }
 
   if (info.menuItemId === 'translate-to-copilot' && tab?.windowId) {
-    const translatedPrompt = `请帮我翻译以下文本为中文（结合当前的语境，给出合理、文艺且正式翻译即可）：\n\n${info.selectionText}`;
-    queueAutoSendPrompt(tab.windowId, translatedPrompt).catch(console.error);
+    queueAutoTask(tab.windowId, 'translate', info.selectionText || '').catch(console.error);
     return;
   }
 
@@ -204,9 +283,11 @@ async function handleCallLlmStream(request) {
   }
 
   const apiHost = new URL(url).hostname;
+  const allowMissingAuth = isPrivateOrLocalHost(apiHost);
   const authHeader = options?.headers?.Authorization || options?.headers?.authorization || '';
   const authToken = String(authHeader).replace(/^Bearer\s+/i, '').trim();
-  if (options?.method !== 'POST' || !String(authHeader).startsWith('Bearer ') || !authToken) {
+  const hasBearerAuth = String(authHeader).startsWith('Bearer ') && !!authToken;
+  if (options?.method !== 'POST' || (!hasBearerAuth && !allowMissingAuth)) {
     sendLlmError(msgId, 'API 请求配置无效');
     return;
   }
@@ -229,14 +310,18 @@ async function handleCallLlmStream(request) {
     return;
   }
 
+  const requestHeaders = {
+    'Content-Type': 'application/json'
+  };
+  if (hasBearerAuth) {
+    requestHeaders.Authorization = authHeader;
+  }
+
   const response = await fetch(url, {
     method: 'POST',
     credentials: 'omit',
     redirect: 'error',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': authHeader
-    },
+    headers: requestHeaders,
     body
   });
 
@@ -249,6 +334,9 @@ async function handleCallLlmStream(request) {
   const contentType = response.headers.get('content-type') || '';
   if (!/text\/event-stream|text\/plain/i.test(contentType)) {
     const dataObj = await response.json();
+    if (Array.isArray(dataObj?.sources)) {
+      sendLlmSources(msgId, dataObj.sources);
+    }
     const content = extractChunkText(dataObj);
     if (content) {
       sendLlmChunk(msgId, content);
@@ -291,7 +379,12 @@ async function handleCallLlmStream(request) {
       }
 
       try {
-        sendLlmChunk(msgId, extractChunkText(JSON.parse(dataStr)));
+        const dataObj = JSON.parse(dataStr);
+        if (dataObj?.type === 'sources') {
+          sendLlmSources(msgId, dataObj.sources);
+          continue;
+        }
+        sendLlmChunk(msgId, extractChunkText(dataObj));
       } catch (error) {
         // 忽略无法解析的流式碎片
       }
@@ -299,11 +392,68 @@ async function handleCallLlmStream(request) {
   }
 }
 
-chrome.runtime.onMessage.addListener((request) => {
+async function handleCallApiJson(request) {
+  const { url, options } = request;
+
+  if (!(await isAllowedPageRefreshUrl(url))) {
+    throw new Error('API 地址不被允许');
+  }
+
+  const apiHost = new URL(url).hostname;
+  const allowMissingAuth = isPrivateOrLocalHost(apiHost);
+  const authHeader = options?.headers?.Authorization || options?.headers?.authorization || '';
+  const authToken = String(authHeader).replace(/^Bearer\s+/i, '').trim();
+  const hasBearerAuth = String(authHeader).startsWith('Bearer ') && !!authToken;
+  if (options?.method !== 'POST' || (!hasBearerAuth && !allowMissingAuth)) {
+    throw new Error('API 请求配置无效');
+  }
+
+  const body = String(options?.body || '');
+  if (!body || body.length > MAX_LLM_BODY_BYTES) {
+    throw new Error('API 请求体为空或过大');
+  }
+
+  try {
+    JSON.parse(body);
+  } catch {
+    throw new Error('API 请求体不是有效 JSON');
+  }
+
+  const requestHeaders = {
+    'Content-Type': 'application/json'
+  };
+  if (hasBearerAuth) {
+    requestHeaders.Authorization = authHeader;
+  }
+
+  const response = await fetch(url, {
+    method: 'POST',
+    credentials: 'omit',
+    redirect: 'error',
+    headers: requestHeaders,
+    body
+  });
+
+  if (!response.ok) {
+    const errorMessage = await getResponseErrorMessage(response);
+    throw new Error(`请求失败 (${response.status})：${errorMessage}`);
+  }
+
+  return response.json();
+}
+
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === 'CALL_LLM_STREAM') {
     handleCallLlmStream(request).catch((error) => {
       sendLlmError(request.msgId, `请求失败：${error?.message || '未知错误'}`);
     });
+    return true;
+  }
+
+  if (request.type === 'CALL_API_JSON') {
+    handleCallApiJson(request)
+      .then((body) => sendResponse({ ok: true, body }))
+      .catch((error) => sendResponse({ ok: false, error: error?.message || '未知错误' }));
     return true;
   }
 });

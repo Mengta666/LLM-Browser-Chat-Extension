@@ -29,20 +29,76 @@
     
     <!-- 新增：快捷功能指令栏 -->
     <div class="quick-prompts">
-      <button class="pill-btn highlight" id="btnSummarizePage">📄 总结当前网页</button>
-      <button class="pill-btn prompt-btn" data-prompt="请帮我翻译以下文本为中文（结合当前的语境，给出合理、文艺且正式翻译即可）：">🌐 翻译</button>
-      <button class="pill-btn prompt-btn" data-prompt="请帮我专业、详细解释以下代码或概念：">💻 解释</button>
+      <button class="pill-btn task-btn" data-task-type="translate">🌐 翻译</button>
+      <button class="pill-btn task-btn" data-task-type="explain">💻 解释</button>
       <button class="pill-btn prompt-btn" data-prompt="请帮我提取图片中的公式，并把它转换为严格的 LaTeX 代码">✍️ 公式提取</button>
+    </div>
+
+    <div class="task-state-panel drawer-panel">
+      <div class="drawer-head">
+        <button id="toggleTaskDrawerBtn" class="drawer-toggle" type="button" aria-expanded="false">
+          <span class="drawer-toggle-text">
+            <span id="taskStateTitle" class="task-state-title">当前任务：普通问答</span>
+            <span id="taskStateSummary" class="drawer-summary">当前选中：未设置</span>
+          </span>
+          <span id="taskDrawerIndicator" class="drawer-indicator">展开</span>
+        </button>
+        <button id="clearFocusTextBtn" class="tool-btn secondary" type="button">清空选中</button>
+      </div>
+      <div id="taskDrawerBody" class="drawer-body" hidden>
+        <div id="taskStateFocusText" class="task-state-focus">当前选中：未设置</div>
+        <div id="taskStateMeta" class="task-state-meta">右键划词后可直接进入翻译或解释任务。</div>
+      </div>
+    </div>
+
+    <div class="page-context-panel drawer-panel">
+      <div class="drawer-head">
+        <button id="togglePageContextDrawerBtn" class="drawer-toggle" type="button" aria-expanded="false">
+          <span class="drawer-toggle-text">
+            <span class="task-state-title">网页快照</span>
+            <span id="pageContextSummary" class="drawer-summary">未启用</span>
+          </span>
+          <span id="pageContextDrawerIndicator" class="drawer-indicator">展开</span>
+        </button>
+        <div class="drawer-actions">
+          <button id="refreshPageContextBtn" class="tool-btn" type="button">刷新快照</button>
+          <button id="clearPageSnapshotBtn" class="tool-btn secondary" type="button">清空快照</button>
+        </div>
+      </div>
+      <div class="page-context-controls">
+        <div class="page-context-row">
+          <label class="page-context-toggle">
+            <input id="useCurrentPageToggle" type="checkbox">
+            <span>使用当前网页</span>
+          </label>
+          <label class="page-context-toggle">
+            <input id="lockCurrentPageToggle" type="checkbox">
+            <span>锁定当前页</span>
+          </label>
+        </div>
+        <div id="pageContextChatIdInline" class="page-context-debug">Chat ID：未创建</div>
+      </div>
+      <div id="pageContextDrawerBody" class="drawer-body" hidden>
+        <div class="page-context-status">
+          <div id="pageContextStatusTitle" class="page-context-status-title">网页上下文未启用</div>
+          <div id="pageContextStatusMeta" class="page-context-status-meta">发送时不会附带当前页面内容。</div>
+          <div id="pageContextChatId" class="page-context-status-value">Chat ID：未创建</div>
+          <div id="pageContextPageTitle" class="page-context-status-value">页面：未采集</div>
+          <div id="pageContextPageUrl" class="page-context-status-url">URL：未采集</div>
+        </div>
+      </div>
     </div>
 
     <div class="input-area">
       <div class="composer">
         <textarea id="chatInput" placeholder="输入问题 (Enter发送, Shift+Enter换行)..."></textarea>
         <div class="attachment-toolbar">
-          <button id="uploadImageBtn" class="tool-btn" type="button" title="上传图片">🖼️ 图片</button>
+          <div class="floating-tip-wrap">
+            <button id="uploadImageBtn" class="tool-btn" type="button" title="上传图片">🖼️ 图片</button>
+            <span class="floating-tip" role="tooltip">支持 PNG / JPG / WebP，截图会作为图片附件</span>
+          </div>
           <button id="captureVisibleTabBtn" class="tool-btn" type="button" title="框选当前标签页区域截图">📸 框选截图</button>
           <button id="clearImageBtn" class="tool-btn secondary" type="button" hidden>移除图片</button>
-          <span class="upload-hint">支持 PNG / JPG / WebP，截图会作为图片附件</span>
           <input type="file" id="imageInput" accept="image/png,image/jpeg,image/webp,image/gif,image/jpg" hidden>
         </div>
         <div id="imagePreview" class="image-preview hidden">

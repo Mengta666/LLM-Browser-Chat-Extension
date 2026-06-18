@@ -1,0 +1,27 @@
+# 文档暂不进入仓库
+docs/
+
+# Python 本地环境与缓存
+backend/.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# 本地配置与密钥
+backend/config/.env
+.env
+.env.*
+!.env.example
+
+# SQLite 本地数据
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+
+# 编辑器与系统文件
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

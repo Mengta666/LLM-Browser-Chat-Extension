@@ -1,0 +1,389 @@
+[
+  {
+    "name": "chat_no_page_non_stream",
+    "request": {
+      "model": "__DEFAULT_MODEL__",
+      "stream": false,
+      "task_type": "chat",
+      "query_text": "请用一句话介绍你自己。",
+      "focus_text": "",
+      "use_current_page": false,
+      "messages": [
+        {
+          "role": "user",
+          "content": "请用一句话介绍你自己。"
+        }
+      ]
+    },
+    "expect": {
+      "status": 200,
+      "stream": false,
+      "sources": "empty",
+      "source_count_min": 0,
+      "must_contain": [],
+      "must_not_contain": []
+    }
+  },
+  {
+    "name": "chat_with_page_non_stream",
+    "request": {
+      "model": "__DEFAULT_MODEL__",
+      "stream": false,
+      "task_type": "chat",
+      "query_text": "这个页面写的退款时限是多少天？回答时给出引用。",
+      "focus_text": "",
+      "use_current_page": true,
+      "chat_id": "chat_eval_refund_non_stream",
+      "page_context_id": "refund-page-1",
+      "current_page": {
+        "url": "https://example.com/refund-policy",
+        "title": "退款政策",
+        "content": "退款政策说明：用户在订单支付成功后的 7 天内可以申请无理由退款。超过 7 天后，仅在商品存在质量问题时支持退款处理。客服审核通过后，退款将在 3 个工作日内原路返回。"
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": "这个页面写的退款时限是多少天？回答时给出引用。"
+        }
+      ]
+    },
+    "expect": {
+      "status": 200,
+      "stream": false,
+      "sources": "present",
+      "source_count_min": 1,
+      "must_contain": [
+        "[S1]"
+      ],
+      "must_not_contain": []
+    }
+  },
+  {
+    "name": "chat_with_page_stream",
+    "request": {
+      "model": "__DEFAULT_MODEL__",
+      "stream": true,
+      "task_type": "chat",
+      "query_text": "这个页面写的退款时限是多少天？回答时给出引用。",
+      "focus_text": "",
+      "use_current_page": true,
+      "chat_id": "chat_eval_refund_stream",
+      "page_context_id": "refund-page-1",
+      "current_page": {
+        "url": "https://example.com/refund-policy",
+        "title": "退款政策",
+        "content": "退款政策说明：用户在订单支付成功后的 7 天内可以申请无理由退款。超过 7 天后，仅在商品存在质量问题时支持退款处理。客服审核通过后，退款将在 3 个工作日内原路返回。"
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": "这个页面写的退款时限是多少天？回答时给出引用。"
+        }
+      ]
+    },
+    "expect": {
+      "status": 200,
+      "stream": true,
+      "sources": "present",
+      "source_count_min": 1,
+      "must_contain": [
+        "[S1]"
+      ],
+      "must_not_contain": []
+    }
+  },
+  {
+    "name": "explain_no_page_non_stream",
+    "request": {
+      "model": "__DEFAULT_MODEL__",
+      "stream": false,
+      "task_type": "explain",
+      "query_text": "",
+      "focus_text": "RAG",
+      "use_current_page": false,
+      "messages": [
+        {
+          "role": "user",
+          "content": "解释一下 RAG。"
+        }
+      ]
+    },
+    "expect": {
+      "status": 200,
+      "stream": false,
+      "sources": "empty",
+      "source_count_min": 0,
+      "must_contain": [],
+      "must_not_contain": []
+    }
+  },
+  {
+    "name": "explain_with_page_non_stream",
+    "request": {
+      "model": "__DEFAULT_MODEL__",
+      "stream": false,
+      "task_type": "explain",
+      "query_text": "请结合页面内容解释，并带上引用。",
+      "focus_text": "chunk overlap",
+      "use_current_page": true,
+      "chat_id": "chat_eval_rag_non_stream",
+      "page_context_id": "rag-page-1",
+      "current_page": {
+        "url": "https://example.com/rag-notes",
+        "title": "RAG 笔记",
+        "content": "在文本切片时，chunk overlap 指相邻切片之间保留一部分重复内容。这样做的目的是减少关键信息刚好落在切片边界时被截断的问题，从而提高召回的连贯性和答案完整度。"
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": "请解释 chunk overlap。"
+        }
+      ]
+    },
+    "expect": {
+      "status": 200,
+      "stream": false,
+      "sources": "present",
+      "source_count_min": 1,
+      "must_contain": [
+        "[S1]"
+      ],
+      "must_not_contain": []
+    }
+  },
+  {
+    "name": "explain_with_page_stream",
+    "request": {
+      "model": "__DEFAULT_MODEL__",
+      "stream": true,
+      "task_type": "explain",
+      "query_text": "请结合页面内容解释，并带上引用。",
+      "focus_text": "chunk overlap",
+      "use_current_page": true,
+      "chat_id": "chat_eval_rag_stream",
+      "page_context_id": "rag-page-1",
+      "current_page": {
+        "url": "https://example.com/rag-notes",
+        "title": "RAG 笔记",
+        "content": "在文本切片时，chunk overlap 指相邻切片之间保留一部分重复内容。这样做的目的是减少关键信息刚好落在切片边界时被截断的问题，从而提高召回的连贯性和答案完整度。"
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": "请解释 chunk overlap。"
+        }
+      ]
+    },
+    "expect": {
+      "status": 200,
+      "stream": true,
+      "sources": "present",
+      "source_count_min": 1,
+      "must_contain": [
+        "[S1]"
+      ],
+      "must_not_contain": []
+    }
+  },
+  {
+    "name": "translate_no_page_non_stream",
+    "request": {
+      "model": "__DEFAULT_MODEL__",
+      "stream": false,
+      "task_type": "translate",
+      "query_text": "翻译成中文，保持技术语气。",
+      "focus_text": "The cache is invalid after restart.",
+      "use_current_page": false,
+      "messages": [
+        {
+          "role": "user",
+          "content": "翻译这句话。"
+        }
+      ]
+    },
+    "expect": {
+      "status": 200,
+      "stream": false,
+      "sources": "empty",
+      "source_count_min": 0,
+      "must_contain": [],
+      "must_not_contain": []
+    }
+  },
+  {
+    "name": "translate_with_page_non_stream",
+    "request": {
+      "model": "__DEFAULT_MODEL__",
+      "stream": false,
+      "task_type": "translate",
+      "query_text": "翻译成中文，术语保持一致。",
+      "focus_text": "It is stateless by design.",
+      "use_current_page": true,
+      "chat_id": "chat_eval_translate_page",
+      "page_context_id": "service-page-1",
+      "current_page": {
+        "url": "https://example.com/service-architecture",
+        "title": "服务架构说明",
+        "content": "该服务采用无状态设计。所有请求上下文都由客户端显式携带，服务端不保留会话状态，因此可以水平扩展并简化故障恢复。"
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": "翻译这句话。"
+        }
+      ]
+    },
+    "expect": {
+      "status": 200,
+      "stream": false,
+      "sources": "empty",
+      "source_count_min": 0,
+      "must_contain": [],
+      "must_not_contain": []
+    }
+  },
+  {
+    "name": "chat_missing_query_text",
+    "request": {
+      "model": "__DEFAULT_MODEL__",
+      "stream": false,
+      "task_type": "chat",
+      "query_text": "",
+      "focus_text": "",
+      "use_current_page": false,
+      "messages": [
+        {
+          "role": "user",
+          "content": "你好"
+        }
+      ]
+    },
+    "expect": {
+      "status": 400,
+      "stream": false,
+      "sources": "ignore",
+      "source_count_min": 0,
+      "must_contain": [
+        "query_text is required for chat"
+      ],
+      "must_not_contain": []
+    }
+  },
+  {
+    "name": "explain_missing_focus_text",
+    "request": {
+      "model": "__DEFAULT_MODEL__",
+      "stream": false,
+      "task_type": "explain",
+      "query_text": "",
+      "focus_text": "",
+      "use_current_page": false,
+      "messages": [
+        {
+          "role": "user",
+          "content": "解释一下这个词。"
+        }
+      ]
+    },
+    "expect": {
+      "status": 400,
+      "stream": false,
+      "sources": "ignore",
+      "source_count_min": 0,
+      "must_contain": [
+        "focus_text is required for explain"
+      ],
+      "must_not_contain": []
+    }
+  },
+  {
+    "name": "translate_missing_focus_text",
+    "request": {
+      "model": "__DEFAULT_MODEL__",
+      "stream": false,
+      "task_type": "translate",
+      "query_text": "",
+      "focus_text": "",
+      "use_current_page": false,
+      "messages": [
+        {
+          "role": "user",
+          "content": "翻译一下。"
+        }
+      ]
+    },
+    "expect": {
+      "status": 400,
+      "stream": false,
+      "sources": "ignore",
+      "source_count_min": 0,
+      "must_contain": [
+        "focus_text is required for translate"
+      ],
+      "must_not_contain": []
+    }
+  },
+  {
+    "name": "page_context_missing_current_page",
+    "request": {
+      "model": "__DEFAULT_MODEL__",
+      "stream": false,
+      "task_type": "chat",
+      "query_text": "页面里说了什么？",
+      "focus_text": "",
+      "use_current_page": true,
+      "chat_id": "chat_eval_missing_page",
+      "page_context_id": "missing-page",
+      "messages": [
+        {
+          "role": "user",
+          "content": "页面里说了什么？"
+        }
+      ]
+    },
+    "expect": {
+      "status": 400,
+      "stream": false,
+      "sources": "ignore",
+      "source_count_min": 0,
+      "must_contain": [
+        "current_page is required when use_current_page is true"
+      ],
+      "must_not_contain": []
+    }
+  },
+  {
+    "name": "page_context_empty_content",
+    "request": {
+      "model": "__DEFAULT_MODEL__",
+      "stream": false,
+      "task_type": "chat",
+      "query_text": "页面里说了什么？",
+      "focus_text": "",
+      "use_current_page": true,
+      "chat_id": "chat_eval_empty_page",
+      "page_context_id": "empty-page",
+      "current_page": {
+        "url": "https://example.com/empty",
+        "title": "空页面",
+        "content": ""
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": "页面里说了什么？"
+        }
+      ]
+    },
+    "expect": {
+      "status": 400,
+      "stream": false,
+      "sources": "ignore",
+      "source_count_min": 0,
+      "must_contain": [
+        "current_page.content is required when use_current_page is true"
+      ],
+      "must_not_contain": []
+    }
+  }
+]

@@ -40,6 +40,7 @@ python -m venv .venv
 
 在 `backend/config/.env` 中配置环境变量。
 
+
 ```env
 MODEL_BASE_URL=https://api.openai.com/v1
 OPENAI_API_KEY=your_chat_model_api_key

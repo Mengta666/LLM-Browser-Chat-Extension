@@ -1,0 +1,8 @@
+*.zip
+*.crx
+*.pem
+.env
+.env.*
+tmp/
+dist/
+/STORE_RELEASE_CHECKLIST.md

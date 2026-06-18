@@ -1,0 +1,46 @@
+{
+  "manifest_version": 3,
+  "name": "私人助手",
+  "version": "0.1.0",
+  "description": "侧边栏 LLM 助手，支持网页摘要、图片上传、框选截图和 Markdown 渲染",
+  "icons": {
+    "16": "icon-16.png",
+    "32": "icon-32.png",
+    "48": "icon-48.png",
+    "128": "icon-128.png"
+  },
+  "permissions": [
+    "sidePanel",
+    "storage",
+    "activeTab",
+    "scripting",
+    "contextMenus",
+    "permissions"
+  ],
+  "host_permissions": [
+    "https://api.openai.com/*"
+  ],
+  "optional_host_permissions": [
+    "<all_urls>",
+    "https://*/*",
+    "http://*/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "打开助手",
+    "default_icon": {
+      "16": "icon-16.png",
+      "32": "icon-32.png",
+      "48": "icon-48.png",
+      "128": "icon-128.png"
+    }
+  },
+  "content_security_policy": {
+    "extension_pages": "default-src 'self'; script-src 'self'; object-src 'none'; connect-src https: http:; img-src 'self' data: blob:; style-src 'self'; font-src 'self'; base-uri 'none';"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  }
+}

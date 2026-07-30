@@ -332,10 +332,136 @@ input { width: 100%; padding: 8px; margin-top: 5px; box-sizing: border-box; bord
   font-weight: normal;
 }
 /* 鼠标悬浮时变成红色警示 */
-.clear-btn:hover { 
-  background: var(--app-danger-soft); 
-  color: var(--app-danger); 
-  border-color: var(--app-danger); 
+.clear-btn:hover {
+  background: var(--app-danger-soft);
+  color: var(--app-danger);
+  border-color: var(--app-danger);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Agent 自动化步骤样式
+   ═══════════════════════════════════════════════════════════════ */
+
+.agent-header {
+  font-weight: bold;
+  color: var(--app-accent);
+  margin-bottom: 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--app-border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.agent-btn-cancel {
+  font-size: 11px;
+  padding: 3px 10px;
+  border: 1px solid #e74c3c;
+  background: transparent;
+  color: #e74c3c;
+  border-radius: 4px;
+  cursor: pointer;
+  font-weight: normal;
+}
+.agent-btn-cancel:hover { background: #e74c3c; color: #fff; }
+.agent-btn-cancel:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.agent-step {
+  margin: 6px 0;
+  padding: 6px 8px;
+  border-left: 3px solid var(--app-border);
+  font-size: 13px;
+}
+
+.agent-thought {
+  color: var(--app-muted);
+  font-style: italic;
+  margin-bottom: 3px;
+}
+
+.agent-action {
+  color: var(--app-accent);
+  font-family: monospace;
+  font-size: 12px;
+}
+
+.agent-result-success {
+  color: var(--app-success);
+  font-size: 12px;
+  margin-top: 2px;
+}
+
+.agent-result-fail {
+  color: var(--app-danger);
+  font-size: 12px;
+  margin-top: 2px;
+}
+
+.agent-complete {
+  margin-top: 10px;
+  padding: 8px 10px;
+  background: color-mix(in srgb, var(--app-success) 10%, transparent);
+  border: 1px solid var(--app-success);
+  border-radius: 6px;
+  color: var(--app-success);
+  font-weight: 500;
+}
+
+.agent-error {
+  margin-top: 10px;
+  padding: 8px 10px;
+  background: var(--app-danger-soft);
+  border: 1px solid var(--app-danger-border);
+  border-radius: 6px;
+  color: var(--app-danger);
+}
+
+.agent-confirm {
+  margin: 8px 0;
+  padding: 10px;
+  background: var(--app-surface);
+  border: 1px solid var(--app-border-strong);
+  border-radius: 8px;
+}
+
+.agent-confirm-msg {
+  font-size: 13px;
+  margin-bottom: 8px;
+  white-space: pre-wrap;
+}
+
+.agent-confirm-btns {
+  display: flex;
+  gap: 8px;
+}
+
+.agent-btn-allow {
+  padding: 5px 14px;
+  border: none;
+  border-radius: 4px;
+  background: var(--app-accent);
+  color: #fff;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.agent-btn-allow:hover {
+  background: var(--app-accent-hover);
+}
+
+.agent-btn-deny {
+  padding: 5px 14px;
+  border: 1px solid var(--app-border);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--app-muted);
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.agent-btn-deny:hover {
+  border-color: var(--app-danger);
+  color: var(--app-danger);
 }
 
 /* ========== 快捷指令胶囊按钮 ========== */

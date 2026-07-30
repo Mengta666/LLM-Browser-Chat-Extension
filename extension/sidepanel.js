@@ -3000,4 +3000,865 @@ document.addEventListener('DOMContentLoaded', async () => {
       chrome.storage.session.remove('pendingSidePanelAction');
     });
   });
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Agent 页面自动化模块
+  // ═══════════════════════════════════════════════════════════════════
+
+  const AGENT_KEYWORDS = [
+    '点击', '点一下', '按一下',
+    '输入', '填写', '填入',
+    '提交', '滚动',
+    '选择', '导航',
+    '帮我操作', '自动执行', '帮我点', '帮我填', '帮我选',
+    '打开网页', '跳转到'
+  ];
+  const AGENT_TRIGGER_PREFIX = '/do ';
+  const AGENT_MAX_STEPS = 15;
+  const AGENT_SETTLE_DELAY_MS = 500;
+  const AGENT_ACTION_TIMEOUT_MS = 10000;
+
+  const agentState = {
+    active: false,
+    sessionId: '',
+    task: '',
+    currentStep: 0,
+    status: 'idle'
+  };
+
+  function shouldUseAgent(text) {
+    const trimmed = text.trim();
+    if (trimmed.startsWith(AGENT_TRIGGER_PREFIX)) return true;
+    const lower = trimmed.toLowerCase();
+    // 必须以动词开头或包含"帮我"才触发，避免描述性句子误触发
+    const actionPrefixes = ['帮我', '请帮', '去', '打开', '点击', '点一下', '按一下', '输入', '填写', '填入', '提交', '滚动', '选择', '导航', '跳转'];
+    const startsWithAction = actionPrefixes.some(p => lower.startsWith(p));
+    if (startsWithAction) return true;
+    // 包含关键词但要求句子较短（命令式），长句子多是描述不触发
+    if (trimmed.length > 50) return false;
+    return AGENT_KEYWORDS.some(kw => lower.includes(kw));
+  }
+
+  async function observePageState() {
+    const tab = await getActiveBrowserTab();
+    if (!tab?.id) throw new Error('无法获取当前标签页');
+
+    const [{ result }] = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: () => {
+        const INTERACTIVE_SELECTORS = [
+          'a[href]', 'button', 'input', 'textarea', 'select',
+          '[role="button"]', '[role="link"]', '[role="tab"]',
+          '[role="menuitem"]', '[role="checkbox"]', '[role="radio"]',
+          '[role="option"]', '[role="switch"]', '[role="slider"]',
+          '[contenteditable="true"]', '[onclick]', '[tabindex]:not([tabindex="-1"])'
+        ];
+        const MAX_ELEMENTS = 150;
+
+        function isVisible(el) {
+          const style = window.getComputedStyle(el);
+          if (style.display === 'none' || style.visibility === 'hidden') return false;
+          const rect = el.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0;
+        }
+
+        function buildCssSelector(el) {
+          if (el.id && !el.id.match(/^[\d:]/) && !el.id.includes('--')) {
+            return `#${CSS.escape(el.id)}`;
+          }
+          const testId = el.getAttribute('data-testid') || el.getAttribute('data-cy') || el.getAttribute('data-test');
+          if (testId) return `[data-testid="${CSS.escape(testId)}"]`;
+
+          const tag = el.tagName.toLowerCase();
+          const attrs = [];
+          if (el.name) attrs.push(`[name="${CSS.escape(el.name)}"]`);
+          if (el.type && el.tagName === 'INPUT') attrs.push(`[type="${el.type}"]`);
+          const ariaLabel = el.getAttribute('aria-label');
+          if (ariaLabel) attrs.push(`[aria-label="${CSS.escape(ariaLabel)}"]`);
+          if (el.className && typeof el.className === 'string') {
+            const stableClasses = el.className.trim().split(/\s+/)
+              .filter(c => !c.match(/^(css|sc|_|jsx|svelte)-|--|[a-z0-9]{6,}$/i))
+              .slice(0, 2);
+            if (stableClasses.length) attrs.push(stableClasses.map(c => `.${CSS.escape(c)}`).join(''));
+          }
+          let selector = tag + attrs.join('');
+          if (document.querySelectorAll(selector).length === 1) return selector;
+          const parent = el.parentElement;
+          if (parent) {
+            const siblings = Array.from(parent.children).filter(c => c.tagName === el.tagName);
+            if (siblings.length > 1) {
+              const idx = siblings.indexOf(el) + 1;
+              selector = `${tag}${attrs.join('')}:nth-of-type(${idx})`;
+            }
+          }
+          return selector;
+        }
+
+        const seen = new Set();
+        const elements = [];
+        let annotationId = 1;
+
+        // 清除旧标记
+        document.querySelectorAll('[data-agent-id]').forEach(el => el.removeAttribute('data-agent-id'));
+
+        for (const selector of INTERACTIVE_SELECTORS) {
+          for (const el of document.querySelectorAll(selector)) {
+            if (elements.length >= MAX_ELEMENTS) break;
+            if (seen.has(el)) continue;
+            if (!isVisible(el)) continue;
+            seen.add(el);
+
+            const id = annotationId++;
+            el.setAttribute('data-agent-id', id);
+
+            const rect = el.getBoundingClientRect();
+            elements.push({
+              id,
+              tag: el.tagName.toLowerCase(),
+              type: el.getAttribute('type') || '',
+              role: el.getAttribute('role') || '',
+              name: el.getAttribute('name') || '',
+              placeholder: el.getAttribute('placeholder') || '',
+              value: (el.value || '').slice(0, 100),
+              text: (el.textContent || '').trim().slice(0, 100),
+              aria_label: el.getAttribute('aria-label') || '',
+              data_testid: el.getAttribute('data-testid') || '',
+              css_selector: buildCssSelector(el),
+              bounding_box: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) },
+              visible: true,
+              enabled: !el.disabled,
+              checked: el.checked !== undefined ? el.checked : null,
+              contenteditable: el.isContentEditable || false
+            });
+          }
+        }
+
+        // 扫描同源 iframe 中的元素
+        try {
+          const iframes = document.querySelectorAll('iframe');
+          for (const iframe of iframes) {
+            if (elements.length >= MAX_ELEMENTS) break;
+            try {
+              const iframeDoc = iframe.contentDocument || iframe.contentWindow?.document;
+              if (!iframeDoc) continue;
+              for (const selector of INTERACTIVE_SELECTORS) {
+                for (const el of iframeDoc.querySelectorAll(selector)) {
+                  if (elements.length >= MAX_ELEMENTS) break;
+                  if (seen.has(el)) continue;
+                  if (!isVisible(el)) continue;
+                  seen.add(el);
+                  const id = annotationId++;
+                  el.setAttribute('data-agent-id', id);
+                  const rect = el.getBoundingClientRect();
+                  elements.push({
+                    id,
+                    tag: el.tagName.toLowerCase(),
+                    type: el.getAttribute('type') || '',
+                    role: el.getAttribute('role') || '',
+                    name: el.getAttribute('name') || '',
+                    placeholder: el.getAttribute('placeholder') || '',
+                    value: (el.value || '').slice(0, 100),
+                    text: (el.textContent || '').trim().slice(0, 100),
+                    aria_label: el.getAttribute('aria-label') || '',
+                    data_testid: el.getAttribute('data-testid') || '',
+                    css_selector: `iframe[src="${iframe.src || ''}"] >>> ${el.tagName.toLowerCase()}`,
+                    bounding_box: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) },
+                    visible: true,
+                    enabled: !el.disabled,
+                    checked: el.checked !== undefined ? el.checked : null,
+                    contenteditable: el.isContentEditable || false,
+                    in_iframe: true
+                  });
+                }
+              }
+            } catch (e) { /* 跨域 iframe 无法访问，跳过 */ }
+          }
+        } catch (e) { /* iframe 扫描失败不影响主流程 */ }
+
+        const truncated = seen.size > MAX_ELEMENTS;
+
+        // 检测弹窗/对话框内的滚动容器状态
+        let scrollable_container = null;
+        const modalSelectors = '[role="dialog"], .modal, .modal-body, .ant-modal-body, .el-dialog__body, [class*="modal"], [class*="dialog"], [class*="popup"]';
+        const modals = document.querySelectorAll(modalSelectors);
+        for (const m of modals) {
+          const style = window.getComputedStyle(m);
+          if (style.display === 'none' || style.visibility === 'hidden') continue;
+          // 找弹窗内的可滚动区域
+          const scrollEls = [m, ...m.querySelectorAll('*')];
+          for (const el of scrollEls) {
+            if (el.scrollHeight > el.clientHeight + 10) {
+              const s = window.getComputedStyle(el);
+              if (s.overflowY === 'auto' || s.overflowY === 'scroll' || el === m) {
+                scrollable_container = {
+                  scroll_top: Math.round(el.scrollTop),
+                  scroll_height: el.scrollHeight,
+                  client_height: el.clientHeight,
+                  at_bottom: el.scrollTop + el.clientHeight >= el.scrollHeight - 10
+                };
+                break;
+              }
+            }
+          }
+          if (scrollable_container) break;
+        }
+
+        return {
+          url: location.href,
+          title: document.title,
+          viewport: { width: window.innerWidth, height: window.innerHeight },
+          scroll_position: { x: Math.round(window.scrollX), y: Math.round(window.scrollY) },
+          document_height: document.documentElement.scrollHeight,
+          scrollable_container,
+          focused_element: document.activeElement?.id ? `#${document.activeElement.id}` : null,
+          interactive_elements: elements,
+          element_count_truncated: truncated,
+          text_content_summary: (document.body?.innerText || '').trim().slice(0, 3000),
+          forms: Array.from(document.forms).slice(0, 10).map(f => ({
+            action: f.action,
+            method: f.method,
+            fields: Array.from(f.elements).map(e => e.name).filter(Boolean)
+          }))
+        };
+      }
+    });
+    return result;
+  }
+
+  async function executePageAction(action) {
+    if (action.type === 'wait') {
+      const ms = Math.min(action.params?.ms || 1000, 5000);
+      await new Promise(resolve => setTimeout(resolve, ms));
+      return { success: true, action_type: 'wait', details: `等待了 ${ms}ms`, timestamp: Date.now() };
+    }
+
+    if (action.type === 'navigate') {
+      const url = action.params?.url;
+      if (!url) return { success: false, action_type: 'navigate', error: '缺少 URL', timestamp: Date.now() };
+      const tab = await getActiveBrowserTab();
+      if (!tab?.id) return { success: false, action_type: 'navigate', error: '无法获取标签页', timestamp: Date.now() };
+      await chrome.tabs.update(tab.id, { url });
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      return { success: true, action_type: 'navigate', details: `导航到 ${url}`, timestamp: Date.now() };
+    }
+
+    if (action.type === 'wait_for_element') {
+      const tab = await getActiveBrowserTab();
+      if (!tab?.id) return { success: false, action_type: 'wait_for_element', error: '无法获取标签页', timestamp: Date.now() };
+      const selector = action.locator?.value || action.params?.selector;
+      if (!selector) return { success: false, action_type: 'wait_for_element', error: '缺少选择器', timestamp: Date.now() };
+      const timeout = Math.min(action.params?.timeout || 5000, 10000);
+      const [{ result }] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: async (sel, maxWait) => {
+          const start = Date.now();
+          while (Date.now() - start < maxWait) {
+            const el = document.querySelector(sel);
+            if (el) return { found: true };
+            await new Promise(r => setTimeout(r, 200));
+          }
+          return { found: false };
+        },
+        args: [selector, timeout]
+      });
+      if (result?.found) {
+        return { success: true, action_type: 'wait_for_element', details: `元素已出现: ${selector}`, timestamp: Date.now() };
+      }
+      return { success: false, action_type: 'wait_for_element', error: `等待超时: ${selector}`, timestamp: Date.now() };
+    }
+
+    const tab = await getActiveBrowserTab();
+    if (!tab?.id) throw new Error('无法获取当前标签页');
+
+    const execPromise = chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: async (actionData) => {
+        function findByMethod(method, value) {
+          if (method === 'css') {
+            return document.querySelector(value);
+          }
+          if (method === 'text') {
+            const normalized = value.toLowerCase().trim();
+            // 搜索所有可见元素，不限制标签类型
+            const allElements = document.querySelectorAll(
+              'button, a, [role="button"], [role="link"], [role="tab"], [role="menuitem"], ' +
+              '[role="option"], [role="switch"], input[type="submit"], input[type="button"], ' +
+              'label, span, div[onclick], li, h1, h2, h3, h4, p, td, th, ' +
+              '[tabindex]:not([tabindex="-1"]), [contenteditable="true"]'
+            );
+            let exactMatch = null;
+            let includesMatch = null;
+            for (const el of allElements) {
+              const style = window.getComputedStyle(el);
+              if (style.display === 'none' || style.visibility === 'hidden') continue;
+              const rect = el.getBoundingClientRect();
+              if (rect.width <= 0 || rect.height <= 0) continue;
+              const elText = (el.textContent || el.value || el.getAttribute('aria-label') || '').toLowerCase().trim();
+              if (elText === normalized) { exactMatch = el; break; }
+              if (!includesMatch && elText.includes(normalized)) {
+                includesMatch = el;
+              }
+            }
+            return exactMatch || includesMatch || null;
+          }
+          if (method === 'annotation_id') {
+            const el = document.querySelector(`[data-agent-id="${value}"]`);
+            if (el) return el;
+            // 回退：按位置序号遍历（兼容 data-agent-id 被清除的情况）
+            const INTERACTIVE_SELECTORS = [
+              'a[href]', 'button', 'input', 'textarea', 'select',
+              '[role="button"]', '[role="link"]', '[role="tab"]',
+              '[role="menuitem"]', '[role="checkbox"]', '[role="radio"]',
+              '[role="option"]', '[role="switch"]', '[role="slider"]',
+              '[contenteditable="true"]', '[onclick]', '[tabindex]:not([tabindex="-1"])'
+            ];
+            const targetId = parseInt(value, 10);
+            let currentId = 1;
+            const seen = new Set();
+            for (const sel of INTERACTIVE_SELECTORS) {
+              for (const el of document.querySelectorAll(sel)) {
+                if (seen.has(el)) continue;
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden') continue;
+                const rect = el.getBoundingClientRect();
+                if (rect.width <= 0 || rect.height <= 0) continue;
+                seen.add(el);
+                if (currentId === targetId) return el;
+                currentId++;
+              }
+            }
+            return null;
+          }
+          return null;
+        }
+
+        function resolveLocator(locator) {
+          if (!locator) return null;
+          let el = findByMethod(locator.method, locator.value);
+          if (!el && locator.fallback) {
+            el = findByMethod(locator.fallback.method, locator.fallback.value);
+          }
+          if (!el && locator.method !== 'text' && locator.value) {
+            el = findByMethod('text', locator.value);
+          }
+          return el;
+        }
+
+        function findBestScrollableContainer() {
+          // 1. 找到当前可见的最顶层弹窗/对话框
+          const modalSelectors = [
+            '[role="dialog"]', '[role="listbox"]', '.modal', '.ant-modal',
+            '.el-dialog', '.ant-drawer', '[class*="modal"]', '[class*="dialog"]',
+            '[class*="popup"]', '[class*="overlay"]', '[class*="drawer"]'
+          ];
+          let modalEl = null;
+          for (const sel of modalSelectors) {
+            const els = document.querySelectorAll(sel);
+            for (const el of els) {
+              const style = window.getComputedStyle(el);
+              if (style.display === 'none' || style.visibility === 'hidden') continue;
+              const rect = el.getBoundingClientRect();
+              if (rect.width <= 0 || rect.height <= 0) continue;
+              modalEl = el;
+              break;
+            }
+            if (modalEl) break;
+          }
+
+          // 2. 在弹窗内（或整个页面）找所有可滚动的后代
+          const searchRoot = modalEl || document.body;
+          let best = null;
+          let bestScrollable = 0;
+
+          const walker = document.createTreeWalker(searchRoot, NodeFilter.SHOW_ELEMENT);
+          let node = walker.nextNode();
+          while (node) {
+            if (node.scrollHeight > node.clientHeight + 20) {
+              const style = window.getComputedStyle(node);
+              const overflow = style.overflowY;
+              // 任何能滚动的容器：overflow auto/scroll，或者元素本身就是可滚动的
+              if (overflow === 'auto' || overflow === 'scroll' || overflow === 'overlay' || node.scrollHeight > node.clientHeight + 50) {
+                const scrollableAmount = node.scrollHeight - node.clientHeight;
+                if (scrollableAmount > bestScrollable) {
+                  bestScrollable = scrollableAmount;
+                  best = node;
+                }
+              }
+            }
+            node = walker.nextNode();
+          }
+          return best;
+        }
+
+        const { type, locator, params = {} } = actionData;
+        const element = (type !== 'scroll' && type !== 'press_key') ? resolveLocator(locator) : null;
+
+        if (type !== 'scroll' && type !== 'press_key' && !element) {
+          return { success: false, error: `找不到目标元素 (${locator?.method}:${locator?.value})`, action_type: type };
+        }
+
+        // 高亮目标元素
+        if (element) {
+          const origOutline = element.style.outline;
+          const origTransition = element.style.transition;
+          element.style.transition = 'outline 0.15s ease';
+          element.style.outline = '3px solid #ff6b35';
+          setTimeout(() => {
+            element.style.outline = origOutline;
+            element.style.transition = origTransition;
+          }, 1200);
+        }
+
+        try {
+          switch (type) {
+            case 'click': {
+              element.scrollIntoView({ block: 'center', behavior: 'smooth' });
+              await new Promise(r => setTimeout(r, 300));
+              const rect = element.getBoundingClientRect();
+              const cx = rect.left + rect.width / 2;
+              const cy = rect.top + rect.height / 2;
+              const evtOpts = { bubbles: true, cancelable: true, clientX: cx, clientY: cy, view: window };
+              element.dispatchEvent(new PointerEvent('pointerdown', evtOpts));
+              element.dispatchEvent(new MouseEvent('mousedown', evtOpts));
+              await new Promise(r => setTimeout(r, 50));
+              element.dispatchEvent(new PointerEvent('pointerup', evtOpts));
+              element.dispatchEvent(new MouseEvent('mouseup', evtOpts));
+              element.dispatchEvent(new MouseEvent('click', evtOpts));
+              return { success: true, details: `点击了 ${locator?.value || '元素'}`, action_type: type };
+            }
+
+            case 'type': {
+              element.scrollIntoView({ block: 'center', behavior: 'smooth' });
+              await new Promise(r => setTimeout(r, 100));
+              element.focus();
+              const text = params.text || '';
+              const isContentEditable = element.isContentEditable || element.getAttribute('contenteditable') === 'true';
+
+              if (isContentEditable) {
+                if (params.clear !== false) {
+                  element.innerHTML = '';
+                  element.dispatchEvent(new Event('input', { bubbles: true }));
+                }
+                element.focus();
+                // 逐字符输入以触发输入法感知的事件
+                for (const char of text) {
+                  element.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, cancelable: true, inputType: 'insertText', data: char }));
+                  document.execCommand('insertText', false, char);
+                  element.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: char }));
+                }
+              } else {
+                if (params.clear !== false) {
+                  element.value = '';
+                  element.dispatchEvent(new Event('input', { bubbles: true }));
+                }
+                // 模拟逐字输入
+                const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                  window.HTMLInputElement.prototype, 'value'
+                )?.set || Object.getOwnPropertyDescriptor(
+                  window.HTMLTextAreaElement.prototype, 'value'
+                )?.set;
+                if (nativeInputValueSetter) {
+                  nativeInputValueSetter.call(element, element.value + text);
+                } else {
+                  element.value += text;
+                }
+                element.dispatchEvent(new Event('input', { bubbles: true }));
+                element.dispatchEvent(new Event('change', { bubbles: true }));
+              }
+              return { success: true, details: `输入了 "${text.slice(0, 20)}"`, action_type: type };
+            }
+
+            case 'clear': {
+              const isContentEditable = element.isContentEditable || element.getAttribute('contenteditable') === 'true';
+              if (isContentEditable) {
+                element.focus();
+                document.execCommand('selectAll', false, null);
+                document.execCommand('delete', false, null);
+                element.dispatchEvent(new Event('input', { bubbles: true }));
+              } else {
+                const setter = Object.getOwnPropertyDescriptor(
+                  window.HTMLInputElement.prototype, 'value'
+                )?.set || Object.getOwnPropertyDescriptor(
+                  window.HTMLTextAreaElement.prototype, 'value'
+                )?.set;
+                if (setter) setter.call(element, '');
+                else element.value = '';
+                element.dispatchEvent(new Event('input', { bubbles: true }));
+                element.dispatchEvent(new Event('change', { bubbles: true }));
+              }
+              return { success: true, details: `清空了 ${locator?.value || '元素'}`, action_type: type };
+            }
+
+            case 'select': {
+              const isNativeSelect = element.tagName.toLowerCase() === 'select';
+              if (isNativeSelect) {
+                if (params.value) {
+                  element.value = params.value;
+                } else if (params.option_text) {
+                  const option = Array.from(element.options).find(
+                    o => o.textContent.trim().toLowerCase() === params.option_text.toLowerCase()
+                  );
+                  if (option) element.value = option.value;
+                }
+                element.dispatchEvent(new Event('change', { bubbles: true }));
+              } else {
+                // 自定义下拉组件：先点击触发器，再点击选项
+                const rect = element.getBoundingClientRect();
+                const cx = rect.left + rect.width / 2;
+                const cy = rect.top + rect.height / 2;
+                const evtOpts = { bubbles: true, cancelable: true, clientX: cx, clientY: cy, view: window };
+                element.dispatchEvent(new PointerEvent('pointerdown', evtOpts));
+                element.dispatchEvent(new MouseEvent('mousedown', evtOpts));
+                element.dispatchEvent(new PointerEvent('pointerup', evtOpts));
+                element.dispatchEvent(new MouseEvent('mouseup', evtOpts));
+                element.dispatchEvent(new MouseEvent('click', evtOpts));
+                await new Promise(r => setTimeout(r, 500));
+                // 在下拉弹出层中查找选项
+                const optionText = (params.option_text || params.value || '').toLowerCase().trim();
+                const dropdownItems = document.querySelectorAll(
+                  '[role="option"], [role="listbox"] li, .ant-select-item, .el-select-dropdown__item, ' +
+                  '[class*="option"], [class*="menu-item"], [class*="dropdown"] li'
+                );
+                let targetOption = null;
+                for (const item of dropdownItems) {
+                  const t = (item.textContent || '').trim().toLowerCase();
+                  if (t === optionText || t.includes(optionText)) {
+                    targetOption = item;
+                    break;
+                  }
+                }
+                if (targetOption) {
+                  targetOption.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
+                  targetOption.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                  targetOption.dispatchEvent(new PointerEvent('pointerup', { bubbles: true }));
+                  targetOption.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                  targetOption.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                } else {
+                  return { success: false, error: `下拉菜单中找不到选项: ${optionText}`, action_type: type };
+                }
+              }
+              return { success: true, details: `选择了 ${params.value || params.option_text || '?'}`, action_type: type };
+            }
+
+            case 'scroll': {
+              const dir = params.direction || 'down';
+              const amount = params.amount || 300;
+              const yDelta = (dir === 'down') ? amount : (dir === 'up' ? -amount : 0);
+              const xDelta = (dir === 'right') ? amount : (dir === 'left' ? -amount : 0);
+              let scrollTarget = locator ? resolveLocator(locator) : null;
+              if (!scrollTarget) {
+                scrollTarget = findBestScrollableContainer();
+              }
+              let scrolledEl;
+              if (scrollTarget && scrollTarget !== document.documentElement && scrollTarget !== document.body) {
+                const before = scrollTarget.scrollTop;
+                scrollTarget.scrollBy(xDelta, yDelta);
+                // 部分框架需要 wheel 事件才生效
+                scrollTarget.dispatchEvent(new WheelEvent('wheel', { deltaX: xDelta, deltaY: yDelta, bubbles: true }));
+                scrolledEl = scrollTarget;
+              } else {
+                const before = window.scrollY;
+                window.scrollBy(xDelta, yDelta);
+                scrolledEl = document.documentElement;
+              }
+              // 等待滚动动画
+              await new Promise(r => setTimeout(r, 100));
+              // 报告滚动状态
+              const atBottom = scrolledEl
+                ? (scrolledEl.scrollTop + scrolledEl.clientHeight >= scrolledEl.scrollHeight - 10)
+                : (window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 10);
+              const detail = atBottom
+                ? `滚动 ${dir} ${amount}px（已到底部）`
+                : `滚动 ${dir} ${amount}px（可继续滚动）`;
+              return { success: true, details: detail, action_type: type };
+            }
+
+            case 'hover': {
+              element.scrollIntoView({ block: 'center', behavior: 'smooth' });
+              await new Promise(r => setTimeout(r, 200));
+              const rect = element.getBoundingClientRect();
+              const evtOpts = { bubbles: true, clientX: rect.left + rect.width/2, clientY: rect.top + rect.height/2 };
+              element.dispatchEvent(new PointerEvent('pointerenter', evtOpts));
+              element.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+              element.dispatchEvent(new MouseEvent('mouseenter', evtOpts));
+              element.dispatchEvent(new MouseEvent('mousemove', evtOpts));
+              return { success: true, details: `悬停在 ${locator?.value || '元素'}`, action_type: type };
+            }
+
+            case 'focus':
+              element.scrollIntoView({ block: 'center', behavior: 'smooth' });
+              element.focus();
+              return { success: true, details: `聚焦到 ${locator?.value || '元素'}`, action_type: type };
+
+            case 'press_key': {
+              const target = element || document.activeElement || document.body;
+              const key = params.key || 'Enter';
+              const modifiers = params.modifiers || [];
+              const code = key.length === 1 ? `Key${key.toUpperCase()}` : key;
+              const eventInit = {
+                key,
+                code,
+                bubbles: true,
+                cancelable: true,
+                ctrlKey: modifiers.includes('ctrl'),
+                shiftKey: modifiers.includes('shift'),
+                altKey: modifiers.includes('alt'),
+                metaKey: modifiers.includes('meta')
+              };
+              target.dispatchEvent(new KeyboardEvent('keydown', eventInit));
+              target.dispatchEvent(new KeyboardEvent('keypress', eventInit));
+              target.dispatchEvent(new KeyboardEvent('keyup', eventInit));
+              return { success: true, details: `按下了 ${key}`, action_type: type };
+            }
+
+            default:
+              return { success: false, error: `不支持的操作: ${type}`, action_type: type };
+          }
+        } catch (err) {
+          return { success: false, error: err.message || '执行失败', action_type: type };
+        }
+      },
+      args: [action]
+    });
+
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('操作执行超时')), AGENT_ACTION_TIMEOUT_MS)
+    );
+
+    const [{ result }] = await Promise.race([execPromise, timeoutPromise]);
+    return { ...result, timestamp: Date.now() };
+  }
+
+  function buildAgentApiUrl(safeApiUrl, path) {
+    return buildBackendEndpointUrl(safeApiUrl, path);
+  }
+
+  async function callAgentApi(safeApiUrl, path, body, apiKey) {
+    const url = buildAgentApiUrl(safeApiUrl, path);
+    const headers = { 'Content-Type': 'application/json' };
+    if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+    return callApiJson(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body)
+    });
+  }
+
+  function renderAgentStepInBubble(bubble, step, thought, action, result) {
+    const stepDiv = document.createElement('div');
+    stepDiv.className = 'agent-step';
+
+    if (thought) {
+      const thoughtEl = document.createElement('div');
+      thoughtEl.className = 'agent-thought';
+      thoughtEl.textContent = `💭 ${thought}`;
+      stepDiv.appendChild(thoughtEl);
+    }
+
+    if (action) {
+      const actionEl = document.createElement('div');
+      actionEl.className = 'agent-action';
+      let actionDesc = `🔧 [步骤${step}] ${action.type}`;
+      if (action.locator) actionDesc += ` → ${action.locator.value}`;
+      if (action.params?.text) actionDesc += ` (文本: "${action.params.text.slice(0, 20)}")`;
+      if (action.params?.direction) actionDesc += ` (${action.params.direction})`;
+      if (action.params?.key) actionDesc += ` (${action.params.key})`;
+      actionEl.textContent = actionDesc;
+      stepDiv.appendChild(actionEl);
+    }
+
+    if (result) {
+      const resultEl = document.createElement('div');
+      resultEl.className = result.success ? 'agent-result-success' : 'agent-result-fail';
+      resultEl.textContent = result.success
+        ? `✓ ${result.details || '成功'}`
+        : `✗ ${result.error || '失败'}`;
+      stepDiv.appendChild(resultEl);
+    }
+
+    bubble.appendChild(stepDiv);
+    scrollToBottom();
+  }
+
+  function renderAgentComplete(bubble, summary, success) {
+    const completeEl = document.createElement('div');
+    completeEl.className = success !== false ? 'agent-complete' : 'agent-error';
+    completeEl.textContent = success !== false
+      ? `✅ 任务完成: ${summary || '已完成所有操作'}`
+      : `⚠️ 任务未能完成: ${summary || ''}`;
+    bubble.appendChild(completeEl);
+    scrollToBottom();
+  }
+
+  function renderAgentError(bubble, error) {
+    const errorEl = document.createElement('div');
+    errorEl.className = 'agent-error';
+    errorEl.textContent = `❌ 错误: ${error}`;
+    bubble.appendChild(errorEl);
+    scrollToBottom();
+  }
+
+  function showAgentConfirmDialog(bubble, action, thought) {
+    return new Promise((resolve) => {
+      const confirmDiv = document.createElement('div');
+      confirmDiv.className = 'agent-confirm';
+
+      const msgEl = document.createElement('div');
+      msgEl.className = 'agent-confirm-msg';
+      let desc = `⚠️ 即将执行: ${action.type}`;
+      if (action.locator) desc += ` → ${action.locator.value}`;
+      if (thought) desc += `\n原因: ${thought}`;
+      msgEl.textContent = desc;
+      confirmDiv.appendChild(msgEl);
+
+      const btnContainer = document.createElement('div');
+      btnContainer.className = 'agent-confirm-btns';
+
+      const allowBtn = document.createElement('button');
+      allowBtn.textContent = '允许';
+      allowBtn.className = 'agent-btn-allow';
+      allowBtn.onclick = () => { confirmDiv.remove(); resolve(true); };
+
+      const denyBtn = document.createElement('button');
+      denyBtn.textContent = '取消';
+      denyBtn.className = 'agent-btn-deny';
+      denyBtn.onclick = () => { confirmDiv.remove(); resolve(false); };
+
+      btnContainer.append(allowBtn, denyBtn);
+      confirmDiv.appendChild(btnContainer);
+      bubble.appendChild(confirmDiv);
+      scrollToBottom();
+    });
+  }
+
+  async function runAgentTask(task) {
+    const sessionId = `agent_${createMessageId()}`;
+    agentState.active = true;
+    agentState.sessionId = sessionId;
+    agentState.task = task;
+    agentState.status = 'running';
+    agentState.currentStep = 0;
+
+    let apiKey, modelName, safeApiUrl;
+    try {
+      ({ apiKey, modelName, safeApiUrl } = await resolveApiRequestConfig());
+    } catch (err) {
+      alert(err.message || 'API 配置无效');
+      agentState.active = false;
+      agentState.status = 'idle';
+      return;
+    }
+
+    const userBubble = createMessageNode('user');
+    const userText = document.createElement('div');
+    userText.textContent = `🤖 [自动化] ${task}`;
+    userBubble.appendChild(userText);
+
+    const aiBubble = createMessageNode('ai');
+    showTypingIndicator(aiBubble);
+    scrollToBottom();
+
+    let cancelBtn = null;
+
+    try {
+      const pageState = await observePageState();
+      aiBubble.textContent = '';
+
+      const headerEl = document.createElement('div');
+      headerEl.className = 'agent-header';
+      headerEl.textContent = '🤖 Agent 自动化执行中...';
+      aiBubble.appendChild(headerEl);
+
+      cancelBtn = document.createElement('button');
+      cancelBtn.className = 'agent-btn-cancel';
+      cancelBtn.textContent = '⏹ 停止';
+      cancelBtn.onclick = async () => {
+        agentState.active = false;
+        cancelBtn.disabled = true;
+        cancelBtn.textContent = '已停止';
+        await callAgentApi(safeApiUrl, '/v1/agent/cancel', { session_id: sessionId }, apiKey).catch(() => {});
+        cancelBtn.remove();
+      };
+      headerEl.appendChild(cancelBtn);
+
+      let response = await callAgentApi(safeApiUrl, '/v1/agent/execute', {
+        task,
+        page_state: pageState,
+        session_id: sessionId,
+        model: modelName || 'gpt-4o',
+        max_steps: AGENT_MAX_STEPS,
+        require_confirmation: ['submit', 'navigate']
+      }, apiKey);
+
+      while (response.status === 'action_required' || response.status === 'confirm_required') {
+        if (!agentState.active) break;
+
+        agentState.currentStep = response.step;
+        const action = response.action;
+
+        if (response.status === 'confirm_required') {
+          const confirmed = await showAgentConfirmDialog(aiBubble, action, response.thought);
+          if (!confirmed) {
+            await callAgentApi(safeApiUrl, '/v1/agent/cancel', { session_id: sessionId }, apiKey).catch(() => {});
+            renderAgentError(aiBubble, '用户取消了操作');
+            break;
+          }
+        }
+
+        renderAgentStepInBubble(aiBubble, response.step, response.thought, action, null);
+
+        const actionResult = await executePageAction(action);
+
+        renderAgentStepInBubble(aiBubble, response.step, null, null, actionResult);
+
+        await new Promise(resolve => setTimeout(resolve, AGENT_SETTLE_DELAY_MS));
+
+        const newPageState = await observePageState();
+
+        response = await callAgentApi(safeApiUrl, '/v1/agent/step', {
+          session_id: sessionId,
+          action_result: actionResult,
+          page_state: newPageState
+        }, apiKey);
+      }
+
+      if (response.status === 'completed') {
+        renderAgentComplete(aiBubble, response.summary, true);
+      } else if (response.status === 'error') {
+        renderAgentError(aiBubble, response.error || '未知错误');
+      }
+
+    } catch (err) {
+      aiBubble.textContent = '';
+      renderAgentError(aiBubble, err.message || '执行失败');
+    } finally {
+      agentState.active = false;
+      agentState.status = 'idle';
+      if (cancelBtn && cancelBtn.parentNode) cancelBtn.remove();
+    }
+  }
+
+  // 拦截发送：如果用户输入匹配 agent 关键词，走 agent 流程而非普通聊天
+  (function installAgentInterceptor() {
+    const inputEl = document.getElementById('chatInput');
+    const btnEl = document.getElementById('sendBtn');
+    if (!inputEl || !btnEl) return;
+
+    function tryAgentIntercept(e) {
+      const text = inputEl.value?.trim() || '';
+      if (text && shouldUseAgent(text) && !agentState.active) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        inputEl.value = '';
+        runAgentTask(text);
+        return true;
+      }
+      return false;
+    }
+
+    btnEl.addEventListener('click', (e) => tryAgentIntercept(e), true);
+    inputEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) tryAgentIntercept(e);
+    }, true);
+  })();
 });

@@ -4,6 +4,7 @@ const MAX_PROMPT_LENGTH = 8000;
 const MAX_LLM_BODY_BYTES = 25 * 1024 * 1024;
 const CUSTOM_API_BASE_URLS_KEY = 'customApiBaseUrls';
 const PAGE_REFRESH_ENDPOINT_PATH = '/api/pages/refresh_snapshot';
+const AGENT_ENDPOINT_PATHS = ['/v1/agent/execute', '/v1/agent/step', '/v1/agent/cancel'];
 const DEFAULT_ALLOWED_CHAT_URLS = new Set([
   'https://api.openai.com/v1/chat/completions'
 ]);
@@ -137,6 +138,25 @@ async function isAllowedPageRefreshUrl(value) {
     return allowedUrls.has(normalizeChatUrl(url.href))
       && !url.search
       && !url.hash;
+  } catch {
+    return false;
+  }
+}
+
+async function isAllowedAgentUrl(value) {
+  try {
+    const url = new URL(String(value || ''));
+    const { [CUSTOM_API_BASE_URLS_KEY]: customUrls = [] } = await chrome.storage.local.get([CUSTOM_API_BASE_URLS_KEY]);
+    const normalized = normalizeChatUrl(url.href);
+    for (const baseUrl of customUrls) {
+      try {
+        const root = buildBackendRootFromApiBase(baseUrl);
+        for (const path of AGENT_ENDPOINT_PATHS) {
+          if (normalized === `${root}${path}`) return true;
+        }
+      } catch { /* skip invalid */ }
+    }
+    return false;
   } catch {
     return false;
   }
@@ -395,7 +415,9 @@ async function handleCallLlmStream(request) {
 async function handleCallApiJson(request) {
   const { url, options } = request;
 
-  if (!(await isAllowedPageRefreshUrl(url))) {
+  const isPageRefresh = await isAllowedPageRefreshUrl(url);
+  const isAgent = await isAllowedAgentUrl(url);
+  if (!isPageRefresh && !isAgent) {
     throw new Error('API 地址不被允许');
   }
 

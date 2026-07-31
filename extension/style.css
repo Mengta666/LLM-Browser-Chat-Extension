@@ -464,6 +464,39 @@ input { width: 100%; padding: 8px; margin-top: 5px; box-sizing: border-box; bord
   color: var(--app-danger);
 }
 
+.agent-plan {
+  margin: 8px 0;
+  padding: 10px 12px;
+  background: var(--app-surface);
+  border: 1px solid var(--app-border);
+  border-radius: 8px;
+}
+
+.agent-plan-title {
+  font-size: 12px;
+  font-weight: 700;
+  margin-bottom: 6px;
+  color: var(--app-text);
+}
+
+.agent-plan-item {
+  font-size: 12px;
+  padding: 3px 0;
+  color: var(--app-text-muted);
+  transition: all 0.2s;
+}
+
+.agent-plan-item.in_progress {
+  color: var(--app-accent);
+  font-weight: 600;
+}
+
+.agent-plan-item.completed {
+  color: var(--app-success, #22c55e);
+  text-decoration: line-through;
+  opacity: 0.7;
+}
+
 /* ========== 快捷指令胶囊按钮 ========== */
 .quick-prompts { 
   display: flex; gap: 6px; flex-wrap: wrap; padding: 2px 0; margin-bottom: 4px; 

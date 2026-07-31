@@ -5,7 +5,7 @@
 
 from typing import Any
 
-from agent.state import PageState, ActionResult, PageAction
+from agent.state import PageState, ActionResult, PageAction, SubTask
 
 
 SYSTEM_PROMPT = """你是一个浏览器自动化助手。用户会给你一个任务，你需要通过操作页面元素来完成它。
@@ -41,40 +41,52 @@ SYSTEM_PROMPT = """你是一个浏览器自动化助手。用户会给你一个�
 4. 等待我返回新的页面状态（每次操作后你都会收到最新的元素列表）
 5. 根据新的页面状态决定下一步，重复直到任务完成，然后调用 task_complete
 
-## 重要策略
+## 核心操作原则
 
-### 滚动查找策略
-当你需要找的元素不在当前可见的元素列表中时：
-1. 使用 scroll(direction="down", amount=500) 滚动页面
-2. **滚动后不要急于操作**——等我返回新的页面状态，你会看到新出现的元素
-3. 在新的元素列表中查找目标，如果还没找到，**继续滚动**
-4. **不要猜测 annotation_id**——每次滚动后元素编号会变化，必须以最新观察为准
-5. 观察"滚动进度"信息：如果显示"可继续向下滚动"，说明页面还有内容没显示出来
-6. **只有到达底部（进度≥95%）且确实找不到目标时，才能判定目标不存在**
-7. 对于弹窗/对话框中的列表，同样需要多次滚动直到底部
+### 1. 先观察，后行动
+- 每次操作前，仔细阅读当前元素列表和页面状态
+- 只操作你在当前观察中确实看到的元素
+- 如果目标不在列表中，先通过 scroll 让它出现
 
-### 信息收集类任务策略
-当任务是"查看"、"看一下"、"有哪些"、"列出"、"找到所有"时：
-1. 这类任务需要你**浏览完整个列表/页面**后汇总信息
-2. 必须反复滚动直到**到达底部**，中途看到的所有内容都要记录
-3. **不要点击不相关的按钮**——只需要滚动和阅读即可
-4. 每次滚动后，从元素列表和页面文本摘要中提取相关信息
-5. 只有浏览完全部内容后，才调用 task_complete 并在 summary 中列出完整结果
-6. **不要使用 press_key (PageDown) 来翻页**——使用 scroll 操作
-7. 不要尝试勾选、点击或修改任何内容，除非任务明确要求
+### 2. 操作后必须等待和确认
+- 任何点击/操作后，等我返回新的页面状态
+- 通过对比前后状态确认操作是否生效
+- 如果页面没有变化，可能需要换一种方式重试
 
-### 分步导航策略
-当任务涉及多层级导航（如菜单→子菜单→具体内容）：
-1. 每次只点击当前可见的下一层入口
-2. 点击后等待新页面状态，确认导航成功
-3. 再寻找下一层的入口
-4. **不要跳步**——如果你还没看到目标菜单项，可能需要先滚动或展开
+### 3. 验证上下文再操作
+- 当面板/弹出层/列表打开后，先确认显示的内容是否匹配目标
+- 如果当前显示的范围/分类/页码不对，先导航到正确的上下文
+- 例如：面板显示的月份不对就先翻月，列表显示的分类不对就先切换分类
+- 不要仅凭某个值看起来像就点击——确保周围上下文也是对的
 
-### annotation_id 使用规则
-- annotation_id 只在当前这一轮观察中有效
-- 每次执行操作后，页面可能变化导致编号重新分配
-- **只引用你在本轮观察中确实看到的编号**，不要猜测
-- 如果不确定编号对应什么元素，用 css 或 text 定位更安全
+### 3. 修改前先清除
+- 需要更改一个已有值时，先清除旧值再设置新值
+- 观察当前已选中/已填写的内容，判断是否需要先清除
+- 常见清除方式：点击元素旁的关闭图标(×)、点击"重置"按钮、使用 clear 操作、取消勾选
+
+### 4. 复杂交互是多步的
+- 很多组件需要"触发→弹出→选择"的多步流程
+- 第一步：点击触发器打开弹出层/面板
+- 第二步：等待弹出层出现（wait）
+- 第三步：在弹出层中找到并点击目标选项
+- 如果直接操作无效，思考是否缺少某个中间步骤
+
+### 5. 滚动查找
+- 目标不在可见列表中时，使用 scroll 而非猜测
+- 滚动后等待新观察结果再决策
+- 观察滚动进度信息，只有到底部后才能判定目标不存在
+- 对弹窗/面板内的列表同样适用
+
+### 6. 分步执行，不要跳跃
+- 每次只执行一个操作
+- 多层级导航逐步点击，不要跳步
+- annotation_id 每次操作后可能变化，只用当前轮次的
+
+### 7. 任务理解
+- "查看/列出/有哪些" → 信息收集：只需滚动阅读，不修改页面，最后汇总
+- "筛选/搜索/查询" → 修改条件：先清除旧条件，设置新条件，提交查询
+- "点击/进入/打开" → 导航操作：逐步点击进入目标页面
+- "填写/输入/提交" → 表单操作：定位输入框，输入内容，提交
 
 ## 注意事项
 - 每次只执行一个操作
@@ -88,27 +100,7 @@ SYSTEM_PROMPT = """你是一个浏览器自动化助手。用户会给你一个�
 """
 
 
-SYSTEM_PROMPT_TEXT_MODE = """你是一个浏览器自动化助手。用户会给你一个任务，你需要通过操作页面元素来完成它。
-
-## 你的能力
-你可以执行以下操作：
-- click: 点击元素（按钮、链接、复选框等）
-- type: 在输入框中输入文字
-- select: 从下拉框选择选项
-- scroll: 滚动页面（up/down/left/right）
-- hover: 悬停在元素上
-- focus: 聚焦元素
-- clear: 清空输入框
-- press_key: 按键盘按键（Enter、Tab、Escape等）
-- wait: 等待一段时间（页面加载后使用）
-- task_complete: 任务完成时必须调用
-
-## 元素定位方式
-你有三种方式定位元素：
-1. **css**: CSS选择器（如 "#username", "button.submit"）—— 最精确
-2. **text**: 元素可见文本匹配（如 "登录", "Submit"）—— 最直观
-3. **annotation_id**: 页面观察中元素的编号ID（如 "3"）—— 直接引用观察结果
-
+TEXT_MODE_FORMAT_APPENDIX = """
 ## 输出格式（非常重要！）
 你必须且只能输出一个 JSON 对象，不要输出任何其他文字说明。格式如下：
 
@@ -157,22 +149,76 @@ SYSTEM_PROMPT_TEXT_MODE = """你是一个浏览器自动化助手。用户会给
 {"action": "task_complete", "summary": "完成了什么", "thought": "你的思考"}
 ```
 
-## 规则
+## 附加规则
 - 每次只输出一个 JSON 动作
-- "thought" 字段用于简短说明你的推理
+- "thought" 字段简短说明你的推理
 - 不要在 JSON 之外添加任何文字
-- 如果操作失败，尝试用不同的定位方式
-- scroll 后不要猜测元素位置，等待新的页面观察结果
-- 只使用你在当前观察中确实看到的 annotation_id，不要猜测编号
-- 不要使用 press_key 来搜索或翻页（用 scroll 代替 PageDown）
-- 分步导航：每次只点一层，等新页面状态确认后再进入下一层
-- **信息收集任务**（查看/列出/找到所有）：只需要反复 scroll 浏览到底部，然后在 task_complete 的 summary 中汇总所有看到的信息。不要点击或修改任何内容。
-- 任务完成或确认无法完成时，必须输出 task_complete
 """
 
+SYSTEM_PROMPT_TEXT_MODE = SYSTEM_PROMPT + TEXT_MODE_FORMAT_APPENDIX
 
-def build_system_prompt() -> str:
-    return SYSTEM_PROMPT
+
+PLANNING_PROMPT = """你是一个浏览器自动化规划助手。用户给你一个目标任务，你需要结合当前页面的实际元素和状态，将目标拆解为有序的子任务列表。
+
+## 规则
+1. 每个子任务必须是一个可以在当前页面（或操作后的页面）上直接执行的具体动作目标
+2. 子任务顺序要合理：先清除/准备 → 再设置条件 → 最后提交/确认
+3. 每个子任务用一句话描述，要具体明确（"选择日期范围为本月" 而非 "设置日期"）
+4. 通常 2-7 个子任务，不要过细也不要过粗
+5. 如果任务本身很简单（单步可完成的操作），返回 1 个子任务即可
+6. 只基于当前页面实际可见的元素来规划，不要假设不存在的功能
+
+## 输出格式
+只输出 JSON，不要其他文字：
+```json
+{"sub_tasks": ["子任务1描述", "子任务2描述", ...]}
+```"""
+
+
+def build_sub_task_context(
+    task: str, sub_tasks: list[SubTask], current_index: int
+) -> str:
+    """构建子任务进度上下文，注入到每轮的 system prompt 中。"""
+    if not sub_tasks:
+        return ""
+
+    total = len(sub_tasks)
+    current = current_index + 1
+    parts = [
+        f"\n## 任务执行计划",
+        f"总目标: {task}",
+        f"当前子任务 [{current}/{total}]: {sub_tasks[current_index].description}",
+    ]
+
+    completed = [st for st in sub_tasks[:current_index] if st.status == "completed"]
+    if completed:
+        parts.append("已完成: " + ", ".join(f"✓ {st.description}" for st in completed))
+
+    remaining = sub_tasks[current_index + 1:]
+    if remaining:
+        parts.append("待完成: " + ", ".join(st.description for st in remaining))
+
+    parts.append("\n请专注完成当前子任务。完成后调用 sub_task_complete 切换到下一个。")
+    return "\n".join(parts)
+
+
+def build_planning_messages(task: str, page_state: PageState) -> list[dict[str, str]]:
+    """构造规划阶段的 messages（用于任务分解）。"""
+    return [
+        {"role": "system", "content": PLANNING_PROMPT},
+        {
+            "role": "user",
+            "content": f"## 目标任务\n{task}\n\n{build_observation_message(page_state)}",
+        },
+    ]
+
+
+def build_system_prompt(sub_task_context: str = "") -> str:
+    return SYSTEM_PROMPT + sub_task_context
+
+
+def build_system_prompt_text_mode(sub_task_context: str = "") -> str:
+    return SYSTEM_PROMPT + sub_task_context + TEXT_MODE_FORMAT_APPENDIX
 
 
 def build_observation_message(page_state: PageState) -> str:
@@ -212,11 +258,45 @@ def build_observation_message(page_state: PageState) -> str:
     if page_state.focused_element:
         parts.append(f"当前焦点: {page_state.focused_element}")
 
+    # 弹出层信息
+    active_popup = getattr(page_state, 'active_popup', None)
+    if not active_popup and hasattr(page_state, '__dict__'):
+        active_popup = page_state.__dict__.get('active_popup')
+    if isinstance(active_popup, dict) and active_popup:
+        popup_type_map = {
+            'date_picker': '日期选择面板',
+            'dropdown': '下拉选择列表',
+            'modal': '弹窗对话框',
+            'menu': '菜单',
+            'popup': '弹出面板',
+        }
+        popup_label = popup_type_map.get(active_popup.get('type', ''), '弹出面板')
+        header = active_popup.get('header_text', '')
+        header_str = f" ({header})" if header else ""
+        parts.append(f"\n📍 当前活跃弹出层: {popup_label}{header_str}")
+        parts.append("   请优先在此弹出层内操作。操作完成后面板通常会自动关闭。")
+
     if page_state.interactive_elements:
-        parts.append("\n## 可交互元素列表")
-        for el in page_state.interactive_elements:
-            line = _format_element(el)
-            parts.append(line)
+        popup_els = [el for el in page_state.interactive_elements if el.get("in_popup")]
+        main_els = [el for el in page_state.interactive_elements if not el.get("in_popup")]
+
+        if popup_els:
+            parts.append(f"\n## 🔍 弹出面板内的元素（共{len(popup_els)}个，优先操作）")
+            for el in popup_els:
+                line = _format_element(el)
+                parts.append(line)
+
+            if main_els:
+                parts.append(f"\n## 主页面元素（共{len(main_els)}个）")
+                for el in main_els:
+                    line = _format_element(el)
+                    parts.append(line)
+        else:
+            parts.append("\n## 可交互元素列表")
+            for el in page_state.interactive_elements:
+                line = _format_element(el)
+                parts.append(line)
+
         if getattr(page_state, 'element_count_truncated', False):
             parts.append("  ⚠️ 元素列表已截断，页面上还有更多元素。如果找不到目标，请先 scroll 让它出现在视口内。")
 
@@ -248,10 +328,10 @@ def build_action_result_message(action: PageAction, result: ActionResult) -> str
     return msg
 
 
-def build_initial_messages(task: str, page_state: PageState) -> list[dict[str, str]]:
+def build_initial_messages(task: str, page_state: PageState, sub_task_context: str = "") -> list[dict[str, str]]:
     """构造 Agent 会话的初始 messages（tool_calls 模式）。"""
     return [
-        {"role": "system", "content": build_system_prompt()},
+        {"role": "system", "content": build_system_prompt(sub_task_context)},
         {
             "role": "user",
             "content": f"## 任务\n{task}\n\n{build_observation_message(page_state)}",
@@ -259,15 +339,18 @@ def build_initial_messages(task: str, page_state: PageState) -> list[dict[str, s
     ]
 
 
-def build_initial_messages_text_mode(task: str, page_state: PageState) -> list[dict[str, str]]:
+def build_initial_messages_text_mode(task: str, page_state: PageState, sub_task_context: str = "") -> list[dict[str, str]]:
     """构造 Agent 会话的初始 messages（text_parse 模式，无 function calling）。"""
     return [
-        {"role": "system", "content": SYSTEM_PROMPT_TEXT_MODE},
+        {"role": "system", "content": build_system_prompt_text_mode(sub_task_context)},
         {
             "role": "user",
             "content": f"## 任务\n{task}\n\n{build_observation_message(page_state)}",
         },
     ]
+
+
+MAX_FULL_OBSERVATION_STEPS = 3
 
 
 def append_step_messages(
@@ -276,7 +359,13 @@ def append_step_messages(
     result: ActionResult,
     new_page_state: PageState,
 ) -> list[dict[str, Any]]:
-    """在已有 messages 基础上追加一轮动作执行结果 + 新观察。"""
+    """在已有 messages 基础上追加一轮动作执行结果 + 新观察。
+
+    使用滑动窗口策略：只保留最近 MAX_FULL_OBSERVATION_STEPS 步的完整观察，
+    更早的步骤压缩为一行摘要，减少 token 消耗和上下文污染。
+    """
+    _compress_old_observations(messages)
+
     messages.append(
         {
             "role": "user",
@@ -287,6 +376,30 @@ def append_step_messages(
         }
     )
     return messages
+
+
+def _compress_old_observations(messages: list[dict[str, Any]]) -> None:
+    """压缩旧的观察步骤，只保留最近 N 步的完整内容。"""
+    observation_indices = []
+    for i, msg in enumerate(messages):
+        if msg.get("role") == "user" and "## 动作执行结果" in msg.get("content", ""):
+            observation_indices.append(i)
+
+    if len(observation_indices) <= MAX_FULL_OBSERVATION_STEPS:
+        return
+
+    to_compress = observation_indices[:-MAX_FULL_OBSERVATION_STEPS]
+    for idx in to_compress:
+        content = messages[idx]["content"]
+        lines = content.split("\n")
+        result_line = ""
+        for line in lines:
+            if line.startswith("[") and ("✓" in line or "✗" in line):
+                result_line = line.strip()
+                break
+        if not result_line:
+            result_line = lines[1] if len(lines) > 1 else "已执行"
+        messages[idx] = {"role": "user", "content": f"[历史步骤] {result_line}"}
 
 
 def _format_element(el: dict[str, Any]) -> str:
@@ -300,9 +413,12 @@ def _format_element(el: dict[str, Any]) -> str:
     aria = el.get("aria_label", "")
     selector = el.get("css_selector", "")
     value = el.get("value", "")
+    component = el.get("component", "")
     enabled = "启用" if el.get("enabled", True) else "禁用"
 
     desc_parts = []
+    if component:
+        desc_parts.append(f"组件={component}")
     if text:
         desc_parts.append(f'文本="{text[:50]}"')
     if name:

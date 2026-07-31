@@ -15,6 +15,7 @@ class AgentStatus(str, Enum):
     RUNNING = "running"
     ACTION_REQUIRED = "action_required"
     CONFIRM_REQUIRED = "confirm_required"
+    PLAN_READY = "plan_ready"
     COMPLETED = "completed"
     ERROR = "error"
     CANCELLED = "cancelled"
@@ -47,11 +48,19 @@ class PageState(BaseModel):
     scroll_position: dict[str, int] = {}
     document_height: int = 0
     scrollable_container: Optional[dict[str, Any]] = None
+    active_popup: Optional[dict[str, Any]] = None
     focused_element: Optional[str] = None
     interactive_elements: list[dict[str, Any]] = []
     element_count_truncated: bool = False
     text_content_summary: str = ""
     forms: list[dict[str, Any]] = []
+
+
+@dataclass
+class SubTask:
+    """Agent 任务分解后的子任务。"""
+    description: str
+    status: str = "pending"  # "pending" | "in_progress" | "completed" | "skipped"
 
 
 @dataclass
@@ -72,3 +81,8 @@ class AgentSession:
     summary: Optional[str] = None
     error: Optional[str] = None
     call_mode: Optional[str] = None  # "tool_calls" | "text_parse" | None(auto)
+
+    # 任务分解
+    sub_tasks: list[SubTask] = field(default_factory=list)
+    current_sub_task_index: int = 0
+    planning_done: bool = False

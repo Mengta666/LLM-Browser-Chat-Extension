@@ -245,10 +245,27 @@ ACTION_SCHEMAS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "sub_task_complete",
+            "description": "标记当前子任务已完成，切换到下一个子任务。当你确认当前子任务的目标已经达成时调用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "summary": {
+                        "type": "string",
+                        "description": "当前子任务完成情况的简要说明",
+                    },
+                },
+                "required": ["summary"],
+            },
+        },
+    },
 ]
 
 ALLOWED_ACTION_TYPES: set[str] = {
     "click", "type", "select", "scroll", "hover",
     "focus", "clear", "press_key", "wait", "navigate",
-    "wait_for_element", "task_complete",
+    "wait_for_element", "task_complete", "sub_task_complete",
 }

@@ -24,10 +24,13 @@ from agent.state import (
     PageState,
     ActionResult,
     ElementLocator,
+    SubTask,
 )
 from agent.context_builder import (
     build_initial_messages,
     build_initial_messages_text_mode,
+    build_planning_messages,
+    build_sub_task_context,
     append_step_messages,
 )
 from agent.router import should_confirm_action
@@ -40,6 +43,8 @@ load_dotenv(dotenv_path=__env_path)
 MODEL_BASE_URL = os.getenv("MODEL_BASE_URL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 AGENT_MODE = os.getenv("AGENT_MODE", "auto")  # "tool_calls" | "text_parse" | "auto"
+
+_llm_client = OpenAI(base_url=MODEL_BASE_URL, api_key=OPENAI_API_KEY)
 
 _sessions: dict[str, AgentSession] = {}
 _SESSION_TTL_SECONDS = 600  # 10分钟过期
@@ -107,22 +112,39 @@ def run_step(
         session.error = f"已达到最大步数限制 ({session.max_steps})"
         return _build_response(session)
 
+    # 首步：先做任务分解规划
+    if not session.planning_done:
+        plan_result = _plan_task(session, page_state)
+        session.planning_done = True
+        if plan_result and len(plan_result) > 1:
+            session.sub_tasks = [SubTask(description=desc) for desc in plan_result]
+            session.sub_tasks[0].status = "in_progress"
+            session.status = AgentStatus.PLAN_READY
+            # 返回带 plan 的响应，前端展示计划后继续执行第一步
+            return _build_response(session, plan=_build_plan_info(session))
+        elif plan_result and len(plan_result) == 1:
+            session.sub_tasks = [SubTask(description=plan_result[0], status="in_progress")]
+
     session.current_step += 1
 
     mode = _resolve_call_mode(session)
 
+    sub_task_ctx = build_sub_task_context(
+        session.task, session.sub_tasks, session.current_sub_task_index
+    ) if session.sub_tasks else ""
+
     if not session.messages:
         if mode == CallMode.TOOL_CALLS:
-            session.messages = build_initial_messages(session.task, page_state)
+            session.messages = build_initial_messages(session.task, page_state, sub_task_ctx)
         else:
-            session.messages = build_initial_messages_text_mode(session.task, page_state)
+            session.messages = build_initial_messages_text_mode(session.task, page_state, sub_task_ctx)
     elif action_result and session.pending_action:
         append_step_messages(
             session.messages, session.pending_action, action_result, page_state
         )
         session.pending_action = None
 
-    client = OpenAI(base_url=MODEL_BASE_URL, api_key=OPENAI_API_KEY)
+    client = _llm_client
 
     if mode == CallMode.TOOL_CALLS:
         func_name, func_args, thought = _call_with_tools(client, session)
@@ -133,6 +155,37 @@ def run_step(
         return _build_response(session, thought=thought)
 
     if func_name == "task_complete":
+        session.status = AgentStatus.COMPLETED
+        session.summary = func_args.get("summary", "任务完成")
+        if session.sub_tasks:
+            session.sub_tasks[session.current_sub_task_index].status = "completed"
+        return _build_response(session, thought=thought)
+
+    if func_name == "sub_task_complete":
+        if session.sub_tasks and session.current_sub_task_index < len(session.sub_tasks):
+            session.sub_tasks[session.current_sub_task_index].status = "completed"
+            session.current_sub_task_index += 1
+            if session.current_sub_task_index >= len(session.sub_tasks):
+                session.status = AgentStatus.COMPLETED
+                session.summary = func_args.get("summary", "所有子任务已完成")
+                return _build_response(session, thought=thought)
+            else:
+                session.sub_tasks[session.current_sub_task_index].status = "in_progress"
+                # 更新 system prompt 中的子任务上下文
+                sub_task_ctx = build_sub_task_context(
+                    session.task, session.sub_tasks, session.current_sub_task_index
+                )
+                if session.messages and session.messages[0].get("role") == "system":
+                    from agent.context_builder import SYSTEM_PROMPT, SYSTEM_PROMPT_TEXT_MODE, TEXT_MODE_FORMAT_APPENDIX
+                    mode = _resolve_call_mode(session)
+                    if mode == CallMode.TOOL_CALLS:
+                        session.messages[0] = {"role": "system", "content": SYSTEM_PROMPT + sub_task_ctx}
+                    else:
+                        session.messages[0] = {"role": "system", "content": SYSTEM_PROMPT + sub_task_ctx + TEXT_MODE_FORMAT_APPENDIX}
+                session.current_step -= 1  # 子任务切换不计入步数
+                session.status = AgentStatus.ACTION_REQUIRED
+                return _build_response(session, thought=thought, plan=_build_plan_info(session))
+        # 没有子任务时当作 task_complete 处理
         session.status = AgentStatus.COMPLETED
         session.summary = func_args.get("summary", "任务完成")
         return _build_response(session, thought=thought)
@@ -402,8 +455,60 @@ def _parse_action(func_name: str, args: dict[str, Any]) -> PageAction:
     return PageAction(type=func_name, locator=locator, params=params)
 
 
+def _plan_task(session: AgentSession, page_state: PageState) -> Optional[list[str]]:
+    """调用 LLM 对任务进行分解规划，返回子任务描述列表。失败时返回 None。"""
+    messages = build_planning_messages(session.task, page_state)
+    client = _llm_client
+
+    try:
+        response = client.chat.completions.create(
+            model=session.model,
+            messages=messages,
+        )
+    except Exception:
+        return None
+
+    if not response or not response.choices:
+        return None
+
+    raw_content = response.choices[0].message.content or ""
+    clean_content = _strip_think_tags(raw_content)
+
+    # 解析 JSON
+    for block in re.finditer(r'```(?:json)?\s*(\{.*?\})\s*```', clean_content, re.DOTALL):
+        try:
+            data = json.loads(block.group(1))
+            if "sub_tasks" in data and isinstance(data["sub_tasks"], list):
+                return [str(t) for t in data["sub_tasks"] if t]
+        except json.JSONDecodeError:
+            continue
+
+    for obj in re.finditer(r'\{[^{}]*"sub_tasks"\s*:\s*\[.*?\][^{}]*\}', clean_content, re.DOTALL):
+        try:
+            data = json.loads(obj.group(0))
+            if "sub_tasks" in data and isinstance(data["sub_tasks"], list):
+                return [str(t) for t in data["sub_tasks"] if t]
+        except json.JSONDecodeError:
+            continue
+
+    return None
+
+
+def _build_plan_info(session: AgentSession) -> Optional[dict[str, Any]]:
+    """构建返回给前端的 plan 信息。"""
+    if not session.sub_tasks:
+        return None
+    return {
+        "sub_tasks": [
+            {"description": st.description, "status": st.status}
+            for st in session.sub_tasks
+        ],
+        "current_index": session.current_sub_task_index,
+    }
+
+
 def _build_response(
-    session: AgentSession, thought: str = ""
+    session: AgentSession, thought: str = "", plan: Optional[dict] = None
 ) -> dict[str, Any]:
     """构造返回给前端的标准响应。"""
     resp: dict[str, Any] = {
@@ -414,6 +519,7 @@ def _build_response(
         "action": None,
         "summary": session.summary,
         "error": session.error,
+        "plan": plan or _build_plan_info(session),
     }
 
     if session.pending_action:

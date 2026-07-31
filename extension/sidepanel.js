@@ -3043,21 +3043,69 @@ document.addEventListener('DOMContentLoaded', async () => {
     const tab = await getActiveBrowserTab();
     if (!tab?.id) throw new Error('无法获取当前标签页');
 
-    const [{ result }] = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: tab.id, allFrames: true },
       func: () => {
         const INTERACTIVE_SELECTORS = [
           'a[href]', 'button', 'input', 'textarea', 'select',
           '[role="button"]', '[role="link"]', '[role="tab"]',
           '[role="menuitem"]', '[role="checkbox"]', '[role="radio"]',
           '[role="option"]', '[role="switch"]', '[role="slider"]',
-          '[contenteditable="true"]', '[onclick]', '[tabindex]:not([tabindex="-1"])'
+          '[contenteditable="true"]', '[onclick]', '[tabindex]:not([tabindex="-1"])',
+          '[data-component-name]',
+          '.jmtd-base-input', '.jmtd-selector', '.jmtd-select',
+          '.ant-select', '.ant-picker', '.ant-input',
+          '.el-input', '.el-select', '.el-date-editor',
+          '[class*="picker"]:not([class*="icon"])',
+          '[class*="selector"]:not([class*="icon"])'
         ];
-        const MAX_ELEMENTS = 150;
+
+        // 弹出层内额外需要采集的选择器（主页面不需要这些细粒度元素）
+        const POPUP_EXTRA_SELECTORS = [
+          'td[role="gridcell"]',
+          'li[role="option"]',
+          '[data-event-content]',
+          '.jmtd-date-picker-header-btn',
+          '.jmtd-date-picker-cell-content-inner',
+          '.jmtd-date-picker-switch-panel-item',
+          '.ant-picker-cell',
+          '.ant-picker-header-btn',
+          '.ant-picker-header-super-prev-btn',
+          '.ant-picker-header-prev-btn',
+          '.ant-picker-header-next-btn',
+          '.ant-picker-header-super-next-btn',
+          '.ant-select-item-option',
+          '.el-picker-panel__btn',
+          '.el-select-dropdown__item',
+          '[class*="picker-cell"]',
+          '[class*="switch-panel-item"]',
+          'li[class*="option"]'
+        ];
+
+        // 弹出层容器检测选择器
+        const POPUP_CONTAINER_SELECTORS = [
+          '[role="dialog"]', '[role="listbox"]', '[role="menu"]',
+          '.jmtd-dropdown-panel', '.jmtd-dropdown-list',
+          '.jmtd-popup', '.jmtd-modal',
+          '.jmtd-date-picker-panel', '.jmtd-select-dropdown',
+          '.ant-modal-content', '.ant-dropdown',
+          '.ant-picker-panel', '.ant-picker-dropdown',
+          '.ant-select-dropdown', '.ant-popover-inner',
+          '.el-dialog', '.el-dropdown-menu',
+          '.el-picker-panel', '.el-select-dropdown', '.el-popover',
+          '[class*="popup"]:not([style*="display: none"])',
+          '[class*="dropdown-list"]', '[class*="picker-panel"]',
+          '.modal[style*="display: block"]', '.modal.show'
+        ];
+
+        const MAX_POPUP_ELEMENTS = 100;
+        const MAX_MAIN_WHEN_POPUP = 50;
+        const MAX_TOTAL_NO_POPUP = 150;
 
         function isVisible(el) {
           const style = window.getComputedStyle(el);
           if (style.display === 'none' || style.visibility === 'hidden') return false;
+          if (parseFloat(style.opacity) === 0) return false;
           const rect = el.getBoundingClientRect();
           return rect.width > 0 && rect.height > 0;
         }
@@ -3094,88 +3142,145 @@ document.addEventListener('DOMContentLoaded', async () => {
           return selector;
         }
 
-        const seen = new Set();
-        const elements = [];
-        let annotationId = 1;
+        function buildElementInfo(el, id, inPopup) {
+          const rect = el.getBoundingClientRect();
+          return {
+            id,
+            tag: el.tagName.toLowerCase(),
+            type: el.getAttribute('type') || '',
+            role: el.getAttribute('role') || '',
+            name: el.getAttribute('name') || '',
+            placeholder: el.getAttribute('placeholder') || '',
+            value: (el.value || '').slice(0, 100),
+            text: (el.textContent || '').trim().slice(0, 100),
+            aria_label: el.getAttribute('aria-label') || '',
+            data_testid: el.getAttribute('data-testid') || '',
+            component: el.getAttribute('data-component-name') || '',
+            css_selector: buildCssSelector(el),
+            bounding_box: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) },
+            visible: true,
+            enabled: !el.disabled && !el.classList.contains('jmtd-date-picker-cell-disabled'),
+            checked: el.checked !== undefined ? el.checked : null,
+            contenteditable: el.isContentEditable || false,
+            in_popup: inPopup
+          };
+        }
+
+        // 检测可见弹出层（取最顶层的）
+        function findVisiblePopups() {
+          const popups = [];
+          for (const sel of POPUP_CONTAINER_SELECTORS) {
+            for (const el of document.querySelectorAll(sel)) {
+              if (!isVisible(el)) continue;
+              // 排除已经被另一个 popup 包含的
+              const dominated = popups.some(p => p.contains(el));
+              if (dominated) continue;
+              // 移除被当前 el 包含的
+              for (let i = popups.length - 1; i >= 0; i--) {
+                if (el.contains(popups[i])) popups.splice(i, 1);
+              }
+              popups.push(el);
+            }
+          }
+          // 按 z-index 排序，最高的在前
+          popups.sort((a, b) => {
+            const za = parseInt(window.getComputedStyle(a).zIndex) || 0;
+            const zb = parseInt(window.getComputedStyle(b).zIndex) || 0;
+            return zb - za;
+          });
+          return popups;
+        }
+
+        // 采集元素的通用函数
+        // skipNestedDedup=true 时禁用嵌套去重（弹出层内部元素不需要）
+        function collectElements(root, selectors, maxCount, seen, annotationIdStart, inPopup, excludeContainers, skipNestedDedup) {
+          const collected = [];
+          let annotationId = annotationIdStart;
+          for (const selector of selectors) {
+            const candidates = root === document
+              ? document.querySelectorAll(selector)
+              : root.querySelectorAll(selector);
+            for (const el of candidates) {
+              if (collected.length >= maxCount) break;
+              if (seen.has(el)) continue;
+              if (!isVisible(el)) continue;
+              // 排除已在弹出层采集过的
+              if (excludeContainers && excludeContainers.some(c => c.contains(el))) continue;
+              // 嵌套去重：仅在主页面采集时启用
+              if (!skipNestedDedup) {
+                let skipNested = false;
+                let parent = el.parentElement;
+                for (let i = 0; i < 3 && parent; i++) {
+                  if (seen.has(parent)) { skipNested = true; break; }
+                  parent = parent.parentElement;
+                }
+                if (skipNested) continue;
+              }
+              seen.add(el);
+
+              const id = annotationId++;
+              el.setAttribute('data-agent-id', id);
+              collected.push(buildElementInfo(el, id, inPopup));
+            }
+          }
+          return { collected, nextId: annotationId };
+        }
 
         // 清除旧标记
         document.querySelectorAll('[data-agent-id]').forEach(el => el.removeAttribute('data-agent-id'));
 
-        for (const selector of INTERACTIVE_SELECTORS) {
-          for (const el of document.querySelectorAll(selector)) {
-            if (elements.length >= MAX_ELEMENTS) break;
-            if (seen.has(el)) continue;
-            if (!isVisible(el)) continue;
-            seen.add(el);
+        const seen = new Set();
+        let elements = [];
+        let annotationId = 1;
+        let activePopup = null;
 
-            const id = annotationId++;
-            el.setAttribute('data-agent-id', id);
+        // Step 1: 检测弹出层
+        const popupContainers = findVisiblePopups();
 
-            const rect = el.getBoundingClientRect();
-            elements.push({
-              id,
-              tag: el.tagName.toLowerCase(),
-              type: el.getAttribute('type') || '',
-              role: el.getAttribute('role') || '',
-              name: el.getAttribute('name') || '',
-              placeholder: el.getAttribute('placeholder') || '',
-              value: (el.value || '').slice(0, 100),
-              text: (el.textContent || '').trim().slice(0, 100),
-              aria_label: el.getAttribute('aria-label') || '',
-              data_testid: el.getAttribute('data-testid') || '',
-              css_selector: buildCssSelector(el),
-              bounding_box: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) },
-              visible: true,
-              enabled: !el.disabled,
-              checked: el.checked !== undefined ? el.checked : null,
-              contenteditable: el.isContentEditable || false
-            });
+        if (popupContainers.length > 0) {
+          // Step 2a: 优先采集弹出层元素（细粒度优先，禁用嵌套去重）
+          const popupSelectors = [...POPUP_EXTRA_SELECTORS, ...INTERACTIVE_SELECTORS];
+          for (const popup of popupContainers) {
+            if (elements.length >= MAX_POPUP_ELEMENTS) break;
+            const remaining = MAX_POPUP_ELEMENTS - elements.length;
+            const result = collectElements(popup, popupSelectors, remaining, seen, annotationId, true, null, true);
+            elements.push(...result.collected);
+            annotationId = result.nextId;
           }
+
+          // 构建弹出层信息
+          const topPopup = popupContainers[0];
+          const headerEl = topPopup.querySelector('.jmtd-date-picker-header-content, .ant-picker-header, .el-date-picker__header, [class*="header-content"]');
+          activePopup = {
+            type: detectPopupType(topPopup),
+            header_text: headerEl ? headerEl.textContent.trim() : '',
+            selector: buildCssSelector(topPopup)
+          };
+
+          // Step 2b: 主页面剩余配额（启用嵌套去重）
+          const mainResult = collectElements(document, INTERACTIVE_SELECTORS, MAX_MAIN_WHEN_POPUP, seen, annotationId, false, popupContainers, false);
+          elements.push(...mainResult.collected);
+          annotationId = mainResult.nextId;
+        } else {
+          // 无弹出层：正常采集（启用嵌套去重）
+          const result = collectElements(document, INTERACTIVE_SELECTORS, MAX_TOTAL_NO_POPUP, seen, annotationId, false, null, false);
+          elements.push(...result.collected);
+          annotationId = result.nextId;
         }
 
-        // 扫描同源 iframe 中的元素
-        try {
-          const iframes = document.querySelectorAll('iframe');
-          for (const iframe of iframes) {
-            if (elements.length >= MAX_ELEMENTS) break;
-            try {
-              const iframeDoc = iframe.contentDocument || iframe.contentWindow?.document;
-              if (!iframeDoc) continue;
-              for (const selector of INTERACTIVE_SELECTORS) {
-                for (const el of iframeDoc.querySelectorAll(selector)) {
-                  if (elements.length >= MAX_ELEMENTS) break;
-                  if (seen.has(el)) continue;
-                  if (!isVisible(el)) continue;
-                  seen.add(el);
-                  const id = annotationId++;
-                  el.setAttribute('data-agent-id', id);
-                  const rect = el.getBoundingClientRect();
-                  elements.push({
-                    id,
-                    tag: el.tagName.toLowerCase(),
-                    type: el.getAttribute('type') || '',
-                    role: el.getAttribute('role') || '',
-                    name: el.getAttribute('name') || '',
-                    placeholder: el.getAttribute('placeholder') || '',
-                    value: (el.value || '').slice(0, 100),
-                    text: (el.textContent || '').trim().slice(0, 100),
-                    aria_label: el.getAttribute('aria-label') || '',
-                    data_testid: el.getAttribute('data-testid') || '',
-                    css_selector: `iframe[src="${iframe.src || ''}"] >>> ${el.tagName.toLowerCase()}`,
-                    bounding_box: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) },
-                    visible: true,
-                    enabled: !el.disabled,
-                    checked: el.checked !== undefined ? el.checked : null,
-                    contenteditable: el.isContentEditable || false,
-                    in_iframe: true
-                  });
-                }
-              }
-            } catch (e) { /* 跨域 iframe 无法访问，跳过 */ }
-          }
-        } catch (e) { /* iframe 扫描失败不影响主流程 */ }
+        function detectPopupType(el) {
+          const cls = el.className || '';
+          if (cls.includes('date-picker') || cls.includes('picker-panel')) return 'date_picker';
+          if (cls.includes('select-dropdown') || cls.includes('dropdown-list')) return 'dropdown';
+          if (cls.includes('modal') || cls.includes('dialog')) return 'modal';
+          if (cls.includes('menu')) return 'menu';
+          if (el.getAttribute('role') === 'listbox') return 'dropdown';
+          if (el.getAttribute('role') === 'dialog') return 'modal';
+          if (el.getAttribute('role') === 'menu') return 'menu';
+          return 'popup';
+        }
 
-        const truncated = seen.size > MAX_ELEMENTS;
+        const truncated = elements.length >= (popupContainers.length > 0 ? MAX_POPUP_ELEMENTS + MAX_MAIN_WHEN_POPUP : MAX_TOTAL_NO_POPUP);
 
         // 检测弹窗/对话框内的滚动容器状态
         let scrollable_container = null;
@@ -3184,7 +3289,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         for (const m of modals) {
           const style = window.getComputedStyle(m);
           if (style.display === 'none' || style.visibility === 'hidden') continue;
-          // 找弹窗内的可滚动区域
           const scrollEls = [m, ...m.querySelectorAll('*')];
           for (const el of scrollEls) {
             if (el.scrollHeight > el.clientHeight + 10) {
@@ -3210,10 +3314,11 @@ document.addEventListener('DOMContentLoaded', async () => {
           scroll_position: { x: Math.round(window.scrollX), y: Math.round(window.scrollY) },
           document_height: document.documentElement.scrollHeight,
           scrollable_container,
+          active_popup: activePopup,
           focused_element: document.activeElement?.id ? `#${document.activeElement.id}` : null,
           interactive_elements: elements,
           element_count_truncated: truncated,
-          text_content_summary: (document.body?.innerText || '').trim().slice(0, 3000),
+          text_content_summary: (document.body?.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 3000),
           forms: Array.from(document.forms).slice(0, 10).map(f => ({
             action: f.action,
             method: f.method,
@@ -3222,7 +3327,26 @@ document.addEventListener('DOMContentLoaded', async () => {
         };
       }
     });
-    return result;
+
+    // 合并所有 frame 的结果（第一个是主 frame，后续是子 frame）
+    const mainResult = results[0]?.result;
+    if (!mainResult) throw new Error('页面观察失败');
+
+    for (let i = 1; i < results.length; i++) {
+      const frameResult = results[i]?.result;
+      if (!frameResult || !frameResult.interactive_elements?.length) continue;
+      // 给子 frame 元素续编 annotation_id
+      const offset = mainResult.interactive_elements.length;
+      for (const el of frameResult.interactive_elements) {
+        el.id = offset + el.id;
+        el.in_iframe = true;
+        mainResult.interactive_elements.push(el);
+      }
+      if (!mainResult.element_count_truncated && frameResult.element_count_truncated) {
+        mainResult.element_count_truncated = true;
+      }
+    }
+    return mainResult;
   }
 
   async function executePageAction(action) {
@@ -3238,7 +3362,18 @@ document.addEventListener('DOMContentLoaded', async () => {
       const tab = await getActiveBrowserTab();
       if (!tab?.id) return { success: false, action_type: 'navigate', error: '无法获取标签页', timestamp: Date.now() };
       await chrome.tabs.update(tab.id, { url });
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      // 等待页面加载完成，而非硬编码等待
+      await new Promise((resolve) => {
+        const timeout = setTimeout(resolve, 10000);
+        const listener = (tabId, info) => {
+          if (tabId === tab.id && info.status === 'complete') {
+            chrome.tabs.onUpdated.removeListener(listener);
+            clearTimeout(timeout);
+            resolve();
+          }
+        };
+        chrome.tabs.onUpdated.addListener(listener);
+      });
       return { success: true, action_type: 'navigate', details: `导航到 ${url}`, timestamp: Date.now() };
     }
 
@@ -3248,8 +3383,8 @@ document.addEventListener('DOMContentLoaded', async () => {
       const selector = action.locator?.value || action.params?.selector;
       if (!selector) return { success: false, action_type: 'wait_for_element', error: '缺少选择器', timestamp: Date.now() };
       const timeout = Math.min(action.params?.timeout || 5000, 10000);
-      const [{ result }] = await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
+      const waitResults = await chrome.scripting.executeScript({
+        target: { tabId: tab.id, allFrames: true },
         func: async (sel, maxWait) => {
           const start = Date.now();
           while (Date.now() - start < maxWait) {
@@ -3261,7 +3396,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         },
         args: [selector, timeout]
       });
-      if (result?.found) {
+      const found = waitResults.some(fr => fr?.result?.found);
+      if (found) {
         return { success: true, action_type: 'wait_for_element', details: `元素已出现: ${selector}`, timestamp: Date.now() };
       }
       return { success: false, action_type: 'wait_for_element', error: `等待超时: ${selector}`, timestamp: Date.now() };
@@ -3271,7 +3407,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (!tab?.id) throw new Error('无法获取当前标签页');
 
     const execPromise = chrome.scripting.executeScript({
-      target: { tabId: tab.id },
+      target: { tabId: tab.id, allFrames: true },
       func: async (actionData) => {
         function findByMethod(method, value) {
           if (method === 'css') {
@@ -3417,14 +3553,26 @@ document.addEventListener('DOMContentLoaded', async () => {
               const rect = element.getBoundingClientRect();
               const cx = rect.left + rect.width / 2;
               const cy = rect.top + rect.height / 2;
-              const evtOpts = { bubbles: true, cancelable: true, clientX: cx, clientY: cy, view: window };
-              element.dispatchEvent(new PointerEvent('pointerdown', evtOpts));
-              element.dispatchEvent(new MouseEvent('mousedown', evtOpts));
-              await new Promise(r => setTimeout(r, 50));
-              element.dispatchEvent(new PointerEvent('pointerup', evtOpts));
-              element.dispatchEvent(new MouseEvent('mouseup', evtOpts));
-              element.dispatchEvent(new MouseEvent('click', evtOpts));
-              return { success: true, details: `点击了 ${locator?.value || '元素'}`, action_type: type };
+              // 计算在顶层视口中的绝对坐标（处理 iframe 偏移）
+              let offsetX = 0, offsetY = 0;
+              let win = window;
+              while (win !== win.parent) {
+                try {
+                  const frame = win.frameElement;
+                  if (frame) {
+                    const frameRect = frame.getBoundingClientRect();
+                    offsetX += frameRect.left;
+                    offsetY += frameRect.top;
+                  }
+                  win = win.parent;
+                } catch (e) { break; } // 跨域时跳出
+              }
+              return {
+                success: true,
+                details: `点击了 ${locator?.value || '元素'}`,
+                action_type: type,
+                _clickCoords: { x: cx + offsetX, y: cy + offsetY }
+              };
             }
 
             case 'type': {
@@ -3625,7 +3773,73 @@ document.addEventListener('DOMContentLoaded', async () => {
       setTimeout(() => reject(new Error('操作执行超时')), AGENT_ACTION_TIMEOUT_MS)
     );
 
-    const [{ result }] = await Promise.race([execPromise, timeoutPromise]);
+    const frameResults = await Promise.race([execPromise, timeoutPromise]);
+    // 从所有 frame 结果中取第一个成功的（非"找不到元素"的）
+    let result = null;
+    for (const fr of frameResults) {
+      if (fr?.result?.success) { result = fr.result; break; }
+    }
+    // 如果没有成功的，取第一个有内容的结果（可能是报错）
+    if (!result) {
+      for (const fr of frameResults) {
+        if (fr?.result) { result = fr.result; break; }
+      }
+    }
+    if (!result) result = { success: false, error: '所有 frame 均无响应', action_type: 'unknown' };
+
+    // click 操作：用 debugger 派发真实鼠标事件（isTrusted=true），失败时回退合成事件
+    if (result.success && result._clickCoords && action.type === 'click') {
+      const { x, y } = result._clickCoords;
+      let debuggerOk = false;
+      try {
+        const resp = await chrome.runtime.sendMessage({
+          type: 'DEBUGGER_CLICK', tabId: tab.id, x: Math.round(x), y: Math.round(y)
+        });
+        debuggerOk = resp?.ok;
+      } catch (e) { /* debugger 不可用 */ }
+
+      if (!debuggerOk) {
+        // 回退：合成事件，用完整 locator 逻辑查找元素
+        await chrome.scripting.executeScript({
+          target: { tabId: tab.id, allFrames: true },
+          func: (locatorData) => {
+            let el = null;
+            if (!locatorData) return;
+            if (locatorData.method === 'css') {
+              el = document.querySelector(locatorData.value);
+            } else if (locatorData.method === 'annotation_id') {
+              el = document.querySelector(`[data-agent-id="${locatorData.value}"]`);
+            } else if (locatorData.method === 'text') {
+              const normalized = locatorData.value.toLowerCase().trim();
+              for (const candidate of document.querySelectorAll('*')) {
+                const t = (candidate.textContent || '').trim().toLowerCase();
+                if (t === normalized || t.includes(normalized)) {
+                  const r = candidate.getBoundingClientRect();
+                  if (r.width > 0 && r.height > 0) { el = candidate; break; }
+                }
+              }
+            }
+            if (!el && locatorData.fallback) {
+              el = document.querySelector(`[data-agent-id="${locatorData.fallback.value}"]`);
+            }
+            if (!el) return;
+            const rect = el.getBoundingClientRect();
+            const cx = rect.left + rect.width / 2;
+            const cy = rect.top + rect.height / 2;
+            const opts = { bubbles: true, cancelable: true, clientX: cx, clientY: cy, view: window, button: 0 };
+            el.dispatchEvent(new PointerEvent('pointerdown', opts));
+            el.dispatchEvent(new MouseEvent('mousedown', opts));
+            el.dispatchEvent(new PointerEvent('pointerup', opts));
+            el.dispatchEvent(new MouseEvent('mouseup', opts));
+            el.dispatchEvent(new MouseEvent('click', opts));
+            el.click();
+          },
+          args: [action.locator || null]
+        }).catch(() => {});
+      }
+      delete result._clickCoords;
+    }
+
     return { ...result, timestamp: Date.now() };
   }
 
@@ -3641,6 +3855,45 @@ document.addEventListener('DOMContentLoaded', async () => {
       method: 'POST',
       headers,
       body: JSON.stringify(body)
+    });
+  }
+
+  function renderAgentPlan(bubble, plan) {
+    const planDiv = document.createElement('div');
+    planDiv.className = 'agent-plan';
+    planDiv.dataset.planContainer = 'true';
+
+    const titleEl = document.createElement('div');
+    titleEl.className = 'agent-plan-title';
+    titleEl.textContent = '📋 执行计划';
+    planDiv.appendChild(titleEl);
+
+    plan.sub_tasks.forEach((st, i) => {
+      const item = document.createElement('div');
+      item.className = `agent-plan-item ${st.status}`;
+      item.dataset.planIndex = i;
+      const icon = st.status === 'completed' ? '✓' : st.status === 'in_progress' ? '▶' : '○';
+      item.textContent = `${icon} ${st.description}`;
+      planDiv.appendChild(item);
+    });
+
+    bubble.appendChild(planDiv);
+    scrollToBottom();
+  }
+
+  function updateAgentPlan(bubble, plan) {
+    if (!plan || !plan.sub_tasks) return;
+    const container = bubble.querySelector('[data-plan-container]');
+    if (!container) {
+      renderAgentPlan(bubble, plan);
+      return;
+    }
+    plan.sub_tasks.forEach((st, i) => {
+      const item = container.querySelector(`[data-plan-index="${i}"]`);
+      if (!item) return;
+      item.className = `agent-plan-item ${st.status}`;
+      const icon = st.status === 'completed' ? '✓' : st.status === 'in_progress' ? '▶' : '○';
+      item.textContent = `${icon} ${st.description}`;
     });
   }
 
@@ -3790,11 +4043,37 @@ document.addEventListener('DOMContentLoaded', async () => {
         require_confirmation: ['submit', 'navigate']
       }, apiKey);
 
+      // 规划阶段：如果返回 plan_ready，展示计划并继续
+      if (response.status === 'plan_ready' && response.plan) {
+        renderAgentPlan(aiBubble, response.plan);
+        // 立即调用 step 继续执行（传入当前页面状态，无 action_result）
+        const freshPageState = await observePageState();
+        response = await callAgentApi(safeApiUrl, '/v1/agent/step', {
+          session_id: sessionId,
+          action_result: { success: true, action_type: 'plan_acknowledged', details: '计划已确认' },
+          page_state: freshPageState
+        }, apiKey);
+      }
+
       while (response.status === 'action_required' || response.status === 'confirm_required') {
         if (!agentState.active) break;
 
+        // 更新子任务计划显示
+        if (response.plan) updateAgentPlan(aiBubble, response.plan);
+
         agentState.currentStep = response.step;
         const action = response.action;
+
+        // 子任务切换时 action 为 null，直接继续请求下一步
+        if (!action) {
+          const freshState = await observePageState();
+          response = await callAgentApi(safeApiUrl, '/v1/agent/step', {
+            session_id: sessionId,
+            action_result: { success: true, action_type: 'sub_task_switch', details: '子任务切换' },
+            page_state: freshState
+          }, apiKey);
+          continue;
+        }
 
         if (response.status === 'confirm_required') {
           const confirmed = await showAgentConfirmDialog(aiBubble, action, response.thought);
@@ -3823,6 +4102,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
 
       if (response.status === 'completed') {
+        if (response.plan) updateAgentPlan(aiBubble, response.plan);
         renderAgentComplete(aiBubble, response.summary, true);
       } else if (response.status === 'error') {
         renderAgentError(aiBubble, response.error || '未知错误');
@@ -3835,6 +4115,11 @@ document.addEventListener('DOMContentLoaded', async () => {
       agentState.active = false;
       agentState.status = 'idle';
       if (cancelBtn && cancelBtn.parentNode) cancelBtn.remove();
+      // 释放 debugger 连接
+      const activeTab = await getActiveBrowserTab().catch(() => null);
+      if (activeTab?.id) {
+        chrome.runtime.sendMessage({ type: 'DEBUGGER_DETACH', tabId: activeTab.id }).catch(() => {});
+      }
     }
   }
 

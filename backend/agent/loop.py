@@ -25,12 +25,14 @@ from agent.state import (
     ActionResult,
     ElementLocator,
     SubTask,
+    FailedAttempt,
 )
 from agent.context_builder import (
     build_initial_messages,
     build_initial_messages_text_mode,
     build_planning_messages,
     build_sub_task_context,
+    build_reflection_prompt,
     append_step_messages,
 )
 from agent.router import should_confirm_action
@@ -139,10 +141,17 @@ def run_step(
         else:
             session.messages = build_initial_messages_text_mode(session.task, page_state, sub_task_ctx)
     elif action_result and session.pending_action:
+        # 记录失败/成功并更新反思状态
+        _track_attempt_result(session, session.pending_action, action_result)
         append_step_messages(
             session.messages, session.pending_action, action_result, page_state
         )
         session.pending_action = None
+
+    # 注入反思提示（如果有重复失败）
+    reflection = build_reflection_prompt(session)
+    if reflection:
+        session.messages.append({"role": "user", "content": reflection})
 
     client = _llm_client
 
@@ -189,6 +198,45 @@ def run_step(
         session.status = AgentStatus.COMPLETED
         session.summary = func_args.get("summary", "任务完成")
         return _build_response(session, thought=thought)
+
+    if func_name == "sub_task_retry":
+        target_index = func_args.get("target_index", 0)
+        reason = func_args.get("reason", "")
+
+        if not session.sub_tasks or target_index < 0 or target_index >= len(session.sub_tasks):
+            session.status = AgentStatus.ERROR
+            session.error = f"无效的回退目标: {target_index}"
+            return _build_response(session, thought=thought)
+
+        target_task = session.sub_tasks[target_index]
+        if target_task.retry_count >= 2:
+            # 超过重试上限，跳过该子任务
+            target_task.status = "skipped"
+            session.sub_tasks[session.current_sub_task_index].status = "in_progress"
+            session.status = AgentStatus.ACTION_REQUIRED
+            return _build_response(session, thought=thought, plan=_build_plan_info(session))
+
+        # 回退：当前子任务重置为 pending，目标子任务标记为 in_progress
+        session.sub_tasks[session.current_sub_task_index].status = "pending"
+        target_task.status = "in_progress"
+        target_task.retry_count += 1
+        target_task.retry_reason = reason
+        session.current_sub_task_index = target_index
+
+        # 更新 system prompt
+        sub_task_ctx = build_sub_task_context(
+            session.task, session.sub_tasks, session.current_sub_task_index
+        )
+        if session.messages and session.messages[0].get("role") == "system":
+            from agent.context_builder import SYSTEM_PROMPT, TEXT_MODE_FORMAT_APPENDIX
+            mode = _resolve_call_mode(session)
+            if mode == CallMode.TOOL_CALLS:
+                session.messages[0] = {"role": "system", "content": SYSTEM_PROMPT + sub_task_ctx}
+            else:
+                session.messages[0] = {"role": "system", "content": SYSTEM_PROMPT + sub_task_ctx + TEXT_MODE_FORMAT_APPENDIX}
+        session.current_step -= 1
+        session.status = AgentStatus.ACTION_REQUIRED
+        return _build_response(session, thought=thought, plan=_build_plan_info(session))
 
     if func_name not in ALLOWED_ACTION_TYPES:
         session.status = AgentStatus.ERROR
@@ -453,6 +501,56 @@ def _parse_action(func_name: str, args: dict[str, Any]) -> PageAction:
         params["timeout"] = min(args.get("timeout", 5000), 10000)
 
     return PageAction(type=func_name, locator=locator, params=params)
+
+
+def _track_attempt_result(
+    session: AgentSession, action: PageAction, result: ActionResult
+) -> None:
+    """追踪操作结果，检测重复失败并更新黑名单。"""
+    target = action.locator.value if action.locator else ""
+
+    if result.success:
+        # 成功时清除与当前目标相关的黑名单
+        session.blacklisted_approaches = [
+            a for a in session.blacklisted_approaches
+            if target not in a
+        ]
+        return
+
+    # 记录失败
+    session.failed_attempts.append(FailedAttempt(
+        action_type=action.type,
+        target=target,
+        error=result.error or result.details or "",
+        step=session.current_step,
+    ))
+
+    # 检测最近 5 步中相同 (action_type + 相似 target) 出现 ≥ 2 次
+    recent = session.failed_attempts[-5:]
+    similar = [
+        a for a in recent
+        if a.action_type == action.type and _is_similar_target(a.target, target)
+    ]
+    if len(similar) >= 2:
+        approach_desc = f"{action.type} → {target}"
+        if approach_desc not in session.blacklisted_approaches:
+            session.blacklisted_approaches.append(approach_desc)
+
+
+def _is_similar_target(a: str, b: str) -> bool:
+    """判断两个 locator value 是否指向同一目标。"""
+    if not a or not b:
+        return a == b
+    # 完全相同
+    if a == b:
+        return True
+    # 一个包含另一个（如 "#btn" vs "btn"）
+    if a in b or b in a:
+        return True
+    # annotation_id 相同
+    if a.isdigit() and b.isdigit() and a == b:
+        return True
+    return False
 
 
 def _plan_task(session: AgentSession, page_state: PageState) -> Optional[list[str]]:

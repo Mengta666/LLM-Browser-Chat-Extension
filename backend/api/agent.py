@@ -77,6 +77,7 @@ def agent_step(item: AgentStepRequest) -> dict[str, Any]:
         details=raw_result.get("details", ""),
         error=raw_result.get("error"),
         timestamp=raw_result.get("timestamp", 0),
+        state_changes=raw_result.get("state_changes"),
     )
     page_state = PageState(**item.page_state)
 

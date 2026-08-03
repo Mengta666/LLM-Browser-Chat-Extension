@@ -227,6 +227,20 @@ ACTION_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "scroll_to_element",
+            "description": "滚动页面使指定元素出现在视口中央。当你知道元素存在但不在当前可见区域时使用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "locator": LOCATOR_SCHEMA,
+                },
+                "required": ["locator"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "task_complete",
             "description": "标记任务已完成或无法完成。必须在任务结束时调用此工具。",
             "parameters": {
@@ -262,10 +276,31 @@ ACTION_SCHEMAS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "sub_task_retry",
+            "description": "回退到之前的某个子任务重新执行。当你发现当前子任务无法继续，原因是之前某个子任务没有正确完成时调用。最多回退重试2次。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target_index": {
+                        "type": "integer",
+                        "description": "要回退到的子任务编号（从0开始）",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "回退原因：之前的子任务哪里做错了，这次应该怎么改",
+                    },
+                },
+                "required": ["target_index", "reason"],
+            },
+        },
+    },
 ]
 
 ALLOWED_ACTION_TYPES: set[str] = {
-    "click", "type", "select", "scroll", "hover",
+    "click", "type", "select", "scroll", "scroll_to_element", "hover",
     "focus", "clear", "press_key", "wait", "navigate",
-    "wait_for_element", "task_complete", "sub_task_complete",
+    "wait_for_element", "task_complete", "sub_task_complete", "sub_task_retry",
 }

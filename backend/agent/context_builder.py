@@ -3,9 +3,14 @@
 负责将用户任务、页面观察状态、历史动作组装成 LLM 可理解的 messages 上下文。
 """
 
-from typing import Any
+from __future__ import annotations
+
+from typing import Any, TYPE_CHECKING
 
 from agent.state import PageState, ActionResult, PageAction, SubTask
+
+if TYPE_CHECKING:
+    from agent.state import AgentSession
 
 
 SYSTEM_PROMPT = """你是一个浏览器自动化助手。用户会给你一个任务，你需要通过操作页面元素来完成它。
@@ -16,6 +21,7 @@ SYSTEM_PROMPT = """你是一个浏览器自动化助手。用户会给你一个�
 - type: 在输入框中输入文字（支持普通输入框和富文本编辑器）
 - select: 从下拉框选择选项（支持原生select和自定义下拉组件）
 - scroll: 滚动页面或容器（up/down/left/right）
+- scroll_to_element: 直接滚动到指定元素使其出现在视口中
 - hover: 悬停在元素上（触发tooltip或下拉菜单）
 - focus: 聚焦元素
 - clear: 清空输入框（支持contenteditable）
@@ -184,21 +190,33 @@ def build_sub_task_context(
 
     total = len(sub_tasks)
     current = current_index + 1
+    current_task = sub_tasks[current_index]
     parts = [
         f"\n## 任务执行计划",
         f"总目标: {task}",
-        f"当前子任务 [{current}/{total}]: {sub_tasks[current_index].description}",
+        f"当前子任务 [{current}/{total}]: {current_task.description}",
     ]
+
+    # 回退重试提示
+    if current_task.retry_count > 0 and current_task.retry_reason:
+        parts.append(f"\n⚠️ 这是第 {current_task.retry_count} 次重试此子任务")
+        parts.append(f"上次失败原因: {current_task.retry_reason}")
+        parts.append("请用不同的方式完成，避免重复上次的错误。")
 
     completed = [st for st in sub_tasks[:current_index] if st.status == "completed"]
     if completed:
         parts.append("已完成: " + ", ".join(f"✓ {st.description}" for st in completed))
+
+    skipped = [st for st in sub_tasks if st.status == "skipped"]
+    if skipped:
+        parts.append("已跳过: " + ", ".join(f"⊘ {st.description}" for st in skipped))
 
     remaining = sub_tasks[current_index + 1:]
     if remaining:
         parts.append("待完成: " + ", ".join(st.description for st in remaining))
 
     parts.append("\n请专注完成当前子任务。完成后调用 sub_task_complete 切换到下一个。")
+    parts.append("如果发现之前的子任务没做对导致当前无法继续，调用 sub_task_retry 回退重试。")
     return "\n".join(parts)
 
 
@@ -211,6 +229,40 @@ def build_planning_messages(task: str, page_state: PageState) -> list[dict[str, 
             "content": f"## 目标任务\n{task}\n\n{build_observation_message(page_state)}",
         },
     ]
+
+
+def build_reflection_prompt(session: "AgentSession") -> str:
+    """当检测到重复失败时，生成反思提示注入到对话中。
+
+    返回空字符串表示无需反思。
+    """
+    if not session.blacklisted_approaches and len(session.failed_attempts) < 3:
+        return ""
+
+    parts = []
+
+    # 有黑名单时注入禁止重复
+    if session.blacklisted_approaches:
+        parts.append("## ⚠️ 反思提醒")
+        parts.append("以下方式已多次尝试失败，**禁止再使用相同方式**，必须换一种不同的策略：")
+        for approach in session.blacklisted_approaches[-5:]:
+            parts.append(f"  ✗ {approach}")
+
+    # 连续 3 步失败时给出更强的方向性引导
+    recent_fails = [
+        a for a in session.failed_attempts[-3:]
+        if a.step >= session.current_step - 3
+    ]
+    if len(recent_fails) >= 3:
+        parts.append("")
+        parts.append("你已连续多次操作失败，请退一步重新思考：")
+        parts.append("- 目标元素是否真的在当前视口内？尝试 scroll 查看更多内容")
+        parts.append("- 是否需要先完成前置操作（如打开面板、切换标签页、关闭当前弹窗）？")
+        parts.append("- 尝试完全不同的交互路径（不同的按钮、不同的菜单入口）")
+        parts.append("- 用 text 定位替代 css，或反过来")
+        parts.append("- 如果确认目标无法完成，调用 task_complete 报告失败原因")
+
+    return "\n".join(parts) if parts else ""
 
 
 def build_system_prompt(sub_task_context: str = "") -> str:
@@ -255,6 +307,9 @@ def build_observation_message(page_state: PageState) -> str:
             f"进度={c_pct}%{'（已到底部）' if c_at_bottom else '（可继续向下滚动）'}"
         )
 
+    if page_state.is_loading:
+        parts.append("\n⏳ 页面正在加载中，建议使用 wait 等待加载完成后再操作。")
+
     if page_state.focused_element:
         parts.append(f"当前焦点: {page_state.focused_element}")
 
@@ -282,20 +337,29 @@ def build_observation_message(page_state: PageState) -> str:
 
         if popup_els:
             parts.append(f"\n## 🔍 弹出面板内的元素（共{len(popup_els)}个，优先操作）")
-            for el in popup_els:
-                line = _format_element(el)
-                parts.append(line)
+            parts.extend(_group_and_format_elements(popup_els))
 
             if main_els:
-                parts.append(f"\n## 主页面元素（共{len(main_els)}个）")
-                for el in main_els:
-                    line = _format_element(el)
-                    parts.append(line)
+                in_vp, out_vp = _split_by_viewport(main_els, page_state.viewport)
+                if in_vp:
+                    parts.append(f"\n## 主页面元素 - 视口内（共{len(in_vp)}个）")
+                    parts.extend(_group_and_format_elements(in_vp))
+                if out_vp:
+                    parts.append(f"\n## 主页面元素 - 视口外（共{len(out_vp)}个，需scroll）")
+                    # 视口外只展示前10个，节省 token
+                    parts.extend(_group_and_format_elements(out_vp[:10]))
+                    if len(out_vp) > 10:
+                        parts.append(f"  ... 还有 {len(out_vp) - 10} 个元素未显示，请 scroll 查看")
         else:
-            parts.append("\n## 可交互元素列表")
-            for el in page_state.interactive_elements:
-                line = _format_element(el)
-                parts.append(line)
+            in_vp, out_vp = _split_by_viewport(page_state.interactive_elements, page_state.viewport)
+            if in_vp:
+                parts.append(f"\n## 可交互元素 - 视口内（共{len(in_vp)}个）")
+                parts.extend(_group_and_format_elements(in_vp))
+            if out_vp:
+                parts.append(f"\n## 可交互元素 - 视口外（共{len(out_vp)}个，需scroll）")
+                parts.extend(_group_and_format_elements(out_vp[:10]))
+                if len(out_vp) > 10:
+                    parts.append(f"  ... 还有 {len(out_vp) - 10} 个元素未显示，请 scroll 查看")
 
         if getattr(page_state, 'element_count_truncated', False):
             parts.append("  ⚠️ 元素列表已截断，页面上还有更多元素。如果找不到目标，请先 scroll 让它出现在视口内。")
@@ -307,10 +371,6 @@ def build_observation_message(page_state: PageState) -> str:
             method = form.get("method", "?").upper()
             fields = ", ".join(form.get("fields", []))
             parts.append(f"  [{method}] {action} — 字段: {fields}")
-
-    if page_state.text_content_summary:
-        summary = page_state.text_content_summary[:2000]
-        parts.append(f"\n## 页面文本摘要\n{summary}")
 
     return "\n".join(parts)
 
@@ -325,6 +385,16 @@ def build_action_result_message(action: PageAction, result: ActionResult) -> str
         msg += f" | {result.details}"
     if result.error:
         msg += f" | 错误: {result.error}"
+
+    # 状态变化提示
+    changes = result.state_changes if result.state_changes else {}
+    if changes.get("url_changed"):
+        msg += "\n⚡ 页面URL已变化，你现在在新页面上。请重新观察当前元素。"
+    if changes.get("popup_disappeared"):
+        msg += "\n⚡ 弹出面板已关闭。如果还需操作面板内容，需要重新打开。"
+    if changes.get("popup_appeared"):
+        msg += "\n⚡ 弹出面板已出现，请优先操作面板内的元素。"
+
     return msg
 
 
@@ -403,34 +473,162 @@ def _compress_old_observations(messages: list[dict[str, Any]]) -> None:
 
 
 def _format_element(el: dict[str, Any]) -> str:
-    """格式化单个元素为可读字符串。"""
+    """精简格式化单个元素。css 只在有唯一标识时展示。"""
     eid = el.get("id", "?")
     tag = el.get("tag", "?")
-    etype = el.get("type", "")
-    text = el.get("text", "")
-    name = el.get("name", "")
-    placeholder = el.get("placeholder", "")
-    aria = el.get("aria_label", "")
-    selector = el.get("css_selector", "")
-    value = el.get("value", "")
+
+    parts = []
     component = el.get("component", "")
-    enabled = "启用" if el.get("enabled", True) else "禁用"
-
-    desc_parts = []
     if component:
-        desc_parts.append(f"组件={component}")
+        parts.append(component)
+    text = el.get("text", "")
     if text:
-        desc_parts.append(f'文本="{text[:50]}"')
-    if name:
-        desc_parts.append(f"name={name}")
+        parts.append(f'"{text[:40]}"')
+    placeholder = el.get("placeholder", "")
     if placeholder:
-        desc_parts.append(f'placeholder="{placeholder}"')
-    if aria:
-        desc_parts.append(f'aria="{aria}"')
+        parts.append(f'placeholder="{placeholder[:30]}"')
+    name = el.get("name", "")
+    if name and not text:
+        parts.append(f"name={name}")
+    value = el.get("value", "")
     if value:
-        desc_parts.append(f'value="{value[:30]}"')
-    if etype:
-        desc_parts.append(f"type={etype}")
+        parts.append(f'当前值="{value[:20]}"')
+    etype = el.get("type", "")
+    if etype and tag == "input":
+        parts.append(etype)
 
-    desc = ", ".join(desc_parts)
-    return f"  [{eid}] <{tag}> {desc} | css={selector} | {enabled}"
+    enabled = el.get("enabled", True)
+    status = " [禁用]" if not enabled else ""
+
+    selector = el.get("css_selector", "")
+    css_part = ""
+    if selector and (
+        selector.startswith("#")
+        or "[name=" in selector
+        or "[data-testid=" in selector
+    ):
+        css_part = f" | css={selector}"
+
+    desc = " ".join(parts)
+    return f"  [{eid}] <{tag}> {desc}{css_part}{status}"
+
+
+def _is_similar_element(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    """判断两个元素是否可以归为一组。"""
+    if a.get("tag") != b.get("tag"):
+        return False
+    if a.get("role") != b.get("role"):
+        return False
+    a_text = a.get("text", "").strip()
+    b_text = b.get("text", "").strip()
+    # 都是纯数字（日期格、分页等）
+    if a_text.isdigit() and b_text.isdigit():
+        return True
+    # 文本长度接近且标签相同（如选项列表）
+    if len(a_text) > 0 and len(b_text) > 0:
+        if abs(len(a_text) - len(b_text)) <= 5 and a.get("tag") == b.get("tag"):
+            # 排除文本完全不同的按钮（如"查询" vs "重置"）
+            if a_text[:2] == b_text[:2]:
+                return True
+    return False
+
+
+def _format_element_group(group: list[dict[str, Any]]) -> str:
+    """将一组相似元素压缩为摘要行，保留 text→id 映射供定位。"""
+    first_id = group[0].get("id", "?")
+    last_id = group[-1].get("id", "?")
+    tag = group[0].get("tag", "?")
+    role = group[0].get("role", "")
+    count = len(group)
+
+    texts = [el.get("text", "").strip() for el in group]
+    disabled = [el for el in group if not el.get("enabled", True)]
+
+    role_str = f" {role}" if role else ""
+
+    # 构建 text=[id] 映射
+    if all(t.isdigit() for t in texts if t):
+        # 数字序列：首3 + ... + 末3 + 禁用项
+        mapping_parts = []
+        disabled_ids = {el.get("id") for el in disabled}
+        for i, el in enumerate(group):
+            t = el.get("text", "").strip()
+            eid = el.get("id", "?")
+            if i < 3 or i >= len(group) - 3 or eid in disabled_ids:
+                mapping_parts.append(f"{t}=[{eid}]")
+            elif i == 3:
+                mapping_parts.append("...")
+        text_summary = " ".join(mapping_parts)
+    elif count <= 8:
+        text_summary = " ".join(
+            f"{el.get('text', '').strip()[:10]}=[{el.get('id', '?')}]"
+            for el in group
+        )
+    else:
+        parts = []
+        for el in group[:3]:
+            parts.append(f"{el.get('text', '').strip()[:10]}=[{el.get('id', '?')}]")
+        parts.append("...")
+        for el in group[-3:]:
+            parts.append(f"{el.get('text', '').strip()[:10]}=[{el.get('id', '?')}]")
+        text_summary = " ".join(parts)
+
+    status = ""
+    if disabled:
+        d_items = [
+            f"{el.get('text', '').strip()}=[{el.get('id', '?')}]"
+            for el in disabled[:3]
+        ]
+        status = f" (禁用: {', '.join(d_items)})"
+
+    return f"  [{first_id}-{last_id}] <{tag}>{role_str} ×{count}: {text_summary}{status}"
+
+
+def _group_and_format_elements(elements: list[dict[str, Any]]) -> list[str]:
+    """对元素列表进行分组压缩，相似元素合并为摘要行。"""
+    lines: list[str] = []
+    i = 0
+    while i < len(elements):
+        el = elements[i]
+        # 向后找连续相似元素
+        group = [el]
+        j = i + 1
+        while j < len(elements):
+            if _is_similar_element(el, elements[j]):
+                group.append(elements[j])
+                j += 1
+            else:
+                break
+
+        if len(group) >= 3:
+            lines.append(_format_element_group(group))
+            i = j
+        else:
+            lines.append(_format_element(el))
+            i += 1
+
+    return lines
+
+
+def _split_by_viewport(
+    elements: list[dict[str, Any]], viewport: dict[str, int]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """按视口拆分元素：视口内 + 视口外。"""
+    vh = viewport.get("height", 900)
+    vw = viewport.get("width", 1920)
+
+    in_vp: list[dict[str, Any]] = []
+    out_vp: list[dict[str, Any]] = []
+
+    for el in elements:
+        box = el.get("bounding_box", {})
+        y = box.get("y", 0)
+        h = box.get("height", 0)
+        x = box.get("x", 0)
+        w = box.get("width", 0)
+        if y + h > 0 and y < vh and x + w > 0 and x < vw:
+            in_vp.append(el)
+        else:
+            out_vp.append(el)
+
+    return in_vp, out_vp

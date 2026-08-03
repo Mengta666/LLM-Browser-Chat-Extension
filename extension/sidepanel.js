@@ -3015,7 +3015,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   ];
   const AGENT_TRIGGER_PREFIX = '/do ';
   const AGENT_MAX_STEPS = 15;
-  const AGENT_SETTLE_DELAY_MS = 500;
+  const AGENT_SETTLE_TIMEOUT_MS = 3000;
   const AGENT_ACTION_TIMEOUT_MS = 10000;
 
   const agentState = {
@@ -3037,6 +3037,45 @@ document.addEventListener('DOMContentLoaded', async () => {
     // 包含关键词但要求句子较短（命令式），长句子多是描述不触发
     if (trimmed.length > 50) return false;
     return AGENT_KEYWORDS.some(kw => lower.includes(kw));
+  }
+
+  async function waitForPageSettle(tabId, timeoutMs) {
+    const timeout = timeoutMs || AGENT_SETTLE_TIMEOUT_MS;
+    try {
+      const results = await chrome.scripting.executeScript({
+        target: { tabId, allFrames: false },
+        func: (maxWait) => {
+          return new Promise(resolve => {
+            let timer = null;
+            let settled = false;
+            const observer = new MutationObserver(() => {
+              clearTimeout(timer);
+              timer = setTimeout(() => {
+                observer.disconnect();
+                settled = true;
+                resolve(true);
+              }, 300);
+            });
+            observer.observe(document.body || document.documentElement, {
+              childList: true, subtree: true,
+              attributes: true, characterData: true
+            });
+            timer = setTimeout(() => {
+              observer.disconnect();
+              if (!settled) resolve(true);
+            }, 300);
+            setTimeout(() => {
+              if (!settled) { observer.disconnect(); resolve(false); }
+            }, maxWait);
+          });
+        },
+        args: [timeout]
+      });
+      return results?.[0]?.result !== false;
+    } catch {
+      await new Promise(r => setTimeout(r, 500));
+      return true;
+    }
   }
 
   async function observePageState() {
@@ -3307,6 +3346,13 @@ document.addEventListener('DOMContentLoaded', async () => {
           if (scrollable_container) break;
         }
 
+        // Loading 检测
+        const isLoading = !!document.querySelector(
+          '.loading, .spinner, [class*="loading"]:not([class*="loading-"]), ' +
+          '[class*="spinner"], .ant-spin-spinning, .el-loading-mask, ' +
+          '.jmtd-loading, .jmtd-spin-spinning, [class*="mask"][style*="display"]'
+        );
+
         return {
           url: location.href,
           title: document.title,
@@ -3315,6 +3361,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           document_height: document.documentElement.scrollHeight,
           scrollable_container,
           active_popup: activePopup,
+          is_loading: isLoading,
           focused_element: document.activeElement?.id ? `#${document.activeElement.id}` : null,
           interactive_elements: elements,
           element_count_truncated: truncated,
@@ -3415,54 +3462,46 @@ document.addEventListener('DOMContentLoaded', async () => {
           }
           if (method === 'text') {
             const normalized = value.toLowerCase().trim();
-            // 搜索所有可见元素，不限制标签类型
-            const allElements = document.querySelectorAll(
-              'button, a, [role="button"], [role="link"], [role="tab"], [role="menuitem"], ' +
-              '[role="option"], [role="switch"], input[type="submit"], input[type="button"], ' +
-              'label, span, div[onclick], li, h1, h2, h3, h4, p, td, th, ' +
-              '[tabindex]:not([tabindex="-1"]), [contenteditable="true"]'
-            );
-            let exactMatch = null;
-            let includesMatch = null;
-            for (const el of allElements) {
+            const candidates = [];
+            // 搜索所有可见元素
+            for (const el of document.querySelectorAll('*')) {
               const style = window.getComputedStyle(el);
               if (style.display === 'none' || style.visibility === 'hidden') continue;
               const rect = el.getBoundingClientRect();
               if (rect.width <= 0 || rect.height <= 0) continue;
-              const elText = (el.textContent || el.value || el.getAttribute('aria-label') || '').toLowerCase().trim();
-              if (elText === normalized) { exactMatch = el; break; }
-              if (!includesMatch && elText.includes(normalized)) {
-                includesMatch = el;
-              }
+              const elText = (el.textContent || el.value || el.getAttribute('aria-label') || '').trim().toLowerCase();
+              if (!elText.includes(normalized)) continue;
+
+              // 计算交互性权重
+              let score = 0;
+              const tag = el.tagName.toLowerCase();
+              // 标签权重
+              if (['button', 'a', 'input', 'select', 'textarea'].includes(tag)) score += 50;
+              if (el.getAttribute('role') === 'button' || el.getAttribute('role') === 'link') score += 45;
+              if (el.getAttribute('role') === 'option' || el.getAttribute('role') === 'menuitem') score += 40;
+              if (el.onclick || el.getAttribute('tabindex')) score += 30;
+              if (el.getAttribute('data-event-content') || el.getAttribute('data-event-name')) score += 35;
+              // 在可交互父元素内的叶子节点
+              if (el.closest('button, a, [role="button"]') && el.closest('button, a, [role="button"]') !== el) score += 15;
+              // 精确匹配 vs 包含匹配
+              if (elText === normalized) score += 40;
+              else if (elText.startsWith(normalized)) score += 20;
+              // 叶子节点优先（子元素越少越好）
+              score += Math.max(0, 10 - el.children.length);
+              // 尺寸合理（太大的通常是容器）
+              if (rect.width < 500 && rect.height < 100) score += 10;
+              // disabled 惩罚
+              if (el.disabled || el.classList.contains('disabled')) score -= 20;
+
+              candidates.push({ el, score });
             }
-            return exactMatch || includesMatch || null;
+            if (!candidates.length) return null;
+            candidates.sort((a, b) => b.score - a.score);
+            return candidates[0].el;
           }
           if (method === 'annotation_id') {
             const el = document.querySelector(`[data-agent-id="${value}"]`);
             if (el) return el;
-            // 回退：按位置序号遍历（兼容 data-agent-id 被清除的情况）
-            const INTERACTIVE_SELECTORS = [
-              'a[href]', 'button', 'input', 'textarea', 'select',
-              '[role="button"]', '[role="link"]', '[role="tab"]',
-              '[role="menuitem"]', '[role="checkbox"]', '[role="radio"]',
-              '[role="option"]', '[role="switch"]', '[role="slider"]',
-              '[contenteditable="true"]', '[onclick]', '[tabindex]:not([tabindex="-1"])'
-            ];
-            const targetId = parseInt(value, 10);
-            let currentId = 1;
-            const seen = new Set();
-            for (const sel of INTERACTIVE_SELECTORS) {
-              for (const el of document.querySelectorAll(sel)) {
-                if (seen.has(el)) continue;
-                const style = window.getComputedStyle(el);
-                if (style.display === 'none' || style.visibility === 'hidden') continue;
-                const rect = el.getBoundingClientRect();
-                if (rect.width <= 0 || rect.height <= 0) continue;
-                seen.add(el);
-                if (currentId === targetId) return el;
-                currentId++;
-              }
-            }
             return null;
           }
           return null;
@@ -3471,8 +3510,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         function resolveLocator(locator) {
           if (!locator) return null;
           let el = findByMethod(locator.method, locator.value);
+          // annotation_id 失效时：尝试 fallback，再尝试 text 匹配
           if (!el && locator.fallback) {
             el = findByMethod(locator.fallback.method, locator.fallback.value);
+          }
+          if (!el && locator.method === 'annotation_id' && locator.value) {
+            // 尝试用 css_selector 回退（如果前端之前存过）
+            el = findByMethod('text', locator.value);
           }
           if (!el && locator.method !== 'text' && locator.value) {
             el = findByMethod('text', locator.value);
@@ -3588,28 +3632,28 @@ document.addEventListener('DOMContentLoaded', async () => {
                   element.dispatchEvent(new Event('input', { bubbles: true }));
                 }
                 element.focus();
-                // 逐字符输入以触发输入法感知的事件
                 for (const char of text) {
                   element.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, cancelable: true, inputType: 'insertText', data: char }));
                   document.execCommand('insertText', false, char);
                   element.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: char }));
                 }
               } else {
+                // 安全地设置 value（兼容 isolated world）
+                function safeSetValue(el, val) {
+                  try {
+                    const proto = el instanceof HTMLTextAreaElement
+                      ? HTMLTextAreaElement.prototype
+                      : HTMLInputElement.prototype;
+                    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+                    if (setter) { setter.call(el, val); return; }
+                  } catch (e) { /* Illegal invocation in isolated world */ }
+                  el.value = val;
+                }
                 if (params.clear !== false) {
-                  element.value = '';
+                  safeSetValue(element, '');
                   element.dispatchEvent(new Event('input', { bubbles: true }));
                 }
-                // 模拟逐字输入
-                const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-                  window.HTMLInputElement.prototype, 'value'
-                )?.set || Object.getOwnPropertyDescriptor(
-                  window.HTMLTextAreaElement.prototype, 'value'
-                )?.set;
-                if (nativeInputValueSetter) {
-                  nativeInputValueSetter.call(element, element.value + text);
-                } else {
-                  element.value += text;
-                }
+                safeSetValue(element, (params.clear !== false ? '' : element.value) + text);
                 element.dispatchEvent(new Event('input', { bubbles: true }));
                 element.dispatchEvent(new Event('change', { bubbles: true }));
               }
@@ -3624,13 +3668,17 @@ document.addEventListener('DOMContentLoaded', async () => {
                 document.execCommand('delete', false, null);
                 element.dispatchEvent(new Event('input', { bubbles: true }));
               } else {
-                const setter = Object.getOwnPropertyDescriptor(
-                  window.HTMLInputElement.prototype, 'value'
-                )?.set || Object.getOwnPropertyDescriptor(
-                  window.HTMLTextAreaElement.prototype, 'value'
-                )?.set;
-                if (setter) setter.call(element, '');
-                else element.value = '';
+                function safeSetValueClear(el, val) {
+                  try {
+                    const proto = el instanceof HTMLTextAreaElement
+                      ? HTMLTextAreaElement.prototype
+                      : HTMLInputElement.prototype;
+                    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+                    if (setter) { setter.call(el, val); return; }
+                  } catch (e) { /* fallback */ }
+                  el.value = val;
+                }
+                safeSetValueClear(element, '');
                 element.dispatchEvent(new Event('input', { bubbles: true }));
                 element.dispatchEvent(new Event('change', { bubbles: true }));
               }
@@ -3698,27 +3746,45 @@ document.addEventListener('DOMContentLoaded', async () => {
                 scrollTarget = findBestScrollableContainer();
               }
               let scrolledEl;
+              const beforeScrollY = scrollTarget
+                ? scrollTarget.scrollTop
+                : window.scrollY;
               if (scrollTarget && scrollTarget !== document.documentElement && scrollTarget !== document.body) {
-                const before = scrollTarget.scrollTop;
                 scrollTarget.scrollBy(xDelta, yDelta);
-                // 部分框架需要 wheel 事件才生效
                 scrollTarget.dispatchEvent(new WheelEvent('wheel', { deltaX: xDelta, deltaY: yDelta, bubbles: true }));
                 scrolledEl = scrollTarget;
               } else {
-                const before = window.scrollY;
                 window.scrollBy(xDelta, yDelta);
                 scrolledEl = document.documentElement;
               }
-              // 等待滚动动画
               await new Promise(r => setTimeout(r, 100));
-              // 报告滚动状态
+              const afterScrollY = scrolledEl ? scrolledEl.scrollTop : window.scrollY;
+              const actualDelta = Math.abs(afterScrollY - beforeScrollY);
               const atBottom = scrolledEl
                 ? (scrolledEl.scrollTop + scrolledEl.clientHeight >= scrolledEl.scrollHeight - 10)
                 : (window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 10);
+              const atBoundary = actualDelta < Math.abs(amount) * 0.1;
               const detail = atBottom
-                ? `滚动 ${dir} ${amount}px（已到底部）`
-                : `滚动 ${dir} ${amount}px（可继续滚动）`;
-              return { success: true, details: detail, action_type: type };
+                ? `滚动 ${dir} ${actualDelta}px（已到底部）`
+                : atBoundary
+                  ? `滚动 ${dir} 仅移动 ${actualDelta}px（已到边界）`
+                  : `滚动 ${dir} ${actualDelta}px（可继续滚动）`;
+              return { success: true, details: detail, action_type: type, at_boundary: atBoundary };
+            }
+
+            case 'scroll_to_element': {
+              if (!element) return { success: false, error: '找不到目标元素', action_type: type };
+              element.scrollIntoView({ block: 'center', behavior: 'smooth' });
+              await new Promise(r => setTimeout(r, 300));
+              const rect = element.getBoundingClientRect();
+              const inViewport = rect.top >= 0 && rect.bottom <= window.innerHeight;
+              return {
+                success: true,
+                details: inViewport
+                  ? `已滚动到 ${locator?.value || '元素'}，元素现在在视口内`
+                  : `已尝试滚动到 ${locator?.value || '元素'}`,
+                action_type: type
+              };
             }
 
             case 'hover': {
@@ -4014,7 +4080,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     let cancelBtn = null;
 
     try {
-      const pageState = await observePageState();
+      let pageState = await observePageState();
       aiBubble.textContent = '';
 
       const headerEl = document.createElement('div');
@@ -4040,7 +4106,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         session_id: sessionId,
         model: modelName || 'gpt-4o',
         max_steps: AGENT_MAX_STEPS,
-        require_confirmation: ['submit', 'navigate']
+        require_confirmation: []
       }, apiKey);
 
       // 规划阶段：如果返回 plan_ready，展示计划并继续
@@ -4086,13 +4152,31 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         renderAgentStepInBubble(aiBubble, response.step, response.thought, action, null);
 
+        // 记录操作前状态
+        const preUrl = pageState?.url || '';
+        const prePopup = pageState?.active_popup || null;
+        const preElementCount = (pageState?.interactive_elements || []).length;
+
         const actionResult = await executePageAction(action);
 
         renderAgentStepInBubble(aiBubble, response.step, null, null, actionResult);
 
-        await new Promise(resolve => setTimeout(resolve, AGENT_SETTLE_DELAY_MS));
+        // 智能等待页面稳定（替代固定延时）
+        const activeTab = await getActiveBrowserTab().catch(() => null);
+        if (activeTab?.id) {
+          await waitForPageSettle(activeTab.id);
+        }
 
         const newPageState = await observePageState();
+
+        // 附加状态变化信息
+        actionResult.state_changes = {
+          url_changed: newPageState.url !== preUrl,
+          popup_appeared: !prePopup && !!newPageState.active_popup,
+          popup_disappeared: !!prePopup && !newPageState.active_popup,
+          element_count_delta: newPageState.interactive_elements.length - preElementCount
+        };
+        pageState = newPageState;
 
         response = await callAgentApi(safeApiUrl, '/v1/agent/step', {
           session_id: sessionId,

@@ -39,6 +39,7 @@ class ActionResult(BaseModel):
     details: str = ""
     error: Optional[str] = None
     timestamp: int = 0
+    state_changes: Optional[dict[str, Any]] = None
 
 
 class PageState(BaseModel):
@@ -49,6 +50,7 @@ class PageState(BaseModel):
     document_height: int = 0
     scrollable_container: Optional[dict[str, Any]] = None
     active_popup: Optional[dict[str, Any]] = None
+    is_loading: bool = False
     focused_element: Optional[str] = None
     interactive_elements: list[dict[str, Any]] = []
     element_count_truncated: bool = False
@@ -61,6 +63,17 @@ class SubTask:
     """Agent 任务分解后的子任务。"""
     description: str
     status: str = "pending"  # "pending" | "in_progress" | "completed" | "skipped"
+    retry_count: int = 0
+    retry_reason: str = ""
+
+
+@dataclass
+class FailedAttempt:
+    """记录一次失败的操作尝试。"""
+    action_type: str
+    target: str
+    error: str
+    step: int
 
 
 @dataclass
@@ -86,3 +99,7 @@ class AgentSession:
     sub_tasks: list[SubTask] = field(default_factory=list)
     current_sub_task_index: int = 0
     planning_done: bool = False
+
+    # 反思机制
+    failed_attempts: list[FailedAttempt] = field(default_factory=list)
+    blacklisted_approaches: list[str] = field(default_factory=list)

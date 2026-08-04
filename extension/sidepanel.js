@@ -3009,7 +3009,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     { name: '/browser-operation', description: '浏览器页面自动化操作（点击、输入、滚动等）', handler: 'agent' },
   ];
   const AGENT_COMMAND = '/browser-operation ';
-  const AGENT_MAX_STEPS = 15;
   const AGENT_SETTLE_TIMEOUT_MS = 3000;
   const AGENT_ACTION_TIMEOUT_MS = 10000;
 
@@ -3117,7 +3116,12 @@ document.addEventListener('DOMContentLoaded', async () => {
           '[class*="list-item"]',
           '[class*="menu-item"]:not([class*="icon"])',
           '.el-dropdown-menu__item',
-          '[data-action-id]'
+          '[data-action-id]',
+          // 搜索建议/自动补全下拉
+          'li.sc-v-center',
+          '[class*="search__dropdown"] li',
+          '[class*="autocomplete"] li',
+          '.el-autocomplete-suggestion li'
         ];
 
         // 弹出层容器检测选择器
@@ -3133,6 +3137,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           '.el-picker-panel', '.el-select-dropdown', '.el-popover',
           '[class*="popup"]:not([style*="display: none"])',
           '[class*="dropdown-list"]', '[class*="picker-panel"]',
+          '[class*="search__dropdown"]', '[class*="autocomplete"]',
           '[class*="dropdownWrap"]', '[class*="dropdown__"]',
           '[class*="select-branch"]',
           '.modal[style*="display: block"]', '.modal.show'
@@ -3147,7 +3152,12 @@ document.addEventListener('DOMContentLoaded', async () => {
           if (style.display === 'none' || style.visibility === 'hidden') return false;
           if (parseFloat(style.opacity) === 0) return false;
           const rect = el.getBoundingClientRect();
-          return rect.width > 0 && rect.height > 0;
+          if (rect.width <= 0 || rect.height <= 0) return false;
+          // 完全在视口外的元素（如隐藏的弹出层 left:-9999px）
+          if (rect.right < -100 || rect.bottom < -100) return false;
+          if (rect.left > window.innerWidth + 100) return false;
+          if (rect.top > window.innerHeight + 100) return false;
+          return true;
         }
 
         function buildCssSelector(el) {
@@ -4152,7 +4162,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         page_state: pageState,
         session_id: sessionId,
         model: modelName || 'gpt-4o',
-        max_steps: AGENT_MAX_STEPS,
         require_confirmation: []
       }, apiKey);
 

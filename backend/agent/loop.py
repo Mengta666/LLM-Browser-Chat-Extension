@@ -80,7 +80,6 @@ def create_session(
     session_id: str,
     task: str,
     model: str,
-    max_steps: int = 15,
     require_confirmation: Optional[list[str]] = None,
 ) -> AgentSession:
     _cleanup_expired_sessions()
@@ -88,13 +87,12 @@ def create_session(
         session_id=session_id,
         task=task,
         model=model,
-        max_steps=max_steps,
         require_confirmation=require_confirmation or [],
     )
     session._created_at = time.time()
     _sessions[session_id] = session
     _agent_log.info("session_create", session_id=session_id,
-                    data={"task": task, "model": model, "max_steps": max_steps})
+                    data={"task": task, "model": model})
     return session
 
 
@@ -115,10 +113,15 @@ def run_step(
 ) -> dict[str, Any]:
     """执行一步：规划 LLM → 执行 LLM。每步都重新规划目标。"""
 
-    if session.current_step >= session.max_steps:
-        session.status = AgentStatus.ERROR
-        session.error = f"已达到最大步数限制 ({session.max_steps})"
-        return _build_response(session)
+    # 当前目标步数上限检查：超限时重置上下文，让规划 LLM 重新评估同一目标
+    if session.goal_step_count >= session.max_steps_per_goal:
+        session.goal_step_count = 0
+        session.messages = []
+        session.failed_attempts = []
+        session.blacklisted_approaches = []
+        _agent_log.warn("goal_step_limit", session_id=session.session_id,
+                        data={"goal": session.current_goal, "step": session.current_step,
+                              "limit": session.max_steps_per_goal})
 
     # 1. 记录上一步结果
     if action_result and session.pending_action:
@@ -126,9 +129,19 @@ def run_step(
         append_step_messages(
             session.messages, session.pending_action, action_result, page_state
         )
+        # 补充执行结果到 step_history（供规划 LLM 查看轨迹）
+        if session.step_history:
+            session.step_history[-1]["result"] = {
+                "success": action_result.success,
+                "details": action_result.details[:50] if action_result.details else "",
+                "url_after": page_state.url,
+                "title_after": page_state.title[:30] if page_state.title else "",
+                "state_changes": action_result.state_changes or {},
+            }
         session.pending_action = None
 
     session.current_step += 1
+    session.goal_step_count += 1
 
     # 2. 规划 LLM：判断目标进度，决定下一步方向
     t0 = time.time()
@@ -152,6 +165,10 @@ def run_step(
         session.next_action_hint = plan.get("next_action_hint", "")
         session.completed_goals = plan.get("completed_goals", session.completed_goals)
         session.remaining_goal = plan.get("remaining", "")
+
+        # 目标切换时重置步数计数器
+        if session.current_goal != old_goal:
+            session.goal_step_count = 0
 
     # 3. 执行 LLM：根据目标返回具体 action
     mode = _resolve_call_mode(session)
@@ -197,6 +214,39 @@ def run_step(
         return _build_response(session, thought=thought)
 
     action = _parse_action(func_name, func_args)
+
+    # 硬控制：连续 wait ≥ 2 次时强制结束，不再无限等待
+    if func_name == "wait":
+        consecutive_waits = 0
+        for s in reversed(session.step_history):
+            if s.get("action", {}).get("type") == "wait":
+                consecutive_waits += 1
+            else:
+                break
+        if consecutive_waits >= 2:
+            session.status = AgentStatus.COMPLETED
+            session.summary = f"任务已完成。当前页面: {page_state.title or page_state.url}"
+            _agent_log.info("session_complete", session_id=session.session_id,
+                            data={"reason": "consecutive_wait_limit", "total_steps": session.current_step})
+            return _build_response(session, thought="连续等待多次，页面已稳定，标记完成")
+
+    # 硬控制：连续 3 次完全相同的操作（同类型+同目标），强制报错让规划换策略
+    if action.locator and len(session.step_history) >= 2:
+        target_key = f"{func_name}:{action.locator.value}"
+        repeat_count = 0
+        for s in reversed(session.step_history[-3:]):
+            a = s.get("action", {})
+            sk = f"{a.get('type', '')}:{(a.get('locator') or {}).get('value', '')}"
+            if sk == target_key:
+                repeat_count += 1
+            else:
+                break
+        if repeat_count >= 2:
+            _agent_log.warn("repeated_action_blocked", session_id=session.session_id,
+                            data={"action": target_key, "count": repeat_count + 1})
+            session.messages.append({"role": "user", "content":
+                f"⚠️ 你已经连续 {repeat_count + 1} 次执行 {target_key}，此操作无效。请换一种完全不同的方式。"})
+
     session.pending_action = action
     _agent_log.info("execution_result", session_id=session.session_id,
                     data={"action_type": func_name, "target": action.locator.value if action.locator else "",

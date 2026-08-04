@@ -20,7 +20,6 @@ class AgentExecuteRequest(BaseModel):
     page_state: dict[str, Any]
     session_id: str
     model: str = "gpt-4o"
-    max_steps: int = 15
     require_confirmation: list[str] = []
 
 
@@ -51,7 +50,6 @@ def agent_execute(item: AgentExecuteRequest) -> dict[str, Any]:
         session_id=item.session_id,
         task=item.task,
         model=item.model,
-        max_steps=item.max_steps,
         require_confirmation=item.require_confirmation,
     )
 

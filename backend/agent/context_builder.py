@@ -147,10 +147,41 @@ STEP_PLANNING_PROMPT = """你是一个浏览器自动化规划助手。根据用
 5. 当整个任务完成时设置 `task_done: true` 并填写完整的 `completed_goals`
 6. 如果上一步操作失败了，current_goal 不变但 next_action_hint 应该给出不同的策略
 
-## 判断目标完成的标准
+## 判断任务完成的标准（非常重要）
+- 如果用户的任务是"查看/查找/查询"类，只要页面上已经**显示了目标信息**就算完成
+  - 不需要额外操作来"读取"内容——你能在元素列表或页面标题中看到它就算完成
+  - 此时设置 task_done: true，并在 completed_goals 最后一项写清楚看到了什么
+- 如果用户的任务是"操作/点击/填写/提交"类，需要操作实际生效后才算完成
 - 根据页面 URL、标题、可见元素来判断之前的操作是否已经成功
-- 如果页面已经发生了预期的变化（如跳转到新页面、出现了新内容），说明目标已完成
 - 不要仅凭"执行了点击"就判断完成——要看页面实际状态
+
+## 最大化意图原则
+
+当判断任务是否完成时，始终选择最深层的解读：
+
+### 信息获取类任务（查看/查找/查询/获取/读取）
+- "查看 X 的内容/详情" → 必须进入 X 的详情页面，看到完整内容，不仅仅是标题
+- "查看代码/diff/变更" → 必须看到具体的代码行或 diff 块，不仅仅是文件名
+- "查看 X 的配置/设置" → 必须进入配置页面看到具体配置项
+- "查找 X" → 必须点进 X 的页面，不仅仅是在列表中看到 X 的名字
+- "获取/读取 X 的信息" → 必须看到 X 的详细字段，不仅仅是概要
+
+### 操作执行类任务（提交/保存/删除/创建/下载）
+- 必须看到操作的最终结果确认（成功提示、页面跳转、列表变化）
+- 仅仅点击了按钮不算完成——要等到结果反馈
+
+### 导航类任务（进入/打开/切换）
+- 目标页面必须加载完成且主要内容可见
+- URL 变化或标题变化不够——页面内容也要加载出来
+
+### 通用规则
+- 如果用户的描述有多种解读深度，默认选最深的
+- 只有用户明确用了限定词（"简单看一下"、"看下标题"、"列出名字就行"）才选浅层
+- 当你不确定是否完成时，倾向于"未完成"而非"已完成"
+
+## 避免无效循环
+- 如果连续 2 步以上 current_goal 没有变化，说明可能卡住了，考虑换策略
+- 如果页面文本中已经包含用户想要的最终详细内容（如 diff 代码块），标记 task_done: true
 """
 
 
@@ -161,7 +192,7 @@ STEP_PLANNING_PROMPT = """你是一个浏览器自动化规划助手。根据用
 def build_step_planning_messages(
     session: "AgentSession", page_state: PageState
 ) -> list[dict[str, str]]:
-    """构造每步规划的 messages。"""
+    """构造每步规划的 messages。包含页面文本摘要供判断任务完成。"""
     parts = [f"## 用户任务\n{session.task}"]
 
     if session.completed_goals:
@@ -173,11 +204,74 @@ def build_step_planning_messages(
         parts.append(f"\n## 上一步的目标: {session.current_goal}")
 
     if session.step_history:
-        last = session.step_history[-1]
-        action_info = last.get("action", {})
-        parts.append(f"上一步操作: {action_info.get('type', '?')}")
+        # 执行轨迹摘要（最近5步的 action + 结果 + 页面变化）
+        recent = session.step_history[-5:]
+        parts.append("\n## 执行轨迹（最近几步）")
+        for s in recent:
+            action = s.get("action", {})
+            result = s.get("result", {})
+            action_type = action.get("type", "?")
+            target = ""
+            locator = action.get("locator")
+            if locator:
+                target = f" → {locator.get('value', '')}"
+            elif action.get("params", {}).get("text"):
+                target = f' "{action["params"]["text"][:15]}"'
 
-    parts.append(f"\n{build_observation_message(page_state)}")
+            line = f"  步骤{s.get('step', '?')}: {action_type}{target}"
+            if result:
+                status = "✓" if result.get("success") else "✗"
+                line += f" | {status}"
+                if result.get("url_after"):
+                    line += f" | → {result['url_after'][-40:]}"
+                if result.get("state_changes", {}).get("url_changed"):
+                    line += " [页面跳转]"
+            parts.append(line)
+
+        # 检测连续 wait
+        consecutive_waits = 0
+        for s in reversed(session.step_history):
+            if s.get("action", {}).get("type") == "wait":
+                consecutive_waits += 1
+            else:
+                break
+        if consecutive_waits >= 2:
+            parts.append(f"\n⚠️ 已经连续 wait 了 {consecutive_waits} 次！页面可能已经加载完成。")
+            parts.append("请检查页面文本内容，如果目标信息已经可见，直接设置 task_done: true。")
+
+    # 页面基本信息（URL + 标题）
+    parts.append(f"\n## 当前页面\nURL: {page_state.url}\n标题: {page_state.title}")
+
+    # 页面文本内容（供规划 LLM 判断任务是否已完成）
+    if page_state.text_content_summary:
+        summary = page_state.text_content_summary[:2000]
+        parts.append(f"\n## 页面可见文本内容\n{summary}")
+
+    # 关键可交互元素摘要（让规划 LLM 知道页面上有什么可以操作的）
+    if page_state.interactive_elements:
+        key_elements = []
+        for el in page_state.interactive_elements[:30]:
+            text = el.get("text", "").strip()
+            tag = el.get("tag", "")
+            if text and len(text) <= 40:
+                key_elements.append(text)
+            elif el.get("placeholder"):
+                key_elements.append(f'[{el["placeholder"]}]')
+        if key_elements:
+            parts.append(f"\n## 页面上的可操作元素（部分）\n{', '.join(key_elements)}")
+
+    # 反思信息：让规划 LLM 知道哪些路走不通
+    if session.blacklisted_approaches:
+        parts.append("\n## ⚠️ 以下操作方式已证实无效，请规划不同的路径：")
+        for approach in session.blacklisted_approaches[-5:]:
+            parts.append(f"  ✗ {approach}")
+
+    if session.failed_attempts:
+        recent_fails = [a for a in session.failed_attempts[-3:]]
+        if recent_fails:
+            parts.append("\n## 最近失败记录")
+            for f in recent_fails:
+                parts.append(f"  - {f.action_type} → {f.target}: {f.error}")
 
     return [
         {"role": "system", "content": STEP_PLANNING_PROMPT},

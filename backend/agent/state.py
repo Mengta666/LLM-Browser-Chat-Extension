@@ -74,7 +74,6 @@ class AgentSession:
     session_id: str
     task: str
     model: str
-    max_steps: int = 20
     current_step: int = 0
     status: AgentStatus = AgentStatus.RUNNING
     require_confirmation: list[str] = field(default_factory=list)
@@ -92,6 +91,8 @@ class AgentSession:
     completed_goals: list[str] = field(default_factory=list)
     remaining_goal: str = ""
     initial_planning_done: bool = False
+    goal_step_count: int = 0
+    max_steps_per_goal: int = 15
 
     # 反思机制
     failed_attempts: list[FailedAttempt] = field(default_factory=list)

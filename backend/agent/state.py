@@ -92,7 +92,9 @@ class AgentSession:
     remaining_goal: str = ""
     initial_planning_done: bool = False
     goal_step_count: int = 0
+    goal_retry_count: int = 0
     max_steps_per_goal: int = 15
+    max_retries_per_goal: int = 3
 
     # 反思机制
     failed_attempts: list[FailedAttempt] = field(default_factory=list)

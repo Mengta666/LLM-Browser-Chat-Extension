@@ -113,15 +113,22 @@ def run_step(
 ) -> dict[str, Any]:
     """执行一步：规划 LLM → 执行 LLM。每步都重新规划目标。"""
 
-    # 当前目标步数上限检查：超限时重置上下文，让规划 LLM 重新评估同一目标
+    # 当前目标步数上限检查：超限时重试同一目标，最多3次后报错
     if session.goal_step_count >= session.max_steps_per_goal:
+        session.goal_retry_count += 1
+        if session.goal_retry_count >= session.max_retries_per_goal:
+            session.status = AgentStatus.ERROR
+            session.error = f"目标「{session.current_goal}」重试{session.max_retries_per_goal}次仍未完成"
+            _agent_log.error("goal_retry_exhausted", session_id=session.session_id,
+                             data={"goal": session.current_goal, "retries": session.goal_retry_count})
+            return _build_response(session)
         session.goal_step_count = 0
         session.messages = []
         session.failed_attempts = []
         session.blacklisted_approaches = []
         _agent_log.warn("goal_step_limit", session_id=session.session_id,
                         data={"goal": session.current_goal, "step": session.current_step,
-                              "limit": session.max_steps_per_goal})
+                              "retry": session.goal_retry_count})
 
     # 1. 记录上一步结果
     if action_result and session.pending_action:
@@ -166,9 +173,10 @@ def run_step(
         session.completed_goals = plan.get("completed_goals", session.completed_goals)
         session.remaining_goal = plan.get("remaining", "")
 
-        # 目标切换时重置步数计数器
+        # 目标切换时重置步数和重试计数器
         if session.current_goal != old_goal:
             session.goal_step_count = 0
+            session.goal_retry_count = 0
 
     # 3. 执行 LLM：根据目标返回具体 action
     mode = _resolve_call_mode(session)

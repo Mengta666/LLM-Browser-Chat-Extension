@@ -1,20 +1,11 @@
-"""聊天链路的结构化追踪日志工具。"""
+"""聊天链路的结构化追踪日志工具（兼容层，重定向到 logger.py）。"""
 
-import json
-import logging
 from datetime import datetime, timezone
 from typing import Any
 
+from observability.logger import get_logger
 
-_LOGGER = logging.getLogger("chat_trace")
-
-if not _LOGGER.handlers:
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("%(message)s"))
-    _LOGGER.addHandler(handler)
-
-_LOGGER.setLevel(logging.INFO)
-_LOGGER.propagate = False
+_chat_log = get_logger("chat")
 
 
 def utc_now_iso() -> str:
@@ -23,5 +14,7 @@ def utc_now_iso() -> str:
 
 
 def emit_trace(payload: dict[str, Any]) -> None:
-    """以单行 JSON 的形式输出追踪日志。"""
-    _LOGGER.info(json.dumps(payload, ensure_ascii=False))
+    """以结构化日志形式输出追踪记录。"""
+    event = payload.get("event", "trace")
+    session_id = payload.get("session_id", payload.get("chat_id", ""))
+    _chat_log.info(event, session_id=session_id, data=payload)

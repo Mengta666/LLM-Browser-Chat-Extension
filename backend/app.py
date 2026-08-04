@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.agent import router as agent_router
+from api.logs import router as logs_router
 
 app = FastAPI()
 
@@ -26,6 +27,7 @@ except Exception as e:
     print(f"[WARN] 聊天/搜索/页面模块加载失败（缺少依赖配置），已跳过: {e}")
 
 app.include_router(agent_router)
+app.include_router(logs_router)
 
 
 if __name__ == "__main__":

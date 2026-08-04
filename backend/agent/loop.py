@@ -36,6 +36,9 @@ from agent.context_builder import (
 )
 from agent.router import should_confirm_action
 from tools.tool_registry import ACTION_SCHEMAS, ALLOWED_ACTION_TYPES
+from observability.logger import get_logger
+
+_agent_log = get_logger("agent")
 
 
 __env_path = Path(__file__).resolve().parents[1] / "config" / ".env"
@@ -90,6 +93,8 @@ def create_session(
     )
     session._created_at = time.time()
     _sessions[session_id] = session
+    _agent_log.info("session_create", session_id=session_id,
+                    data={"task": task, "model": model, "max_steps": max_steps})
     return session
 
 
@@ -98,6 +103,8 @@ def cancel_session(session_id: str) -> bool:
     if not session:
         return False
     session.status = AgentStatus.CANCELLED
+    _agent_log.info("session_cancel", session_id=session_id,
+                    data={"step": session.current_step})
     return True
 
 
@@ -124,12 +131,18 @@ def run_step(
     session.current_step += 1
 
     # 2. 规划 LLM：判断目标进度，决定下一步方向
+    t0 = time.time()
     plan = _call_planning_llm(session, page_state)
+    plan_ms = int((time.time() - t0) * 1000)
+    _agent_log.info("planning_result", session_id=session.session_id,
+                    data=plan or {"error": "parse_failed"}, duration_ms=plan_ms)
 
     if plan and plan.get("task_done"):
         session.status = AgentStatus.COMPLETED
         session.summary = plan.get("summary", "任务完成")
         session.completed_goals = plan.get("completed_goals", session.completed_goals)
+        _agent_log.info("session_complete", session_id=session.session_id,
+                        data={"summary": session.summary, "total_steps": session.current_step})
         return _build_response(session)
 
     # 更新规划状态
@@ -185,6 +198,9 @@ def run_step(
 
     action = _parse_action(func_name, func_args)
     session.pending_action = action
+    _agent_log.info("execution_result", session_id=session.session_id,
+                    data={"action_type": func_name, "target": action.locator.value if action.locator else "",
+                          "thought": thought[:100], "step": session.current_step})
 
     session.step_history.append(
         {"step": session.current_step, "thought": thought, "action": action.model_dump()}

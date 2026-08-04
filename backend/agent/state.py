@@ -59,10 +59,14 @@ class PageState(BaseModel):
 
 
 @dataclass
-class SubTask:
-    """Agent 任务分解后的子任务。"""
+class Goal:
+    """一个可执行目标（已拆解或待拆解）。"""
     description: str
-    status: str = "pending"  # "pending" | "in_progress" | "completed" | "skipped"
+    status: str = "pending"         # "pending" | "planning" | "in_progress" | "completed" | "skipped"
+    planned: bool = False
+    sub_steps: list[str] = field(default_factory=list)
+    current_sub_step: int = 0
+    step_count: int = 0
     retry_count: int = 0
     retry_reason: str = ""
 
@@ -95,10 +99,11 @@ class AgentSession:
     error: Optional[str] = None
     call_mode: Optional[str] = None  # "tool_calls" | "text_parse" | None(auto)
 
-    # 任务分解
-    sub_tasks: list[SubTask] = field(default_factory=list)
-    current_sub_task_index: int = 0
-    planning_done: bool = False
+    # 渐进式任务分解
+    goals: list[Goal] = field(default_factory=list)
+    current_goal_index: int = 0
+    max_steps_per_goal: int = 10
+    initial_planning_done: bool = False
 
     # 反思机制
     failed_attempts: list[FailedAttempt] = field(default_factory=list)

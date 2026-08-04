@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Any, TYPE_CHECKING
 
-from agent.state import PageState, ActionResult, PageAction, SubTask
+from agent.state import PageState, ActionResult, PageAction, Goal
 
 if TYPE_CHECKING:
     from agent.state import AgentSession
@@ -164,91 +164,192 @@ TEXT_MODE_FORMAT_APPENDIX = """
 SYSTEM_PROMPT_TEXT_MODE = SYSTEM_PROMPT + TEXT_MODE_FORMAT_APPENDIX
 
 
-PLANNING_PROMPT = """你是一个浏览器自动化规划助手。用户给你一个目标任务，你需要结合当前页面的实际元素和状态，将目标拆解为有序的子任务列表。
+PLANNING_PROMPT = """你是一个浏览器自动化规划助手。用户给你一个目标任务，你需要结合当前页面的实际状态进行规划。
 
-## 规则
-1. 每个子任务必须是一个可以在当前页面（或操作后的页面）上直接执行的具体动作目标
-2. 子任务顺序要合理：先清除/准备 → 再设置条件 → 最后提交/确认
-3. 每个子任务用一句话描述，要具体明确（"选择日期范围为本月" 而非 "设置日期"）
-4. 通常 2-7 个子任务，不要过细也不要过粗
-5. 如果任务本身很简单（单步可完成的操作），返回 1 个子任务即可
-6. 只基于当前页面实际可见的元素来规划，不要假设不存在的功能
+## 核心原则（非常重要）
+- 你只能规划在**当前页面上可以直接执行**的操作作为 current_goal
+- current_goal 只能包含当前页面上已经可见的元素和按钮的操作
+- 所有需要页面跳转、新弹窗出现、或当前看不到的元素的操作，全部归入 remaining_goals
+- remaining_goals 只需要一条简短描述，概括"剩下还要做什么"即可，不要细分多个目标
+- 不要猜测未来页面会有什么元素
 
 ## 输出格式
 只输出 JSON，不要其他文字：
 ```json
-{"sub_tasks": ["子任务1描述", "子任务2描述", ...]}
-```"""
+{
+  "current_goal": {
+    "description": "在当前页面上要完成的具体目标",
+    "sub_steps": ["基于当前可见元素的步骤1", "步骤2", ...]
+  },
+  "remaining_goals": ["剩余任务的一句话概括（如果有）"]
+}
+```
+
+## 规则
+1. current_goal 必须是在当前页面上**立即可执行**的——页面上有对应按钮/输入框/链接
+2. remaining_goals 最多1-2条，是高层描述而非具体操作
+3. 如果整个任务在当前页面就能完成，remaining_goals 为空数组
+4. sub_steps 通常 2-5 步
+5. 如果当前页面能做的事很少（比如只需点一个链接跳转），current_goal 只需 1 步
+
+## 示例
+用户任务: "在供应链系统中筛选北京仓异常订单，然后导出Excel"
+当前页面: 供应链首页，有侧边栏菜单
+
+正确输出:
+```json
+{
+  "current_goal": {
+    "description": "从首页进入订单管理页面",
+    "sub_steps": ["点击侧边栏的'订单管理'菜单"]
+  },
+  "remaining_goals": ["在订单管理页面筛选北京仓异常订单并导出Excel"]
+}
+```
+
+错误输出（不要这样做）:
+```json
+{
+  "current_goal": {"description": "进入订单管理", ...},
+  "remaining_goals": ["设置筛选条件", "选择北京仓", "选择异常状态", "导出Excel"]
+}
+```
+remaining_goals 不应该被细分成多个步骤。
+"""
+
+GOAL_PLANNING_PROMPT = """你是一个浏览器自动化规划助手。用户有一个总目标，当前轮到下一个子目标需要拆解。
+
+## 背景
+用户的总目标: {task}
+当前需要完成的目标: {goal_description}
+{retry_info}
+
+## 核心原则（非常重要）
+- 只规划在当前页面上**可以直接执行**的操作
+- 如果这个目标需要跨页面完成（比如先跳转再操作），只规划当前页面能做的部分
+- 当前页面做不到的后续操作放到 remaining_goals
+
+## 输出格式
+只输出 JSON，不要其他文字：
+```json
+{{
+  "current_goal": {{
+    "description": "在当前页面上要完成的具体目标",
+    "sub_steps": ["基于当前可见元素的步骤1", "步骤2", ...]
+  }},
+  "remaining_goals": ["剩余未完成部分的一句话概括（如果当前页面就能全部完成则为空数组）"]
+}}
+```
+
+## 规则
+1. current_goal 的 description 可以和原目标相同（如果当前页面能全部完成）或是其中一部分
+2. sub_steps 必须基于当前页面可见元素
+3. remaining_goals 为空数组表示这个目标在当前页面就能全部搞定
+"""
 
 
-def build_sub_task_context(
-    task: str, sub_tasks: list[SubTask], current_index: int
+def build_goal_context(
+    task: str, goals: list[Goal], current_index: int
 ) -> str:
-    """构建子任务进度上下文，注入到每轮的 system prompt 中。"""
-    if not sub_tasks:
+    """构建目标进度上下文，注入到每轮的 system prompt 中。"""
+    if not goals:
         return ""
 
-    total = len(sub_tasks)
-    current = current_index + 1
-    current_task = sub_tasks[current_index]
+    goal = goals[current_index]
     parts = [
-        f"\n## 任务执行计划",
+        f"\n## 任务执行进度",
         f"总目标: {task}",
-        f"当前子任务 [{current}/{total}]: {current_task.description}",
     ]
 
-    # 回退重试提示
-    if current_task.retry_count > 0 and current_task.retry_reason:
-        parts.append(f"\n⚠️ 这是第 {current_task.retry_count} 次重试此子任务")
-        parts.append(f"上次失败原因: {current_task.retry_reason}")
-        parts.append("请用不同的方式完成，避免重复上次的错误。")
+    # 已完成目标
+    for i, g in enumerate(goals[:current_index]):
+        if g.status == "completed":
+            parts.append(f"  ✓ 目标{i+1}: {g.description}")
+        elif g.status == "skipped":
+            parts.append(f"  ⊘ 目标{i+1}: {g.description} (已跳过)")
 
-    completed = [st for st in sub_tasks[:current_index] if st.status == "completed"]
-    if completed:
-        parts.append("已完成: " + ", ".join(f"✓ {st.description}" for st in completed))
+    # 当前目标
+    parts.append(f"\n当前目标 [{current_index+1}/{len(goals)}]: {goal.description}")
+    if goal.sub_steps:
+        parts.append("参考步骤（仅供参考，实际操作以页面为准）:")
+        for j, step in enumerate(goal.sub_steps):
+            prefix = "  ▶" if j == goal.current_sub_step else "  ○"
+            if j < goal.current_sub_step:
+                prefix = "  ✓"
+            parts.append(f"{prefix} {step}")
 
-    skipped = [st for st in sub_tasks if st.status == "skipped"]
-    if skipped:
-        parts.append("已跳过: " + ", ".join(f"⊘ {st.description}" for st in skipped))
+    # 重试提示
+    if goal.retry_count > 0 and goal.retry_reason:
+        parts.append(f"\n⚠️ 第{goal.retry_count}次重试此目标。上次失败原因: {goal.retry_reason}")
+        parts.append("请用不同方式完成，避免重复错误。")
 
-    remaining = sub_tasks[current_index + 1:]
+    # 待拆解目标
+    remaining = [g for g in goals[current_index + 1:] if g.status == "pending"]
     if remaining:
-        parts.append("待完成: " + ", ".join(st.description for st in remaining))
+        parts.append(f"\n后续待完成: {', '.join(g.description for g in remaining)}")
 
-    parts.append("\n请专注完成当前子任务。完成后调用 sub_task_complete 切换到下一个。")
-    parts.append("如果发现之前的子任务没做对导致当前无法继续，调用 sub_task_retry 回退重试。")
+    parts.append("\n## 重要规则")
+    parts.append("- 每执行一步后，判断当前目标是否已经达成。一旦达成立即调用 goal_complete")
+    parts.append("- 不要等所有参考步骤做完才调 goal_complete——目标达成了就立即调用")
+    parts.append("- 不要调用 task_complete，只用 goal_complete，系统会自动判断整体完成")
+    parts.append("- 如果发现前面目标做错了导致当前无法继续，调用 goal_retry 回退")
     return "\n".join(parts)
 
 
-def build_planning_messages(task: str, page_state: PageState) -> list[dict[str, str]]:
-    """构造规划阶段的 messages（用于任务分解）。"""
+def build_initial_planning_messages(task: str, page_state: PageState) -> list[dict[str, str]]:
+    """构造首次规划的 messages（拆出第一个目标 + 待拆解列表）。"""
     return [
         {"role": "system", "content": PLANNING_PROMPT},
         {
             "role": "user",
-            "content": f"## 目标任务\n{task}\n\n{build_observation_message(page_state)}",
+            "content": f"## 用户任务\n{task}\n\n{build_observation_message(page_state)}",
+        },
+    ]
+
+
+def build_goal_planning_messages(
+    task: str, goal_description: str, goals: list[Goal],
+    page_state: PageState, retry_reason: str = ""
+) -> list[dict[str, str]]:
+    """构造单个目标拆解的 messages（结合新页面状态）。"""
+    retry_info = ""
+    if retry_reason:
+        retry_info = f"上次执行失败原因: {retry_reason}\n请用不同方式制定步骤。"
+
+    prompt = GOAL_PLANNING_PROMPT.format(
+        task=task, goal_description=goal_description, retry_info=retry_info
+    )
+
+    # 已完成目标摘要
+    completed_summary = ""
+    completed = [g for g in goals if g.status == "completed"]
+    if completed:
+        completed_summary = "\n## 已完成的目标\n" + "\n".join(
+            f"  ✓ {g.description}" for g in completed
+        )
+
+    return [
+        {"role": "system", "content": prompt},
+        {
+            "role": "user",
+            "content": f"{completed_summary}\n\n{build_observation_message(page_state)}",
         },
     ]
 
 
 def build_reflection_prompt(session: "AgentSession") -> str:
-    """当检测到重复失败时，生成反思提示注入到对话中。
-
-    返回空字符串表示无需反思。
-    """
+    """当检测到重复失败时，生成反思提示注入到对话中。"""
     if not session.blacklisted_approaches and len(session.failed_attempts) < 3:
         return ""
 
     parts = []
 
-    # 有黑名单时注入禁止重复
     if session.blacklisted_approaches:
         parts.append("## ⚠️ 反思提醒")
         parts.append("以下方式已多次尝试失败，**禁止再使用相同方式**，必须换一种不同的策略：")
         for approach in session.blacklisted_approaches[-5:]:
             parts.append(f"  ✗ {approach}")
 
-    # 连续 3 步失败时给出更强的方向性引导
     recent_fails = [
         a for a in session.failed_attempts[-3:]
         if a.step >= session.current_step - 3
@@ -265,12 +366,12 @@ def build_reflection_prompt(session: "AgentSession") -> str:
     return "\n".join(parts) if parts else ""
 
 
-def build_system_prompt(sub_task_context: str = "") -> str:
-    return SYSTEM_PROMPT + sub_task_context
+def build_system_prompt(goal_context: str = "") -> str:
+    return SYSTEM_PROMPT + goal_context
 
 
-def build_system_prompt_text_mode(sub_task_context: str = "") -> str:
-    return SYSTEM_PROMPT + sub_task_context + TEXT_MODE_FORMAT_APPENDIX
+def build_system_prompt_text_mode(goal_context: str = "") -> str:
+    return SYSTEM_PROMPT + goal_context + TEXT_MODE_FORMAT_APPENDIX
 
 
 def build_observation_message(page_state: PageState) -> str:

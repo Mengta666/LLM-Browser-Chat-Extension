@@ -194,6 +194,7 @@ textarea#chatInput { min-height: 88px; }
 }
 .tool-btn { padding: 6px 10px; font-size: 12px; background: var(--app-surface); color: var(--app-text); border: 1px solid var(--app-border); border-radius: 999px; cursor: pointer; font-weight: 600; }
 .tool-btn:hover { background: var(--app-border); }
+.tool-btn.is-active { background: var(--app-accent-soft, rgba(59,130,246,0.1)); color: var(--app-accent, #3b82f6); border-color: var(--app-accent, #3b82f6); }
 .tool-btn.secondary { background: var(--app-surface-3); color: var(--app-muted); }
 .image-preview { display: flex; align-items: center; gap: 10px; padding: 8px; border: 1px dashed var(--app-border-strong); border-radius: 10px; background: var(--app-surface); }
 .image-preview.hidden { display: none; }
@@ -475,26 +476,113 @@ input { width: 100%; padding: 8px; margin-top: 5px; box-sizing: border-box; bord
 .agent-plan-title {
   font-size: 12px;
   font-weight: 700;
-  margin-bottom: 6px;
+  margin-bottom: 8px;
   color: var(--app-text);
 }
 
-.agent-plan-item {
-  font-size: 12px;
-  padding: 3px 0;
-  color: var(--app-text-muted);
-  transition: all 0.2s;
+.agent-goal {
+  margin-bottom: 6px;
+  padding-left: 4px;
+  border-left: 2px solid var(--app-border);
 }
 
-.agent-plan-item.in_progress {
-  color: var(--app-accent);
+.agent-goal.in_progress { border-left-color: var(--app-accent, #3b82f6); }
+.agent-goal.completed { border-left-color: var(--app-success, #22c55e); }
+.agent-goal.skipped { border-left-color: var(--app-text-muted, #999); }
+
+.agent-goal-title {
+  font-size: 12px;
+  padding: 4px 6px;
+  color: var(--app-text);
   font-weight: 600;
 }
 
-.agent-plan-item.completed {
+.agent-goal.completed .agent-goal-title {
   color: var(--app-success, #22c55e);
   text-decoration: line-through;
   opacity: 0.7;
+}
+
+.agent-goal.in_progress .agent-goal-title { color: var(--app-accent, #3b82f6); }
+.agent-goal.skipped .agent-goal-title { color: var(--app-text-muted); text-decoration: line-through; opacity: 0.5; }
+
+.agent-goal-title.collapsible { cursor: pointer; }
+.agent-goal-title.collapsible:hover { opacity: 0.8; }
+
+.agent-goal-steps {
+  padding: 2px 0 2px 16px;
+  transition: max-height 0.2s;
+}
+
+.agent-goal-steps.collapsed { display: none; }
+
+.agent-goal-step {
+  font-size: 11px;
+  padding: 2px 0;
+  color: var(--app-text-muted);
+}
+
+.agent-goal-pending {
+  font-size: 11px;
+  padding: 2px 6px;
+  color: var(--app-text-muted);
+  font-style: italic;
+  opacity: 0.6;
+}
+
+.agent-goal-actions {
+  padding: 4px 0 4px 12px;
+  border-left: 1px dashed var(--app-border);
+  margin-left: 8px;
+}
+
+.agent-goal-actions.collapsed { display: none; }
+
+.agent-goal-badge {
+  font-size: 10px;
+  font-weight: 400;
+  color: var(--app-text-muted);
+  opacity: 0.7;
+}
+
+/* ========== 斜杠命令菜单 ========== */
+.slash-menu {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  right: 0;
+  margin-bottom: 4px;
+  background: var(--app-bg, #fff);
+  border: 1px solid var(--app-border);
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+  z-index: 100;
+  overflow: hidden;
+}
+
+.slash-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.slash-menu-item:hover {
+  background: var(--app-surface, #f5f5f5);
+}
+
+.slash-menu-cmd {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--app-accent, #3b82f6);
+  white-space: nowrap;
+}
+
+.slash-menu-desc {
+  font-size: 12px;
+  color: var(--app-text-muted, #666);
 }
 
 /* ========== 快捷指令胶囊按钮 ========== */

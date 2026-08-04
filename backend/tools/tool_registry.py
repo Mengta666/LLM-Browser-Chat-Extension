@@ -262,14 +262,14 @@ ACTION_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "sub_task_complete",
-            "description": "标记当前子任务已完成，切换到下一个子任务。当你确认当前子任务的目标已经达成时调用。",
+            "name": "goal_complete",
+            "description": "当前目标已完成。调用后系统会结合新页面状态拆解下一个目标。当你确认当前目标的所有步骤已经达成时调用。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "summary": {
                         "type": "string",
-                        "description": "当前子任务完成情况的简要说明",
+                        "description": "当前目标完成情况的简要说明",
                     },
                 },
                 "required": ["summary"],
@@ -279,18 +279,18 @@ ACTION_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "sub_task_retry",
-            "description": "回退到之前的某个子任务重新执行。当你发现当前子任务无法继续，原因是之前某个子任务没有正确完成时调用。最多回退重试2次。",
+            "name": "goal_retry",
+            "description": "回退到之前的某个目标重新执行。当你发现前面的操作导致当前目标无法继续时调用。系统会携带错误原因在新页面上重新拆解该目标。最多回退2次。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "target_index": {
                         "type": "integer",
-                        "description": "要回退到的子任务编号（从0开始）",
+                        "description": "要回退到的目标编号（从0开始）",
                     },
                     "reason": {
                         "type": "string",
-                        "description": "回退原因：之前的子任务哪里做错了，这次应该怎么改",
+                        "description": "回退原因：之前的目标哪里做错了，这次应该怎么改",
                     },
                 },
                 "required": ["target_index", "reason"],
@@ -302,5 +302,5 @@ ACTION_SCHEMAS: list[dict[str, Any]] = [
 ALLOWED_ACTION_TYPES: set[str] = {
     "click", "type", "select", "scroll", "scroll_to_element", "hover",
     "focus", "clear", "press_key", "wait", "navigate",
-    "wait_for_element", "task_complete", "sub_task_complete", "sub_task_retry",
+    "wait_for_element", "task_complete", "goal_complete", "goal_retry",
 }

@@ -3005,15 +3005,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Agent 页面自动化模块
   // ═══════════════════════════════════════════════════════════════════
 
-  const AGENT_KEYWORDS = [
-    '点击', '点一下', '按一下',
-    '输入', '填写', '填入',
-    '提交', '滚动',
-    '选择', '导航',
-    '帮我操作', '自动执行', '帮我点', '帮我填', '帮我选',
-    '打开网页', '跳转到'
+  const SLASH_COMMANDS = [
+    { name: '/browser-operation', description: '浏览器页面自动化操作（点击、输入、滚动等）', handler: 'agent' },
   ];
-  const AGENT_TRIGGER_PREFIX = '/do ';
+  const AGENT_COMMAND = '/browser-operation ';
   const AGENT_MAX_STEPS = 15;
   const AGENT_SETTLE_TIMEOUT_MS = 3000;
   const AGENT_ACTION_TIMEOUT_MS = 10000;
@@ -3028,15 +3023,12 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   function shouldUseAgent(text) {
     const trimmed = text.trim();
-    if (trimmed.startsWith(AGENT_TRIGGER_PREFIX)) return true;
-    const lower = trimmed.toLowerCase();
-    // 必须以动词开头或包含"帮我"才触发，避免描述性句子误触发
-    const actionPrefixes = ['帮我', '请帮', '去', '打开', '点击', '点一下', '按一下', '输入', '填写', '填入', '提交', '滚动', '选择', '导航', '跳转'];
-    const startsWithAction = actionPrefixes.some(p => lower.startsWith(p));
-    if (startsWithAction) return true;
-    // 包含关键词但要求句子较短（命令式），长句子多是描述不触发
-    if (trimmed.length > 50) return false;
-    return AGENT_KEYWORDS.some(kw => lower.includes(kw));
+    // 方式1: /browser-operation 前缀触发
+    if (trimmed.startsWith(AGENT_COMMAND.trim())) return true;
+    // 方式2: 自动化开关打开时，所有输入走 agent
+    const toggle = document.getElementById('agentModeToggle');
+    if (toggle && toggle.checked) return true;
+    return false;
   }
 
   async function waitForPageSettle(tabId, timeoutMs) {
@@ -3925,6 +3917,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function renderAgentPlan(bubble, plan) {
+    if (!plan || !plan.goals) return;
     const planDiv = document.createElement('div');
     planDiv.className = 'agent-plan';
     planDiv.dataset.planContainer = 'true';
@@ -3934,13 +3927,29 @@ document.addEventListener('DOMContentLoaded', async () => {
     titleEl.textContent = '📋 执行计划';
     planDiv.appendChild(titleEl);
 
-    plan.sub_tasks.forEach((st, i) => {
-      const item = document.createElement('div');
-      item.className = `agent-plan-item ${st.status}`;
-      item.dataset.planIndex = i;
-      const icon = st.status === 'completed' ? '✓' : st.status === 'in_progress' ? '▶' : '○';
-      item.textContent = `${icon} ${st.description}`;
-      planDiv.appendChild(item);
+    plan.goals.forEach((goal, i) => {
+      const goalDiv = document.createElement('div');
+      goalDiv.className = `agent-goal ${goal.status}`;
+      goalDiv.dataset.goalIndex = i;
+
+      const icon = goal.status === 'completed' ? '✓' :
+                   goal.status === 'in_progress' ? '▶' :
+                   goal.status === 'skipped' ? '⊘' :
+                   goal.planned ? '○' : '◇';
+      const titleRow = document.createElement('div');
+      titleRow.className = 'agent-goal-title';
+      titleRow.textContent = `${icon} 目标${i + 1}: ${goal.description}`;
+      goalDiv.appendChild(titleRow);
+
+      // 待拆解标记
+      if (!goal.planned && goal.status === 'pending') {
+        const pendingEl = document.createElement('div');
+        pendingEl.className = 'agent-goal-pending';
+        pendingEl.textContent = '（将在前面目标完成后拆解）';
+        goalDiv.appendChild(pendingEl);
+      }
+
+      planDiv.appendChild(goalDiv);
     });
 
     bubble.appendChild(planDiv);
@@ -3948,18 +3957,70 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function updateAgentPlan(bubble, plan) {
-    if (!plan || !plan.sub_tasks) return;
+    if (!plan || !plan.goals) return;
     const container = bubble.querySelector('[data-plan-container]');
     if (!container) {
       renderAgentPlan(bubble, plan);
       return;
     }
-    plan.sub_tasks.forEach((st, i) => {
-      const item = container.querySelector(`[data-plan-index="${i}"]`);
-      if (!item) return;
-      item.className = `agent-plan-item ${st.status}`;
-      const icon = st.status === 'completed' ? '✓' : st.status === 'in_progress' ? '▶' : '○';
-      item.textContent = `${icon} ${st.description}`;
+
+    // 更新目标状态（保留已渲染的执行步骤）
+    plan.goals.forEach((goal, i) => {
+      let goalDiv = container.querySelector(`[data-goal-index="${i}"]`);
+      if (!goalDiv) {
+        // 新增的目标（动态拆解出来的）
+        goalDiv = document.createElement('div');
+        goalDiv.className = `agent-goal ${goal.status}`;
+        goalDiv.dataset.goalIndex = i;
+        const icon = goal.status === 'completed' ? '✓' :
+                     goal.status === 'in_progress' ? '▶' :
+                     goal.status === 'skipped' ? '⊘' :
+                     goal.planned ? '○' : '◇';
+        const titleRow = document.createElement('div');
+        titleRow.className = 'agent-goal-title';
+        titleRow.textContent = `${icon} 目标${i + 1}: ${goal.description}`;
+        goalDiv.appendChild(titleRow);
+        if (!goal.planned && goal.status === 'pending') {
+          const pendingEl = document.createElement('div');
+          pendingEl.className = 'agent-goal-pending';
+          pendingEl.textContent = '（将在前面目标完成后拆解）';
+          goalDiv.appendChild(pendingEl);
+        }
+        container.appendChild(goalDiv);
+      } else {
+        // 更新状态
+        goalDiv.className = `agent-goal ${goal.status}`;
+        const titleRow = goalDiv.querySelector('.agent-goal-title');
+        if (titleRow) {
+          const icon = goal.status === 'completed' ? '✓' :
+                       goal.status === 'in_progress' ? '▶' :
+                       goal.status === 'skipped' ? '⊘' :
+                       goal.planned ? '○' : '◇';
+          titleRow.textContent = `${icon} 目标${i + 1}: ${goal.description}`;
+        }
+        // 已完成的目标折叠执行步骤
+        if (goal.status === 'completed') {
+          const actionsArea = goalDiv.querySelector('.agent-goal-actions');
+          if (actionsArea && !actionsArea.classList.contains('collapsed')) {
+            actionsArea.classList.add('collapsed');
+            const titleRow = goalDiv.querySelector('.agent-goal-title');
+            if (titleRow && !titleRow.classList.contains('collapsible')) {
+              titleRow.classList.add('collapsible');
+              const stepCount = actionsArea.querySelectorAll('.agent-action').length || Math.ceil(actionsArea.children.length / 2);
+              const badge = document.createElement('span');
+              badge.className = 'agent-goal-badge';
+              badge.textContent = ` (${stepCount}步已完成，点击展开)`;
+              titleRow.appendChild(badge);
+              titleRow.addEventListener('click', () => actionsArea.classList.toggle('collapsed'));
+            }
+          }
+        }
+        // 移除待拆解标记（已拆解时）
+        if (goal.planned || goal.status !== 'pending') {
+          const pendingEl = goalDiv.querySelector('.agent-goal-pending');
+          if (pendingEl) pendingEl.remove();
+        }
+      }
     });
   }
 
@@ -3995,6 +4056,23 @@ document.addEventListener('DOMContentLoaded', async () => {
       stepDiv.appendChild(resultEl);
     }
 
+    // 追加到当前活跃目标的步骤区域内（而非 bubble 根级别）
+    const container = bubble.querySelector('[data-plan-container]');
+    if (container) {
+      const activeGoal = container.querySelector('.agent-goal.in_progress');
+      if (activeGoal) {
+        let stepsArea = activeGoal.querySelector('.agent-goal-actions');
+        if (!stepsArea) {
+          stepsArea = document.createElement('div');
+          stepsArea.className = 'agent-goal-actions';
+          activeGoal.appendChild(stepsArea);
+        }
+        stepsArea.appendChild(stepDiv);
+        scrollToBottom();
+        return;
+      }
+    }
+    // 无计划面板时直接追加到 bubble
     bubble.appendChild(stepDiv);
     scrollToBottom();
   }
@@ -4109,20 +4187,29 @@ document.addEventListener('DOMContentLoaded', async () => {
         require_confirmation: []
       }, apiKey);
 
-      // 规划阶段：如果返回 plan_ready，展示计划并继续
+      // 首次 plan_ready 时渲染计划面板
+      console.log('[Agent] execute response:', response.status, JSON.stringify(response.plan));
       if (response.status === 'plan_ready' && response.plan) {
         renderAgentPlan(aiBubble, response.plan);
-        // 立即调用 step 继续执行（传入当前页面状态，无 action_result）
-        const freshPageState = await observePageState();
-        response = await callAgentApi(safeApiUrl, '/v1/agent/step', {
-          session_id: sessionId,
-          action_result: { success: true, action_type: 'plan_acknowledged', details: '计划已确认' },
-          page_state: freshPageState
-        }, apiKey);
+        console.log('[Agent] plan rendered, bubble children:', aiBubble.children.length);
       }
 
-      while (response.status === 'action_required' || response.status === 'confirm_required') {
+      while (response.status === 'action_required' || response.status === 'confirm_required' || response.status === 'plan_ready') {
         if (!agentState.active) break;
+
+        // 规划阶段（目标拆解完成），展示计划并继续
+        if (response.status === 'plan_ready' && response.plan) {
+          console.log('[Agent] goal replanned:', JSON.stringify(response.plan));
+          updateAgentPlan(aiBubble, response.plan);
+          const freshState = await observePageState();
+          pageState = freshState;
+          response = await callAgentApi(safeApiUrl, '/v1/agent/step', {
+            session_id: sessionId,
+            action_result: { success: true, action_type: 'plan_acknowledged', details: '计划已确认' },
+            page_state: freshState
+          }, apiKey);
+          continue;
+        }
 
         // 更新子任务计划显示
         if (response.plan) updateAgentPlan(aiBubble, response.plan);
@@ -4211,15 +4298,89 @@ document.addEventListener('DOMContentLoaded', async () => {
   (function installAgentInterceptor() {
     const inputEl = document.getElementById('chatInput');
     const btnEl = document.getElementById('sendBtn');
+    const toggleEl = document.getElementById('agentModeToggle');
+    const agentBtn = document.getElementById('agentModeBtn');
     if (!inputEl || !btnEl) return;
 
+    // 按钮点击切换自动化模式
+    if (agentBtn && toggleEl) {
+      agentBtn.addEventListener('click', () => {
+        toggleEl.checked = !toggleEl.checked;
+        agentBtn.classList.toggle('is-active', toggleEl.checked);
+        inputEl.placeholder = toggleEl.checked
+          ? '输入自动化指令 (如: 帮我点击搜索按钮)...'
+          : '输入问题 (Enter发送, Shift+Enter换行)...';
+      });
+    }
+
+    // ═══ 斜杠命令菜单 ═══
+    let slashMenu = null;
+
+    function createSlashMenu() {
+      if (slashMenu) return slashMenu;
+      slashMenu = document.createElement('div');
+      slashMenu.className = 'slash-menu';
+      slashMenu.style.display = 'none';
+      SLASH_COMMANDS.forEach((cmd, i) => {
+        const item = document.createElement('div');
+        item.className = 'slash-menu-item';
+        item.dataset.index = i;
+        item.innerHTML = `<span class="slash-menu-cmd">${cmd.name}</span><span class="slash-menu-desc">${cmd.description}</span>`;
+        item.addEventListener('click', () => {
+          inputEl.value = cmd.name + ' ';
+          inputEl.focus();
+          hideSlashMenu();
+        });
+        slashMenu.appendChild(item);
+      });
+      inputEl.parentElement.style.position = 'relative';
+      inputEl.parentElement.appendChild(slashMenu);
+      return slashMenu;
+    }
+
+    function showSlashMenu(filter) {
+      const menu = createSlashMenu();
+      const items = menu.querySelectorAll('.slash-menu-item');
+      let hasVisible = false;
+      items.forEach((item, i) => {
+        const cmd = SLASH_COMMANDS[i];
+        const show = !filter || cmd.name.includes(filter);
+        item.style.display = show ? 'flex' : 'none';
+        if (show) hasVisible = true;
+      });
+      menu.style.display = hasVisible ? 'block' : 'none';
+    }
+
+    function hideSlashMenu() {
+      if (slashMenu) slashMenu.style.display = 'none';
+    }
+
+    inputEl.addEventListener('input', () => {
+      const val = inputEl.value;
+      if (val.startsWith('/') && !val.includes(' ')) {
+        showSlashMenu(val);
+      } else {
+        hideSlashMenu();
+      }
+    });
+
+    inputEl.addEventListener('blur', () => {
+      setTimeout(hideSlashMenu, 150);
+    });
+
+    // ═══ 发送拦截 ═══
     function tryAgentIntercept(e) {
       const text = inputEl.value?.trim() || '';
       if (text && shouldUseAgent(text) && !agentState.active) {
         e.preventDefault();
         e.stopImmediatePropagation();
         inputEl.value = '';
-        runAgentTask(text);
+        hideSlashMenu();
+        // 去掉命令前缀
+        const task = text.startsWith(AGENT_COMMAND.trim())
+          ? text.slice(AGENT_COMMAND.trim().length).trim()
+          : text;
+        runAgentTask(task);
         return true;
       }
       return false;

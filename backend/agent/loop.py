@@ -24,14 +24,15 @@ from agent.state import (
     PageState,
     ActionResult,
     ElementLocator,
-    SubTask,
+    Goal,
     FailedAttempt,
 )
 from agent.context_builder import (
     build_initial_messages,
     build_initial_messages_text_mode,
-    build_planning_messages,
-    build_sub_task_context,
+    build_initial_planning_messages,
+    build_goal_planning_messages,
+    build_goal_context,
     build_reflection_prompt,
     append_step_messages,
 )
@@ -107,48 +108,67 @@ def run_step(
     page_state: PageState,
     action_result: Optional[ActionResult] = None,
 ) -> dict[str, Any]:
-    """执行 Agent 循环的一步：观察→思考→决策。"""
+    """执行 Agent 循环的一步。每步执行后都重新规划目标进度。"""
 
     if session.current_step >= session.max_steps:
         session.status = AgentStatus.ERROR
         session.error = f"已达到最大步数限制 ({session.max_steps})"
         return _build_response(session)
 
-    # 首步：先做任务分解规划
-    if not session.planning_done:
-        plan_result = _plan_task(session, page_state)
-        session.planning_done = True
-        if plan_result and len(plan_result) > 1:
-            session.sub_tasks = [SubTask(description=desc) for desc in plan_result]
-            session.sub_tasks[0].status = "in_progress"
+    # 首次规划：拆出第一个可执行目标 + 待拆解目标
+    if not session.initial_planning_done:
+        _initial_plan(session, page_state)
+        session.initial_planning_done = True
+        if session.goals:
             session.status = AgentStatus.PLAN_READY
-            # 返回带 plan 的响应，前端展示计划后继续执行第一步
             return _build_response(session, plan=_build_plan_info(session))
-        elif plan_result and len(plan_result) == 1:
-            session.sub_tasks = [SubTask(description=plan_result[0], status="in_progress")]
+
+    # 每步都重新规划当前目标（结合最新页面）
+    if session.goals and session.current_goal_index < len(session.goals):
+        current_goal = session.goals[session.current_goal_index]
+        if not current_goal.planned:
+            _plan_current_goal(session, page_state)
+            session.status = AgentStatus.PLAN_READY
+            return _build_response(session, plan=_build_plan_info(session))
+        # 步骤上限
+        if current_goal.step_count >= session.max_steps_per_goal:
+            current_goal.status = "completed"
+            return _advance_to_next_goal(session, page_state)
 
     session.current_step += 1
+    if session.goals and session.current_goal_index < len(session.goals):
+        session.goals[session.current_goal_index].step_count += 1
 
-    mode = _resolve_call_mode(session)
-
-    sub_task_ctx = build_sub_task_context(
-        session.task, session.sub_tasks, session.current_sub_task_index
-    ) if session.sub_tasks else ""
-
-    if not session.messages:
-        if mode == CallMode.TOOL_CALLS:
-            session.messages = build_initial_messages(session.task, page_state, sub_task_ctx)
-        else:
-            session.messages = build_initial_messages_text_mode(session.task, page_state, sub_task_ctx)
-    elif action_result and session.pending_action:
-        # 记录失败/成功并更新反思状态
+    # 记录上一步结果
+    if action_result and session.pending_action:
         _track_attempt_result(session, session.pending_action, action_result)
         append_step_messages(
             session.messages, session.pending_action, action_result, page_state
         )
         session.pending_action = None
 
-    # 注入反思提示（如果有重复失败）
+    mode = _resolve_call_mode(session)
+
+    # 每步用最新目标进度构建上下文
+    goal_ctx = build_goal_context(
+        session.task, session.goals, session.current_goal_index
+    ) if session.goals else ""
+
+    if not session.messages:
+        if mode == CallMode.TOOL_CALLS:
+            session.messages = build_initial_messages(session.task, page_state, goal_ctx)
+        else:
+            session.messages = build_initial_messages_text_mode(session.task, page_state, goal_ctx)
+    else:
+        # 每步更新 system prompt 中的目标进度
+        if session.messages[0].get("role") == "system":
+            from agent.context_builder import SYSTEM_PROMPT, TEXT_MODE_FORMAT_APPENDIX
+            if mode == CallMode.TOOL_CALLS:
+                session.messages[0] = {"role": "system", "content": SYSTEM_PROMPT + goal_ctx}
+            else:
+                session.messages[0] = {"role": "system", "content": SYSTEM_PROMPT + goal_ctx + TEXT_MODE_FORMAT_APPENDIX}
+
+    # 注入反思提示
     reflection = build_reflection_prompt(session)
     if reflection:
         session.messages.append({"role": "user", "content": reflection})
@@ -163,80 +183,21 @@ def run_step(
     if func_name is None:
         return _build_response(session, thought=thought)
 
-    if func_name == "task_complete":
-        session.status = AgentStatus.COMPLETED
-        session.summary = func_args.get("summary", "任务完成")
-        if session.sub_tasks:
-            session.sub_tasks[session.current_sub_task_index].status = "completed"
-        return _build_response(session, thought=thought)
-
-    if func_name == "sub_task_complete":
-        if session.sub_tasks and session.current_sub_task_index < len(session.sub_tasks):
-            session.sub_tasks[session.current_sub_task_index].status = "completed"
-            session.current_sub_task_index += 1
-            if session.current_sub_task_index >= len(session.sub_tasks):
-                session.status = AgentStatus.COMPLETED
-                session.summary = func_args.get("summary", "所有子任务已完成")
-                return _build_response(session, thought=thought)
-            else:
-                session.sub_tasks[session.current_sub_task_index].status = "in_progress"
-                # 更新 system prompt 中的子任务上下文
-                sub_task_ctx = build_sub_task_context(
-                    session.task, session.sub_tasks, session.current_sub_task_index
-                )
-                if session.messages and session.messages[0].get("role") == "system":
-                    from agent.context_builder import SYSTEM_PROMPT, SYSTEM_PROMPT_TEXT_MODE, TEXT_MODE_FORMAT_APPENDIX
-                    mode = _resolve_call_mode(session)
-                    if mode == CallMode.TOOL_CALLS:
-                        session.messages[0] = {"role": "system", "content": SYSTEM_PROMPT + sub_task_ctx}
-                    else:
-                        session.messages[0] = {"role": "system", "content": SYSTEM_PROMPT + sub_task_ctx + TEXT_MODE_FORMAT_APPENDIX}
-                session.current_step -= 1  # 子任务切换不计入步数
-                session.status = AgentStatus.ACTION_REQUIRED
-                return _build_response(session, thought=thought, plan=_build_plan_info(session))
-        # 没有子任务时当作 task_complete 处理
+    # goal_complete / task_complete → 完成当前目标，重新规划下一个
+    if func_name in ("task_complete", "goal_complete"):
+        if session.goals and session.current_goal_index < len(session.goals):
+            session.goals[session.current_goal_index].status = "completed"
+            has_remaining = any(
+                g.status == "pending" for g in session.goals[session.current_goal_index + 1:]
+            )
+            if has_remaining:
+                return _advance_to_next_goal(session, page_state, thought=thought)
         session.status = AgentStatus.COMPLETED
         session.summary = func_args.get("summary", "任务完成")
         return _build_response(session, thought=thought)
 
-    if func_name == "sub_task_retry":
-        target_index = func_args.get("target_index", 0)
-        reason = func_args.get("reason", "")
-
-        if not session.sub_tasks or target_index < 0 or target_index >= len(session.sub_tasks):
-            session.status = AgentStatus.ERROR
-            session.error = f"无效的回退目标: {target_index}"
-            return _build_response(session, thought=thought)
-
-        target_task = session.sub_tasks[target_index]
-        if target_task.retry_count >= 2:
-            # 超过重试上限，跳过该子任务
-            target_task.status = "skipped"
-            session.sub_tasks[session.current_sub_task_index].status = "in_progress"
-            session.status = AgentStatus.ACTION_REQUIRED
-            return _build_response(session, thought=thought, plan=_build_plan_info(session))
-
-        # 回退：当前子任务重置为 pending，目标子任务标记为 in_progress
-        session.sub_tasks[session.current_sub_task_index].status = "pending"
-        target_task.status = "in_progress"
-        target_task.retry_count += 1
-        target_task.retry_reason = reason
-        session.current_sub_task_index = target_index
-
-        # 更新 system prompt
-        sub_task_ctx = build_sub_task_context(
-            session.task, session.sub_tasks, session.current_sub_task_index
-        )
-        if session.messages and session.messages[0].get("role") == "system":
-            from agent.context_builder import SYSTEM_PROMPT, TEXT_MODE_FORMAT_APPENDIX
-            mode = _resolve_call_mode(session)
-            if mode == CallMode.TOOL_CALLS:
-                session.messages[0] = {"role": "system", "content": SYSTEM_PROMPT + sub_task_ctx}
-            else:
-                session.messages[0] = {"role": "system", "content": SYSTEM_PROMPT + sub_task_ctx + TEXT_MODE_FORMAT_APPENDIX}
-        session.current_step -= 1
-        session.status = AgentStatus.ACTION_REQUIRED
-        return _build_response(session, thought=thought, plan=_build_plan_info(session))
+    if func_name == "goal_retry":
+        return _retry_goal(session, func_args, thought=thought)
 
     if func_name not in ALLOWED_ACTION_TYPES:
         session.status = AgentStatus.ERROR
@@ -553,55 +514,205 @@ def _is_similar_target(a: str, b: str) -> bool:
     return False
 
 
-def _plan_task(session: AgentSession, page_state: PageState) -> Optional[list[str]]:
-    """调用 LLM 对任务进行分解规划，返回子任务描述列表。失败时返回 None。"""
-    messages = build_planning_messages(session.task, page_state)
-    client = _llm_client
-
+def _initial_plan(session: AgentSession, page_state: PageState) -> None:
+    """首次规划：拆出第一个可执行目标 + 待拆解目标列表。"""
+    messages = build_initial_planning_messages(session.task, page_state)
     try:
-        response = client.chat.completions.create(
-            model=session.model,
-            messages=messages,
+        response = _llm_client.chat.completions.create(
+            model=session.model, messages=messages,
         )
     except Exception:
-        return None
+        session.goals = [Goal(description=session.task, status="in_progress", planned=True,
+                              sub_steps=[session.task])]
+        return
 
     if not response or not response.choices:
-        return None
+        session.goals = [Goal(description=session.task, status="in_progress", planned=True,
+                              sub_steps=[session.task])]
+        return
 
-    raw_content = response.choices[0].message.content or ""
-    clean_content = _strip_think_tags(raw_content)
+    raw = response.choices[0].message.content or ""
+    clean = _strip_think_tags(raw)
+    data = _parse_plan_json(clean)
 
-    # 解析 JSON
-    for block in re.finditer(r'```(?:json)?\s*(\{.*?\})\s*```', clean_content, re.DOTALL):
+    if data and "current_goal" in data:
+        cg = data["current_goal"]
+        first_goal = Goal(
+            description=cg.get("description", session.task),
+            status="in_progress",
+            planned=True,
+            sub_steps=[str(s) for s in cg.get("sub_steps", []) if s],
+        )
+        session.goals = [first_goal]
+        # remaining_goals: 合并为最多1个待拆解目标
+        remaining = [str(d) for d in data.get("remaining_goals", []) if d]
+        if remaining:
+            merged_desc = "；".join(remaining) if len(remaining) <= 2 else remaining[0]
+            session.goals.append(Goal(description=merged_desc))
+    else:
+        session.goals = [Goal(description=session.task, status="in_progress", planned=True,
+                              sub_steps=[session.task])]
+
+
+def _plan_current_goal(session: AgentSession, page_state: PageState) -> None:
+    """对当前待拆解目标进行拆解（结合最新页面状态）。
+
+    LLM 返回 current_goal + remaining_goals:
+    - current_goal 成为当前目标的实际执行内容
+    - remaining_goals 追加为新的待拆解目标（插入到当前目标后面）
+    """
+    goal = session.goals[session.current_goal_index]
+    messages = build_goal_planning_messages(
+        session.task, goal.description, session.goals, page_state,
+        retry_reason=goal.retry_reason,
+    )
+    try:
+        response = _llm_client.chat.completions.create(
+            model=session.model, messages=messages,
+        )
+    except Exception:
+        goal.sub_steps = [goal.description]
+        goal.planned = True
+        goal.status = "in_progress"
+        session.messages = []
+        return
+
+    if response and response.choices:
+        raw = response.choices[0].message.content or ""
+        clean = _strip_think_tags(raw)
+        data = _parse_plan_json(clean)
+
+        if data and "current_goal" in data:
+            cg = data["current_goal"]
+            goal.description = cg.get("description", goal.description)
+            goal.sub_steps = [str(s) for s in cg.get("sub_steps", []) if s]
+            # 追加新的 remaining 目标
+            remaining = [str(d) for d in data.get("remaining_goals", []) if d]
+            if remaining:
+                insert_pos = session.current_goal_index + 1
+                # 移除旧的 pending 目标（会被新拆解替代）
+                old_remaining = [
+                    i for i, g in enumerate(session.goals)
+                    if i >= insert_pos and g.status == "pending" and not g.planned
+                ]
+                for i in reversed(old_remaining):
+                    session.goals.pop(i)
+                # 插入新 remaining
+                for desc in remaining:
+                    session.goals.insert(insert_pos, Goal(description=desc))
+                    insert_pos += 1
+        elif data and "sub_steps" in data:
+            goal.sub_steps = [str(s) for s in data["sub_steps"] if s]
+        else:
+            goal.sub_steps = [goal.description]
+    else:
+        goal.sub_steps = [goal.description]
+
+    goal.planned = True
+    goal.status = "in_progress"
+    goal.current_sub_step = 0
+    session.messages = []
+
+
+def _advance_to_next_goal(session: AgentSession, page_state: PageState = None, thought: str = "") -> dict[str, Any]:
+    """推进到下一个目标，触发重新规划。"""
+    session.current_goal_index += 1
+    if session.current_goal_index >= len(session.goals):
+        session.status = AgentStatus.COMPLETED
+        session.summary = "所有目标已完成"
+        return _build_response(session, thought=thought)
+
+    next_goal = session.goals[session.current_goal_index]
+    next_goal.status = "planning"
+    # 重置上下文（新目标从零开始）
+    session.messages = []
+    session.failed_attempts = []
+    session.blacklisted_approaches = []
+    session.current_step -= 1  # 目标切换不计入步数
+
+    # 如果有 page_state，立即拆解新目标
+    if page_state:
+        _plan_current_goal(session, page_state)
+        session.status = AgentStatus.PLAN_READY
+    else:
+        session.status = AgentStatus.ACTION_REQUIRED
+
+    return _build_response(session, thought=thought, plan=_build_plan_info(session))
+
+
+def _retry_goal(session: AgentSession, args: dict, thought: str = "") -> dict[str, Any]:
+    """回退到指定目标，携带错误原因重新拆解。"""
+    target_index = args.get("target_index", max(0, session.current_goal_index - 1))
+    reason = args.get("reason", "")
+
+    if target_index < 0 or target_index >= len(session.goals):
+        session.status = AgentStatus.ERROR
+        session.error = f"无效的回退目标: {target_index}"
+        return _build_response(session, thought=thought)
+
+    target_goal = session.goals[target_index]
+    if target_goal.retry_count >= 2:
+        target_goal.status = "skipped"
+        return _advance_to_next_goal(session, thought=thought)
+
+    # 重置当前目标
+    current_goal = session.goals[session.current_goal_index]
+    current_goal.status = "pending"
+    current_goal.planned = False
+
+    # 回退目标：重新拆解
+    target_goal.status = "planning"
+    target_goal.planned = False
+    target_goal.retry_count += 1
+    target_goal.retry_reason = reason
+    target_goal.sub_steps = []
+    target_goal.step_count = 0
+    target_goal.current_sub_step = 0
+    session.current_goal_index = target_index
+
+    # 清空上下文
+    session.messages = []
+    session.failed_attempts = []
+    session.blacklisted_approaches = []
+    session.current_step -= 1
+    session.status = AgentStatus.ACTION_REQUIRED
+    return _build_response(session, thought=thought, plan=_build_plan_info(session))
+
+
+def _parse_plan_json(text: str) -> Optional[dict]:
+    """从文本中解析规划 JSON。"""
+    for block in re.finditer(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL):
         try:
-            data = json.loads(block.group(1))
-            if "sub_tasks" in data and isinstance(data["sub_tasks"], list):
-                return [str(t) for t in data["sub_tasks"] if t]
+            return json.loads(block.group(1))
         except json.JSONDecodeError:
             continue
-
-    for obj in re.finditer(r'\{[^{}]*"sub_tasks"\s*:\s*\[.*?\][^{}]*\}', clean_content, re.DOTALL):
+    for obj in re.finditer(r'\{[^{}]*(?:\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}[^{}]*)*\}', text, re.DOTALL):
         try:
             data = json.loads(obj.group(0))
-            if "sub_tasks" in data and isinstance(data["sub_tasks"], list):
-                return [str(t) for t in data["sub_tasks"] if t]
+            if "current_goal" in data or "sub_steps" in data:
+                return data
         except json.JSONDecodeError:
             continue
-
     return None
 
 
 def _build_plan_info(session: AgentSession) -> Optional[dict[str, Any]]:
     """构建返回给前端的 plan 信息。"""
-    if not session.sub_tasks:
+    if not session.goals:
         return None
     return {
-        "sub_tasks": [
-            {"description": st.description, "status": st.status}
-            for st in session.sub_tasks
+        "goals": [
+            {
+                "description": g.description,
+                "status": g.status,
+                "planned": g.planned,
+                "sub_steps": g.sub_steps,
+                "current_sub_step": g.current_sub_step,
+                "step_count": g.step_count,
+            }
+            for g in session.goals
         ],
-        "current_index": session.current_sub_task_index,
+        "current_index": session.current_goal_index,
     }
 
 

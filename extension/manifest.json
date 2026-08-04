@@ -15,7 +15,8 @@
     "activeTab",
     "scripting",
     "contextMenus",
-    "permissions"
+    "permissions",
+    "debugger"
   ],
   "host_permissions": [
     "https://api.openai.com/*",

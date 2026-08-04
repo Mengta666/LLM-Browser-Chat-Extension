@@ -478,4 +478,66 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       .catch((error) => sendResponse({ ok: false, error: error?.message || '未知错误' }));
     return true;
   }
+
+  if (request.type === 'DEBUGGER_CLICK') {
+    handleDebuggerClick(request.tabId, request.x, request.y)
+      .then(() => sendResponse({ ok: true }))
+      .catch((error) => sendResponse({ ok: false, error: error?.message || '未知错误' }));
+    return true;
+  }
+
+  if (request.type === 'DEBUGGER_TYPE') {
+    handleDebuggerType(request.tabId, request.text)
+      .then(() => sendResponse({ ok: true }))
+      .catch((error) => sendResponse({ ok: false, error: error?.message || '未知错误' }));
+    return true;
+  }
+
+  if (request.type === 'DEBUGGER_DETACH') {
+    debuggerDetach(request.tabId)
+      .then(() => sendResponse({ ok: true }))
+      .catch(() => sendResponse({ ok: true }));
+    return true;
+  }
 });
+
+// Debugger 会话管理：保持 attach 状态复用，避免每次 attach/detach 的开销
+const _debuggerAttached = new Set();
+
+chrome.debugger.onDetach.addListener((source) => {
+  _debuggerAttached.delete(source.tabId);
+});
+
+async function debuggerEnsureAttached(tabId) {
+  if (_debuggerAttached.has(tabId)) return;
+  await chrome.debugger.attach({ tabId }, '1.3');
+  _debuggerAttached.add(tabId);
+}
+
+async function debuggerDetach(tabId) {
+  if (!_debuggerAttached.has(tabId)) return;
+  await chrome.debugger.detach({ tabId }).catch(() => {});
+  _debuggerAttached.delete(tabId);
+}
+
+async function handleDebuggerClick(tabId, x, y) {
+  await debuggerEnsureAttached(tabId);
+  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
+    type: 'mousePressed', x, y, button: 'left', clickCount: 1
+  });
+  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
+    type: 'mouseReleased', x, y, button: 'left', clickCount: 1
+  });
+}
+
+async function handleDebuggerType(tabId, text) {
+  await debuggerEnsureAttached(tabId);
+  for (const char of text) {
+    await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', {
+      type: 'keyDown', text: char
+    });
+    await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', {
+      type: 'keyUp', text: char
+    });
+  }
+}

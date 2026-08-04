@@ -59,19 +59,6 @@ class PageState(BaseModel):
 
 
 @dataclass
-class Goal:
-    """一个可执行目标（已拆解或待拆解）。"""
-    description: str
-    status: str = "pending"         # "pending" | "planning" | "in_progress" | "completed" | "skipped"
-    planned: bool = False
-    sub_steps: list[str] = field(default_factory=list)
-    current_sub_step: int = 0
-    step_count: int = 0
-    retry_count: int = 0
-    retry_reason: str = ""
-
-
-@dataclass
 class FailedAttempt:
     """记录一次失败的操作尝试。"""
     action_type: str
@@ -87,7 +74,7 @@ class AgentSession:
     session_id: str
     task: str
     model: str
-    max_steps: int = 15
+    max_steps: int = 20
     current_step: int = 0
     status: AgentStatus = AgentStatus.RUNNING
     require_confirmation: list[str] = field(default_factory=list)
@@ -97,12 +84,13 @@ class AgentSession:
     pending_action: Optional[PageAction] = None
     summary: Optional[str] = None
     error: Optional[str] = None
-    call_mode: Optional[str] = None  # "tool_calls" | "text_parse" | None(auto)
+    call_mode: Optional[str] = None
 
-    # 渐进式任务分解
-    goals: list[Goal] = field(default_factory=list)
-    current_goal_index: int = 0
-    max_steps_per_goal: int = 10
+    # 规划状态（每步由规划 LLM 刷新）
+    current_goal: str = ""
+    next_action_hint: str = ""
+    completed_goals: list[str] = field(default_factory=list)
+    remaining_goal: str = ""
     initial_planning_done: bool = False
 
     # 反思机制

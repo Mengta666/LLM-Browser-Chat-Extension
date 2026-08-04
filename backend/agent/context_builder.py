@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Any, TYPE_CHECKING
 
-from agent.state import PageState, ActionResult, PageAction, Goal
+from agent.state import PageState, ActionResult, PageAction
 
 if TYPE_CHECKING:
     from agent.state import AgentSession
@@ -164,7 +164,123 @@ TEXT_MODE_FORMAT_APPENDIX = """
 SYSTEM_PROMPT_TEXT_MODE = SYSTEM_PROMPT + TEXT_MODE_FORMAT_APPENDIX
 
 
-PLANNING_PROMPT = """你是一个浏览器自动化规划助手。用户给你一个目标任务，你需要结合当前页面的实际状态进行规划。
+# ═══════════════════════════════════════════════════════════════════════════════
+# 每步规划 Prompt（双次调用架构：规划 + 执行）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+STEP_PLANNING_PROMPT = """你是一个浏览器自动化规划助手。根据用户的总任务和当前页面状态，判断目标进度并决定下一步方向。
+
+## 输出格式
+只输出 JSON，不要其他文字：
+```json
+{
+  "task_done": false,
+  "current_goal": "当前正在执行的目标（基于当前页面能做的事）",
+  "next_action_hint": "下一步应该做什么操作（给执行器的提示）",
+  "completed_goals": ["已完成的目标1", "已完成的目标2"],
+  "remaining": "后续还需要做什么（一句话概括，如果没有则为空字符串）"
+}
+```
+
+## 规则
+1. `current_goal` 必须是当前页面上可以直接操作的目标
+2. `next_action_hint` 是对下一步操作的简短提示（如"点击分支选择器"）
+3. `completed_goals` 是已经成功完成的目标列表（根据页面状态判断）
+4. `remaining` 是还没做完的部分，一句话概括
+5. 当整个任务完成时设置 `task_done: true` 并填写完整的 `completed_goals`
+6. 如果上一步操作失败了，current_goal 不变但 next_action_hint 应该给出不同的策略
+
+## 判断目标完成的标准
+- 根据页面 URL、标题、可见元素来判断之前的操作是否已经成功
+- 如果页面已经发生了预期的变化（如跳转到新页面、出现了新内容），说明目标已完成
+- 不要仅凭"执行了点击"就判断完成——要看页面实际状态
+"""
+
+
+def build_step_planning_messages(
+    session: "AgentSession", page_state: PageState
+) -> list[dict[str, str]]:
+    """构造每步规划的 messages。"""
+    parts = [f"## 用户任务\n{session.task}"]
+
+    if session.completed_goals:
+        parts.append("\n## 已完成的目标")
+        for g in session.completed_goals:
+            parts.append(f"  ✓ {g}")
+
+    if session.current_goal:
+        parts.append(f"\n## 上一步的目标: {session.current_goal}")
+
+    # 上一步执行结果
+    if session.pending_action is None and session.step_history:
+        last = session.step_history[-1]
+        parts.append(f"上一步操作: {last.get('action', {}).get('type', '?')}")
+
+    parts.append(f"\n{build_observation_message(page_state)}")
+
+    return [
+        {"role": "system", "content": STEP_PLANNING_PROMPT},
+        {"role": "user", "content": "\n".join(parts)},
+    ]
+
+
+def build_execution_goal_context(session: "AgentSession") -> str:
+    """构建注入到执行 LLM system prompt 中的目标上下文。"""
+    if not session.current_goal:
+        return ""
+
+    parts = [f"\n## 当前目标\n{session.current_goal}"]
+
+    if session.next_action_hint:
+        parts.append(f"\n## 操作提示\n{session.next_action_hint}")
+
+    if session.completed_goals:
+        parts.append(f"\n已完成: {', '.join(session.completed_goals)}")
+
+    if session.remaining_goal:
+        parts.append(f"后续待做: {session.remaining_goal}")
+
+    parts.append("\n请执行一个操作来推进当前目标。每次只执行一个操作。")
+    return "\n".join(parts)
+
+
+def build_reflection_prompt(session: "AgentSession") -> str:
+    """当检测到重复失败时，生成反思提示注入到对话中。"""
+    if not session.blacklisted_approaches and len(session.failed_attempts) < 3:
+        return ""
+
+    parts = []
+
+    if session.blacklisted_approaches:
+        parts.append("## ⚠️ 反思提醒")
+        parts.append("以下方式已多次尝试失败，**禁止再使用相同方式**，必须换一种不同的策略：")
+        for approach in session.blacklisted_approaches[-5:]:
+            parts.append(f"  ✗ {approach}")
+
+    recent_fails = [
+        a for a in session.failed_attempts[-3:]
+        if a.step >= session.current_step - 3
+    ]
+    if len(recent_fails) >= 3:
+        parts.append("")
+        parts.append("你已连续多次操作失败，请退一步重新思考：")
+        parts.append("- 目标元素是否真的在当前视口内？尝试 scroll 查看更多内容")
+        parts.append("- 是否需要先完成前置操作（如打开面板、切换标签页、关闭当前弹窗）？")
+        parts.append("- 尝试完全不同的交互路径（不同的按钮、不同的菜单入口）")
+        parts.append("- 如果确认目标无法完成，调用 task_complete 报告失败原因")
+
+    return "\n".join(parts) if parts else ""
+
+
+def build_system_prompt(goal_context: str = "") -> str:
+    return SYSTEM_PROMPT + goal_context
+
+
+def build_system_prompt_text_mode(goal_context: str = "") -> str:
+    return SYSTEM_PROMPT + goal_context + TEXT_MODE_FORMAT_APPENDIX
+
+
+def build_observation_message(page_state: PageState) -> str:
 
 ## 核心原则（非常重要）
 - 你只能规划在**当前页面上可以直接执行**的操作作为 current_goal

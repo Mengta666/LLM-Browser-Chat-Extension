@@ -259,48 +259,10 @@ ACTION_SCHEMAS: list[dict[str, Any]] = [
             },
         },
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "goal_complete",
-            "description": "当前目标已完成。调用后系统会结合新页面状态拆解下一个目标。当你确认当前目标的所有步骤已经达成时调用。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "summary": {
-                        "type": "string",
-                        "description": "当前目标完成情况的简要说明",
-                    },
-                },
-                "required": ["summary"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "goal_retry",
-            "description": "回退到之前的某个目标重新执行。当你发现前面的操作导致当前目标无法继续时调用。系统会携带错误原因在新页面上重新拆解该目标。最多回退2次。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "target_index": {
-                        "type": "integer",
-                        "description": "要回退到的目标编号（从0开始）",
-                    },
-                    "reason": {
-                        "type": "string",
-                        "description": "回退原因：之前的目标哪里做错了，这次应该怎么改",
-                    },
-                },
-                "required": ["target_index", "reason"],
-            },
-        },
-    },
 ]
 
 ALLOWED_ACTION_TYPES: set[str] = {
     "click", "type", "select", "scroll", "scroll_to_element", "hover",
     "focus", "clear", "press_key", "wait", "navigate",
-    "wait_for_element", "task_complete", "goal_complete", "goal_retry",
+    "wait_for_element", "task_complete",
 }

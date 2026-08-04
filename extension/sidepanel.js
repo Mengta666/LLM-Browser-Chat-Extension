@@ -3110,7 +3110,14 @@ document.addEventListener('DOMContentLoaded', async () => {
           '.el-select-dropdown__item',
           '[class*="picker-cell"]',
           '[class*="switch-panel-item"]',
-          'li[class*="option"]'
+          'li[class*="option"]',
+          // 通用列表选项（下拉面板内的可点击项）
+          '[class*="select-branch__item"]',
+          '[class*="dropdown-item"]',
+          '[class*="list-item"]',
+          '[class*="menu-item"]:not([class*="icon"])',
+          '.el-dropdown-menu__item',
+          '[data-action-id]'
         ];
 
         // 弹出层容器检测选择器
@@ -3126,6 +3133,8 @@ document.addEventListener('DOMContentLoaded', async () => {
           '.el-picker-panel', '.el-select-dropdown', '.el-popover',
           '[class*="popup"]:not([style*="display: none"])',
           '[class*="dropdown-list"]', '[class*="picker-panel"]',
+          '[class*="dropdownWrap"]', '[class*="dropdown__"]',
+          '[class*="select-branch"]',
           '.modal[style*="display: block"]', '.modal.show'
         ];
 
@@ -3917,111 +3926,71 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function renderAgentPlan(bubble, plan) {
-    if (!plan || !plan.goals) return;
+    if (!plan) return;
     const planDiv = document.createElement('div');
     planDiv.className = 'agent-plan';
     planDiv.dataset.planContainer = 'true';
 
     const titleEl = document.createElement('div');
     titleEl.className = 'agent-plan-title';
-    titleEl.textContent = '📋 执行计划';
+    titleEl.textContent = '📋 执行进度';
     planDiv.appendChild(titleEl);
 
-    plan.goals.forEach((goal, i) => {
-      const goalDiv = document.createElement('div');
-      goalDiv.className = `agent-goal ${goal.status}`;
-      goalDiv.dataset.goalIndex = i;
-
-      const icon = goal.status === 'completed' ? '✓' :
-                   goal.status === 'in_progress' ? '▶' :
-                   goal.status === 'skipped' ? '⊘' :
-                   goal.planned ? '○' : '◇';
-      const titleRow = document.createElement('div');
-      titleRow.className = 'agent-goal-title';
-      titleRow.textContent = `${icon} 目标${i + 1}: ${goal.description}`;
-      goalDiv.appendChild(titleRow);
-
-      // 待拆解标记
-      if (!goal.planned && goal.status === 'pending') {
-        const pendingEl = document.createElement('div');
-        pendingEl.className = 'agent-goal-pending';
-        pendingEl.textContent = '（将在前面目标完成后拆解）';
-        goalDiv.appendChild(pendingEl);
-      }
-
-      planDiv.appendChild(goalDiv);
-    });
-
+    _renderPlanContent(planDiv, plan);
     bubble.appendChild(planDiv);
     scrollToBottom();
   }
 
   function updateAgentPlan(bubble, plan) {
-    if (!plan || !plan.goals) return;
+    if (!plan) return;
     const container = bubble.querySelector('[data-plan-container]');
     if (!container) {
       renderAgentPlan(bubble, plan);
       return;
     }
+    // 保存当前执行步骤区域
+    const actionsArea = container.querySelector('.agent-goal-actions');
 
-    // 更新目标状态（保留已渲染的执行步骤）
-    plan.goals.forEach((goal, i) => {
-      let goalDiv = container.querySelector(`[data-goal-index="${i}"]`);
-      if (!goalDiv) {
-        // 新增的目标（动态拆解出来的）
-        goalDiv = document.createElement('div');
-        goalDiv.className = `agent-goal ${goal.status}`;
-        goalDiv.dataset.goalIndex = i;
-        const icon = goal.status === 'completed' ? '✓' :
-                     goal.status === 'in_progress' ? '▶' :
-                     goal.status === 'skipped' ? '⊘' :
-                     goal.planned ? '○' : '◇';
-        const titleRow = document.createElement('div');
-        titleRow.className = 'agent-goal-title';
-        titleRow.textContent = `${icon} 目标${i + 1}: ${goal.description}`;
-        goalDiv.appendChild(titleRow);
-        if (!goal.planned && goal.status === 'pending') {
-          const pendingEl = document.createElement('div');
-          pendingEl.className = 'agent-goal-pending';
-          pendingEl.textContent = '（将在前面目标完成后拆解）';
-          goalDiv.appendChild(pendingEl);
-        }
-        container.appendChild(goalDiv);
-      } else {
-        // 更新状态
-        goalDiv.className = `agent-goal ${goal.status}`;
-        const titleRow = goalDiv.querySelector('.agent-goal-title');
-        if (titleRow) {
-          const icon = goal.status === 'completed' ? '✓' :
-                       goal.status === 'in_progress' ? '▶' :
-                       goal.status === 'skipped' ? '⊘' :
-                       goal.planned ? '○' : '◇';
-          titleRow.textContent = `${icon} 目标${i + 1}: ${goal.description}`;
-        }
-        // 已完成的目标折叠执行步骤
-        if (goal.status === 'completed') {
-          const actionsArea = goalDiv.querySelector('.agent-goal-actions');
-          if (actionsArea && !actionsArea.classList.contains('collapsed')) {
-            actionsArea.classList.add('collapsed');
-            const titleRow = goalDiv.querySelector('.agent-goal-title');
-            if (titleRow && !titleRow.classList.contains('collapsible')) {
-              titleRow.classList.add('collapsible');
-              const stepCount = actionsArea.querySelectorAll('.agent-action').length || Math.ceil(actionsArea.children.length / 2);
-              const badge = document.createElement('span');
-              badge.className = 'agent-goal-badge';
-              badge.textContent = ` (${stepCount}步已完成，点击展开)`;
-              titleRow.appendChild(badge);
-              titleRow.addEventListener('click', () => actionsArea.classList.toggle('collapsed'));
-            }
-          }
-        }
-        // 移除待拆解标记（已拆解时）
-        if (goal.planned || goal.status !== 'pending') {
-          const pendingEl = goalDiv.querySelector('.agent-goal-pending');
-          if (pendingEl) pendingEl.remove();
-        }
+    // 清除旧内容（保留标题）
+    const title = container.querySelector('.agent-plan-title');
+    container.innerHTML = '';
+    if (title) container.appendChild(title);
+    _renderPlanContent(container, plan);
+
+    // 将执行步骤区域挂到新的当前目标下
+    if (actionsArea) {
+      const newCurrentGoal = container.querySelector('.agent-goal.in_progress');
+      if (newCurrentGoal) {
+        newCurrentGoal.appendChild(actionsArea);
       }
-    });
+    }
+  }
+
+  function _renderPlanContent(container, plan) {
+    // 已完成目标
+    if (plan.completed_goals && plan.completed_goals.length > 0) {
+      plan.completed_goals.forEach(g => {
+        const item = document.createElement('div');
+        item.className = 'agent-goal completed';
+        item.textContent = `✓ ${g}`;
+        container.appendChild(item);
+      });
+    }
+    // 当前目标
+    if (plan.current_goal && !plan.task_done) {
+      const current = document.createElement('div');
+      current.className = 'agent-goal in_progress';
+      current.dataset.currentGoal = 'true';
+      current.textContent = `▶ ${plan.current_goal}`;
+      container.appendChild(current);
+    }
+    // 剩余
+    if (plan.remaining) {
+      const remaining = document.createElement('div');
+      remaining.className = 'agent-goal pending';
+      remaining.textContent = `◇ ${plan.remaining}`;
+      container.appendChild(remaining);
+    }
   }
 
   function renderAgentStepInBubble(bubble, step, thought, action, result) {
@@ -4187,31 +4156,15 @@ document.addEventListener('DOMContentLoaded', async () => {
         require_confirmation: []
       }, apiKey);
 
-      // 首次 plan_ready 时渲染计划面板
-      console.log('[Agent] execute response:', response.status, JSON.stringify(response.plan));
-      if (response.status === 'plan_ready' && response.plan) {
+      // 首次渲染计划面板
+      if (response.plan) {
         renderAgentPlan(aiBubble, response.plan);
-        console.log('[Agent] plan rendered, bubble children:', aiBubble.children.length);
       }
 
-      while (response.status === 'action_required' || response.status === 'confirm_required' || response.status === 'plan_ready') {
+      while (response.status === 'action_required' || response.status === 'confirm_required') {
         if (!agentState.active) break;
 
-        // 规划阶段（目标拆解完成），展示计划并继续
-        if (response.status === 'plan_ready' && response.plan) {
-          console.log('[Agent] goal replanned:', JSON.stringify(response.plan));
-          updateAgentPlan(aiBubble, response.plan);
-          const freshState = await observePageState();
-          pageState = freshState;
-          response = await callAgentApi(safeApiUrl, '/v1/agent/step', {
-            session_id: sessionId,
-            action_result: { success: true, action_type: 'plan_acknowledged', details: '计划已确认' },
-            page_state: freshState
-          }, apiKey);
-          continue;
-        }
-
-        // 更新子任务计划显示
+        // 每步更新目标进度
         if (response.plan) updateAgentPlan(aiBubble, response.plan);
 
         agentState.currentStep = response.step;

@@ -1,6 +1,7 @@
 """Agent 上下文构建模块。
 
 负责将用户任务、页面观察状态、历史动作组装成 LLM 可理解的 messages 上下文。
+双次调用架构：每步先调规划 LLM，再调执行 LLM。
 """
 
 from __future__ import annotations
@@ -62,46 +63,27 @@ SYSTEM_PROMPT = """你是一个浏览器自动化助手。用户会给你一个�
 ### 3. 验证上下文再操作
 - 当面板/弹出层/列表打开后，先确认显示的内容是否匹配目标
 - 如果当前显示的范围/分类/页码不对，先导航到正确的上下文
-- 例如：面板显示的月份不对就先翻月，列表显示的分类不对就先切换分类
 - 不要仅凭某个值看起来像就点击——确保周围上下文也是对的
 
-### 3. 修改前先清除
+### 4. 修改前先清除
 - 需要更改一个已有值时，先清除旧值再设置新值
-- 观察当前已选中/已填写的内容，判断是否需要先清除
-- 常见清除方式：点击元素旁的关闭图标(×)、点击"重置"按钮、使用 clear 操作、取消勾选
+- 常见清除方式：点击关闭图标(×)、点击"重置"按钮、使用 clear 操作
 
-### 4. 复杂交互是多步的
+### 5. 复杂交互是多步的
 - 很多组件需要"触发→弹出→选择"的多步流程
-- 第一步：点击触发器打开弹出层/面板
-- 第二步：等待弹出层出现（wait）
-- 第三步：在弹出层中找到并点击目标选项
 - 如果直接操作无效，思考是否缺少某个中间步骤
 
-### 5. 滚动查找
+### 6. 滚动查找
 - 目标不在可见列表中时，使用 scroll 而非猜测
-- 滚动后等待新观察结果再决策
 - 观察滚动进度信息，只有到底部后才能判定目标不存在
-- 对弹窗/面板内的列表同样适用
 
-### 6. 分步执行，不要跳跃
+### 7. 分步执行，不要跳跃
 - 每次只执行一个操作
-- 多层级导航逐步点击，不要跳步
 - annotation_id 每次操作后可能变化，只用当前轮次的
-
-### 7. 任务理解
-- "查看/列出/有哪些" → 信息收集：只需滚动阅读，不修改页面，最后汇总
-- "筛选/搜索/查询" → 修改条件：先清除旧条件，设置新条件，提交查询
-- "点击/进入/打开" → 导航操作：逐步点击进入目标页面
-- "填写/输入/提交" → 表单操作：定位输入框，输入内容，提交
 
 ## 注意事项
 - 每次只执行一个操作
-- 如果目标元素不可见，先 scroll 再在新的观察结果中查找
 - 如果操作失败，尝试用不同的定位方式（css→text→annotation_id）
-- 如果元素列表显示"已截断"，需要 scroll 来发现更多元素
-- 表单填写后通常需要点击提交按钮
-- 页面跳转后使用 wait 或 wait_for_element 等待加载
-- 不要使用 press_key 来搜索页面内容（浏览器搜索框不可控）
 - 任务完成或确认无法完成时，必须调用 task_complete
 """
 
@@ -120,34 +102,9 @@ TEXT_MODE_FORMAT_APPENDIX = """
 {"action": "type", "locator": {"method": "css", "value": "#input-id"}, "text": "要输入的文字", "thought": "你的思考"}
 ```
 
-下拉选择：
-```json
-{"action": "select", "locator": {"method": "css", "value": "select#city"}, "option_text": "北京", "thought": "你的思考"}
-```
-
 滚动页面：
 ```json
 {"action": "scroll", "direction": "down", "amount": 300, "thought": "你的思考"}
-```
-
-按键：
-```json
-{"action": "press_key", "key": "Enter", "thought": "你的思考"}
-```
-
-等待：
-```json
-{"action": "wait", "ms": 1000, "thought": "你的思考"}
-```
-
-导航到URL：
-```json
-{"action": "navigate", "url": "https://example.com", "thought": "你的思考"}
-```
-
-等待元素出现：
-```json
-{"action": "wait_for_element", "locator": {"method": "css", "value": "#result"}, "timeout": 5000, "thought": "你的思考"}
 ```
 
 任务完成：
@@ -165,7 +122,7 @@ SYSTEM_PROMPT_TEXT_MODE = SYSTEM_PROMPT + TEXT_MODE_FORMAT_APPENDIX
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 每步规划 Prompt（双次调用架构：规划 + 执行）
+# 每步规划 Prompt（双次调用架构）
 # ═══════════════════════════════════════════════════════════════════════════════
 
 STEP_PLANNING_PROMPT = """你是一个浏览器自动化规划助手。根据用户的总任务和当前页面状态，判断目标进度并决定下一步方向。
@@ -197,6 +154,10 @@ STEP_PLANNING_PROMPT = """你是一个浏览器自动化规划助手。根据用
 """
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# 构建函数
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def build_step_planning_messages(
     session: "AgentSession", page_state: PageState
 ) -> list[dict[str, str]]:
@@ -211,10 +172,10 @@ def build_step_planning_messages(
     if session.current_goal:
         parts.append(f"\n## 上一步的目标: {session.current_goal}")
 
-    # 上一步执行结果
-    if session.pending_action is None and session.step_history:
+    if session.step_history:
         last = session.step_history[-1]
-        parts.append(f"上一步操作: {last.get('action', {}).get('type', '?')}")
+        action_info = last.get("action", {})
+        parts.append(f"上一步操作: {action_info.get('type', '?')}")
 
     parts.append(f"\n{build_observation_message(page_state)}")
 
@@ -245,7 +206,7 @@ def build_execution_goal_context(session: "AgentSession") -> str:
 
 
 def build_reflection_prompt(session: "AgentSession") -> str:
-    """当检测到重复失败时，生成反思提示注入到对话中。"""
+    """当检测到重复失败时，生成反思提示。"""
     if not session.blacklisted_approaches and len(session.failed_attempts) < 3:
         return ""
 
@@ -253,7 +214,7 @@ def build_reflection_prompt(session: "AgentSession") -> str:
 
     if session.blacklisted_approaches:
         parts.append("## ⚠️ 反思提醒")
-        parts.append("以下方式已多次尝试失败，**禁止再使用相同方式**，必须换一种不同的策略：")
+        parts.append("以下方式已多次尝试失败，**禁止再使用**：")
         for approach in session.blacklisted_approaches[-5:]:
             parts.append(f"  ✗ {approach}")
 
@@ -263,11 +224,7 @@ def build_reflection_prompt(session: "AgentSession") -> str:
     ]
     if len(recent_fails) >= 3:
         parts.append("")
-        parts.append("你已连续多次操作失败，请退一步重新思考：")
-        parts.append("- 目标元素是否真的在当前视口内？尝试 scroll 查看更多内容")
-        parts.append("- 是否需要先完成前置操作（如打开面板、切换标签页、关闭当前弹窗）？")
-        parts.append("- 尝试完全不同的交互路径（不同的按钮、不同的菜单入口）")
-        parts.append("- 如果确认目标无法完成，调用 task_complete 报告失败原因")
+        parts.append("连续多次失败，请换一种完全不同的方式。")
 
     return "\n".join(parts) if parts else ""
 
@@ -280,360 +237,19 @@ def build_system_prompt_text_mode(goal_context: str = "") -> str:
     return SYSTEM_PROMPT + goal_context + TEXT_MODE_FORMAT_APPENDIX
 
 
-def build_observation_message(page_state: PageState) -> str:
-
-## 核心原则（非常重要）
-- 你只能规划在**当前页面上可以直接执行**的操作作为 current_goal
-- current_goal 只能包含当前页面上已经可见的元素和按钮的操作
-- 所有需要页面跳转、新弹窗出现、或当前看不到的元素的操作，全部归入 remaining_goals
-- remaining_goals 只需要一条简短描述，概括"剩下还要做什么"即可，不要细分多个目标
-- 不要猜测未来页面会有什么元素
-
-## 输出格式
-只输出 JSON，不要其他文字：
-```json
-{
-  "current_goal": {
-    "description": "在当前页面上要完成的具体目标",
-    "sub_steps": ["基于当前可见元素的步骤1", "步骤2", ...]
-  },
-  "remaining_goals": ["剩余任务的一句话概括（如果有）"]
-}
-```
-
-## 规则
-1. current_goal 必须是在当前页面上**立即可执行**的——页面上有对应按钮/输入框/链接
-2. remaining_goals 最多1-2条，是高层描述而非具体操作
-3. 如果整个任务在当前页面就能完成，remaining_goals 为空数组
-4. sub_steps 通常 2-5 步
-5. 如果当前页面能做的事很少（比如只需点一个链接跳转），current_goal 只需 1 步
-
-## 示例
-用户任务: "在供应链系统中筛选北京仓异常订单，然后导出Excel"
-当前页面: 供应链首页，有侧边栏菜单
-
-正确输出:
-```json
-{
-  "current_goal": {
-    "description": "从首页进入订单管理页面",
-    "sub_steps": ["点击侧边栏的'订单管理'菜单"]
-  },
-  "remaining_goals": ["在订单管理页面筛选北京仓异常订单并导出Excel"]
-}
-```
-
-错误输出（不要这样做）:
-```json
-{
-  "current_goal": {"description": "进入订单管理", ...},
-  "remaining_goals": ["设置筛选条件", "选择北京仓", "选择异常状态", "导出Excel"]
-}
-```
-remaining_goals 不应该被细分成多个步骤。
-"""
-
-GOAL_PLANNING_PROMPT = """你是一个浏览器自动化规划助手。用户有一个总目标，当前轮到下一个子目标需要拆解。
-
-## 背景
-用户的总目标: {task}
-当前需要完成的目标: {goal_description}
-{retry_info}
-
-## 核心原则（非常重要）
-- 只规划在当前页面上**可以直接执行**的操作
-- 如果这个目标需要跨页面完成（比如先跳转再操作），只规划当前页面能做的部分
-- 当前页面做不到的后续操作放到 remaining_goals
-
-## 输出格式
-只输出 JSON，不要其他文字：
-```json
-{{
-  "current_goal": {{
-    "description": "在当前页面上要完成的具体目标",
-    "sub_steps": ["基于当前可见元素的步骤1", "步骤2", ...]
-  }},
-  "remaining_goals": ["剩余未完成部分的一句话概括（如果当前页面就能全部完成则为空数组）"]
-}}
-```
-
-## 规则
-1. current_goal 的 description 可以和原目标相同（如果当前页面能全部完成）或是其中一部分
-2. sub_steps 必须基于当前页面可见元素
-3. remaining_goals 为空数组表示这个目标在当前页面就能全部搞定
-"""
-
-
-def build_goal_context(
-    task: str, goals: list[Goal], current_index: int
-) -> str:
-    """构建目标进度上下文，注入到每轮的 system prompt 中。"""
-    if not goals:
-        return ""
-
-    goal = goals[current_index]
-    parts = [
-        f"\n## 任务执行进度",
-        f"总目标: {task}",
-    ]
-
-    # 已完成目标
-    for i, g in enumerate(goals[:current_index]):
-        if g.status == "completed":
-            parts.append(f"  ✓ 目标{i+1}: {g.description}")
-        elif g.status == "skipped":
-            parts.append(f"  ⊘ 目标{i+1}: {g.description} (已跳过)")
-
-    # 当前目标
-    parts.append(f"\n当前目标 [{current_index+1}/{len(goals)}]: {goal.description}")
-    if goal.sub_steps:
-        parts.append("参考步骤（仅供参考，实际操作以页面为准）:")
-        for j, step in enumerate(goal.sub_steps):
-            prefix = "  ▶" if j == goal.current_sub_step else "  ○"
-            if j < goal.current_sub_step:
-                prefix = "  ✓"
-            parts.append(f"{prefix} {step}")
-
-    # 重试提示
-    if goal.retry_count > 0 and goal.retry_reason:
-        parts.append(f"\n⚠️ 第{goal.retry_count}次重试此目标。上次失败原因: {goal.retry_reason}")
-        parts.append("请用不同方式完成，避免重复错误。")
-
-    # 待拆解目标
-    remaining = [g for g in goals[current_index + 1:] if g.status == "pending"]
-    if remaining:
-        parts.append(f"\n后续待完成: {', '.join(g.description for g in remaining)}")
-
-    parts.append("\n## 重要规则")
-    parts.append("- 每执行一步后，判断当前目标是否已经达成。一旦达成立即调用 goal_complete")
-    parts.append("- 不要等所有参考步骤做完才调 goal_complete——目标达成了就立即调用")
-    parts.append("- 不要调用 task_complete，只用 goal_complete，系统会自动判断整体完成")
-    parts.append("- 如果发现前面目标做错了导致当前无法继续，调用 goal_retry 回退")
-    return "\n".join(parts)
-
-
-def build_initial_planning_messages(task: str, page_state: PageState) -> list[dict[str, str]]:
-    """构造首次规划的 messages（拆出第一个目标 + 待拆解列表）。"""
+def build_initial_messages(task: str, page_state: PageState, goal_context: str = "") -> list[dict[str, str]]:
+    """构造执行 LLM 的初始 messages（tool_calls 模式）。"""
     return [
-        {"role": "system", "content": PLANNING_PROMPT},
-        {
-            "role": "user",
-            "content": f"## 用户任务\n{task}\n\n{build_observation_message(page_state)}",
-        },
+        {"role": "system", "content": build_system_prompt(goal_context)},
+        {"role": "user", "content": f"## 任务\n{task}\n\n{build_observation_message(page_state)}"},
     ]
 
 
-def build_goal_planning_messages(
-    task: str, goal_description: str, goals: list[Goal],
-    page_state: PageState, retry_reason: str = ""
-) -> list[dict[str, str]]:
-    """构造单个目标拆解的 messages（结合新页面状态）。"""
-    retry_info = ""
-    if retry_reason:
-        retry_info = f"上次执行失败原因: {retry_reason}\n请用不同方式制定步骤。"
-
-    prompt = GOAL_PLANNING_PROMPT.format(
-        task=task, goal_description=goal_description, retry_info=retry_info
-    )
-
-    # 已完成目标摘要
-    completed_summary = ""
-    completed = [g for g in goals if g.status == "completed"]
-    if completed:
-        completed_summary = "\n## 已完成的目标\n" + "\n".join(
-            f"  ✓ {g.description}" for g in completed
-        )
-
+def build_initial_messages_text_mode(task: str, page_state: PageState, goal_context: str = "") -> list[dict[str, str]]:
+    """构造执行 LLM 的初始 messages（text_parse 模式）。"""
     return [
-        {"role": "system", "content": prompt},
-        {
-            "role": "user",
-            "content": f"{completed_summary}\n\n{build_observation_message(page_state)}",
-        },
-    ]
-
-
-def build_reflection_prompt(session: "AgentSession") -> str:
-    """当检测到重复失败时，生成反思提示注入到对话中。"""
-    if not session.blacklisted_approaches and len(session.failed_attempts) < 3:
-        return ""
-
-    parts = []
-
-    if session.blacklisted_approaches:
-        parts.append("## ⚠️ 反思提醒")
-        parts.append("以下方式已多次尝试失败，**禁止再使用相同方式**，必须换一种不同的策略：")
-        for approach in session.blacklisted_approaches[-5:]:
-            parts.append(f"  ✗ {approach}")
-
-    recent_fails = [
-        a for a in session.failed_attempts[-3:]
-        if a.step >= session.current_step - 3
-    ]
-    if len(recent_fails) >= 3:
-        parts.append("")
-        parts.append("你已连续多次操作失败，请退一步重新思考：")
-        parts.append("- 目标元素是否真的在当前视口内？尝试 scroll 查看更多内容")
-        parts.append("- 是否需要先完成前置操作（如打开面板、切换标签页、关闭当前弹窗）？")
-        parts.append("- 尝试完全不同的交互路径（不同的按钮、不同的菜单入口）")
-        parts.append("- 用 text 定位替代 css，或反过来")
-        parts.append("- 如果确认目标无法完成，调用 task_complete 报告失败原因")
-
-    return "\n".join(parts) if parts else ""
-
-
-def build_system_prompt(goal_context: str = "") -> str:
-    return SYSTEM_PROMPT + goal_context
-
-
-def build_system_prompt_text_mode(goal_context: str = "") -> str:
-    return SYSTEM_PROMPT + goal_context + TEXT_MODE_FORMAT_APPENDIX
-
-
-def build_observation_message(page_state: PageState) -> str:
-    """将页面状态格式化为 LLM 可阅读的观察信息。"""
-    parts = []
-
-    parts.append(f"## 当前页面\nURL: {page_state.url}\n标题: {page_state.title}")
-
-    viewport_h = page_state.viewport.get('height', 0)
-    scroll_y = page_state.scroll_position.get('y', 0)
-    doc_height = page_state.document_height
-    scroll_pct = round(scroll_y / max(doc_height - viewport_h, 1) * 100) if doc_height > viewport_h else 100
-    at_bottom = scroll_pct >= 95
-
-    parts.append(
-        f"视口: {page_state.viewport.get('width', '?')}x{viewport_h} | "
-        f"滚动位置: y={scroll_y} | "
-        f"页面总高度: {doc_height} | "
-        f"滚动进度: {scroll_pct}%{'（已到底部）' if at_bottom else '（可继续向下滚动）'}"
-    )
-
-    # 弹窗/容器内的滚动状态
-    container_info = getattr(page_state, 'scrollable_container', None)
-    if not container_info and hasattr(page_state, '__dict__'):
-        container_info = page_state.__dict__.get('scrollable_container')
-    if isinstance(container_info, dict) and container_info:
-        c_top = container_info.get('scroll_top', 0)
-        c_total = container_info.get('scroll_height', 0)
-        c_visible = container_info.get('client_height', 0)
-        c_at_bottom = container_info.get('at_bottom', False)
-        c_pct = round(c_top / max(c_total - c_visible, 1) * 100) if c_total > c_visible else 100
-        parts.append(
-            f"📦 弹窗/容器滚动: 位置={c_top}px, 总高={c_total}px, 可见={c_visible}px, "
-            f"进度={c_pct}%{'（已到底部）' if c_at_bottom else '（可继续向下滚动）'}"
-        )
-
-    if page_state.is_loading:
-        parts.append("\n⏳ 页面正在加载中，建议使用 wait 等待加载完成后再操作。")
-
-    if page_state.focused_element:
-        parts.append(f"当前焦点: {page_state.focused_element}")
-
-    # 弹出层信息
-    active_popup = getattr(page_state, 'active_popup', None)
-    if not active_popup and hasattr(page_state, '__dict__'):
-        active_popup = page_state.__dict__.get('active_popup')
-    if isinstance(active_popup, dict) and active_popup:
-        popup_type_map = {
-            'date_picker': '日期选择面板',
-            'dropdown': '下拉选择列表',
-            'modal': '弹窗对话框',
-            'menu': '菜单',
-            'popup': '弹出面板',
-        }
-        popup_label = popup_type_map.get(active_popup.get('type', ''), '弹出面板')
-        header = active_popup.get('header_text', '')
-        header_str = f" ({header})" if header else ""
-        parts.append(f"\n📍 当前活跃弹出层: {popup_label}{header_str}")
-        parts.append("   请优先在此弹出层内操作。操作完成后面板通常会自动关闭。")
-
-    if page_state.interactive_elements:
-        popup_els = [el for el in page_state.interactive_elements if el.get("in_popup")]
-        main_els = [el for el in page_state.interactive_elements if not el.get("in_popup")]
-
-        if popup_els:
-            parts.append(f"\n## 🔍 弹出面板内的元素（共{len(popup_els)}个，优先操作）")
-            parts.extend(_group_and_format_elements(popup_els))
-
-            if main_els:
-                in_vp, out_vp = _split_by_viewport(main_els, page_state.viewport)
-                if in_vp:
-                    parts.append(f"\n## 主页面元素 - 视口内（共{len(in_vp)}个）")
-                    parts.extend(_group_and_format_elements(in_vp))
-                if out_vp:
-                    parts.append(f"\n## 主页面元素 - 视口外（共{len(out_vp)}个，需scroll）")
-                    # 视口外只展示前10个，节省 token
-                    parts.extend(_group_and_format_elements(out_vp[:10]))
-                    if len(out_vp) > 10:
-                        parts.append(f"  ... 还有 {len(out_vp) - 10} 个元素未显示，请 scroll 查看")
-        else:
-            in_vp, out_vp = _split_by_viewport(page_state.interactive_elements, page_state.viewport)
-            if in_vp:
-                parts.append(f"\n## 可交互元素 - 视口内（共{len(in_vp)}个）")
-                parts.extend(_group_and_format_elements(in_vp))
-            if out_vp:
-                parts.append(f"\n## 可交互元素 - 视口外（共{len(out_vp)}个，需scroll）")
-                parts.extend(_group_and_format_elements(out_vp[:10]))
-                if len(out_vp) > 10:
-                    parts.append(f"  ... 还有 {len(out_vp) - 10} 个元素未显示，请 scroll 查看")
-
-        if getattr(page_state, 'element_count_truncated', False):
-            parts.append("  ⚠️ 元素列表已截断，页面上还有更多元素。如果找不到目标，请先 scroll 让它出现在视口内。")
-
-    if page_state.forms:
-        parts.append("\n## 表单")
-        for form in page_state.forms:
-            action = form.get("action", "?")
-            method = form.get("method", "?").upper()
-            fields = ", ".join(form.get("fields", []))
-            parts.append(f"  [{method}] {action} — 字段: {fields}")
-
-    return "\n".join(parts)
-
-
-def build_action_result_message(action: PageAction, result: ActionResult) -> str:
-    """格式化动作执行结果。"""
-    status = "✓ 成功" if result.success else "✗ 失败"
-    msg = f"[{status}] {action.type}"
-    if action.locator:
-        msg += f" → {action.locator.method}:{action.locator.value}"
-    if result.details:
-        msg += f" | {result.details}"
-    if result.error:
-        msg += f" | 错误: {result.error}"
-
-    # 状态变化提示
-    changes = result.state_changes if result.state_changes else {}
-    if changes.get("url_changed"):
-        msg += "\n⚡ 页面URL已变化，你现在在新页面上。请重新观察当前元素。"
-    if changes.get("popup_disappeared"):
-        msg += "\n⚡ 弹出面板已关闭。如果还需操作面板内容，需要重新打开。"
-    if changes.get("popup_appeared"):
-        msg += "\n⚡ 弹出面板已出现，请优先操作面板内的元素。"
-
-    return msg
-
-
-def build_initial_messages(task: str, page_state: PageState, sub_task_context: str = "") -> list[dict[str, str]]:
-    """构造 Agent 会话的初始 messages（tool_calls 模式）。"""
-    return [
-        {"role": "system", "content": build_system_prompt(sub_task_context)},
-        {
-            "role": "user",
-            "content": f"## 任务\n{task}\n\n{build_observation_message(page_state)}",
-        },
-    ]
-
-
-def build_initial_messages_text_mode(task: str, page_state: PageState, sub_task_context: str = "") -> list[dict[str, str]]:
-    """构造 Agent 会话的初始 messages（text_parse 模式，无 function calling）。"""
-    return [
-        {"role": "system", "content": build_system_prompt_text_mode(sub_task_context)},
-        {
-            "role": "user",
-            "content": f"## 任务\n{task}\n\n{build_observation_message(page_state)}",
-        },
+        {"role": "system", "content": build_system_prompt_text_mode(goal_context)},
+        {"role": "user", "content": f"## 任务\n{task}\n\n{build_observation_message(page_state)}"},
     ]
 
 
@@ -646,27 +262,20 @@ def append_step_messages(
     result: ActionResult,
     new_page_state: PageState,
 ) -> list[dict[str, Any]]:
-    """在已有 messages 基础上追加一轮动作执行结果 + 新观察。
-
-    使用滑动窗口策略：只保留最近 MAX_FULL_OBSERVATION_STEPS 步的完整观察，
-    更早的步骤压缩为一行摘要，减少 token 消耗和上下文污染。
-    """
+    """追加一轮动作结果 + 新观察。滑动窗口压缩旧步骤。"""
     _compress_old_observations(messages)
-
-    messages.append(
-        {
-            "role": "user",
-            "content": (
-                f"## 动作执行结果\n{build_action_result_message(action, result)}\n\n"
-                f"{build_observation_message(new_page_state)}"
-            ),
-        }
-    )
+    messages.append({
+        "role": "user",
+        "content": (
+            f"## 动作执行结果\n{build_action_result_message(action, result)}\n\n"
+            f"{build_observation_message(new_page_state)}"
+        ),
+    })
     return messages
 
 
 def _compress_old_observations(messages: list[dict[str, Any]]) -> None:
-    """压缩旧的观察步骤，只保留最近 N 步的完整内容。"""
+    """压缩旧的观察步骤，只保留最近 N 步完整内容。"""
     observation_indices = []
     for i, msg in enumerate(messages):
         if msg.get("role") == "user" and "## 动作执行结果" in msg.get("content", ""):
@@ -689,83 +298,171 @@ def _compress_old_observations(messages: list[dict[str, Any]]) -> None:
         messages[idx] = {"role": "user", "content": f"[历史步骤] {result_line}"}
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# 页面观察格式化
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def build_observation_message(page_state: PageState) -> str:
+    """将页面状态格式化为 LLM 可阅读的观察信息。"""
+    parts = []
+
+    parts.append(f"## 当前页面\nURL: {page_state.url}\n标题: {page_state.title}")
+
+    viewport_h = page_state.viewport.get('height', 0)
+    scroll_y = page_state.scroll_position.get('y', 0)
+    doc_height = page_state.document_height
+    scroll_pct = round(scroll_y / max(doc_height - viewport_h, 1) * 100) if doc_height > viewport_h else 100
+    at_bottom = scroll_pct >= 95
+
+    parts.append(
+        f"视口: {page_state.viewport.get('width', '?')}x{viewport_h} | "
+        f"滚动位置: y={scroll_y} | 页面总高度: {doc_height} | "
+        f"滚动进度: {scroll_pct}%{'（已到底部）' if at_bottom else '（可继续向下滚动）'}"
+    )
+
+    container_info = getattr(page_state, 'scrollable_container', None)
+    if isinstance(container_info, dict) and container_info:
+        c_top = container_info.get('scroll_top', 0)
+        c_total = container_info.get('scroll_height', 0)
+        c_visible = container_info.get('client_height', 0)
+        c_at_bottom = container_info.get('at_bottom', False)
+        c_pct = round(c_top / max(c_total - c_visible, 1) * 100) if c_total > c_visible else 100
+        parts.append(
+            f"📦 容器滚动: {c_pct}%{'（已到底部）' if c_at_bottom else '（可继续滚动）'}"
+        )
+
+    if page_state.is_loading:
+        parts.append("\n⏳ 页面正在加载中，建议 wait 等待。")
+
+    active_popup = getattr(page_state, 'active_popup', None)
+    if isinstance(active_popup, dict) and active_popup:
+        popup_type_map = {
+            'date_picker': '日期选择面板', 'dropdown': '下拉列表',
+            'modal': '弹窗', 'menu': '菜单', 'popup': '弹出面板',
+        }
+        popup_label = popup_type_map.get(active_popup.get('type', ''), '弹出面板')
+        header = active_popup.get('header_text', '')
+        header_str = f" ({header})" if header else ""
+        parts.append(f"\n📍 活跃弹出层: {popup_label}{header_str}")
+        parts.append("   请优先操作弹出层内元素。")
+
+    if page_state.interactive_elements:
+        popup_els = [el for el in page_state.interactive_elements if el.get("in_popup")]
+        main_els = [el for el in page_state.interactive_elements if not el.get("in_popup")]
+
+        if popup_els:
+            parts.append(f"\n## 🔍 弹出面板内元素（共{len(popup_els)}个，优先操作）")
+            parts.extend(_group_and_format_elements(popup_els))
+            if main_els:
+                in_vp, out_vp = _split_by_viewport(main_els, page_state.viewport)
+                if in_vp:
+                    parts.append(f"\n## 主页面 - 视口内（{len(in_vp)}个）")
+                    parts.extend(_group_and_format_elements(in_vp))
+                if out_vp:
+                    parts.append(f"\n## 主页面 - 视口外（{len(out_vp)}个，需scroll）")
+                    parts.extend(_group_and_format_elements(out_vp[:10]))
+                    if len(out_vp) > 10:
+                        parts.append(f"  ... 还有 {len(out_vp) - 10} 个未显示")
+        else:
+            in_vp, out_vp = _split_by_viewport(page_state.interactive_elements, page_state.viewport)
+            if in_vp:
+                parts.append(f"\n## 可交互元素 - 视口内（{len(in_vp)}个）")
+                parts.extend(_group_and_format_elements(in_vp))
+            if out_vp:
+                parts.append(f"\n## 可交互元素 - 视口外（{len(out_vp)}个，需scroll）")
+                parts.extend(_group_and_format_elements(out_vp[:10]))
+                if len(out_vp) > 10:
+                    parts.append(f"  ... 还有 {len(out_vp) - 10} 个未显示")
+
+        if getattr(page_state, 'element_count_truncated', False):
+            parts.append("  ⚠️ 元素已截断，scroll 查看更多。")
+
+    if page_state.forms:
+        parts.append("\n## 表单")
+        for form in page_state.forms:
+            fields = ", ".join(form.get("fields", []))
+            parts.append(f"  [{form.get('method','?').upper()}] {form.get('action','?')} — {fields}")
+
+    return "\n".join(parts)
+
+
+def build_action_result_message(action: PageAction, result: ActionResult) -> str:
+    """格式化动作执行结果。"""
+    status = "✓ 成功" if result.success else "✗ 失败"
+    msg = f"[{status}] {action.type}"
+    if action.locator:
+        msg += f" → {action.locator.method}:{action.locator.value}"
+    if result.details:
+        msg += f" | {result.details}"
+    if result.error:
+        msg += f" | 错误: {result.error}"
+
+    changes = result.state_changes if result.state_changes else {}
+    if changes.get("url_changed"):
+        msg += "\n⚡ 页面URL已变化。"
+    if changes.get("popup_disappeared"):
+        msg += "\n⚡ 弹出面板已关闭。"
+    if changes.get("popup_appeared"):
+        msg += "\n⚡ 弹出面板已出现。"
+
+    return msg
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 元素格式化辅助
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def _format_element(el: dict[str, Any]) -> str:
-    """精简格式化单个元素。css 只在有唯一标识时展示。"""
     eid = el.get("id", "?")
     tag = el.get("tag", "?")
-
     parts = []
-    component = el.get("component", "")
-    if component:
-        parts.append(component)
+    if el.get("component"):
+        parts.append(el["component"])
     text = el.get("text", "")
     if text:
         parts.append(f'"{text[:40]}"')
-    placeholder = el.get("placeholder", "")
-    if placeholder:
-        parts.append(f'placeholder="{placeholder[:30]}"')
-    name = el.get("name", "")
-    if name and not text:
-        parts.append(f"name={name}")
-    value = el.get("value", "")
-    if value:
-        parts.append(f'当前值="{value[:20]}"')
-    etype = el.get("type", "")
-    if etype and tag == "input":
-        parts.append(etype)
+    if el.get("placeholder"):
+        parts.append(f'placeholder="{el["placeholder"][:30]}"')
+    if el.get("name") and not text:
+        parts.append(f"name={el['name']}")
+    if el.get("value"):
+        parts.append(f'当前值="{el["value"][:20]}"')
+    if el.get("type") and tag == "input":
+        parts.append(el["type"])
 
-    enabled = el.get("enabled", True)
-    status = " [禁用]" if not enabled else ""
-
+    status = " [禁用]" if not el.get("enabled", True) else ""
     selector = el.get("css_selector", "")
     css_part = ""
-    if selector and (
-        selector.startswith("#")
-        or "[name=" in selector
-        or "[data-testid=" in selector
-    ):
+    if selector and (selector.startswith("#") or "[name=" in selector or "[data-testid=" in selector):
         css_part = f" | css={selector}"
 
-    desc = " ".join(parts)
-    return f"  [{eid}] <{tag}> {desc}{css_part}{status}"
+    return f"  [{eid}] <{tag}> {' '.join(parts)}{css_part}{status}"
 
 
 def _is_similar_element(a: dict[str, Any], b: dict[str, Any]) -> bool:
-    """判断两个元素是否可以归为一组。"""
-    if a.get("tag") != b.get("tag"):
-        return False
-    if a.get("role") != b.get("role"):
+    if a.get("tag") != b.get("tag") or a.get("role") != b.get("role"):
         return False
     a_text = a.get("text", "").strip()
     b_text = b.get("text", "").strip()
-    # 都是纯数字（日期格、分页等）
     if a_text.isdigit() and b_text.isdigit():
         return True
-    # 文本长度接近且标签相同（如选项列表）
-    if len(a_text) > 0 and len(b_text) > 0:
-        if abs(len(a_text) - len(b_text)) <= 5 and a.get("tag") == b.get("tag"):
-            # 排除文本完全不同的按钮（如"查询" vs "重置"）
-            if a_text[:2] == b_text[:2]:
-                return True
+    if len(a_text) > 0 and len(b_text) > 0 and abs(len(a_text) - len(b_text)) <= 5:
+        if a_text[:2] == b_text[:2]:
+            return True
     return False
 
 
 def _format_element_group(group: list[dict[str, Any]]) -> str:
-    """将一组相似元素压缩为摘要行，保留 text→id 映射供定位。"""
     first_id = group[0].get("id", "?")
     last_id = group[-1].get("id", "?")
     tag = group[0].get("tag", "?")
     role = group[0].get("role", "")
     count = len(group)
-
     texts = [el.get("text", "").strip() for el in group]
     disabled = [el for el in group if not el.get("enabled", True)]
-
     role_str = f" {role}" if role else ""
 
-    # 构建 text=[id] 映射
     if all(t.isdigit() for t in texts if t):
-        # 数字序列：首3 + ... + 末3 + 禁用项
         mapping_parts = []
         disabled_ids = {el.get("id") for el in disabled}
         for i, el in enumerate(group):
@@ -777,37 +474,26 @@ def _format_element_group(group: list[dict[str, Any]]) -> str:
                 mapping_parts.append("...")
         text_summary = " ".join(mapping_parts)
     elif count <= 8:
-        text_summary = " ".join(
-            f"{el.get('text', '').strip()[:10]}=[{el.get('id', '?')}]"
-            for el in group
-        )
+        text_summary = " ".join(f"{el.get('text','').strip()[:10]}=[{el.get('id','?')}]" for el in group)
     else:
-        parts = []
-        for el in group[:3]:
-            parts.append(f"{el.get('text', '').strip()[:10]}=[{el.get('id', '?')}]")
+        parts = [f"{el.get('text','').strip()[:10]}=[{el.get('id','?')}]" for el in group[:3]]
         parts.append("...")
-        for el in group[-3:]:
-            parts.append(f"{el.get('text', '').strip()[:10]}=[{el.get('id', '?')}]")
+        parts.extend(f"{el.get('text','').strip()[:10]}=[{el.get('id','?')}]" for el in group[-3:])
         text_summary = " ".join(parts)
 
     status = ""
     if disabled:
-        d_items = [
-            f"{el.get('text', '').strip()}=[{el.get('id', '?')}]"
-            for el in disabled[:3]
-        ]
+        d_items = [f"{el.get('text','').strip()}=[{el.get('id','?')}]" for el in disabled[:3]]
         status = f" (禁用: {', '.join(d_items)})"
 
     return f"  [{first_id}-{last_id}] <{tag}>{role_str} ×{count}: {text_summary}{status}"
 
 
 def _group_and_format_elements(elements: list[dict[str, Any]]) -> list[str]:
-    """对元素列表进行分组压缩，相似元素合并为摘要行。"""
     lines: list[str] = []
     i = 0
     while i < len(elements):
         el = elements[i]
-        # 向后找连续相似元素
         group = [el]
         j = i + 1
         while j < len(elements):
@@ -816,36 +502,27 @@ def _group_and_format_elements(elements: list[dict[str, Any]]) -> list[str]:
                 j += 1
             else:
                 break
-
         if len(group) >= 3:
             lines.append(_format_element_group(group))
             i = j
         else:
             lines.append(_format_element(el))
             i += 1
-
     return lines
 
 
 def _split_by_viewport(
     elements: list[dict[str, Any]], viewport: dict[str, int]
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """按视口拆分元素：视口内 + 视口外。"""
     vh = viewport.get("height", 900)
     vw = viewport.get("width", 1920)
-
-    in_vp: list[dict[str, Any]] = []
-    out_vp: list[dict[str, Any]] = []
-
+    in_vp, out_vp = [], []
     for el in elements:
         box = el.get("bounding_box", {})
-        y = box.get("y", 0)
-        h = box.get("height", 0)
-        x = box.get("x", 0)
-        w = box.get("width", 0)
+        y, h = box.get("y", 0), box.get("height", 0)
+        x, w = box.get("x", 0), box.get("width", 0)
         if y + h > 0 and y < vh and x + w > 0 and x < vw:
             in_vp.append(el)
         else:
             out_vp.append(el)
-
     return in_vp, out_vp

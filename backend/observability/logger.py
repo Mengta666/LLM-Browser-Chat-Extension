@@ -10,6 +10,7 @@
 """
 
 import json
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -24,8 +25,7 @@ class StructuredLogger:
 
     def __init__(self, channel: str, max_memory_entries: int = 1000):
         self.channel = channel
-        self._max_memory = max_memory_entries
-        self._memory: list[dict[str, Any]] = []
+        self._memory: deque[dict[str, Any]] = deque(maxlen=max_memory_entries)
 
     def log(
         self,
@@ -46,8 +46,6 @@ class StructuredLogger:
         }
         self._write_file(entry)
         self._memory.append(entry)
-        if len(self._memory) > self._max_memory:
-            self._memory = self._memory[-self._max_memory:]
         return entry
 
     def info(self, event: str, **kwargs) -> dict[str, Any]:
@@ -80,7 +78,7 @@ class StructuredLogger:
         return results[-limit:]
 
     def _write_file(self, entry: dict[str, Any]) -> None:
-        date_str = datetime.now().strftime("%Y-%m-%d")
+        date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         filepath = LOG_DIR / f"{self.channel}_{date_str}.jsonl"
         try:
             with open(filepath, "a", encoding="utf-8") as f:

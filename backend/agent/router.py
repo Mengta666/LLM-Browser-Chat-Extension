@@ -27,18 +27,6 @@ DANGEROUS_KEYWORDS: list[str] = [
 ]
 
 
-def classify_task(task: str) -> str:
-    """判断用户输入应走 agent 还是普通 chat。
-
-    Returns: "agent" | "chat"
-    """
-    task_lower = task.lower()
-    for keyword in AGENT_KEYWORDS:
-        if keyword in task_lower:
-            return "agent"
-    return "chat"
-
-
 def should_confirm_action(
     action: PageAction, require_confirmation: list[str]
 ) -> bool:

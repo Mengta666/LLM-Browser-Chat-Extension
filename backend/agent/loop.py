@@ -51,8 +51,10 @@ AGENT_MODE = os.getenv("AGENT_MODE", "auto")  # "tool_calls" | "text_parse" | "a
 
 _llm_client = OpenAI(base_url=MODEL_BASE_URL, api_key=OPENAI_API_KEY)
 
+import threading
 _sessions: dict[str, AgentSession] = {}
-_SESSION_TTL_SECONDS = 600  # 10分钟过期
+_sessions_lock = threading.Lock()
+_SESSION_TTL_SECONDS = 600
 
 
 def _cleanup_expired_sessions():
@@ -60,7 +62,7 @@ def _cleanup_expired_sessions():
     now = time.time()
     expired = [
         sid for sid, s in _sessions.items()
-        if now - getattr(s, '_created_at', now) > _SESSION_TTL_SECONDS
+        if now - s.created_at > _SESSION_TTL_SECONDS
         and s.status in (AgentStatus.COMPLETED, AgentStatus.ERROR, AgentStatus.CANCELLED)
     ]
     for sid in expired:
@@ -73,8 +75,9 @@ class CallMode(str, Enum):
 
 
 def get_session(session_id: str) -> Optional[AgentSession]:
-    _cleanup_expired_sessions()
-    return _sessions.get(session_id)
+    with _sessions_lock:
+        _cleanup_expired_sessions()
+        return _sessions.get(session_id)
 
 
 def create_session(
@@ -83,15 +86,15 @@ def create_session(
     model: str,
     require_confirmation: Optional[list[str]] = None,
 ) -> AgentSession:
-    _cleanup_expired_sessions()
-    session = AgentSession(
-        session_id=session_id,
-        task=task,
-        model=model,
-        require_confirmation=require_confirmation or [],
-    )
-    session._created_at = time.time()
-    _sessions[session_id] = session
+    with _sessions_lock:
+        _cleanup_expired_sessions()
+        session = AgentSession(
+            session_id=session_id,
+            task=task,
+            model=model,
+            require_confirmation=require_confirmation or [],
+        )
+        _sessions[session_id] = session
     _agent_log.info("session_create", session_id=session_id,
                     data={"task": task, "model": model})
     return session
@@ -153,9 +156,6 @@ def run_step(
                 "state_changes": action_result.state_changes or {},
             }
         session.pending_action = None
-
-    session.current_step += 1
-    session.goal_step_count += 1
 
     # 2. 规划 LLM：判断目标进度，决定下一步方向
     t0 = time.time()
@@ -240,6 +240,8 @@ def run_step(
     action = _parse_action(func_name, func_args)
 
     session.pending_action = action
+    session.current_step += 1
+    session.goal_step_count += 1
     _agent_log.info("execution_result", session_id=session.session_id,
                     data={"action_type": func_name, "target": action.locator.value if action.locator else "",
                           "thought": thought[:100], "step": session.current_step})
@@ -351,7 +353,7 @@ def _call_text_parse(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 MAX_LLM_RETRIES = 3
-RETRY_DELAYS = [1, 3, 8]
+RETRY_DELAYS = [0.5, 1, 2]
 
 
 def _llm_call_with_retry(
@@ -588,7 +590,9 @@ def _call_judgment_llm(session: AgentSession, page_state: PageState) -> FailedPa
         response = _llm_client.chat.completions.create(
             model=session.model, messages=messages,
         )
-    except Exception:
+    except Exception as e:
+        _agent_log.error("judgment_call_error", session_id=session.session_id,
+                         data={"error": f"{type(e).__name__}: {str(e)[:200]}"})
         return FailedPath(failure_reason="评判调用失败", avoid="")
 
     if not response or not response.choices:
@@ -628,7 +632,9 @@ def _call_planning_llm(session: AgentSession, page_state: PageState) -> Optional
         response = _llm_client.chat.completions.create(
             model=session.model, messages=messages,
         )
-    except Exception:
+    except Exception as e:
+        _agent_log.error("planning_call_error", session_id=session.session_id,
+                         data={"error": f"{type(e).__name__}: {str(e)[:200]}"})
         return None
 
     if not response or not response.choices:

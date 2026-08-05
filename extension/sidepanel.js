@@ -2565,7 +2565,13 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   // 4. 发送与流式接收核心逻辑
+  let _sendingLock = false;
   async function handleSend() {
+    if (_sendingLock) return;
+    _sendingLock = true;
+    const sendBtn = document.getElementById('sendBtn');
+    if (sendBtn) sendBtn.disabled = true;
+    try {
     const input = document.getElementById('chatInput');
     const queryText = input.value.trim();
     const hasImage = Boolean(attachedImage);
@@ -2716,19 +2722,22 @@ document.addEventListener('DOMContentLoaded', async () => {
     };
 
     // 监听后台传回的字元块
+    let _renderTimer = null;
     const messageListener = (msg) => {
       if (msg.msgId !== msgId) return; // 过滤非本次请求的流
-      
+
       if (msg.type === 'LLM_CHUNK') {
         fullReply += msg.chunk;
-        setRenderedMarkdown(aiBubble, fullReply);
-        enhanceCodeBlocks(aiBubble);
-        renderMathInContainer(aiBubble);
-        decorateSourceCitations(aiBubble);
-        if (citedSources.length) {
-          renderCitedSources(aiBubble, citedSources);
+        // debounce 渲染：每 100ms 最多渲染一次
+        if (!_renderTimer) {
+          _renderTimer = setTimeout(() => {
+            _renderTimer = null;
+            setRenderedMarkdown(aiBubble, fullReply);
+            enhanceCodeBlocks(aiBubble);
+            renderMathInContainer(aiBubble);
+            scrollToBottom();
+          }, 100);
         }
-        scrollToBottom();
       }
       else if (msg.type === 'LLM_SOURCES') {
         citedSources = Array.isArray(msg.sources) ? msg.sources : [];
@@ -2743,9 +2752,18 @@ document.addEventListener('DOMContentLoaded', async () => {
       else if (msg.type === 'LLM_DONE') {
         if (isStreamDone) return;
         isStreamDone = true;
+        // 流结束：清除 debounce，立即渲染最终内容
+        if (_renderTimer) { clearTimeout(_renderTimer); _renderTimer = null; }
+        setRenderedMarkdown(aiBubble, fullReply);
+        enhanceCodeBlocks(aiBubble);
+        renderMathInContainer(aiBubble);
+        decorateSourceCitations(aiBubble);
+        if (citedSources.length) renderCitedSources(aiBubble, citedSources);
+        scrollToBottom();
         finalizeTimer = setTimeout(finalizeAssistantResponse, 150);
-      } 
+      }
       else if (msg.type === 'LLM_ERROR') {
+        if (_renderTimer) { clearTimeout(_renderTimer); _renderTimer = null; }
         if (finalizeTimer) {
           clearTimeout(finalizeTimer);
           finalizeTimer = null;
@@ -2759,6 +2777,10 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
     };
     chrome.runtime.onMessage.addListener(messageListener);
+    } finally {
+      _sendingLock = false;
+      if (sendBtn) sendBtn.disabled = false;
+    }
   }
 
   // 5. 绑定各种交互事件
@@ -3011,6 +3033,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const AGENT_COMMAND = '/browser-operation ';
   const AGENT_SETTLE_TIMEOUT_MS = 3000;
   const AGENT_ACTION_TIMEOUT_MS = 10000;
+  const AGENT_TOTAL_TIMEOUT_MS = 300000;
 
   const agentState = {
     active: false,
@@ -4170,8 +4193,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         renderAgentPlan(aiBubble, response.plan);
       }
 
+      const agentStartTime = Date.now();
       while (response.status === 'action_required' || response.status === 'confirm_required') {
         if (!agentState.active) break;
+        if (Date.now() - agentStartTime > AGENT_TOTAL_TIMEOUT_MS) {
+          renderAgentError(aiBubble, '执行超时（5分钟）');
+          break;
+        }
 
         // 每步更新目标进度
         if (response.plan) updateAgentPlan(aiBubble, response.plan);

@@ -342,7 +342,8 @@ async function handleCallLlmStream(request) {
     credentials: 'omit',
     redirect: 'error',
     headers: requestHeaders,
-    body
+    body,
+    signal: AbortSignal.timeout(60000)
   });
 
   if (!response.ok) {
@@ -453,7 +454,8 @@ async function handleCallApiJson(request) {
     credentials: 'omit',
     redirect: 'error',
     headers: requestHeaders,
-    body
+    body,
+    signal: AbortSignal.timeout(60000)
   });
 
   if (!response.ok) {
@@ -539,5 +541,6 @@ async function handleDebuggerType(tabId, text) {
     await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', {
       type: 'keyUp', text: char
     });
+    await new Promise(r => setTimeout(r, 10));
   }
 }

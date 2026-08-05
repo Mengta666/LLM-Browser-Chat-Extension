@@ -6,7 +6,7 @@
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from agent.loop import create_session, get_session, run_step, cancel_session
 from agent.state import PageState, ActionResult
@@ -53,7 +53,10 @@ def agent_execute(item: AgentExecuteRequest) -> dict[str, Any]:
         require_confirmation=item.require_confirmation,
     )
 
-    page_state = PageState(**item.page_state)
+    try:
+        page_state = PageState(**item.page_state)
+    except (ValidationError, TypeError) as e:
+        raise HTTPException(400, f"page_state 格式错误: {str(e)[:200]}")
 
     try:
         return run_step(session, page_state)

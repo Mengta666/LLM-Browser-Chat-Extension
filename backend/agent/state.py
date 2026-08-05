@@ -6,6 +6,7 @@
 
 from dataclasses import dataclass, field
 from enum import Enum
+import time
 from typing import Any, Optional
 
 from pydantic import BaseModel
@@ -92,12 +93,14 @@ class AgentSession:
     error: Optional[str] = None
     call_mode: Optional[str] = None
 
+    # 时间戳
+    created_at: float = field(default_factory=time.time)
+
     # 规划状态（每步由规划 LLM 刷新）
     current_goal: str = ""
     next_action_hint: str = ""
     completed_goals: list[str] = field(default_factory=list)
     remaining_goal: str = ""
-    initial_planning_done: bool = False
     goal_step_count: int = 0
     goal_retry_count: int = 0
     max_steps_per_goal: int = 10

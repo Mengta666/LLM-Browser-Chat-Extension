@@ -58,12 +58,14 @@ _SESSION_TTL_SECONDS = 600
 
 
 def _cleanup_expired_sessions():
-    """清理过期会话。"""
+    """清理过期会话。终态会话 10 分钟过期，非终态会话 30 分钟强制过期。"""
     now = time.time()
+    _SESSION_ABSOLUTE_TTL = 1800  # 30 分钟绝对超时（防 RUNNING 状态泄漏）
     expired = [
         sid for sid, s in _sessions.items()
-        if now - s.created_at > _SESSION_TTL_SECONDS
-        and s.status in (AgentStatus.COMPLETED, AgentStatus.ERROR, AgentStatus.CANCELLED)
+        if (now - s.created_at > _SESSION_TTL_SECONDS
+            and s.status in (AgentStatus.COMPLETED, AgentStatus.ERROR, AgentStatus.CANCELLED))
+        or (now - s.created_at > _SESSION_ABSOLUTE_TTL)
     ]
     for sid in expired:
         del _sessions[sid]

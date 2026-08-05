@@ -3385,13 +3385,28 @@ document.addEventListener('DOMContentLoaded', async () => {
     for (let i = 1; i < results.length; i++) {
       const frameResult = results[i]?.result;
       if (!frameResult || !frameResult.interactive_elements?.length) continue;
-      // 给子 frame 元素续编 annotation_id
+      // 给子 frame 元素续编 annotation_id，并同步更新 iframe 内 DOM
       const offset = mainResult.interactive_elements.length;
+      const idMapping = [];
       for (const el of frameResult.interactive_elements) {
-        el.id = offset + el.id;
+        const originalId = el.id;
+        el.id = offset + originalId;
         el.in_iframe = true;
+        el.iframe_index = i;
+        idMapping.push({ original: originalId, newId: el.id });
         mainResult.interactive_elements.push(el);
       }
+      // 更新 iframe 内的 data-agent-id 属性以匹配 offset 后的值
+      chrome.scripting.executeScript({
+        target: { tabId: tab.id, frameIds: [results[i].frameId || i] },
+        func: (mapping) => {
+          for (const { original, newId } of mapping) {
+            const el = document.querySelector(`[data-agent-id="${original}"]`);
+            if (el) el.setAttribute('data-agent-id', newId);
+          }
+        },
+        args: [idMapping]
+      }).catch(() => {});
       if (!mainResult.element_count_truncated && frameResult.element_count_truncated) {
         mainResult.element_count_truncated = true;
       }
@@ -3409,12 +3424,20 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (action.type === 'navigate') {
       const url = action.params?.url;
       if (!url) return { success: false, action_type: 'navigate', error: '缺少 URL', timestamp: Date.now() };
+      // 安全校验：只允许 http/https 协议
+      try {
+        const parsed = new URL(url);
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+          return { success: false, action_type: 'navigate', error: `不允许的 URL 协议: ${parsed.protocol}`, timestamp: Date.now() };
+        }
+      } catch {
+        return { success: false, action_type: 'navigate', error: `无效的 URL: ${url}`, timestamp: Date.now() };
+      }
       const tab = await getActiveBrowserTab();
       if (!tab?.id) return { success: false, action_type: 'navigate', error: '无法获取标签页', timestamp: Date.now() };
       await chrome.tabs.update(tab.id, { url });
-      // 等待页面加载完成，而非硬编码等待
+      // 等待页面加载完成
       await new Promise((resolve) => {
-        const timeout = setTimeout(resolve, 10000);
         const listener = (tabId, info) => {
           if (tabId === tab.id && info.status === 'complete') {
             chrome.tabs.onUpdated.removeListener(listener);
@@ -3422,6 +3445,10 @@ document.addEventListener('DOMContentLoaded', async () => {
             resolve();
           }
         };
+        const timeout = setTimeout(() => {
+          chrome.tabs.onUpdated.removeListener(listener);
+          resolve();
+        }, 10000);
         chrome.tabs.onUpdated.addListener(listener);
       });
       return { success: true, action_type: 'navigate', details: `导航到 ${url}`, timestamp: Date.now() };

@@ -3107,7 +3107,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           '[data-action-id]',
           // 通用菜单项（有 data-id 或 cursor-pointer 的可点击容器）
           '[data-id][class*="cursor-pointer"]',
-          '[menu-item]'
+          '[menu-item]',
           // 搜索建议/自动补全下拉
           'li.sc-v-center',
           '[class*="search__dropdown"] li',

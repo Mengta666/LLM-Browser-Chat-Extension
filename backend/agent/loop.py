@@ -168,6 +168,11 @@ def run_step(
         session.status = AgentStatus.COMPLETED
         session.summary = plan.get("summary", "任务完成")
         session.completed_goals = plan.get("completed_goals", session.completed_goals)
+        # 确保当前目标也标记完成
+        if session.current_goal and session.current_goal not in session.completed_goals:
+            session.completed_goals.append(session.current_goal)
+        session.current_goal = ""
+        session.remaining_goal = ""
         _agent_log.info("session_complete", session_id=session.session_id,
                         data={"summary": session.summary, "total_steps": session.current_step})
         return _build_response(session)
@@ -221,6 +226,10 @@ def run_step(
     if func_name == "task_complete":
         session.status = AgentStatus.COMPLETED
         session.summary = func_args.get("summary", "任务完成")
+        if session.current_goal and session.current_goal not in session.completed_goals:
+            session.completed_goals.append(session.current_goal)
+        session.current_goal = ""
+        session.remaining_goal = ""
         return _build_response(session, thought=thought)
 
     if func_name not in ALLOWED_ACTION_TYPES:

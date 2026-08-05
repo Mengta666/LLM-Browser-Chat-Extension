@@ -100,7 +100,7 @@ class AgentSession:
     initial_planning_done: bool = False
     goal_step_count: int = 0
     goal_retry_count: int = 0
-    max_steps_per_goal: int = 15
+    max_steps_per_goal: int = 10
     max_retries_per_goal: int = 3
     failed_paths: list[FailedPath] = field(default_factory=list)
 

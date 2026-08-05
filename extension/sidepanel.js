@@ -32,14 +32,12 @@ document.addEventListener('DOMContentLoaded', async () => {
   };
   const markdownParser = window.marked;
   const MAX_HISTORY_MESSAGES = 12;
-  const MAX_PROMPT_LENGTH = 8000;
   const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
   const MAX_IMAGE_PIXELS = 20_000_000;
   const MAX_ACTION_AGE_MS = 5 * 60 * 1000;
   const MAX_URL_LENGTH = 2048;
   const PRIVACY_NOTICE_KEY = 'privacyNoticeAccepted';
   const CURRENT_CHAT_ID_KEY = 'currentChatId';
-  const CUSTOM_API_BASE_URLS_KEY = 'customApiBaseUrls';
   const PAGE_REFRESH_ENDPOINT_PATH = '/api/pages/refresh_snapshot';
   const ALLOWED_IMAGE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
   const SOURCE_BLOCK_PATTERN = /\[([^\[\]]+)\]/g;
@@ -317,24 +315,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     await chrome.storage.session.set({ [CURRENT_CHAT_ID_KEY]: currentChatId });
     updatePageContextUi();
     return currentChatId;
-  }
-
-  function normalizeApiBaseUrl(apiUrl) {
-    const parsedUrl = new URL(String(apiUrl || DEFAULT_API_URL).trim());
-    const allowLocalHttp = parsedUrl.protocol === 'http:' && isPrivateOrLocalHost(parsedUrl.hostname);
-    if (parsedUrl.protocol !== 'https:' && !allowLocalHttp) {
-      throw new Error('API 地址必须使用 HTTPS');
-    }
-    if (parsedUrl.username || parsedUrl.password) {
-      throw new Error('API 地址不能包含用户名或密码');
-    }
-    const normalizedPath = parsedUrl.pathname.replace(/\/$/, '');
-    const normalizedApiUrl = `${parsedUrl.origin}${normalizedPath}`;
-    if (parsedUrl.search || parsedUrl.hash) {
-      throw new Error('API 地址不能包含查询参数或片段');
-    }
-
-    return normalizedApiUrl;
   }
 
   function buildBackendEndpointUrl(apiBaseUrl, endpointPath) {
@@ -1122,38 +1102,6 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     const estimatedBytes = Math.floor(match[2].length * 0.75);
     return estimatedBytes <= MAX_IMAGE_BYTES;
-  }
-
-  function isPrivateIpv4Host(host) {
-    return /^127\./.test(host)
-      || /^10\./.test(host)
-      || /^192\.168\./.test(host)
-      || /^0\.0\.0\.0$/.test(host)
-      || /^172\.(1[6-9]|2\d|3[01])\./.test(host)
-      || /^169\.254\./.test(host)
-      || /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(host);
-  }
-
-  function isPrivateOrLocalHost(hostname) {
-    const rawHost = String(hostname || '').trim().toLowerCase();
-    if (!rawHost) return false;
-
-    const host = rawHost.startsWith('[') && rawHost.endsWith(']')
-      ? rawHost.slice(1, -1)
-      : rawHost;
-
-    if (!host) return false;
-    if (host === 'localhost' || host === '::1' || host === '::') return true;
-    if (isPrivateIpv4Host(host)) return true;
-    if (/^(?:fc|fd)[0-9a-f:]*$/i.test(host)) return true;
-    if (/^fe80:/i.test(host)) return true;
-
-    const ipv4MappedMatch = host.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i);
-    if (ipv4MappedMatch) {
-      return isPrivateIpv4Host(ipv4MappedMatch[1]);
-    }
-
-    return false;
   }
 
   function parseImageHttpUrl(value) {
@@ -2723,12 +2671,28 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // 监听后台传回的字元块
     let _renderTimer = null;
+    let _lastActivity = Date.now();
+    const _STALL_TIMEOUT = 30000;
+
+    const _stallChecker = setInterval(() => {
+      if (Date.now() - _lastActivity > _STALL_TIMEOUT) {
+        clearInterval(_stallChecker);
+        chrome.runtime.onMessage.removeListener(messageListener);
+        if (_renderTimer) { clearTimeout(_renderTimer); _renderTimer = null; }
+        aiBubble.textContent = '';
+        aiBubble.appendChild(Object.assign(document.createElement('span'), {
+          className: 'error-text',
+          textContent: '⚠️ 响应超时（30秒无数据）'
+        }));
+      }
+    }, 5000);
+
     const messageListener = (msg) => {
-      if (msg.msgId !== msgId) return; // 过滤非本次请求的流
+      if (msg.msgId !== msgId) return;
+      _lastActivity = Date.now();
 
       if (msg.type === 'LLM_CHUNK') {
         fullReply += msg.chunk;
-        // debounce 渲染：每 100ms 最多渲染一次
         if (!_renderTimer) {
           _renderTimer = setTimeout(() => {
             _renderTimer = null;
@@ -2752,7 +2716,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       else if (msg.type === 'LLM_DONE') {
         if (isStreamDone) return;
         isStreamDone = true;
-        // 流结束：清除 debounce，立即渲染最终内容
+        clearInterval(_stallChecker);
         if (_renderTimer) { clearTimeout(_renderTimer); _renderTimer = null; }
         setRenderedMarkdown(aiBubble, fullReply);
         enhanceCodeBlocks(aiBubble);
@@ -2763,6 +2727,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         finalizeTimer = setTimeout(finalizeAssistantResponse, 150);
       }
       else if (msg.type === 'LLM_ERROR') {
+        clearInterval(_stallChecker);
         if (_renderTimer) { clearTimeout(_renderTimer); _renderTimer = null; }
         if (finalizeTimer) {
           clearTimeout(finalizeTimer);

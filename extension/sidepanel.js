@@ -3105,6 +3105,9 @@ document.addEventListener('DOMContentLoaded', async () => {
           '[class*="menu-item"]:not([class*="icon"])',
           '.el-dropdown-menu__item',
           '[data-action-id]',
+          // 通用菜单项（有 data-id 或 cursor-pointer 的可点击容器）
+          '[data-id][class*="cursor-pointer"]',
+          '[menu-item]'
           // 搜索建议/自动补全下拉
           'li.sc-v-center',
           '[class*="search__dropdown"] li',
@@ -3126,6 +3129,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           '[class*="popup"]:not([style*="display: none"])',
           '[class*="dropdown-list"]', '[class*="picker-panel"]',
           '[class*="search__dropdown"]', '[class*="autocomplete"]',
+          '[class*="popover__content"]', '[class*="popper"]',
           '[class*="dropdownWrap"]', '[class*="dropdown__"]',
           '[class*="select-branch"]',
           '.modal[style*="display: block"]', '.modal.show'

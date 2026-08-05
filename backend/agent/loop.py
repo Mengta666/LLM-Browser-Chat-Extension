@@ -25,6 +25,7 @@ from agent.state import (
     ActionResult,
     ElementLocator,
     FailedAttempt,
+    FailedPath,
 )
 from agent.context_builder import (
     build_initial_messages,
@@ -113,7 +114,7 @@ def run_step(
 ) -> dict[str, Any]:
     """执行一步：规划 LLM → 执行 LLM。每步都重新规划目标。"""
 
-    # 当前目标步数上限检查：超限时重试同一目标，最多3次后报错
+    # 安全阀：步数超限 → 调评判 LLM 归因 → 重试
     if session.goal_step_count >= session.max_steps_per_goal:
         session.goal_retry_count += 1
         if session.goal_retry_count >= session.max_retries_per_goal:
@@ -122,13 +123,19 @@ def run_step(
             _agent_log.error("goal_retry_exhausted", session_id=session.session_id,
                              data={"goal": session.current_goal, "retries": session.goal_retry_count})
             return _build_response(session)
+
+        # 调评判 LLM 归因
+        judgment = _call_judgment_llm(session, page_state)
+        session.failed_paths.append(judgment)
+        _agent_log.warn("goal_step_limit", session_id=session.session_id,
+                        data={"goal": session.current_goal, "retry": session.goal_retry_count,
+                              "judgment": {"reason": judgment.failure_reason, "avoid": judgment.avoid}})
+
+        # 重置上下文
         session.goal_step_count = 0
         session.messages = []
         session.failed_attempts = []
         session.blacklisted_approaches = []
-        _agent_log.warn("goal_step_limit", session_id=session.session_id,
-                        data={"goal": session.current_goal, "step": session.current_step,
-                              "retry": session.goal_retry_count})
 
     # 1. 记录上一步结果
     if action_result and session.pending_action:
@@ -222,38 +229,6 @@ def run_step(
         return _build_response(session, thought=thought)
 
     action = _parse_action(func_name, func_args)
-
-    # 硬控制：连续 wait ≥ 2 次时强制结束，不再无限等待
-    if func_name == "wait":
-        consecutive_waits = 0
-        for s in reversed(session.step_history):
-            if s.get("action", {}).get("type") == "wait":
-                consecutive_waits += 1
-            else:
-                break
-        if consecutive_waits >= 2:
-            session.status = AgentStatus.COMPLETED
-            session.summary = f"任务已完成。当前页面: {page_state.title or page_state.url}"
-            _agent_log.info("session_complete", session_id=session.session_id,
-                            data={"reason": "consecutive_wait_limit", "total_steps": session.current_step})
-            return _build_response(session, thought="连续等待多次，页面已稳定，标记完成")
-
-    # 硬控制：连续 3 次完全相同的操作（同类型+同目标），强制报错让规划换策略
-    if action.locator and len(session.step_history) >= 2:
-        target_key = f"{func_name}:{action.locator.value}"
-        repeat_count = 0
-        for s in reversed(session.step_history[-3:]):
-            a = s.get("action", {})
-            sk = f"{a.get('type', '')}:{(a.get('locator') or {}).get('value', '')}"
-            if sk == target_key:
-                repeat_count += 1
-            else:
-                break
-        if repeat_count >= 2:
-            _agent_log.warn("repeated_action_blocked", session_id=session.session_id,
-                            data={"action": target_key, "count": repeat_count + 1})
-            session.messages.append({"role": "user", "content":
-                f"⚠️ 你已经连续 {repeat_count + 1} 次执行 {target_key}，此操作无效。请换一种完全不同的方式。"})
 
     session.pending_action = action
     _agent_log.info("execution_result", session_id=session.session_id,
@@ -565,6 +540,76 @@ def _is_similar_target(a: str, b: str) -> bool:
     if a.isdigit() and b.isdigit() and a == b:
         return True
     return False
+
+
+def _call_judgment_llm(session: AgentSession, page_state: PageState) -> FailedPath:
+    """调用评判 LLM 对本轮失败进行归因。"""
+    from agent.context_builder import JUDGMENT_PROMPT
+
+    # 构建轨迹摘要
+    trajectory_lines = []
+    for s in session.step_history[-10:]:
+        action = s.get("action", {})
+        result = s.get("result", {})
+        a_type = action.get("type", "?")
+        target = (action.get("locator") or {}).get("value", "")[:20]
+        status = "✓" if result.get("success", True) else "✗"
+        url = result.get("url_after", "")[-40:] if result.get("url_after") else ""
+        line = f"{a_type}"
+        if target:
+            line += f" → {target}"
+        line += f" | {status}"
+        if url:
+            line += f" | {url}"
+        trajectory_lines.append(line)
+
+    user_content = (
+        f"## 用户任务\n{session.task}\n\n"
+        f"## 当前目标\n{session.current_goal}\n\n"
+        f"## 这一轮的操作轨迹\n" + "\n".join(trajectory_lines) + "\n\n"
+        f"## 最终页面\nURL: {page_state.url}\n标题: {page_state.title}"
+    )
+
+    messages = [
+        {"role": "system", "content": JUDGMENT_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
+
+    try:
+        response = _llm_client.chat.completions.create(
+            model=session.model, messages=messages,
+        )
+    except Exception:
+        return FailedPath(failure_reason="评判调用失败", avoid="")
+
+    if not response or not response.choices:
+        return FailedPath(failure_reason="评判无响应", avoid="")
+
+    raw = response.choices[0].message.content or ""
+    clean = _strip_think_tags(raw)
+
+    # 解析 JSON
+    for block in re.finditer(r'```(?:json)?\s*(\{.*?\})\s*```', clean, re.DOTALL):
+        try:
+            data = json.loads(block.group(1))
+            return FailedPath(
+                failure_reason=data.get("failure_reason", "未知原因"),
+                avoid=data.get("avoid", ""),
+            )
+        except json.JSONDecodeError:
+            continue
+    for obj in re.finditer(r'\{[^{}]*\}', clean, re.DOTALL):
+        try:
+            data = json.loads(obj.group(0))
+            if "failure_reason" in data:
+                return FailedPath(
+                    failure_reason=data.get("failure_reason", "未知原因"),
+                    avoid=data.get("avoid", ""),
+                )
+        except json.JSONDecodeError:
+            continue
+
+    return FailedPath(failure_reason=clean[:200], avoid="")
 
 
 def _call_planning_llm(session: AgentSession, page_state: PageState) -> Optional[dict]:

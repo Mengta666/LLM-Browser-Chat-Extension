@@ -59,6 +59,13 @@ class PageState(BaseModel):
 
 
 @dataclass
+class FailedPath:
+    """一轮失败的归因记录（由评判 LLM 生成）。"""
+    failure_reason: str
+    avoid: str
+
+
+@dataclass
 class FailedAttempt:
     """记录一次失败的操作尝试。"""
     action_type: str
@@ -95,6 +102,7 @@ class AgentSession:
     goal_retry_count: int = 0
     max_steps_per_goal: int = 15
     max_retries_per_goal: int = 3
+    failed_paths: list[FailedPath] = field(default_factory=list)
 
     # 反思机制
     failed_attempts: list[FailedAttempt] = field(default_factory=list)

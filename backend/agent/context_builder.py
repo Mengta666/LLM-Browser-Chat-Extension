@@ -178,10 +178,24 @@ STEP_PLANNING_PROMPT = """你是一个浏览器自动化规划助手。根据用
 - 如果用户的描述有多种解读深度，默认选最深的
 - 只有用户明确用了限定词（"简单看一下"、"看下标题"、"列出名字就行"）才选浅层
 - 当你不确定是否完成时，倾向于"未完成"而非"已完成"
+"""
 
-## 避免无效循环
-- 如果连续 2 步以上 current_goal 没有变化，说明可能卡住了，考虑换策略
-- 如果页面文本中已经包含用户想要的最终详细内容（如 diff 代码块），标记 task_done: true
+
+JUDGMENT_PROMPT = """你是一个浏览器自动化执行的评判助手。一个自动化任务在执行了多步后仍未完成当前目标，你需要分析失败原因。
+
+## 输出格式
+只输出 JSON，不要其他文字：
+```json
+{
+  "failure_reason": "简要说明为什么这一轮没有完成目标（1-2句话，要具体）",
+  "avoid": "下一轮应该避开的关键词/路径/操作（逗号分隔）"
+}
+```
+
+## 规则
+1. failure_reason 要具体——不是"没找到"，而是"通过XX路径进入了YY系统，该系统没有ZZ功能"
+2. avoid 列出具体的菜单名、按钮名、URL 路径片段，让下一轮能明确避开
+3. 不需要给出"正确方向"——下一轮会根据实际页面重新规划
 """
 
 
@@ -228,17 +242,6 @@ def build_step_planning_messages(
                     line += " [页面跳转]"
             parts.append(line)
 
-        # 检测连续 wait
-        consecutive_waits = 0
-        for s in reversed(session.step_history):
-            if s.get("action", {}).get("type") == "wait":
-                consecutive_waits += 1
-            else:
-                break
-        if consecutive_waits >= 2:
-            parts.append(f"\n⚠️ 已经连续 wait 了 {consecutive_waits} 次！页面可能已经加载完成。")
-            parts.append("请检查页面文本内容，如果目标信息已经可见，直接设置 task_done: true。")
-
     # 页面基本信息（URL + 标题）
     parts.append(f"\n## 当前页面\nURL: {page_state.url}\n标题: {page_state.title}")
 
@@ -272,6 +275,15 @@ def build_step_planning_messages(
             parts.append("\n## 最近失败记录")
             for f in recent_fails:
                 parts.append(f"  - {f.action_type} → {f.target}: {f.error}")
+
+    # 之前重试失败的评判结论
+    if session.failed_paths:
+        parts.append(f"\n## ⚠️ 之前的尝试失败了（第{session.goal_retry_count}次重试）")
+        for i, fp in enumerate(session.failed_paths):
+            parts.append(f"  第{i+1}次失败原因: {fp.failure_reason}")
+            if fp.avoid:
+                parts.append(f"    避开: {fp.avoid}")
+        parts.append("\n请基于当前页面元素选择一条与上述失败路径完全不同的方向。")
 
     return [
         {"role": "system", "content": STEP_PLANNING_PROMPT},

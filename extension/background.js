@@ -304,7 +304,7 @@ async function handleCallLlmStream(request) {
     redirect: 'error',
     headers: requestHeaders,
     body,
-    signal: AbortSignal.timeout(60000)
+    signal: AbortSignal.timeout(120000)
   });
 
   if (!response.ok) {
@@ -416,7 +416,7 @@ async function handleCallApiJson(request) {
     redirect: 'error',
     headers: requestHeaders,
     body,
-    signal: AbortSignal.timeout(60000)
+    signal: AbortSignal.timeout(120000)
   });
 
   if (!response.ok) {

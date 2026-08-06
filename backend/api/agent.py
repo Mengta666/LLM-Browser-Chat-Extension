@@ -8,7 +8,7 @@ from typing import Any, Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ValidationError
 
-from agent.loop import create_session, get_session, run_step, cancel_session
+from agent.loop import create_session, get_session, run_step, run_plan, run_action, cancel_session
 from agent.state import PageState, ActionResult
 
 
@@ -84,6 +84,48 @@ def agent_step(item: AgentStepRequest) -> dict[str, Any]:
 
     try:
         return run_step(session, page_state, action_result)
+    except Exception as exc:
+        raise HTTPException(502, f"Agent 执行出错: {exc}") from exc
+
+
+@router.post("/plan")
+def agent_plan(item: AgentStepRequest) -> dict[str, Any]:
+    """只做规划阶段（快速返回 plan 信息，不调执行 LLM）。"""
+    session = get_session(item.session_id)
+    if not session:
+        raise HTTPException(404, f"会话 {item.session_id} 不存在")
+
+    raw_result = item.action_result or {}
+    action_result = ActionResult(
+        success=raw_result.get("success", False),
+        action_type=raw_result.get("action_type", "unknown"),
+        details=raw_result.get("details", ""),
+        error=raw_result.get("error"),
+        timestamp=raw_result.get("timestamp", 0),
+        state_changes=raw_result.get("state_changes"),
+    )
+
+    try:
+        page_state = PageState(**item.page_state)
+    except (ValidationError, TypeError) as e:
+        raise HTTPException(400, f"page_state 格式错误: {str(e)[:200]}")
+
+    try:
+        return run_plan(session, page_state, action_result)
+    except Exception as exc:
+        raise HTTPException(502, f"Agent 规划出错: {exc}") from exc
+
+
+@router.post("/action")
+def agent_action(item: AgentCancelRequest) -> dict[str, Any]:
+    """只做执行阶段（在 plan 之后调用，返回具体 action）。"""
+    session = get_session(item.session_id)
+    if not session:
+        raise HTTPException(404, f"会话 {item.session_id} 不存在")
+
+    try:
+        from agent.state import PageState as PS
+        return run_action(session, PS(url="", title=""))
     except Exception as exc:
         raise HTTPException(502, f"Agent 执行出错: {exc}") from exc
 

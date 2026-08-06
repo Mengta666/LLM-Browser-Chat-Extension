@@ -112,12 +112,12 @@ def cancel_session(session_id: str) -> bool:
     return True
 
 
-def run_step(
+def run_plan(
     session: AgentSession,
     page_state: PageState,
     action_result: Optional[ActionResult] = None,
 ) -> dict[str, Any]:
-    """执行一步：规划 LLM → 执行 LLM。每步都重新规划目标。"""
+    """第一阶段：记录结果 + 调规划 LLM。返回 plan 信息。"""
 
     # 安全阀：步数超限 → 调评判 LLM 归因 → 重试
     if session.goal_step_count >= session.max_steps_per_goal:
@@ -129,14 +129,12 @@ def run_step(
                              data={"goal": session.current_goal, "retries": session.goal_retry_count})
             return _build_response(session)
 
-        # 调评判 LLM 归因
         judgment = _call_judgment_llm(session, page_state)
         session.failed_paths.append(judgment)
         _agent_log.warn("goal_step_limit", session_id=session.session_id,
                         data={"goal": session.current_goal, "retry": session.goal_retry_count,
                               "judgment": {"reason": judgment.failure_reason, "avoid": judgment.avoid}})
 
-        # 重置上下文
         session.goal_step_count = 0
         session.messages = []
         session.failed_attempts = []
@@ -148,7 +146,6 @@ def run_step(
         append_step_messages(
             session.messages, session.pending_action, action_result, page_state
         )
-        # 补充执行结果到 step_history（供规划 LLM 查看轨迹）
         if session.step_history:
             session.step_history[-1]["result"] = {
                 "success": action_result.success,
@@ -159,7 +156,7 @@ def run_step(
             }
         session.pending_action = None
 
-    # 2. 规划 LLM：判断目标进度，决定下一步方向
+    # 2. 规划 LLM
     t0 = time.time()
     plan = _call_planning_llm(session, page_state)
     plan_ms = int((time.time() - t0) * 1000)
@@ -170,7 +167,6 @@ def run_step(
         session.status = AgentStatus.COMPLETED
         session.summary = plan.get("summary", "任务完成")
         session.completed_goals = plan.get("completed_goals", session.completed_goals)
-        # 确保当前目标也标记完成
         if session.current_goal and session.current_goal not in session.completed_goals:
             session.completed_goals.append(session.current_goal)
         session.current_goal = ""
@@ -187,12 +183,20 @@ def run_step(
         session.completed_goals = plan.get("completed_goals", session.completed_goals)
         session.remaining_goal = plan.get("remaining", "")
 
-        # 目标切换时重置步数和重试计数器
         if session.current_goal != old_goal:
             session.goal_step_count = 0
             session.goal_retry_count = 0
 
-    # 3. 执行 LLM：根据目标返回具体 action
+    session.status = AgentStatus.ACTION_REQUIRED
+    return _build_response(session)
+
+
+def run_action(
+    session: AgentSession,
+    page_state: PageState,
+) -> dict[str, Any]:
+    """第二阶段：调执行 LLM 返回 action。"""
+
     mode = _resolve_call_mode(session)
     goal_ctx = build_execution_goal_context(session)
 
@@ -202,7 +206,6 @@ def run_step(
         else:
             session.messages = build_initial_messages_text_mode(session.task, page_state, goal_ctx)
     else:
-        # 每步更新 system prompt
         from agent.context_builder import SYSTEM_PROMPT, TEXT_MODE_FORMAT_APPENDIX
         if session.messages and session.messages[0].get("role") == "system":
             if mode == CallMode.TOOL_CALLS:
@@ -210,7 +213,6 @@ def run_step(
             else:
                 session.messages[0] = {"role": "system", "content": SYSTEM_PROMPT + goal_ctx + TEXT_MODE_FORMAT_APPENDIX}
 
-    # 注入反思提示
     reflection = build_reflection_prompt(session)
     if reflection:
         session.messages.append({"role": "user", "content": reflection})
@@ -240,7 +242,6 @@ def run_step(
         return _build_response(session, thought=thought)
 
     action = _parse_action(func_name, func_args)
-
     session.pending_action = action
     session.current_step += 1
     session.goal_step_count += 1
@@ -258,6 +259,18 @@ def run_step(
         session.status = AgentStatus.ACTION_REQUIRED
 
     return _build_response(session, thought=thought)
+
+
+def run_step(
+    session: AgentSession,
+    page_state: PageState,
+    action_result: Optional[ActionResult] = None,
+) -> dict[str, Any]:
+    """兼容接口：规划+执行合一调用。"""
+    plan_resp = run_plan(session, page_state, action_result)
+    if session.status in (AgentStatus.COMPLETED, AgentStatus.ERROR):
+        return plan_resp
+    return run_action(session, page_state)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

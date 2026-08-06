@@ -4251,11 +4251,25 @@ document.addEventListener('DOMContentLoaded', async () => {
         };
         pageState = newPageState;
 
-        response = await callAgentApi(safeApiUrl, '/v1/agent/step', {
+        // 两阶段调用：先规划（快速更新目标面板），再执行
+        const planResponse = await callAgentApi(safeApiUrl, '/v1/agent/plan', {
           session_id: sessionId,
           action_result: actionResult,
           page_state: newPageState
         }, apiKey);
+
+        // 立即更新目标面板
+        if (planResponse.plan) updateAgentPlan(aiBubble, planResponse.plan);
+
+        // 如果规划阶段就完成/出错了，不再调执行
+        if (planResponse.status === 'completed' || planResponse.status === 'error') {
+          response = planResponse;
+        } else {
+          // 调执行 LLM 获取 action
+          response = await callAgentApi(safeApiUrl, '/v1/agent/action', {
+            session_id: sessionId
+          }, apiKey);
+        }
       }
 
       if (response.status === 'completed') {

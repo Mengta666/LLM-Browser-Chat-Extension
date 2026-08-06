@@ -4489,4 +4489,147 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (e.key === 'Enter' && !e.shiftKey) tryAgentIntercept(e);
     }, true);
   })();
+
+  // ═══════════════════════════════════════════════════════════════════
+  // 操作录制模块（存入知识库）
+  // ═══════════════════════════════════════════════════════════════════
+  (function installRecorder() {
+    const recordBtn = document.getElementById('recordBtn');
+    if (!recordBtn) return;
+
+    let recording = false;
+    let recordedSteps = [];
+    let recordTask = '';
+    let recordFingerprint = null;
+
+    recordBtn.addEventListener('click', async () => {
+      if (!recording) {
+        // 开始录制
+        const desc = prompt('请输入这次操作的描述（如：在coding中搜索仓库）:');
+        if (!desc || !desc.trim()) return;
+        recordTask = desc.trim();
+        recordedSteps = [];
+        recordFingerprint = null;
+
+        const tab = await getActiveBrowserTab().catch(() => null);
+        if (!tab?.id) { alert('无法获取当前标签页'); return; }
+
+        // 采集起始页面指纹
+        try {
+          const fpResults = await chrome.scripting.executeScript({
+            target: { tabId: tab.id, allFrames: false },
+            func: () => ({
+              site: location.hostname,
+              title_keywords: document.title.split(/[\s\-_|]+/).filter(w => w.length > 1).slice(0, 5),
+              menu_texts: Array.from(document.querySelectorAll(
+                'nav a, [class*="menu"] a, [class*="nav"] a, [role="menuitem"], [data-id]'
+              )).map(el => (el.textContent || '').trim()).filter(t => t && t.length <= 12).slice(0, 20),
+              url_pattern: location.pathname
+            })
+          });
+          recordFingerprint = fpResults?.[0]?.result || null;
+        } catch { /* ignore */ }
+
+        // 注入录制拦截脚本到所有 frame
+        await chrome.scripting.executeScript({
+          target: { tabId: tab.id, allFrames: true },
+          func: () => {
+            if (window.__agentRecorderInstalled) return;
+            window.__agentRecorderInstalled = true;
+            window.__agentRecordedSteps = [];
+
+            function selectorOf(el) {
+              if (el.id && !el.id.match(/^[\d:]/)) return `#${el.id}`;
+              const testId = el.getAttribute('data-testid');
+              if (testId) return `[data-testid="${testId}"]`;
+              return '';
+            }
+
+            document.addEventListener('click', (e) => {
+              if (!window.__agentRecording) return;
+              const el = e.target;
+              window.__agentRecordedSteps.push({
+                action: 'click',
+                target_text: (el.textContent || '').trim().slice(0, 40),
+                css_selector: selectorOf(el),
+                text: '',
+                url_pattern: location.pathname
+              });
+            }, true);
+
+            let inputTimer = null;
+            document.addEventListener('input', (e) => {
+              if (!window.__agentRecording) return;
+              const el = e.target;
+              clearTimeout(inputTimer);
+              inputTimer = setTimeout(() => {
+                window.__agentRecordedSteps.push({
+                  action: 'type',
+                  target_text: el.placeholder || el.name || '',
+                  css_selector: selectorOf(el),
+                  text: (el.value || '').slice(0, 50),
+                  url_pattern: location.pathname
+                });
+              }, 500);
+            }, true);
+          }
+        }).catch(() => {});
+
+        // 打开录制标志
+        await chrome.scripting.executeScript({
+          target: { tabId: tab.id, allFrames: true },
+          func: () => { window.__agentRecording = true; }
+        }).catch(() => {});
+
+        recording = true;
+        recordBtn.classList.add('is-active');
+        recordBtn.textContent = '⏹️ 停止录制';
+      } else {
+        // 停止录制并保存
+        recording = false;
+        recordBtn.classList.remove('is-active');
+        recordBtn.textContent = '⏺️ 录制';
+
+        const tab = await getActiveBrowserTab().catch(() => null);
+        if (tab?.id) {
+          try {
+            const results = await chrome.scripting.executeScript({
+              target: { tabId: tab.id, allFrames: true },
+              func: () => {
+                window.__agentRecording = false;
+                const steps = window.__agentRecordedSteps || [];
+                window.__agentRecordedSteps = [];
+                return steps;
+              }
+            });
+            // 合并所有 frame 的录制步骤
+            for (const r of results) {
+              if (r?.result?.length) recordedSteps.push(...r.result);
+            }
+          } catch { /* ignore */ }
+        }
+
+        if (recordedSteps.length === 0) {
+          alert('未录制到任何操作');
+          return;
+        }
+
+        // 保存到知识库
+        try {
+          const { apiKey, safeApiUrl } = await resolveApiRequestConfig();
+          await callAgentApi(safeApiUrl, '/v1/knowledge/record', {
+            task_description: recordTask,
+            trigger_prompt: recordTask,
+            source: 'recorded',
+            page_fingerprint: recordFingerprint || {},
+            steps: recordedSteps,
+            user_note: ''
+          }, apiKey);
+          alert(`录制完成，已保存 ${recordedSteps.length} 步操作到知识库`);
+        } catch (e) {
+          alert(`保存失败: ${e.message || '未知错误'}`);
+        }
+      }
+    });
+  })();
 });

@@ -205,79 +205,76 @@ def build_step_planning_messages(
     parts = [f"## 用户任务\n{session.task}"]
 
     if session.completed_goals:
-        parts.append("\n## 已完成的目标")
-        for g in session.completed_goals:
-            parts.append(f"  ✓ {g}")
+        parts.append(f"\n## 已完成: {' → '.join(session.completed_goals)}")
 
     if session.current_goal:
-        parts.append(f"\n## 上一步的目标: {session.current_goal}")
+        parts.append(f"\n## 当前目标: {session.current_goal}")
 
     if session.step_history:
-        # 执行轨迹摘要（最近5步的 action + 结果 + 页面变化）
+        # 压缩轨迹格式：每步一行极短摘要
         recent = session.step_history[-5:]
-        parts.append("\n## 执行轨迹（最近几步）")
+        trail = []
         for s in recent:
             action = s.get("action", {})
             result = s.get("result", {})
-            action_type = action.get("type", "?")
-            target = ""
-            locator = action.get("locator")
-            if locator:
-                target = f" → {locator.get('value', '')}"
-            elif action.get("params", {}).get("text"):
-                target = f' "{action["params"]["text"][:15]}"'
+            a_type = action.get("type", "?")
+            target = (action.get("locator") or {}).get("value", "")[:12]
+            if not target and action.get("params", {}).get("text"):
+                target = action["params"]["text"][:10]
+            status = "✓" if result.get("success", True) else "✗"
+            url_changed = "→" if result.get("state_changes", {}).get("url_changed") else ""
+            trail.append(f"{a_type}:{target}{status}{url_changed}")
+        parts.append(f"\n## 轨迹: {' | '.join(trail)}")
 
-            line = f"  步骤{s.get('step', '?')}: {action_type}{target}"
-            if result:
-                status = "✓" if result.get("success") else "✗"
-                line += f" | {status}"
-                if result.get("url_after"):
-                    line += f" | → {result['url_after'][-40:]}"
-                if result.get("state_changes", {}).get("url_changed"):
-                    line += " [页面跳转]"
-            parts.append(line)
+    # 页面信息（精简：URL + 标题 + 去重压缩后的文本）
+    parts.append(f"\n## 页面: {page_state.url}")
+    if page_state.title:
+        parts.append(f"标题: {page_state.title}")
 
-    # 页面基本信息（URL + 标题）
-    parts.append(f"\n## 当前页面\nURL: {page_state.url}\n标题: {page_state.title}")
-
-    # 页面文本内容（供规划 LLM 判断任务是否已完成）
     if page_state.text_content_summary:
-        summary = page_state.text_content_summary[:2000]
-        parts.append(f"\n## 页面可见文本内容\n{summary}")
+        # 去重压缩：去掉连续重复词、多余空白，截取关键500字
+        raw = page_state.text_content_summary
+        words = raw.split()
+        deduped = []
+        prev = ""
+        for w in words:
+            if w != prev:
+                deduped.append(w)
+                prev = w
+        compressed = " ".join(deduped)[:800]
+        parts.append(f"\n## 页面文本（压缩）: {compressed}")
 
-    # 关键可交互元素摘要（让规划 LLM 知道页面上有什么可以操作的）
+    # 元素摘要：去重，只取唯一文本的前15个
     if page_state.interactive_elements:
+        seen_texts = set()
         key_elements = []
-        for el in page_state.interactive_elements[:30]:
+        for el in page_state.interactive_elements[:50]:
             text = el.get("text", "").strip()
-            tag = el.get("tag", "")
-            if text and len(text) <= 40:
+            if text and len(text) <= 30 and text not in seen_texts:
+                seen_texts.add(text)
                 key_elements.append(text)
-            elif el.get("placeholder"):
-                key_elements.append(f'[{el["placeholder"]}]')
+            elif el.get("placeholder") and el["placeholder"] not in seen_texts:
+                seen_texts.add(el["placeholder"])
+                key_elements.append(f'[{el["placeholder"][:20]}]')
+            if len(key_elements) >= 15:
+                break
         if key_elements:
-            parts.append(f"\n## 页面上的可操作元素（部分）\n{', '.join(key_elements)}")
+            parts.append(f"\n## 可操作元素: {', '.join(key_elements)}")
 
-    # 反思信息：让规划 LLM 知道哪些路走不通
+    # 反思（压缩为一行）
     if session.blacklisted_approaches:
-        parts.append("\n## ⚠️ 以下操作方式已证实无效，请规划不同的路径：")
-        for approach in session.blacklisted_approaches[-5:]:
-            parts.append(f"  ✗ {approach}")
+        parts.append(f"\n## ⚠️ 无效路径: {'; '.join(session.blacklisted_approaches[-3:])}")
 
     if session.failed_attempts:
-        recent_fails = [a for a in session.failed_attempts[-3:]]
-        if recent_fails:
-            parts.append("\n## 最近失败记录")
-            for f in recent_fails:
-                parts.append(f"  - {f.action_type} → {f.target}: {f.error}")
+        recent_fails = session.failed_attempts[-3:]
+        fail_summary = "; ".join(f"{f.action_type}:{f.target[:10]}失败" for f in recent_fails)
+        parts.append(f"\n## 最近失败: {fail_summary}")
 
-    # 之前重试失败的评判结论
+    # 评判结论（压缩）
     if session.failed_paths:
-        parts.append(f"\n## ⚠️ 之前的尝试失败了（第{session.goal_retry_count}次重试）")
-        for i, fp in enumerate(session.failed_paths):
-            parts.append(f"  第{i+1}次失败原因: {fp.failure_reason}")
-            if fp.avoid:
-                parts.append(f"    避开: {fp.avoid}")
+        parts.append(f"\n## ⚠️ 重试第{session.goal_retry_count}次")
+        for fp in session.failed_paths:
+            parts.append(f"  原因:{fp.failure_reason[:50]} 避开:{fp.avoid}")
         parts.append("\n请基于当前页面元素选择一条与上述失败路径完全不同的方向。")
 
     return [

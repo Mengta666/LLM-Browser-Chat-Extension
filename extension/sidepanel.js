@@ -4105,6 +4105,32 @@ document.addEventListener('DOMContentLoaded', async () => {
     title.textContent = `本次执行是否成功？接受后存入知识库供下次参考（${info.executedSteps.length}步）`;
     card.appendChild(title);
 
+    // 可折叠的待保存步骤 trace（默认隐藏）
+    const traceToggle = document.createElement('div');
+    traceToggle.className = 'agent-trace-toggle';
+    traceToggle.textContent = '▸ 查看待保存的操作步骤';
+    card.appendChild(traceToggle);
+
+    const traceList = document.createElement('div');
+    traceList.className = 'agent-record-steps';
+    traceList.style.display = 'none';
+    info.executedSteps.forEach((s, i) => {
+      const stepEl = document.createElement('div');
+      stepEl.className = 'agent-record-step';
+      let desc = `${i + 1}. ${s.action}`;
+      if (s.target_text) desc += ` → ${s.target_text}`;
+      if (s.text) desc += ` (输入: "${s.text.slice(0, 20)}")`;
+      stepEl.textContent = desc;
+      traceList.appendChild(stepEl);
+    });
+    card.appendChild(traceList);
+
+    traceToggle.addEventListener('click', () => {
+      const hidden = traceList.style.display === 'none';
+      traceList.style.display = hidden ? 'block' : 'none';
+      traceToggle.textContent = hidden ? '▾ 收起操作步骤' : '▸ 查看待保存的操作步骤';
+    });
+
     const noteInput = document.createElement('textarea');
     noteInput.className = 'agent-eval-note';
     noteInput.placeholder = '备注（可选）：例如"第一步要先点Coding"';

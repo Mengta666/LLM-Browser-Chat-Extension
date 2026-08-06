@@ -684,6 +684,7 @@ def _build_response(
         "completed_goals": session.completed_goals,
         "remaining": session.remaining_goal,
         "task_done": session.status == AgentStatus.COMPLETED,
+        "referenced_id": getattr(session, "_kb_referenced_id", ""),
     } if session.current_goal or session.completed_goals else None
 
     resp: dict[str, Any] = {

@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from api.agent import router as agent_router
 from api.logs import router as logs_router
+from api.knowledge import router as knowledge_router
 
 app = FastAPI()
 
@@ -28,6 +29,7 @@ except Exception as e:
 
 app.include_router(agent_router)
 app.include_router(logs_router)
+app.include_router(knowledge_router)
 
 
 if __name__ == "__main__":

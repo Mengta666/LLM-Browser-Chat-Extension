@@ -3356,6 +3356,16 @@ document.addEventListener('DOMContentLoaded', async () => {
           '.jmtd-loading, .jmtd-spin-spinning, [class*="mask"][style*="display"]'
         );
 
+        // 页面结构指纹（用于知识库跨域名匹配）
+        const pageFingerprint = {
+          site: location.hostname,
+          title_keywords: document.title.split(/[\s\-_|]+/).filter(w => w.length > 1).slice(0, 5),
+          menu_texts: Array.from(document.querySelectorAll(
+            'nav a, [class*="menu"] a, [class*="nav"] a, [class*="nav"] span, [role="menuitem"], [data-id]'
+          )).map(el => (el.textContent || '').trim()).filter(t => t && t.length <= 12).slice(0, 20),
+          url_pattern: location.pathname
+        };
+
         return {
           url: location.href,
           title: document.title,
@@ -3364,6 +3374,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           document_height: document.documentElement.scrollHeight,
           scrollable_container,
           active_popup: activePopup,
+          page_fingerprint: pageFingerprint,
           is_loading: isLoading,
           focused_element: document.activeElement?.id ? `#${document.activeElement.id}` : null,
           interactive_elements: elements,
@@ -4085,6 +4096,67 @@ document.addEventListener('DOMContentLoaded', async () => {
     scrollToBottom();
   }
 
+  function renderEvaluationCard(bubble, info) {
+    const card = document.createElement('div');
+    card.className = 'agent-eval-card';
+
+    const title = document.createElement('div');
+    title.className = 'agent-eval-title';
+    title.textContent = `本次执行是否成功？接受后存入知识库供下次参考（${info.executedSteps.length}步）`;
+    card.appendChild(title);
+
+    const noteInput = document.createElement('textarea');
+    noteInput.className = 'agent-eval-note';
+    noteInput.placeholder = '备注（可选）：例如"第一步要先点Coding"';
+    card.appendChild(noteInput);
+
+    const btnRow = document.createElement('div');
+    btnRow.className = 'agent-eval-btns';
+
+    const acceptBtn = document.createElement('button');
+    acceptBtn.className = 'agent-btn-allow';
+    acceptBtn.textContent = '✓ 接受并保存';
+    acceptBtn.onclick = async () => {
+      acceptBtn.disabled = true;
+      // 引用回报：如果本次参照了知识库记录，回报成功
+      if (info.referencedId) {
+        await callAgentApi(info.safeApiUrl, '/v1/knowledge/usage',
+          { record_id: info.referencedId, success: true }, info.apiKey).catch(() => {});
+      }
+      // 保存新记录
+      try {
+        await callAgentApi(info.safeApiUrl, '/v1/knowledge/record', {
+          task_description: info.task,
+          trigger_prompt: info.task,
+          source: 'confirmed',
+          page_fingerprint: info.fingerprint,
+          steps: info.executedSteps,
+          user_note: noteInput.value.trim()
+        }, info.apiKey);
+        card.innerHTML = '<div class="agent-eval-done">✓ 已存入知识库</div>';
+      } catch (e) {
+        card.innerHTML = `<div class="agent-eval-done">保存失败: ${e.message || '未知错误'}</div>`;
+      }
+    };
+
+    const rejectBtn = document.createElement('button');
+    rejectBtn.className = 'agent-btn-deny';
+    rejectBtn.textContent = '✗ 不保存';
+    rejectBtn.onclick = async () => {
+      // 引用回报：如果参照了知识库但用户拒绝，回报失败
+      if (info.referencedId) {
+        await callAgentApi(info.safeApiUrl, '/v1/knowledge/usage',
+          { record_id: info.referencedId, success: false }, info.apiKey).catch(() => {});
+      }
+      card.remove();
+    };
+
+    btnRow.append(acceptBtn, rejectBtn);
+    card.appendChild(btnRow);
+    bubble.appendChild(card);
+    scrollToBottom();
+  }
+
   function renderAgentError(bubble, error) {
     const errorEl = document.createElement('div');
     errorEl.className = 'agent-error';
@@ -4134,6 +4206,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     agentState.status = 'running';
     agentState.currentStep = 0;
 
+    // 记录本次执行的操作序列和页面指纹，供知识库保存
+    const executedSteps = [];
+    let firstFingerprint = null;
+
     let apiKey, modelName, safeApiUrl;
     try {
       ({ apiKey, modelName, safeApiUrl } = await resolveApiRequestConfig());
@@ -4157,6 +4233,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     try {
       let pageState = await observePageState();
+      firstFingerprint = pageState?.page_fingerprint || null;
       aiBubble.textContent = '';
 
       const headerEl = document.createElement('div');
@@ -4234,6 +4311,20 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         renderAgentStepInBubble(aiBubble, response.step, null, null, actionResult);
 
+        // 记录成功的操作步骤（供知识库保存）
+        if (actionResult.success && action.type !== 'wait') {
+          executedSteps.push({
+            action: action.type,
+            target_text: action.locator?.value || '',
+            css_selector: action.locator?.method === 'css' ? action.locator.value : '',
+            text: action.params?.text || '',
+            url_pattern: pageState?.url ? new URL(pageState.url).pathname : ''
+          });
+        }
+        if (!firstFingerprint && pageState?.page_fingerprint) {
+          firstFingerprint = pageState.page_fingerprint;
+        }
+
         // 智能等待页面稳定（替代固定延时）
         const activeTab = await getActiveBrowserTab().catch(() => null);
         if (activeTab?.id) {
@@ -4275,6 +4366,13 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (response.status === 'completed') {
         if (response.plan) updateAgentPlan(aiBubble, response.plan);
         renderAgentComplete(aiBubble, response.summary, true);
+        // 弹出评价窗口，用户接受则存入知识库
+        if (executedSteps.length >= 2 && firstFingerprint) {
+          renderEvaluationCard(aiBubble, {
+            task, executedSteps, fingerprint: firstFingerprint,
+            safeApiUrl, apiKey, referencedId: response.plan?.referenced_id
+          });
+        }
       } else if (response.status === 'error') {
         renderAgentError(aiBubble, response.error || '未知错误');
       }

@@ -51,6 +51,7 @@ class PageState(BaseModel):
     document_height: int = 0
     scrollable_container: Optional[dict[str, Any]] = None
     active_popup: Optional[dict[str, Any]] = None
+    page_fingerprint: Optional[dict[str, Any]] = None
     is_loading: bool = False
     focused_element: Optional[str] = None
     interactive_elements: list[dict[str, Any]] = []
@@ -110,3 +111,7 @@ class AgentSession:
     # 反思机制
     failed_attempts: list[FailedAttempt] = field(default_factory=list)
     blacklisted_approaches: list[str] = field(default_factory=list)
+
+    # 知识库引用（召回缓存 + 被引用记录 id）
+    _kb_hint_cache: str = ""
+    _kb_referenced_id: str = ""

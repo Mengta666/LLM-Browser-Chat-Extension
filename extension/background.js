@@ -4,7 +4,7 @@ chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(consol
 
 const MAX_LLM_BODY_BYTES = 25 * 1024 * 1024;
 const PAGE_REFRESH_ENDPOINT_PATH = '/api/pages/refresh_snapshot';
-const AGENT_ENDPOINT_PATHS = ['/v1/agent/execute', '/v1/agent/step', '/v1/agent/plan', '/v1/agent/action', '/v1/agent/cancel'];
+const AGENT_ENDPOINT_PATHS = ['/v1/agent/execute', '/v1/agent/step', '/v1/agent/plan', '/v1/agent/action', '/v1/agent/cancel', '/v1/knowledge/record', '/v1/knowledge/query', '/v1/knowledge/usage'];
 const DEFAULT_ALLOWED_CHAT_URLS = new Set([
   'https://api.openai.com/v1/chat/completions'
 ]);

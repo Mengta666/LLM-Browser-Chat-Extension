@@ -198,11 +198,62 @@ JUDGMENT_PROMPT = """你是一个浏览器自动化执行的评判助手。一�
 # 构建函数
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _build_knowledge_hint(session: "AgentSession", page_state: PageState) -> str:
+    """查询知识库，返回参考经验注入文本。只在首步或目标切换时查询。"""
+    # 只在首步查询（current_step <= 1），避免每步都调 embedding
+    if session.current_step > 1:
+        # 复用已缓存的召回结果（存在 session 上）
+        cached = getattr(session, "_kb_hint_cache", None)
+        return cached or ""
+
+    fingerprint = page_state.page_fingerprint or {}
+    if not fingerprint:
+        return ""
+
+    try:
+        from rag.embedder import embed_text
+        from knowledge.store import query_records
+
+        vector = embed_text(session.task)
+        results = query_records(vector, fingerprint)
+    except Exception:
+        return ""
+
+    if not results:
+        session._kb_hint_cache = ""
+        return ""
+
+    score, rec = results[0]
+    steps_str = " → ".join(
+        f"{s.get('action', '?')}:{s.get('target_text', '')[:12]}"
+        for s in rec.steps[:8]
+    )
+    lines = [
+        f"\n## 📖 参考经验（用户确认的成功路径，相似度{score:.2f}）",
+        f"相似任务: {rec.task_description}",
+        f"操作步骤: {steps_str}",
+    ]
+    if rec.user_note:
+        lines.append(f"💡 用户提示: {rec.user_note}")
+    lines.append("注意: 仅供参考，请根据当前页面实际元素灵活调整。")
+
+    hint = "\n".join(lines)
+    session._kb_hint_cache = hint
+    # 记录被引用的 record_id，供后续回报使用
+    session._kb_referenced_id = rec.id
+    return hint
+
+
 def build_step_planning_messages(
     session: "AgentSession", page_state: PageState
 ) -> list[dict[str, str]]:
     """构造每步规划的 messages。包含页面文本摘要供判断任务完成。"""
     parts = [f"## 用户任务\n{session.task}"]
+
+    # 知识库参考经验（只在首步或目标切换时注入，避免每步查询）
+    kb_hint = _build_knowledge_hint(session, page_state)
+    if kb_hint:
+        parts.append(kb_hint)
 
     if session.completed_goals:
         parts.append(f"\n## 已完成: {' → '.join(session.completed_goals)}")

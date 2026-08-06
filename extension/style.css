@@ -530,6 +530,43 @@ input { width: 100%; padding: 8px; margin-top: 5px; box-sizing: border-box; bord
   opacity: 0.6;
 }
 
+/* ========== 知识库评价卡片 ========== */
+.agent-eval-card {
+  margin: 8px 0;
+  padding: 10px 12px;
+  background: var(--app-accent-soft, rgba(59,130,246,0.08));
+  border: 1px solid var(--app-accent, #3b82f6);
+  border-radius: 8px;
+}
+.agent-eval-title {
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 8px;
+  color: var(--app-text);
+}
+.agent-eval-note {
+  width: 100%;
+  min-height: 44px;
+  font-size: 12px;
+  padding: 6px 8px;
+  border: 1px solid var(--app-border);
+  border-radius: 6px;
+  resize: vertical;
+  box-sizing: border-box;
+  margin-bottom: 8px;
+  background: var(--app-bg, #fff);
+  color: var(--app-text);
+}
+.agent-eval-btns {
+  display: flex;
+  gap: 8px;
+}
+.agent-eval-done {
+  font-size: 12px;
+  color: var(--app-success, #22c55e);
+  font-weight: 600;
+}
+
 .agent-goal-actions {
   padding: 4px 0 4px 12px;
   border-left: 1px dashed var(--app-border);

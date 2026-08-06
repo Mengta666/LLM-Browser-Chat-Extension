@@ -4157,6 +4157,72 @@ document.addEventListener('DOMContentLoaded', async () => {
     scrollToBottom();
   }
 
+  function renderRecordingConfirmCard(info) {
+    const bubble = createMessageNode('ai');
+    const card = document.createElement('div');
+    card.className = 'agent-eval-card';
+
+    const title = document.createElement('div');
+    title.className = 'agent-eval-title';
+    title.textContent = `录制完成：「${info.task}」共 ${info.steps.length} 步。确认后存入知识库：`;
+    card.appendChild(title);
+
+    // 展示录制的步骤列表
+    const stepsList = document.createElement('div');
+    stepsList.className = 'agent-record-steps';
+    info.steps.forEach((s, i) => {
+      const stepEl = document.createElement('div');
+      stepEl.className = 'agent-record-step';
+      let desc = `${i + 1}. ${s.action}`;
+      if (s.target_text) desc += ` → ${s.target_text}`;
+      if (s.text) desc += ` (输入: "${s.text.slice(0, 20)}")`;
+      stepEl.textContent = desc;
+      stepsList.appendChild(stepEl);
+    });
+    card.appendChild(stepsList);
+
+    const noteInput = document.createElement('textarea');
+    noteInput.className = 'agent-eval-note';
+    noteInput.placeholder = '备注（可选）：例如"这个流程用于查询本月订单"';
+    card.appendChild(noteInput);
+
+    const btnRow = document.createElement('div');
+    btnRow.className = 'agent-eval-btns';
+
+    const acceptBtn = document.createElement('button');
+    acceptBtn.className = 'agent-btn-allow';
+    acceptBtn.textContent = '✓ 确认保存';
+    acceptBtn.onclick = async () => {
+      acceptBtn.disabled = true;
+      try {
+        const { apiKey, safeApiUrl } = await resolveApiRequestConfig();
+        await callAgentApi(safeApiUrl, '/v1/knowledge/record', {
+          task_description: info.task,
+          trigger_prompt: info.task,
+          source: 'recorded',
+          page_fingerprint: info.fingerprint,
+          steps: info.steps,
+          user_note: noteInput.value.trim()
+        }, apiKey);
+        card.innerHTML = `<div class="agent-eval-done">✓ 已保存 ${info.steps.length} 步到知识库</div>`;
+      } catch (e) {
+        card.innerHTML = `<div class="agent-eval-done">保存失败: ${e.message || '未知错误'}</div>`;
+      }
+    };
+
+    const rejectBtn = document.createElement('button');
+    rejectBtn.className = 'agent-btn-deny';
+    rejectBtn.textContent = '✗ 放弃';
+    rejectBtn.onclick = () => {
+      card.innerHTML = '<div class="agent-eval-done">已放弃本次录制</div>';
+    };
+
+    btnRow.append(acceptBtn, rejectBtn);
+    card.appendChild(btnRow);
+    bubble.appendChild(card);
+    scrollToBottom();
+  }
+
   function renderAgentError(bubble, error) {
     const errorEl = document.createElement('div');
     errorEl.className = 'agent-error';
@@ -4614,21 +4680,12 @@ document.addEventListener('DOMContentLoaded', async () => {
           return;
         }
 
-        // 保存到知识库
-        try {
-          const { apiKey, safeApiUrl } = await resolveApiRequestConfig();
-          await callAgentApi(safeApiUrl, '/v1/knowledge/record', {
-            task_description: recordTask,
-            trigger_prompt: recordTask,
-            source: 'recorded',
-            page_fingerprint: recordFingerprint || {},
-            steps: recordedSteps,
-            user_note: ''
-          }, apiKey);
-          alert(`录制完成，已保存 ${recordedSteps.length} 步操作到知识库`);
-        } catch (e) {
-          alert(`保存失败: ${e.message || '未知错误'}`);
-        }
+        // 展示录制结果确认卡片，用户确认后才保存
+        renderRecordingConfirmCard({
+          task: recordTask,
+          steps: recordedSteps,
+          fingerprint: recordFingerprint || {}
+        });
       }
     });
   })();

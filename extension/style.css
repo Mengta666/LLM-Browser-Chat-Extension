@@ -567,6 +567,21 @@ input { width: 100%; padding: 8px; margin-top: 5px; box-sizing: border-box; bord
   font-weight: 600;
 }
 
+.agent-record-steps {
+  max-height: 160px;
+  overflow-y: auto;
+  margin-bottom: 8px;
+  padding: 6px 8px;
+  background: var(--app-bg, #fff);
+  border: 1px solid var(--app-border);
+  border-radius: 6px;
+}
+.agent-record-step {
+  font-size: 11px;
+  padding: 2px 0;
+  color: var(--app-text-muted);
+}
+
 .agent-goal-actions {
   padding: 4px 0 4px 12px;
   border-left: 1px dashed var(--app-border);

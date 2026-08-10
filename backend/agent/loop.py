@@ -103,10 +103,11 @@ def create_session(
 
 
 def cancel_session(session_id: str) -> bool:
-    session = _sessions.get(session_id)
-    if not session:
-        return False
-    session.status = AgentStatus.CANCELLED
+    with _sessions_lock:
+        session = _sessions.get(session_id)
+        if not session:
+            return False
+        session.status = AgentStatus.CANCELLED
     _agent_log.info("session_cancel", session_id=session_id,
                     data={"step": session.current_step})
     return True
@@ -139,6 +140,7 @@ def run_plan(
         session.messages = []
         session.failed_attempts = []
         session.blacklisted_approaches = []
+        session._retrying = True
 
     # 1. 记录上一步结果
     if action_result and session.pending_action:
@@ -185,7 +187,10 @@ def run_plan(
 
         if session.current_goal != old_goal:
             session.goal_step_count = 0
-            session.goal_retry_count = 0
+            # 超限重试不清 retry 计数，否则 max_retries_per_goal 永远触发不了
+            if not session._retrying:
+                session.goal_retry_count = 0
+        session._retrying = False
 
     session.status = AgentStatus.ACTION_REQUIRED
     return _build_response(session)
@@ -215,6 +220,13 @@ def run_action(
 
     reflection = build_reflection_prompt(session)
     if reflection:
+        # 剔除历史反思消息（首行哨兵），只保留最新一条，避免累积撑爆上下文
+        from agent.context_builder import REFLECT_SENTINEL
+        session.messages = [
+            m for m in session.messages
+            if not (m.get("role") == "user"
+                    and str(m.get("content", "")).startswith(REFLECT_SENTINEL))
+        ]
         session.messages.append({"role": "user", "content": reflection})
 
     client = _llm_client
@@ -371,18 +383,19 @@ MAX_LLM_RETRIES = 3
 RETRY_DELAYS = [0.5, 1, 2]
 
 
-def _llm_call_with_retry(
-    client: OpenAI, session: AgentSession,
-    tools=None, tool_choice=None,
+def _create_with_retry(
+    client: OpenAI, model: str, messages: list,
+    tools=None, tool_choice=None, session: Optional[AgentSession] = None,
 ):
-    """带重试的 LLM API 调用，区分可恢复/不可恢复错误。"""
+    """带重试的底层 LLM 调用。区分可恢复/不可恢复错误。
+
+    session 非空时：401/404 等致命错误直接置会话为 ERROR 并返回 None；
+    session 为空时（规划/评判等辅助调用）：所有错误重试耗尽后返回 None，不改会话状态。
+    """
     last_error = None
     for attempt in range(MAX_LLM_RETRIES):
         try:
-            kwargs = {
-                "model": session.model,
-                "messages": session.messages,
-            }
+            kwargs = {"model": model, "messages": messages}
             if tools:
                 kwargs["tools"] = tools
             if tool_choice:
@@ -396,28 +409,44 @@ def _llm_call_with_retry(
             last_error = f"网络连接失败: {str(e)[:100]}"
         except APIStatusError as e:
             if e.status_code == 401:
-                session.status = AgentStatus.ERROR
-                session.error = "API 认证失败 (401): 请检查 OPENAI_API_KEY 配置"
+                if session:
+                    session.status = AgentStatus.ERROR
+                    session.error = "API 认证失败 (401): 请检查 OPENAI_API_KEY 配置"
                 return None
             if e.status_code == 404:
-                session.status = AgentStatus.ERROR
-                session.error = f"模型不存在 (404): {session.model}"
+                if session:
+                    session.status = AgentStatus.ERROR
+                    session.error = f"模型不存在 (404): {model}"
                 return None
             if e.status_code >= 500:
                 last_error = f"API 服务端错误 ({e.status_code})"
             else:
-                session.status = AgentStatus.ERROR
-                session.error = f"API 错误 ({e.status_code}): {str(e)[:150]}"
-                return None
+                if session:
+                    session.status = AgentStatus.ERROR
+                    session.error = f"API 错误 ({e.status_code}): {str(e)[:150]}"
+                    return None
+                last_error = f"API 错误 ({e.status_code})"
         except Exception as e:
             last_error = f"未知错误: {type(e).__name__}: {str(e)[:100]}"
 
         if attempt < MAX_LLM_RETRIES - 1:
             time.sleep(RETRY_DELAYS[attempt])
 
-    session.status = AgentStatus.ERROR
-    session.error = f"LLM 调用失败（重试{MAX_LLM_RETRIES}次后放弃）: {last_error}"
+    if session:
+        session.status = AgentStatus.ERROR
+        session.error = f"LLM 调用失败（重试{MAX_LLM_RETRIES}次后放弃）: {last_error}"
     return None
+
+
+def _llm_call_with_retry(
+    client: OpenAI, session: AgentSession,
+    tools=None, tool_choice=None,
+):
+    """带重试的执行 LLM 调用（使用 session.messages）。"""
+    return _create_with_retry(
+        client, session.model, session.messages,
+        tools=tools, tool_choice=tool_choice, session=session,
+    )
 
 def _resolve_call_mode(session: AgentSession) -> CallMode:
     """根据配置和会话状态决定调用模式。"""
@@ -556,14 +585,13 @@ def _is_similar_target(a: str, b: str) -> bool:
     """判断两个 locator value 是否指向同一目标。"""
     if not a or not b:
         return a == b
-    # 完全相同
     if a == b:
         return True
-    # 一个包含另一个（如 "#btn" vs "btn"）
-    if a in b or b in a:
-        return True
-    # annotation_id 相同
-    if a.isdigit() and b.isdigit() and a == b:
+    # 纯数字（annotation_id）必须精确相等，避免 "1" 命中 "10"
+    if a.isdigit() or b.isdigit():
+        return a == b
+    # 子串包含仅在较短串足够长（≥4）时才算相似，避免短 css 片段互相误判
+    if (a in b or b in a) and min(len(a), len(b)) >= 4:
         return True
     return False
 
@@ -602,9 +630,7 @@ def _call_judgment_llm(session: AgentSession, page_state: PageState) -> FailedPa
     ]
 
     try:
-        response = _llm_client.chat.completions.create(
-            model=session.model, messages=messages,
-        )
+        response = _create_with_retry(_llm_client, session.model, messages)
     except Exception as e:
         _agent_log.error("judgment_call_error", session_id=session.session_id,
                          data={"error": f"{type(e).__name__}: {str(e)[:200]}"})
@@ -648,12 +674,9 @@ def _call_planning_llm(session: AgentSession, page_state: PageState) -> Optional
     has_kb = "📖 参考经验" in user_msg
     _agent_log.info("planning_prompt_debug", session_id=session.session_id,
                     data={"step": session.current_step, "has_kb_hint": has_kb,
-                          "prompt_len": len(user_msg),
-                          "prompt_head": user_msg[:1200]})
+                          "prompt_len": len(user_msg)})
     try:
-        response = _llm_client.chat.completions.create(
-            model=session.model, messages=messages,
-        )
+        response = _create_with_retry(_llm_client, session.model, messages)
     except Exception as e:
         _agent_log.error("planning_call_error", session_id=session.session_id,
                          data={"error": f"{type(e).__name__}: {str(e)[:200]}"})

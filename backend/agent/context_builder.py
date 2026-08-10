@@ -14,6 +14,10 @@ if TYPE_CHECKING:
     from agent.state import AgentSession
 
 
+# 反思消息首行哨兵：run_action 据此在追加新反思前剔除旧反思，防止累积
+REFLECT_SENTINEL = "[[reflect]]"
+
+
 SYSTEM_PROMPT = """你是一个浏览器自动化助手。用户会给你一个任务，你需要通过操作页面元素来完成它。
 
 ## 你的能力
@@ -387,11 +391,15 @@ def build_execution_goal_context(session: "AgentSession") -> str:
 
 
 def build_reflection_prompt(session: "AgentSession") -> str:
-    """当检测到重复失败时，生成反思提示。"""
+    """当检测到重复失败时，生成反思提示。
+
+    首行为哨兵 REFLECT_SENTINEL，供 run_action 在追加新反思前剔除旧反思，
+    避免反思消息逐步累积撑爆上下文。
+    """
     if not session.blacklisted_approaches and len(session.failed_attempts) < 3:
         return ""
 
-    parts = []
+    parts = [REFLECT_SENTINEL]
 
     if session.blacklisted_approaches:
         parts.append("## ⚠️ 反思提醒")
@@ -407,7 +415,8 @@ def build_reflection_prompt(session: "AgentSession") -> str:
         parts.append("")
         parts.append("连续多次失败，请换一种完全不同的方式。")
 
-    return "\n".join(parts) if parts else ""
+    # 仅有哨兵、无实际内容时不注入
+    return "\n".join(parts) if len(parts) > 1 else ""
 
 
 def build_system_prompt(goal_context: str = "") -> str:

@@ -21,7 +21,7 @@ class QdrantMongoBackend(KnowledgeBackend):
     def save(self, record: OperationRecord, vector: list[float]) -> str:
         raise NotImplementedError
 
-    def query(self, vector, fingerprint, top_k, min_score):
+    def query(self, vector, fingerprint, top_k, min_score, vec_min=0.0):
         raise NotImplementedError
 
     def update_usage(self, record_id: str, success: bool) -> None:

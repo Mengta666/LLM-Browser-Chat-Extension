@@ -4837,33 +4837,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (!tab?.id) { alert('无法获取当前标签页'); return; }
         recordTabId = tab.id;
 
-        // 采集起始页面指纹
+        // 采集起始页面指纹（复用 observePageState，避免与其重复维护同一段指纹逻辑）
         try {
-          const fpResults = await chrome.scripting.executeScript({
-            target: { tabId: tab.id, allFrames: false },
-            func: () => ({
-              site: location.hostname,
-              title_keywords: document.title.split(/[\s\-_|]+/).filter(w => w.length > 1).slice(0, 5),
-              menu_texts: (() => {
-                const raw = Array.from(document.querySelectorAll(
-                  'nav a, [class*="menu"] a, [class*="nav"] a, [role="menuitem"]'
-                )).map(el => (el.textContent || '').trim());
-                const seen = new Set();
-                const result = [];
-                for (const t of raw) {
-                  if (!t || t.length > 8) continue;
-                  if (/[\d()（）]/.test(t)) continue;
-                  if (seen.has(t)) continue;
-                  seen.add(t);
-                  result.push(t);
-                  if (result.length >= 12) break;
-                }
-                return result;
-              })(),
-              url_pattern: location.pathname
-            })
-          });
-          recordFingerprint = fpResults?.[0]?.result || null;
+          const startState = await observePageState();
+          recordFingerprint = startState?.page_fingerprint || null;
         } catch { /* ignore */ }
 
         startListeners();

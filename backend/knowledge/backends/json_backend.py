@@ -54,18 +54,34 @@ class JsonBackend(KnowledgeBackend):
         fingerprint: dict,
         top_k: int,
         min_score: float,
+        vec_min: float = 0.0,
     ) -> list[tuple[float, OperationRecord]]:
         results: list[tuple[float, OperationRecord]] = []
+        dim_mismatch = 0
         with self._lock:
             entries = list(self._records.values())
         for entry in entries:
             vec = entry.get("vector", [])
+            if vec and vector and len(vec) != len(vector):
+                dim_mismatch += 1
+                continue
             vec_sim = cosine(vector, vec)
+            if vec_sim < vec_min:
+                continue
             fp_record = entry["record"].get("page_fingerprint", {})
             score = combined_score(vec_sim, fingerprint, fp_record)
             if score >= min_score:
                 rec = OperationRecord.from_dict(entry["record"])
                 results.append((score, rec))
+        if dim_mismatch:
+            try:
+                from observability.logger import get_logger
+                get_logger("agent").warn("kb_vector_dim_mismatch", data={
+                    "skipped": dim_mismatch, "query_dim": len(vector),
+                    "hint": "EMBEDDING_MODEL 维度与已存记录不一致，这些记录被跳过",
+                })
+            except Exception:
+                pass
         # 综合分降序；同分时质量分高的优先
         results.sort(key=lambda x: (x[0], x[1].quality_score()), reverse=True)
         return results[:top_k]

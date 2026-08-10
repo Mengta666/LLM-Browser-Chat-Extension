@@ -21,6 +21,7 @@ load_dotenv(dotenv_path=__env_path)
 KNOWLEDGE_DIR = Path(__file__).resolve().parent / "records"
 KNOWLEDGE_BACKEND = os.getenv("KNOWLEDGE_BACKEND", "json")
 KNOWLEDGE_MIN_SCORE = float(os.getenv("KNOWLEDGE_MIN_SCORE", "0.65"))
+KNOWLEDGE_VEC_MIN = float(os.getenv("KNOWLEDGE_VEC_MIN", "0.55"))
 KNOWLEDGE_TOP_K = int(os.getenv("KNOWLEDGE_TOP_K", "1"))
 # 保存去重阈值：新记录与已有记录综合相似度 ≥ 此值时视为同一任务，覆盖更新
 KNOWLEDGE_DEDUP_SCORE = float(os.getenv("KNOWLEDGE_DEDUP_SCORE", "0.9"))
@@ -46,21 +47,24 @@ def new_record_id() -> str:
 def save_record(record: OperationRecord, vector: list[float]) -> str:
     """保存记录（业务层入口）。
 
-    去重：若已存在同任务（综合相似度 ≥ KNOWLEDGE_DEDUP_SCORE）的记录，
-    则覆盖更新——沿用旧记录的引用统计（used_count/success_after_use），
+    去重：若已存在**同 source** 同任务（综合相似度 ≥ KNOWLEDGE_DEDUP_SCORE）
+    的记录，则覆盖更新——沿用旧记录的引用统计（used_count/success_after_use），
     删除旧记录后写入新记录，避免同一任务重复累积。
+    不同 source（如 recorded vs confirmed）视为不同记录，并存不覆盖。
     """
     if not record.created_at:
         record.created_at = time.strftime("%Y-%m-%dT%H:%M:%S")
 
     fingerprint = record.page_fingerprint or {}
-    duplicates = _backend.query(vector, fingerprint, top_k=1, min_score=KNOWLEDGE_DEDUP_SCORE)
-    if duplicates:
-        _score, old = duplicates[0]
+    duplicates = _backend.query(vector, fingerprint, top_k=5, min_score=KNOWLEDGE_DEDUP_SCORE)
+    for _score, old in duplicates:
+        if old.source != record.source:
+            continue
         # 沿用旧记录的引用统计
         record.used_count = old.used_count
         record.success_after_use = old.success_after_use
         _backend.delete(old.id)
+        break
 
     return _backend.save(record, vector)
 
@@ -77,6 +81,7 @@ def query_records(
         fingerprint,
         top_k if top_k is not None else KNOWLEDGE_TOP_K,
         min_score if min_score is not None else KNOWLEDGE_MIN_SCORE,
+        vec_min=KNOWLEDGE_VEC_MIN,
     )
 
 

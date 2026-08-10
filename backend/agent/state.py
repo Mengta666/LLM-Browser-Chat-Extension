@@ -107,6 +107,7 @@ class AgentSession:
     max_steps_per_goal: int = 10
     max_retries_per_goal: int = 3
     failed_paths: list[FailedPath] = field(default_factory=list)
+    _retrying: bool = False  # 本轮是超限重试（而非用户/规划切换目标）
 
     # 反思机制
     failed_attempts: list[FailedAttempt] = field(default_factory=list)

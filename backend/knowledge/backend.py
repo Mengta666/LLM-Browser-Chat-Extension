@@ -25,8 +25,13 @@ class KnowledgeBackend(ABC):
         fingerprint: dict,
         top_k: int,
         min_score: float,
+        vec_min: float = 0.0,
     ) -> list[tuple[float, OperationRecord]]:
-        """向量召回 + 指纹加权，返回 [(score, record), ...] 按分降序。"""
+        """向量召回 + 指纹加权，返回 [(score, record), ...] 按分降序。
+
+        vec_min: 向量相似度独立下限。综合分含指纹/域名地板分，
+        同域同页时仅靠地板分即可越过 min_score，故对向量另设下限避免误召回。
+        """
         ...
 
     @abstractmethod

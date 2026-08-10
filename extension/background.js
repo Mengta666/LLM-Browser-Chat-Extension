@@ -456,6 +456,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
 
+  if (request.type === 'DEBUGGER_HOVER') {
+    handleDebuggerHover(request.tabId, request.x, request.y)
+      .then(() => sendResponse({ ok: true }))
+      .catch((error) => sendResponse({ ok: false, error: error?.message || '未知错误' }));
+    return true;
+  }
+
   if (request.type === 'DEBUGGER_DETACH') {
     debuggerDetach(request.tabId)
       .then(() => sendResponse({ ok: true }))
@@ -490,6 +497,14 @@ async function handleDebuggerClick(tabId, x, y) {
   });
   await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
     type: 'mouseReleased', x, y, button: 'left', clickCount: 1
+  });
+}
+
+// 真实鼠标移动，触发 hover 浮层（CSS :hover 和 JS mouseenter 都生效）
+async function handleDebuggerHover(tabId, x, y) {
+  await debuggerEnsureAttached(tabId);
+  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
+    type: 'mouseMoved', x, y
   });
 }
 

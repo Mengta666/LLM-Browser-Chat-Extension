@@ -10,24 +10,31 @@ from typing import Any, Optional
 
 @dataclass
 class OperationStep:
-    """一个操作步骤。"""
+    """一个操作步骤（语义化）。"""
     action: str                  # click/type/scroll/navigate/select 等
+    intent: str = ""             # 高层意图（这一步为了什么）
     target_text: str = ""        # 元素可见文本
-    css_selector: str = ""       # 定位选择器
+    css_selector: str = ""       # 稳定定位选择器（动态ID已清洗）
     text: str = ""               # type 动作的输入内容
-    url_pattern: str = ""        # 操作时的 URL 路径（去域名）
+    value: str = ""              # select 动作选中的值
+    url_before: str = ""         # 操作前的 URL 路径
+    result: str = ""             # 操作结果描述
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        # 省略空字段以精简存储（from_dict 用默认值补回）
+        return {k: v for k, v in asdict(self).items() if v not in ("", None)}
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "OperationStep":
         return cls(
             action=d.get("action", ""),
+            intent=d.get("intent", ""),
             target_text=d.get("target_text", ""),
             css_selector=d.get("css_selector", ""),
             text=d.get("text", ""),
-            url_pattern=d.get("url_pattern", ""),
+            value=d.get("value", ""),
+            url_before=d.get("url_before") or d.get("url_pattern", ""),
+            result=d.get("result", ""),
         )
 
 

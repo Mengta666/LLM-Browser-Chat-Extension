@@ -136,6 +136,7 @@ STEP_PLANNING_PROMPT = """你是一个浏览器自动化规划助手。根据用
 ## 第二步：基于匹配结果规划
 - 如果匹配到了元素：current_goal 和 next_action_hint 必须围绕该元素展开
 - 如果没有匹配：按正常逻辑自由规划
+- **重要**：如果参考经验或任务明确提到某入口（如"Coding"），但当前元素列表里找不到它，不要反复点击/搜索去凑——它很可能藏在悬浮菜单里。此时用 hover 动作悬浮"更多应用/菜单"类触发器，展开后目标会出现在下一次观察中，再点击。绝不要在找不到入口时原地打转。
 
 ## 输出格式
 只输出 JSON，不要其他文字：
@@ -216,22 +217,53 @@ def _build_knowledge_hint(session: "AgentSession", page_state: PageState) -> str
 
         vector = embed_text(session.task)
         results = query_records(vector, fingerprint)
-    except Exception:
+    except Exception as exc:
+        try:
+            from observability.logger import get_logger
+            get_logger("agent").warn("kb_recall_error", session_id=session.session_id,
+                                     data={"error": str(exc)[:200]})
+        except Exception:
+            pass
         return ""
 
     if not results:
         session._kb_hint_cache = ""
+        try:
+            from observability.logger import get_logger
+            get_logger("agent").info("kb_recall_miss", session_id=session.session_id,
+                                     data={"task": session.task[:80]})
+        except Exception:
+            pass
         return ""
 
     score, rec = results[0]
-    steps_str = " → ".join(
-        f"{s.get('action', '?')}:{s.get('target_text', '')[:12]}"
-        for s in rec.steps[:8]
-    )
+    try:
+        from observability.logger import get_logger
+        get_logger("agent").info("kb_recall_hit", session_id=session.session_id,
+                                 data={"score": round(score, 3), "record_id": rec.id,
+                                       "matched_task": rec.task_description[:80]})
+    except Exception:
+        pass
+    # 优先展示 intent（高层意图），无则回退到 action:target
+    step_lines = []
+    for i, s in enumerate(rec.steps[:8]):
+        intent = s.get("intent", "").strip()
+        if intent:
+            desc = intent
+        else:
+            desc = f"{s.get('action', '?')}"
+            if s.get("target_text"):
+                desc += f" {s['target_text'][:12]}"
+            if s.get("value"):
+                desc += f" = {s['value']}"
+            elif s.get("text"):
+                desc += f" 输入'{s['text'][:15]}'"
+        step_lines.append(f"  {i+1}. {desc}")
     lines = [
         f"\n## 📖 参考经验（用户确认的成功路径，相似度{score:.2f}）",
         f"相似任务: {rec.task_description}",
-        f"操作步骤: {steps_str}",
+        "操作步骤:",
+        *step_lines,
     ]
     if rec.user_note:
         lines.append(f"💡 用户提示: {rec.user_note}")

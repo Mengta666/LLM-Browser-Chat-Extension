@@ -643,6 +643,13 @@ def _call_judgment_llm(session: AgentSession, page_state: PageState) -> FailedPa
 def _call_planning_llm(session: AgentSession, page_state: PageState) -> Optional[dict]:
     """调用规划 LLM，返回解析后的 plan dict。失败返回 None。"""
     messages = build_step_planning_messages(session, page_state)
+    # 埋点：记录规划 prompt 是否包含参考经验，以及首屏元素文本
+    user_msg = next((m["content"] for m in messages if m.get("role") == "user"), "")
+    has_kb = "📖 参考经验" in user_msg
+    _agent_log.info("planning_prompt_debug", session_id=session.session_id,
+                    data={"step": session.current_step, "has_kb_hint": has_kb,
+                          "prompt_len": len(user_msg),
+                          "prompt_head": user_msg[:1200]})
     try:
         response = _llm_client.chat.completions.create(
             model=session.model, messages=messages,

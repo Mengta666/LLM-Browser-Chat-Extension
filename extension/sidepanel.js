@@ -3360,9 +3360,22 @@ document.addEventListener('DOMContentLoaded', async () => {
         const pageFingerprint = {
           site: location.hostname,
           title_keywords: document.title.split(/[\s\-_|]+/).filter(w => w.length > 1).slice(0, 5),
-          menu_texts: Array.from(document.querySelectorAll(
-            'nav a, [class*="menu"] a, [class*="nav"] a, [class*="nav"] span, [role="menuitem"], [data-id]'
-          )).map(el => (el.textContent || '').trim()).filter(t => t && t.length <= 12).slice(0, 20),
+          menu_texts: (() => {
+            const raw = Array.from(document.querySelectorAll(
+              'nav a, [class*="menu"] a, [class*="nav"] a, [role="menuitem"]'
+            )).map(el => (el.textContent || '').trim());
+            const seen = new Set();
+            const result = [];
+            for (const t of raw) {
+              if (!t || t.length > 8) continue;
+              if (/[\d()（）]/.test(t)) continue;
+              if (seen.has(t)) continue;
+              seen.add(t);
+              result.push(t);
+              if (result.length >= 12) break;
+            }
+            return result;
+          })(),
           url_pattern: location.pathname
         };
 
@@ -3832,12 +3845,33 @@ document.addEventListener('DOMContentLoaded', async () => {
               element.scrollIntoView({ block: 'center', behavior: 'smooth' });
               await new Promise(r => setTimeout(r, 200));
               const rect = element.getBoundingClientRect();
-              const evtOpts = { bubbles: true, clientX: rect.left + rect.width/2, clientY: rect.top + rect.height/2 };
+              const cx = rect.left + rect.width / 2;
+              const cy = rect.top + rect.height / 2;
+              // 计算顶层视口绝对坐标（处理 iframe 偏移）
+              let offsetX = 0, offsetY = 0;
+              let win = window;
+              while (win !== win.parent) {
+                try {
+                  const frame = win.frameElement;
+                  if (frame) {
+                    const frameRect = frame.getBoundingClientRect();
+                    offsetX += frameRect.left;
+                    offsetY += frameRect.top;
+                  }
+                  win = win.parent;
+                } catch (e) { break; }
+              }
+              // 同时派发合成事件（对 JS mouseenter 浮层兜底），坐标交外层 debugger 真实移动
+              const evtOpts = { bubbles: true, clientX: cx, clientY: cy };
               element.dispatchEvent(new PointerEvent('pointerenter', evtOpts));
               element.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
               element.dispatchEvent(new MouseEvent('mouseenter', evtOpts));
-              element.dispatchEvent(new MouseEvent('mousemove', evtOpts));
-              return { success: true, details: `悬停在 ${locator?.value || '元素'}`, action_type: type };
+              return {
+                success: true,
+                details: `悬停在 ${locator?.value || '元素'}`,
+                action_type: type,
+                _hoverCoords: { x: cx + offsetX, y: cy + offsetY }
+              };
             }
 
             case 'focus':
@@ -3945,6 +3979,19 @@ document.addEventListener('DOMContentLoaded', async () => {
         }).catch(() => {});
       }
       delete result._clickCoords;
+    }
+
+    // hover 操作：用 debugger 真实移动鼠标触发悬浮浮层（CSS/JS hover 都生效）
+    if (result.success && result._hoverCoords && action.type === 'hover') {
+      const { x, y } = result._hoverCoords;
+      try {
+        await chrome.runtime.sendMessage({
+          type: 'DEBUGGER_HOVER', tabId: tab.id, x: Math.round(x), y: Math.round(y)
+        });
+        // 等浮层展开动画完成；鼠标停留在触发器上，下一步采集能抓到浮层内元素
+        await new Promise(r => setTimeout(r, 500));
+      } catch (e) { /* debugger 不可用，已派发合成事件兜底 */ }
+      delete result._hoverCoords;
     }
 
     return { ...result, timestamp: Date.now() };
@@ -4117,9 +4164,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     info.executedSteps.forEach((s, i) => {
       const stepEl = document.createElement('div');
       stepEl.className = 'agent-record-step';
-      let desc = `${i + 1}. ${s.action}`;
-      if (s.target_text) desc += ` → ${s.target_text}`;
-      if (s.text) desc += ` (输入: "${s.text.slice(0, 20)}")`;
+      let desc;
+      if (s.intent) {
+        desc = `${i + 1}. ${s.intent}`;
+      } else {
+        desc = `${i + 1}. ${s.action}`;
+        if (s.target_text) desc += ` → ${s.target_text}`;
+        if (s.value) desc += ` = ${s.value}`;
+        else if (s.text) desc += ` (输入: "${s.text.slice(0, 20)}")`;
+      }
       stepEl.textContent = desc;
       traceList.appendChild(stepEl);
     });
@@ -4221,14 +4274,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     acceptBtn.onclick = async () => {
       acceptBtn.disabled = true;
       try {
-        const { apiKey, safeApiUrl } = await resolveApiRequestConfig();
+        const { apiKey, safeApiUrl, modelName } = await resolveApiRequestConfig();
         await callAgentApi(safeApiUrl, '/v1/knowledge/record', {
           task_description: info.task,
           trigger_prompt: info.task,
           source: 'recorded',
           page_fingerprint: info.fingerprint,
           steps: info.steps,
-          user_note: noteInput.value.trim()
+          user_note: noteInput.value.trim(),
+          model: modelName || ''
         }, apiKey);
         card.innerHTML = `<div class="agent-eval-done">✓ 已保存 ${info.steps.length} 步到知识库</div>`;
       } catch (e) {
@@ -4403,14 +4457,17 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         renderAgentStepInBubble(aiBubble, response.step, null, null, actionResult);
 
-        // 记录成功的操作步骤（供知识库保存）
+        // 记录成功的操作步骤（供知识库保存，含意图/值/结果）
         if (actionResult.success && action.type !== 'wait') {
           executedSteps.push({
+            intent: response.thought || response.plan?.current_goal || '',
             action: action.type,
             target_text: action.locator?.value || '',
             css_selector: action.locator?.method === 'css' ? action.locator.value : '',
             text: action.params?.text || '',
-            url_pattern: pageState?.url ? new URL(pageState.url).pathname : ''
+            value: action.params?.option_text || action.params?.value || '',
+            url_before: preUrl ? new URL(preUrl).pathname : '',
+            result: actionResult.details || ''
           });
         }
         if (!firstFingerprint && pageState?.page_fingerprint) {
@@ -4421,6 +4478,22 @@ document.addEventListener('DOMContentLoaded', async () => {
         const activeTab = await getActiveBrowserTab().catch(() => null);
         if (activeTab?.id) {
           await waitForPageSettle(activeTab.id);
+        }
+
+        // 导航后先移鼠标到中性位收掉 hover 残留浮层，再观察，保证采集到收起后的干净页面
+        const preObserveTab = await getActiveBrowserTab().catch(() => null);
+        if (preObserveTab?.id) {
+          // 仅当页面可能已导航时才重置（避免干扰 hover→click 链路）
+          try {
+            const curUrl = await chrome.scripting.executeScript({
+              target: { tabId: preObserveTab.id, allFrames: false },
+              func: () => location.href
+            }).then(r => r?.[0]?.result).catch(() => null);
+            if (curUrl && curUrl !== preUrl) {
+              await chrome.runtime.sendMessage({ type: 'DEBUGGER_HOVER', tabId: preObserveTab.id, x: 2, y: 2 });
+              await new Promise(r => setTimeout(r, 250));
+            }
+          } catch (e) { /* ignore */ }
         }
 
         const newPageState = await observePageState();
@@ -4593,6 +4666,162 @@ document.addEventListener('DOMContentLoaded', async () => {
     let recordedSteps = [];
     let recordTask = '';
     let recordFingerprint = null;
+    let recordTabId = null;
+    let pageEpoch = 0;              // 每次注入递增，用于跨页面步骤排序
+    let stepListener = null;
+    let reinjectListener = null;
+
+    // 注入到页面的录制拦截脚本（可重复注入，幂等）
+    function recorderScriptFn(epoch) {
+      // 已装过监听器：只重开标志 + 更新 epoch，不重复装（防风险2）
+      if (window.__agentRecorderInstalled) {
+        window.__agentRecording = true;
+        window.__agentRecordEpoch = epoch;
+        return;
+      }
+      window.__agentRecorderInstalled = true;
+      window.__agentRecording = true;
+      window.__agentRecordEpoch = epoch;
+      window.__agentSeq = 0;
+
+      function selectorOf(el) {
+        if (el.id && !el.id.match(/^[\d:]/) && !el.id.includes('--')) return `#${el.id}`;
+        const testId = el.getAttribute('data-testid') || el.getAttribute('data-cy');
+        if (testId) return `[data-testid="${testId}"]`;
+        return '';
+      }
+
+      function interactiveAncestor(el) {
+        return el.closest(
+          'button, a, [role="button"], [role="menuitem"], [role="option"], [role="tab"], [role="checkbox"], [role="radio"], li, td'
+        ) || el;
+      }
+
+      function labelTextOf(el) {
+        if (el.id) {
+          const lbl = document.querySelector(`label[for="${el.id}"]`);
+          if (lbl) return (lbl.textContent || '').trim().slice(0, 40);
+        }
+        const wrap = el.closest('label');
+        if (wrap) return (wrap.textContent || '').trim().slice(0, 40);
+        return el.name || el.getAttribute('aria-label') || '';
+      }
+
+      // 上报一步到侧边栏（导航不会丢，防风险1的持久化）
+      function sendStep(step) {
+        try {
+          chrome.runtime.sendMessage({
+            type: 'RECORD_STEP',
+            step: { ...step, epoch: window.__agentRecordEpoch, seq: window.__agentSeq++ }
+          });
+        } catch { /* 扩展上下文失效（导航中），忽略（防风险3） */ }
+      }
+
+      // click：向上找可交互祖先（防目标不准）
+      document.addEventListener('click', (e) => {
+        if (!window.__agentRecording) return;
+        const el = interactiveAncestor(e.target);
+        // checkbox/radio 交给 change 处理，避免重复
+        if (el.type === 'checkbox' || el.type === 'radio') return;
+        sendStep({
+          action: 'click',
+          target_text: (el.textContent || el.getAttribute('aria-label') || '').trim().slice(0, 40),
+          css_selector: selectorOf(el),
+          url_before: location.pathname
+        });
+      }, true);
+
+      // change：select下拉、checkbox、radio
+      document.addEventListener('change', (e) => {
+        if (!window.__agentRecording) return;
+        const el = e.target;
+        const tag = el.tagName.toLowerCase();
+        if (tag === 'select') {
+          sendStep({
+            action: 'select',
+            target_text: el.name || el.getAttribute('aria-label') || labelTextOf(el),
+            css_selector: selectorOf(el),
+            value: (el.options[el.selectedIndex] || {}).text || el.value || '',
+            url_before: location.pathname
+          });
+        } else if (el.type === 'checkbox' || el.type === 'radio') {
+          sendStep({
+            action: 'click',
+            target_text: labelTextOf(el),
+            css_selector: selectorOf(el),
+            value: el.checked ? '选中' : '取消',
+            url_before: location.pathname
+          });
+        }
+      }, true);
+
+      // keydown：只记录关键键
+      document.addEventListener('keydown', (e) => {
+        if (!window.__agentRecording) return;
+        if (['Enter', 'Escape', 'Tab'].includes(e.key)) {
+          sendStep({ action: 'press_key', key: e.key, url_before: location.pathname });
+        }
+      }, true);
+
+      // input：debounce + blur 兜底（防吞输入，风险处理）
+      let inputTimer = null;
+      let pendingInput = null;
+      function flushInput() {
+        clearTimeout(inputTimer);
+        if (!pendingInput) return;
+        sendStep(pendingInput);
+        pendingInput = null;
+      }
+      document.addEventListener('input', (e) => {
+        if (!window.__agentRecording) return;
+        const el = e.target;
+        pendingInput = {
+          action: 'type',
+          target_text: el.placeholder || el.name || el.getAttribute('aria-label') || '',
+          css_selector: selectorOf(el),
+          text: (el.value || '').slice(0, 50),
+          url_before: location.pathname
+        };
+        clearTimeout(inputTimer);
+        inputTimer = setTimeout(flushInput, 800);
+      }, true);
+      document.addEventListener('blur', () => {
+        if (window.__agentRecording) flushInput();
+      }, true);
+    }
+
+    async function injectRecorderScript(tabId, epoch) {
+      await chrome.scripting.executeScript({
+        target: { tabId, allFrames: true },
+        func: recorderScriptFn,
+        args: [epoch]
+      }).catch(() => {});
+    }
+
+    function startListeners() {
+      stepListener = (msg, sender) => {
+        if (msg.type === 'RECORD_STEP' && recording && sender.tab?.id === recordTabId) {
+          recordedSteps.push(msg.step);
+        }
+      };
+      reinjectListener = (tabId, info) => {
+        if (recording && tabId === recordTabId && info.status === 'complete') {
+          pageEpoch += 1;
+          injectRecorderScript(tabId, pageEpoch);  // 跳转后重注入（防风险3）
+        }
+      };
+      chrome.runtime.onMessage.addListener(stepListener);
+      chrome.tabs.onUpdated.addListener(reinjectListener);
+    }
+
+    function stopListeners() {
+      if (stepListener) chrome.runtime.onMessage.removeListener(stepListener);
+      if (reinjectListener) chrome.tabs.onUpdated.removeListener(reinjectListener);
+      stepListener = reinjectListener = null;
+    }
+
+    // 侧边栏关闭兜底，防 listener 泄漏（风险1）
+    window.addEventListener('beforeunload', () => { if (recording) stopListeners(); });
 
     recordBtn.addEventListener('click', async () => {
       if (!recording) {
@@ -4602,9 +4831,11 @@ document.addEventListener('DOMContentLoaded', async () => {
         recordTask = desc.trim();
         recordedSteps = [];
         recordFingerprint = null;
+        pageEpoch = 1;
 
         const tab = await getActiveBrowserTab().catch(() => null);
         if (!tab?.id) { alert('无法获取当前标签页'); return; }
+        recordTabId = tab.id;
 
         // 采集起始页面指纹
         try {
@@ -4613,106 +4844,68 @@ document.addEventListener('DOMContentLoaded', async () => {
             func: () => ({
               site: location.hostname,
               title_keywords: document.title.split(/[\s\-_|]+/).filter(w => w.length > 1).slice(0, 5),
-              menu_texts: Array.from(document.querySelectorAll(
-                'nav a, [class*="menu"] a, [class*="nav"] a, [role="menuitem"], [data-id]'
-              )).map(el => (el.textContent || '').trim()).filter(t => t && t.length <= 12).slice(0, 20),
+              menu_texts: (() => {
+                const raw = Array.from(document.querySelectorAll(
+                  'nav a, [class*="menu"] a, [class*="nav"] a, [role="menuitem"]'
+                )).map(el => (el.textContent || '').trim());
+                const seen = new Set();
+                const result = [];
+                for (const t of raw) {
+                  if (!t || t.length > 8) continue;
+                  if (/[\d()（）]/.test(t)) continue;
+                  if (seen.has(t)) continue;
+                  seen.add(t);
+                  result.push(t);
+                  if (result.length >= 12) break;
+                }
+                return result;
+              })(),
               url_pattern: location.pathname
             })
           });
           recordFingerprint = fpResults?.[0]?.result || null;
         } catch { /* ignore */ }
 
-        // 注入录制拦截脚本到所有 frame
-        await chrome.scripting.executeScript({
-          target: { tabId: tab.id, allFrames: true },
-          func: () => {
-            if (window.__agentRecorderInstalled) return;
-            window.__agentRecorderInstalled = true;
-            window.__agentRecordedSteps = [];
-
-            function selectorOf(el) {
-              if (el.id && !el.id.match(/^[\d:]/)) return `#${el.id}`;
-              const testId = el.getAttribute('data-testid');
-              if (testId) return `[data-testid="${testId}"]`;
-              return '';
-            }
-
-            document.addEventListener('click', (e) => {
-              if (!window.__agentRecording) return;
-              const el = e.target;
-              window.__agentRecordedSteps.push({
-                action: 'click',
-                target_text: (el.textContent || '').trim().slice(0, 40),
-                css_selector: selectorOf(el),
-                text: '',
-                url_pattern: location.pathname
-              });
-            }, true);
-
-            let inputTimer = null;
-            document.addEventListener('input', (e) => {
-              if (!window.__agentRecording) return;
-              const el = e.target;
-              clearTimeout(inputTimer);
-              inputTimer = setTimeout(() => {
-                window.__agentRecordedSteps.push({
-                  action: 'type',
-                  target_text: el.placeholder || el.name || '',
-                  css_selector: selectorOf(el),
-                  text: (el.value || '').slice(0, 50),
-                  url_pattern: location.pathname
-                });
-              }, 500);
-            }, true);
-          }
-        }).catch(() => {});
-
-        // 打开录制标志
-        await chrome.scripting.executeScript({
-          target: { tabId: tab.id, allFrames: true },
-          func: () => { window.__agentRecording = true; }
-        }).catch(() => {});
+        startListeners();
+        await injectRecorderScript(tab.id, pageEpoch);
 
         recording = true;
         recordBtn.classList.add('is-active');
         recordBtn.textContent = '⏹️ 停止录制';
       } else {
-        // 停止录制并保存
+        // 停止录制
         recording = false;
         recordBtn.classList.remove('is-active');
         recordBtn.textContent = '⏺️ 录制';
 
-        const tab = await getActiveBrowserTab().catch(() => null);
-        if (tab?.id) {
-          try {
-            const results = await chrome.scripting.executeScript({
-              target: { tabId: tab.id, allFrames: true },
-              func: () => {
-                window.__agentRecording = false;
-                const steps = window.__agentRecordedSteps || [];
-                window.__agentRecordedSteps = [];
-                return steps;
-              }
-            });
-            // 合并所有 frame 的录制步骤
-            for (const r of results) {
-              if (r?.result?.length) recordedSteps.push(...r.result);
-            }
-          } catch { /* ignore */ }
+        // 关闭页面录制标志（尽力而为）
+        if (recordTabId != null) {
+          await chrome.scripting.executeScript({
+            target: { tabId: recordTabId, allFrames: true },
+            func: () => { window.__agentRecording = false; }
+          }).catch(() => {});
         }
+        stopListeners();
 
         if (recordedSteps.length === 0) {
           alert('未录制到任何操作');
+          recordTabId = null;
           return;
         }
 
-        // 展示录制结果确认卡片，用户确认后才保存
+        // 按 (epoch, seq) 排序，保证跨页面顺序正确（风险3/4）
+        recordedSteps.sort((a, b) =>
+          (a.epoch || 0) - (b.epoch || 0) || (a.seq || 0) - (b.seq || 0)
+        );
+
         renderRecordingConfirmCard({
           task: recordTask,
           steps: recordedSteps,
           fingerprint: recordFingerprint || {}
         });
+        recordTabId = null;
       }
     });
   })();
 });
+

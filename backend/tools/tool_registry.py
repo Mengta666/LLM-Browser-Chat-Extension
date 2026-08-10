@@ -105,7 +105,7 @@ ACTION_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "hover",
-            "description": "悬停在元素上（触发 tooltip 或下拉菜单）",
+            "description": "悬停在元素上以展开悬浮菜单/下拉/tooltip。当任务需要的入口（如某个应用、菜单项）在当前元素列表中找不到时，它很可能藏在悬浮菜单里——先 hover『更多应用』『菜单』等触发器，展开后目标就会出现在下一次观察中。",
             "parameters": {
                 "type": "object",
                 "properties": {

@@ -29,6 +29,7 @@ class RecordSaveRequest(BaseModel):
     page_fingerprint: dict[str, Any] = {}
     steps: list[dict[str, Any]] = []
     user_note: str = ""
+    model: str = ""              # 用于 recorded 记录的 intent 补全
 
 
 class UsageReportRequest(BaseModel):
@@ -57,13 +58,23 @@ def create_record(item: RecordSaveRequest) -> dict[str, Any]:
     if not item.steps:
         raise HTTPException(400, "steps 不能为空")
 
+    from knowledge.cleaner import clean_steps, clean_fingerprint
+    cleaned_steps = clean_steps(item.steps)
+    if not cleaned_steps:
+        raise HTTPException(400, "清洗后无有效步骤")
+
+    # recorded 记录缺少 intent，调 LLM 批量补全（失败不阻断）
+    if item.source == "recorded" and item.model:
+        from knowledge.enricher import enrich_intents
+        cleaned_steps = enrich_intents(item.task_description, cleaned_steps, item.model)
+
     record = OperationRecord(
         id=new_record_id(),
         task_description=item.task_description,
         trigger_prompt=item.trigger_prompt,
         source=item.source,
-        page_fingerprint=item.page_fingerprint,
-        steps=item.steps,
+        page_fingerprint=clean_fingerprint(item.page_fingerprint),
+        steps=cleaned_steps,
         user_note=item.user_note,
     )
 

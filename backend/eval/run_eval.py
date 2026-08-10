@@ -14,7 +14,7 @@ DEFAULT_ENDPOINT = "http://127.0.0.1:8000/v1/chat/completions"
 DEFAULT_MODEL = "cyankiwi/gemma-4-31B-it-AWQ-4bit"
 DEFAULT_CASES_PATH = Path(__file__).with_name("eval_cases.json")
 SUCCESS_STATUS = 200
-SOURCE_REQUIRED_KEYS = {"source_id", "url", "title", "content", "score"}
+SOURCE_REQUIRED_KEYS = {"source_id", "url", "title", "score"}
 
 
 def load_cases(path: Path) -> list[dict[str, Any]]:

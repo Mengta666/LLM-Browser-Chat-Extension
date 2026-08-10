@@ -8,9 +8,11 @@
 
 import os
 from typing import Any
+from urllib.parse import urlsplit
 
 from common.page_identity import (
     build_chunk_id,
+    canonicalize_url,
     build_page_identity,
     build_point_id,
 )
@@ -369,9 +371,21 @@ def index_or_reuse_page(
 def _hit_to_source(index: int, hit: dict[str, Any]) -> dict[str, Any]:
     """把 Qdrant 命中结果转换成前端引用卡片需要的 source 结构。"""
     payload = hit.get("payload") or {}
+    url = str(payload.get("url", ""))
+    canonical_url = str(payload.get("canonical_url", ""))
+    if not canonical_url and url:
+        try:
+            canonical_url = canonicalize_url(url)
+        except ValueError:
+            canonical_url = url
+    domain = urlsplit(canonical_url or url).hostname or ""
     return {
         "source_id": f"S{index}",
+        "type": "page",
+        "source_kind": "current_page",
         "url": str(payload.get("url", "")),
+        "canonical_url": canonical_url,
+        "domain": domain.lower(),
         "title": str(payload.get("title", "")),
         "content": str(payload.get("content", "")),
         "score": float(hit.get("score", 0.0) or 0.0),

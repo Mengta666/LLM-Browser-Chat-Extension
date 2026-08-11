@@ -293,6 +293,11 @@ def _call_with_tools(
     client: OpenAI, session: AgentSession
 ) -> tuple[Optional[str], dict, str]:
     """使用 tools 参数调用 LLM，解析 tool_calls 返回。"""
+    _tok = _estimate_tokens(session.messages, tools=ACTION_SCHEMAS)
+    _agent_log.info("exec_prompt_tokens", session_id=session.session_id,
+                    data={"step": session.current_step, "call": "tool_calls",
+                          "total": _tok["total"], "messages": _tok["messages"],
+                          "tools": _tok["tools"], "method": _tok["method"]})
     response = _llm_call_with_retry(
         client, session,
         tools=ACTION_SCHEMAS,
@@ -355,6 +360,11 @@ def _call_text_parse(
             url="", title="", elements=[]
         ))
 
+    _tok = _estimate_tokens(session.messages)
+    _agent_log.info("exec_prompt_tokens", session_id=session.session_id,
+                    data={"step": session.current_step, "call": "text_parse",
+                          "total": _tok["total"], "messages": _tok["messages"],
+                          "tools": _tok["tools"], "method": _tok["method"]})
     response = _llm_call_with_retry(client, session)
     if response is None:
         return None, {}, ""
@@ -381,6 +391,49 @@ def _call_text_parse(
 
 MAX_LLM_RETRIES = 3
 RETRY_DELAYS = [0.5, 1, 2]
+
+# token 估算：优先 tiktoken（精确），失败退回字符启发式（中文~1.5char/tok，其余~4char/tok）
+try:
+    import tiktoken
+    _tok_enc = tiktoken.get_encoding("cl100k_base")
+except Exception:
+    _tok_enc = None
+
+
+def _estimate_tokens(messages: list, tools=None) -> dict:
+    """估算一次 LLM 调用的输入 token。返回 {total, messages, tools, method}。"""
+    def _count(text: str) -> int:
+        if not text:
+            return 0
+        if _tok_enc is not None:
+            try:
+                return len(_tok_enc.encode(text))
+            except Exception:
+                pass
+        zh = sum(1 for c in text if ord(c) > 127)
+        return int((len(text) - zh) / 4 + zh / 1.5)
+
+    def _msg_text(m) -> str:
+        # messages 可能是 dict，content 可能是 str 或 None；tool_calls 也计入
+        parts = []
+        c = m.get("content") if isinstance(m, dict) else None
+        if isinstance(c, str):
+            parts.append(c)
+        elif isinstance(c, list):
+            parts.append(json.dumps(c, ensure_ascii=False))
+        tc = m.get("tool_calls") if isinstance(m, dict) else None
+        if tc:
+            parts.append(json.dumps(tc, ensure_ascii=False, default=str))
+        return "\n".join(parts)
+
+    msg_tok = sum(_count(_msg_text(m)) for m in (messages or []))
+    tools_tok = _count(json.dumps(tools, ensure_ascii=False)) if tools else 0
+    return {
+        "total": msg_tok + tools_tok,
+        "messages": msg_tok,
+        "tools": tools_tok,
+        "method": "tiktoken" if _tok_enc is not None else "heuristic",
+    }
 
 
 def _create_with_retry(
@@ -669,12 +722,14 @@ def _call_judgment_llm(session: AgentSession, page_state: PageState) -> FailedPa
 def _call_planning_llm(session: AgentSession, page_state: PageState) -> Optional[dict]:
     """调用规划 LLM，返回解析后的 plan dict。失败返回 None。"""
     messages = build_step_planning_messages(session, page_state)
-    # 埋点：记录规划 prompt 是否包含参考经验，以及首屏元素文本
+    # 埋点：记录规划 prompt 是否包含参考经验 + 完整消息 token 估算
     user_msg = next((m["content"] for m in messages if m.get("role") == "user"), "")
     has_kb = "📖 参考经验" in user_msg
+    _tok = _estimate_tokens(messages)
     _agent_log.info("planning_prompt_debug", session_id=session.session_id,
                     data={"step": session.current_step, "has_kb_hint": has_kb,
-                          "prompt_len": len(user_msg)})
+                          "prompt_len": len(user_msg), "tokens": _tok["total"],
+                          "method": _tok["method"]})
     try:
         response = _create_with_retry(_llm_client, session.model, messages)
     except Exception as e:

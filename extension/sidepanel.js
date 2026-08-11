@@ -3101,6 +3101,8 @@ document.addEventListener('DOMContentLoaded', async () => {
           // 通用列表选项（下拉面板内的可点击项）
           '[class*="select-branch__item"]',
           '[class*="dropdown-item"]',
+          '[class*="select-item"]',
+          '[class*="select-list"] > *',
           '[class*="list-item"]',
           '[class*="menu-item"]:not([class*="icon"])',
           '.el-dropdown-menu__item',
@@ -3132,6 +3134,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           '[class*="popover__content"]', '[class*="popper"]',
           '[class*="dropdownWrap"]', '[class*="dropdown__"]',
           '[class*="select-branch"]',
+          '[class*="select-list"]', '[class*="select-dropdown"]',
           '.modal[style*="display: block"]', '.modal.show'
         ];
 
@@ -3186,6 +3189,13 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         function buildElementInfo(el, id, inPopup) {
           const rect = el.getBoundingClientRect();
+          // 父节点轻量指纹：用于跨轮 diff 时判断"新增元素是否成组"（同父=同一簇）
+          let parentSig = '';
+          const p = el.parentElement;
+          if (p) {
+            const pr = p.getBoundingClientRect();
+            parentSig = `${p.tagName}:${Math.round(pr.top)}:${Math.round(pr.left)}:${p.children.length}`;
+          }
           return {
             id,
             tag: el.tagName.toLowerCase(),
@@ -3204,6 +3214,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             enabled: !el.disabled && !el.classList.contains('jmtd-date-picker-cell-disabled'),
             checked: el.checked !== undefined ? el.checked : null,
             contenteditable: el.isContentEditable || false,
+            parent_sig: parentSig,
             in_popup: inPopup
           };
         }
@@ -3211,6 +3222,14 @@ document.addEventListener('DOMContentLoaded', async () => {
         // 检测可见弹出层（取最顶层的）
         function findVisiblePopups() {
           const popups = [];
+          const pushUnique = (el) => {
+            if (!el || !isVisible(el)) return;
+            if (popups.some(p => p === el || p.contains(el))) return;
+            for (let i = popups.length - 1; i >= 0; i--) {
+              if (el.contains(popups[i])) popups.splice(i, 1);
+            }
+            popups.push(el);
+          };
           for (const sel of POPUP_CONTAINER_SELECTORS) {
             for (const el of document.querySelectorAll(sel)) {
               if (!isVisible(el)) continue;
@@ -3223,6 +3242,20 @@ document.addEventListener('DOMContentLoaded', async () => {
               }
               popups.push(el);
             }
+          }
+          // ARIA 兜底：只认 W3C 标准的「浮层型」信号（不碰厂商 class，也不认常驻的 group/tree，
+          // 否则常驻容器会让 active_popup 永远非空，压制真正弹层的 popup_appeared 信号）
+          // 1) aria-expanded=true 的触发器所控制的组（aria-controls 或紧邻兄弟）—— 明确"刚展开"
+          for (const trigger of document.querySelectorAll('[aria-expanded="true"]')) {
+            if (!isVisible(trigger)) continue;
+            const controlsId = trigger.getAttribute('aria-controls');
+            let group = controlsId ? document.getElementById(controlsId) : null;
+            if (!group && trigger.nextElementSibling) group = trigger.nextElementSibling;
+            pushUnique(group);
+          }
+          // 2) 可见的 listbox / menu —— 语义上就是弹出选择层
+          for (const el of document.querySelectorAll('[role="listbox"],[role="menu"]')) {
+            pushUnique(el);
           }
           // 按 z-index 排序，最高的在前
           popups.sort((a, b) => {
@@ -3624,12 +3657,70 @@ document.addEventListener('DOMContentLoaded', async () => {
           return best;
         }
 
+        // 为回放构建定位级联：按稳定性排序，回放时逐个试直到唯一命中
+        function __buildSelectorCascade(el) {
+          if (!el || !el.tagName) return { tag: '', role: '', selectors: [] };
+          const tag = el.tagName.toLowerCase();
+          const isDynamicId = (id) =>
+            !id || /^[\d:]/.test(id) || id.includes('--')
+            || /jd-id-\d/.test(id) || /^[a-z]+-\d{4,}$/.test(id) || /:r[0-9a-z]+:/.test(id);
+          const esc = (v) => (window.CSS && CSS.escape) ? CSS.escape(v) : v.replace(/["\\]/g, '\\$&');
+          const sels = [];
+          if (el.id && !isDynamicId(el.id)) sels.push({ by: 'css', value: `#${esc(el.id)}` });
+          for (const attr of ['data-testid', 'data-cy', 'data-test']) {
+            const v = el.getAttribute(attr);
+            if (v) sels.push({ by: 'css', value: `[${attr}="${v}"]` });
+          }
+          const name = el.getAttribute('name');
+          if (name) sels.push({ by: 'css', value: `${tag}[name="${name}"]` });
+          const aria = el.getAttribute('aria-label');
+          if (aria) sels.push({ by: 'css', value: `${tag}[aria-label="${aria.slice(0, 40)}"]` });
+          if (el.classList && el.classList.length) {
+            const stable = Array.from(el.classList).filter(c =>
+              c.length <= 30 && !/\d{4,}/.test(c) && !c.includes('--') && !/^[a-f0-9]{8,}$/.test(c)
+            ).slice(0, 3);
+            if (stable.length) sels.push({ by: 'css', value: `${tag}.${stable.map(esc).join('.')}` });
+          }
+          const text = (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 30);
+          if (text) sels.push({ by: 'text', tag, value: text });
+          try {
+            const parts = [];
+            let node = el, depth = 0;
+            while (node && node.nodeType === 1 && depth < 4) {
+              let seg = node.tagName.toLowerCase();
+              const parent = node.parentElement;
+              if (node.id && !isDynamicId(node.id)) { parts.unshift(`#${esc(node.id)}`); break; }
+              if (parent) {
+                const sameTag = Array.from(parent.children).filter(c => c.tagName === node.tagName);
+                if (sameTag.length > 1) seg += `:nth-of-type(${sameTag.indexOf(node) + 1})`;
+              }
+              parts.unshift(seg);
+              node = parent; depth++;
+            }
+            if (parts.length) sels.push({ by: 'css', value: parts.join(' > ') });
+          } catch (e) { /* ignore */ }
+          // 唯一性校验：css 候选必须在当前页面唯一命中目标，否则回放会点中同类的第一个（静默错点）
+          const uniq = [];
+          for (const s of sels) {
+            if (s.by === 'css') {
+              try {
+                const hits = document.querySelectorAll(s.value);
+                if (hits.length !== 1 || hits[0] !== el) continue;
+              } catch (e) { continue; }
+            }
+            uniq.push(s);
+          }
+          return { tag, role: el.getAttribute('role') || '', selectors: uniq };
+        }
+
         const { type, locator, params = {} } = actionData;
         const element = (type !== 'scroll' && type !== 'press_key') ? resolveLocator(locator) : null;
 
         if (type !== 'scroll' && type !== 'press_key' && !element) {
           return { success: false, error: `找不到目标元素 (${locator?.method}:${locator?.value})`, action_type: type };
         }
+
+        const __ei = element ? __buildSelectorCascade(element) : null;
 
         // 高亮目标元素
         if (element) {
@@ -3669,7 +3760,8 @@ document.addEventListener('DOMContentLoaded', async () => {
                 success: true,
                 details: `点击了 ${locator?.value || '元素'}`,
                 action_type: type,
-                _clickCoords: { x: cx + offsetX, y: cy + offsetY }
+                _clickCoords: { x: cx + offsetX, y: cy + offsetY },
+                _elementInfo: __ei
               };
             }
 
@@ -3711,7 +3803,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 element.dispatchEvent(new Event('input', { bubbles: true }));
                 element.dispatchEvent(new Event('change', { bubbles: true }));
               }
-              return { success: true, details: `输入了 "${text.slice(0, 20)}"`, action_type: type };
+              return { success: true, details: `输入了 "${text.slice(0, 20)}"`, action_type: type, _elementInfo: __ei };
             }
 
             case 'clear': {
@@ -3787,7 +3879,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                   return { success: false, error: `下拉菜单中找不到选项: ${optionText}`, action_type: type };
                 }
               }
-              return { success: true, details: `选择了 ${params.value || params.option_text || '?'}`, action_type: type };
+              return { success: true, details: `选择了 ${params.value || params.option_text || '?'}`, action_type: type, _elementInfo: __ei };
             }
 
             case 'scroll': {
@@ -3870,7 +3962,8 @@ document.addEventListener('DOMContentLoaded', async () => {
                 success: true,
                 details: `悬停在 ${locator?.value || '元素'}`,
                 action_type: type,
-                _hoverCoords: { x: cx + offsetX, y: cy + offsetY }
+                _hoverCoords: { x: cx + offsetX, y: cy + offsetY },
+                _elementInfo: __ei
               };
             }
 
@@ -4344,6 +4437,45 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
 
+  // 跨轮 diff：检测上一步操作是否"就地展开了一组选项/复选框"（checkbox/radio/inline下拉）。
+  // 采集端的 findVisiblePopups 只认容器型/ARIA弹层，就地展开的组（已被采集但未被判为弹层）靠这里兜底。
+  // 判定：本轮相对上轮新增元素成簇（同 parent_sig ≥2 个）且新增不是页面大改（占比<30% 且 ≤15 个）。
+  //
+  // ⚠️ 边界（重要）：本函数只对"已进入 interactive_elements 的元素"做前后 diff，
+  //    它工作在【采集之后】，不是采集层。若某元素因 class 不匹配任何选择器而【采集阶段就漏了】，
+  //    它既不在 prevEls 也不在 newEls，diff 永远发现不了它——这不是 bug，是设计边界。
+  //    采集漏掉的元素只能靠"结构/cursor 通用抽取"（不依赖 class 的第2道防线）在采集层捞回，
+  //    不能指望这里兜。参见 POPUP_EXTRA_SELECTORS / POPUP_CONTAINER_SELECTORS 的 class 匹配。
+  function detectInlineGroup(prevEls, newEls) {
+    if (!Array.isArray(prevEls) || !Array.isArray(newEls) || !newEls.length) return null;
+    const sig = (e) => `${e.tag}|${e.role}|${(e.text || '').slice(0, 20)}|${e.name}`;
+    const prevSet = new Set(prevEls.map(sig));
+    const added = newEls.filter(e => !prevSet.has(sig(e)));
+    if (added.length < 2) return null;
+    // 大面积变化视为翻页/重渲染，不算展开组
+    if (added.length > 15) return null;
+    if (added.length / Math.max(newEls.length, 1) >= 0.3) return null;
+    // 按 parent_sig 聚簇，取最大的一簇
+    const byParent = {};
+    for (const e of added) {
+      const k = e.parent_sig || '';
+      if (!k) continue;
+      (byParent[k] ||= []).push(e);
+    }
+    let best = null;
+    for (const k of Object.keys(byParent)) {
+      if (!best || byParent[k].length > best.length) best = byParent[k];
+    }
+    if (!best || best.length < 2) return null;
+    return {
+      type: 'inline_group',
+      header_text: '',
+      selector: '',
+      synthesized: true,
+      member_count: best.length
+    };
+  }
+
   async function runAgentTask(task) {
     const sessionId = `agent_${createMessageId()}`;
     agentState.active = true;
@@ -4457,19 +4589,6 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         renderAgentStepInBubble(aiBubble, response.step, null, null, actionResult);
 
-        // 记录成功的操作步骤（供知识库保存，含意图/值/结果）
-        if (actionResult.success && action.type !== 'wait') {
-          executedSteps.push({
-            intent: response.thought || response.plan?.current_goal || '',
-            action: action.type,
-            target_text: action.locator?.value || '',
-            css_selector: action.locator?.method === 'css' ? action.locator.value : '',
-            text: action.params?.text || '',
-            value: action.params?.option_text || action.params?.value || '',
-            url_before: preUrl ? new URL(preUrl).pathname : '',
-            result: actionResult.details || ''
-          });
-        }
         if (!firstFingerprint && pageState?.page_fingerprint) {
           firstFingerprint = pageState.page_fingerprint;
         }
@@ -4498,6 +4617,24 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         const newPageState = await observePageState();
 
+        // 1b 兜底：采集端没识别出弹层，但本轮相对上轮"成簇新增"→ 判为就地展开的选项/复选组，
+        // 合成 active_popup，让 popup_appeared 信号成立、格式化置顶，避免 LLM 重复点触发器把组点没。
+        if (!newPageState.active_popup) {
+          const inlineGroup = detectInlineGroup(
+            pageState?.interactive_elements || [],
+            newPageState.interactive_elements || []
+          );
+          if (inlineGroup) {
+            newPageState.active_popup = inlineGroup;
+            // 把该簇元素标记为 in_popup，使格式化时它们被置顶为"面板内元素"
+            const sig = (e) => `${e.tag}|${e.role}|${(e.text || '').slice(0, 20)}|${e.name}`;
+            const prevSet = new Set((pageState?.interactive_elements || []).map(sig));
+            for (const e of newPageState.interactive_elements) {
+              if (!prevSet.has(sig(e))) e.in_popup = true;
+            }
+          }
+        }
+
         // 附加状态变化信息
         actionResult.state_changes = {
           url_changed: newPageState.url !== preUrl,
@@ -4506,6 +4643,30 @@ document.addEventListener('DOMContentLoaded', async () => {
           element_count_delta: newPageState.interactive_elements.length - preElementCount
         };
         pageState = newPageState;
+
+        // 记录成功的操作步骤（供知识库精确回放：含 tag/selectors 级联 + 预期结果 expected）
+        if (actionResult.success && action.type !== 'wait') {
+          const ei = actionResult._elementInfo || null;
+          const sc = actionResult.state_changes;
+          const expected = {};
+          if (sc.url_changed) expected.url_after = newPageState.url ? new URL(newPageState.url).pathname : '';
+          if (sc.popup_appeared) expected.popup_appeared = true;
+          if (sc.popup_disappeared) expected.popup_disappeared = true;
+          executedSteps.push({
+            intent: response.thought || response.plan?.current_goal || '',
+            action: action.type,
+            tag: ei?.tag || '',
+            role: ei?.role || '',
+            target_text: action.locator?.value || '',
+            css_selector: action.locator?.method === 'css' ? action.locator.value : '',
+            selectors: ei?.selectors || [],
+            text: action.params?.text || '',
+            value: action.params?.option_text || action.params?.value || '',
+            url_before: preUrl ? new URL(preUrl).pathname : '',
+            expected,
+            result: actionResult.details || ''
+          });
+        }
 
         // 两阶段调用：先规划（快速更新目标面板），再执行
         const planResponse = await callAgentApi(safeApiUrl, '/v1/agent/plan', {
@@ -4691,6 +4852,62 @@ document.addEventListener('DOMContentLoaded', async () => {
         return '';
       }
 
+      // 回放定位级联（与 observePageState 的 __buildSelectorCascade 同源逻辑）
+      function selectorCascade(el) {
+        if (!el || !el.tagName) return { tag: '', role: '', selectors: [] };
+        const tag = el.tagName.toLowerCase();
+        const isDynamicId = (id) =>
+          !id || /^[\d:]/.test(id) || id.includes('--')
+          || /jd-id-\d/.test(id) || /^[a-z]+-\d{4,}$/.test(id) || /:r[0-9a-z]+:/.test(id);
+        const esc = (v) => (window.CSS && CSS.escape) ? CSS.escape(v) : v.replace(/["\\]/g, '\\$&');
+        const sels = [];
+        if (el.id && !isDynamicId(el.id)) sels.push({ by: 'css', value: `#${esc(el.id)}` });
+        for (const attr of ['data-testid', 'data-cy', 'data-test']) {
+          const v = el.getAttribute(attr);
+          if (v) sels.push({ by: 'css', value: `[${attr}="${v}"]` });
+        }
+        const nm = el.getAttribute('name');
+        if (nm) sels.push({ by: 'css', value: `${tag}[name="${nm}"]` });
+        const aria = el.getAttribute('aria-label');
+        if (aria) sels.push({ by: 'css', value: `${tag}[aria-label="${aria.slice(0, 40)}"]` });
+        if (el.classList && el.classList.length) {
+          const stable = Array.from(el.classList).filter(c =>
+            c.length <= 30 && !/\d{4,}/.test(c) && !c.includes('--') && !/^[a-f0-9]{8,}$/.test(c)
+          ).slice(0, 3);
+          if (stable.length) sels.push({ by: 'css', value: `${tag}.${stable.map(esc).join('.')}` });
+        }
+        const txt = (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 30);
+        if (txt) sels.push({ by: 'text', tag, value: txt });
+        try {
+          const parts = [];
+          let node = el, depth = 0;
+          while (node && node.nodeType === 1 && depth < 4) {
+            let seg = node.tagName.toLowerCase();
+            const parent = node.parentElement;
+            if (node.id && !isDynamicId(node.id)) { parts.unshift(`#${esc(node.id)}`); break; }
+            if (parent) {
+              const sameTag = Array.from(parent.children).filter(c => c.tagName === node.tagName);
+              if (sameTag.length > 1) seg += `:nth-of-type(${sameTag.indexOf(node) + 1})`;
+            }
+            parts.unshift(seg);
+            node = parent; depth++;
+          }
+          if (parts.length) sels.push({ by: 'css', value: parts.join(' > ') });
+        } catch (e) { /* ignore */ }
+        // 唯一性校验：css 候选须唯一命中目标，否则回放会点中同类第一个（静默错点）
+        const uniq = [];
+        for (const s of sels) {
+          if (s.by === 'css') {
+            try {
+              const hits = document.querySelectorAll(s.value);
+              if (hits.length !== 1 || hits[0] !== el) continue;
+            } catch (e) { continue; }
+          }
+          uniq.push(s);
+        }
+        return { tag, role: el.getAttribute('role') || '', selectors: uniq };
+      }
+
       function interactiveAncestor(el) {
         return el.closest(
           'button, a, [role="button"], [role="menuitem"], [role="option"], [role="tab"], [role="checkbox"], [role="radio"], li, td'
@@ -4723,10 +4940,14 @@ document.addEventListener('DOMContentLoaded', async () => {
         const el = interactiveAncestor(e.target);
         // checkbox/radio 交给 change 处理，避免重复
         if (el.type === 'checkbox' || el.type === 'radio') return;
+        const ei = selectorCascade(el);
         sendStep({
           action: 'click',
+          tag: ei.tag,
+          role: ei.role,
           target_text: (el.textContent || el.getAttribute('aria-label') || '').trim().slice(0, 40),
           css_selector: selectorOf(el),
+          selectors: ei.selectors,
           url_before: location.pathname
         });
       }, true);
@@ -4736,19 +4957,26 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (!window.__agentRecording) return;
         const el = e.target;
         const tag = el.tagName.toLowerCase();
+        const ei = selectorCascade(el);
         if (tag === 'select') {
           sendStep({
             action: 'select',
+            tag: ei.tag,
+            role: ei.role,
             target_text: el.name || el.getAttribute('aria-label') || labelTextOf(el),
             css_selector: selectorOf(el),
+            selectors: ei.selectors,
             value: (el.options[el.selectedIndex] || {}).text || el.value || '',
             url_before: location.pathname
           });
         } else if (el.type === 'checkbox' || el.type === 'radio') {
           sendStep({
             action: 'click',
+            tag: ei.tag,
+            role: ei.role,
             target_text: labelTextOf(el),
             css_selector: selectorOf(el),
+            selectors: ei.selectors,
             value: el.checked ? '选中' : '取消',
             url_before: location.pathname
           });
@@ -4775,11 +5003,16 @@ document.addEventListener('DOMContentLoaded', async () => {
       document.addEventListener('input', (e) => {
         if (!window.__agentRecording) return;
         const el = e.target;
+        const ei = selectorCascade(el);
+        const val = el.isContentEditable ? (el.textContent || '') : (el.value || '');
         pendingInput = {
           action: 'type',
+          tag: ei.tag,
+          role: ei.role,
           target_text: el.placeholder || el.name || el.getAttribute('aria-label') || '',
           css_selector: selectorOf(el),
-          text: (el.value || '').slice(0, 50),
+          selectors: ei.selectors,
+          text: val.slice(0, 50),
           url_before: location.pathname
         };
         clearTimeout(inputTimer);

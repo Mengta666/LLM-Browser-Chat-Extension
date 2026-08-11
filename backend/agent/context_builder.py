@@ -141,6 +141,7 @@ STEP_PLANNING_PROMPT = """你是一个浏览器自动化规划助手。根据用
 - 如果匹配到了元素：current_goal 和 next_action_hint 必须围绕该元素展开
 - 如果没有匹配：按正常逻辑自由规划
 - **重要**：如果参考经验或任务明确提到某入口（如"Coding"），但当前元素列表里找不到它，不要反复点击/搜索去凑——它很可能藏在悬浮菜单里。此时用 hover 动作悬浮"更多应用/菜单"类触发器，展开后目标会出现在下一次观察中，再点击。绝不要在找不到入口时原地打转。
+- **面板已展开时**：如果观察显示"活跃弹出层"（尤其是下拉列表/就地展开的选项组），说明上一步刚把它打开。此时 next_action_hint 必须指向面板内的目标选项，直接选择即可；**禁止**再次点击展开它的触发器（会把面板关掉，导致反复展开-关闭的死循环）。若上一步点击后没看到预期选项，也不要重复点同一个触发器，改用 scroll 在面板内查找或换定位方式。
 
 ## 输出格式
 只输出 JSON，不要其他文字：
@@ -529,12 +530,16 @@ def build_observation_message(page_state: PageState) -> str:
         popup_type_map = {
             'date_picker': '日期选择面板', 'dropdown': '下拉列表',
             'modal': '弹窗', 'menu': '菜单', 'popup': '弹出面板',
+            'inline_group': '就地展开的选项组',
         }
         popup_label = popup_type_map.get(active_popup.get('type', ''), '弹出面板')
         header = active_popup.get('header_text', '')
         header_str = f" ({header})" if header else ""
         parts.append(f"\n📍 活跃弹出层: {popup_label}{header_str}")
         parts.append("   请优先操作弹出层内元素。")
+        parts.append("   ⚠️ 该面板/选项组是上一步操作刚展开的，现在处于打开状态。"
+                     "直接点击面板内的目标选项即可；不要再次点击展开它的触发器、"
+                     "也不要点击面板外的空白区域——那会导致面板收起，你将不得不重新展开。")
 
     if page_state.interactive_elements:
         popup_els = [el for el in page_state.interactive_elements if el.get("in_popup")]

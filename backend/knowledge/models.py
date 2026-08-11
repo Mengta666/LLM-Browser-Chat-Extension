@@ -10,30 +10,38 @@ from typing import Any, Optional
 
 @dataclass
 class OperationStep:
-    """一个操作步骤（语义化）。"""
+    """一个操作步骤（语义化 + 回放定位）。"""
     action: str                  # click/type/scroll/navigate/select 等
     intent: str = ""             # 高层意图（这一步为了什么）
+    tag: str = ""                # 元素标签 button/a/input/div（回放定位收窄）
+    role: str = ""               # ARIA role（可空）
     target_text: str = ""        # 元素可见文本
     css_selector: str = ""       # 稳定定位选择器（动态ID已清洗）
+    selectors: list = field(default_factory=list)  # 定位级联，按稳定性排序，回放逐个试
     text: str = ""               # type 动作的输入内容
     value: str = ""              # select 动作选中的值
     url_before: str = ""         # 操作前的 URL 路径
+    expected: dict = field(default_factory=dict)   # 预期结果 {url_after/popup_appeared/...}，回放验证用
     result: str = ""             # 操作结果描述
 
     def to_dict(self) -> dict[str, Any]:
         # 省略空字段以精简存储（from_dict 用默认值补回）
-        return {k: v for k, v in asdict(self).items() if v not in ("", None)}
+        return {k: v for k, v in asdict(self).items() if v not in ("", None, [], {})}
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "OperationStep":
         return cls(
             action=d.get("action", ""),
             intent=d.get("intent", ""),
+            tag=d.get("tag", ""),
+            role=d.get("role", ""),
             target_text=d.get("target_text", ""),
             css_selector=d.get("css_selector", ""),
+            selectors=d.get("selectors", []) or [],
             text=d.get("text", ""),
             value=d.get("value", ""),
             url_before=d.get("url_before") or d.get("url_pattern", ""),
+            expected=d.get("expected", {}) or {},
             result=d.get("result", ""),
         )
 

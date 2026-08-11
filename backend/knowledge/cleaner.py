@@ -48,6 +48,27 @@ def _clean_selector(step: dict[str, Any]) -> None:
     elif tt:
         # 归一化动态数量短语（"250个提交" → "N个提交"）
         step["target_text"] = _normalize_dynamic_text(tt)
+    # 清洗回放定位级联：剔除动态 css 项、含动态数量的文本项，去重，保留稳定项
+    sels = step.get("selectors")
+    if isinstance(sels, list) and sels:
+        cleaned_sels = []
+        seen = set()
+        for s in sels:
+            if not isinstance(s, dict):
+                continue
+            val = s.get("value", "")
+            by = s.get("by", "")
+            if by == "css" and _is_dynamic(val):
+                continue
+            # 含动态数量的文本选择器（"259 个提交"）无法字面回放，丢弃
+            if by == "text" and _COUNT_PHRASE.search(val):
+                continue
+            key = (by, val)
+            if not val or key in seen:
+                continue
+            seen.add(key)
+            cleaned_sels.append(s)
+        step["selectors"] = cleaned_sels
 
 
 def clean_steps(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -80,10 +101,22 @@ def clean_steps(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
         cleaned.append(s)
 
+    # 反推 expected.url_after：第 i 步的结果 URL 约等于第 i+1 步的 url_before。
+    # 仅在 expected 缺失时填（agent 记录已带真实 expected，不覆盖）；供 recorded 记录回放验证。
+    for i in range(len(cleaned) - 1):
+        cur = cleaned[i]
+        nxt_url = cleaned[i + 1].get("url_before", "")
+        cur_url = cur.get("url_before", "")
+        exp = cur.get("expected") or {}
+        if nxt_url and nxt_url != cur_url and not exp.get("url_after"):
+            exp = dict(exp)
+            exp["url_after"] = nxt_url
+            cur["expected"] = exp
+
     # 省略空字段 + 剥掉临时排序字段（epoch/seq 仅前端排序用，不入库）
     _drop = {"epoch", "seq"}
     return [
-        {k: v for k, v in s.items() if v not in ("", None) and k not in _drop}
+        {k: v for k, v in s.items() if v not in ("", None, [], {}) and k not in _drop}
         for s in cleaned
     ]
 

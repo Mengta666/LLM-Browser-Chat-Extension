@@ -1,0 +1,19 @@
+# Python 依赖 — 后端 (backend/)
+# 安装核心依赖：  pip install -r requirements.txt
+# 版本为当前验证环境实测值；如需最小约束可改为 >=。
+
+# ── 核心：Agent 自动化 + 知识库（必需）──
+fastapi==0.141.1
+uvicorn==0.51.0
+pydantic==2.13.4
+openai==2.50.0
+python-dotenv==1.2.2
+requests==2.32.5
+tiktoken==0.13.0          # 执行/规划调用的 token 埋点（缺失时回退字符估算，但精度下降）
+
+# ── 可选：RAG 网页问答 / 向量检索 / 搜索 ──
+# app.py 以 try/except 懒加载这些模块，未安装时仅跳过网页问答与搜索，
+# 不影响 Agent 自动化和知识库召回。需要这些功能时再装。
+numpy>=1.26            # rag/retriever.py 向量相似度
+qdrant-client>=1.7     # rag/vector_store.py 向量库后端
+trafilatura>=1.6       # tools/web_search.py 网页正文抽取

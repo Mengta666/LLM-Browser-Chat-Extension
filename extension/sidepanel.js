@@ -3511,104 +3511,16 @@ document.addEventListener('DOMContentLoaded', async () => {
       return { success: true, action_type: 'navigate', details: `导航到 ${url}`, timestamp: Date.now() };
     }
 
-    if (action.type === 'wait_for_element') {
-      const tab = await getActiveBrowserTab();
-      if (!tab?.id) return { success: false, action_type: 'wait_for_element', error: '无法获取标签页', timestamp: Date.now() };
-      const selector = action.locator?.value || action.params?.selector;
-      if (!selector) return { success: false, action_type: 'wait_for_element', error: '缺少选择器', timestamp: Date.now() };
-      const timeout = Math.min(action.params?.timeout || 5000, 10000);
-      const waitResults = await chrome.scripting.executeScript({
-        target: { tabId: tab.id, allFrames: true },
-        func: async (sel, maxWait) => {
-          const start = Date.now();
-          while (Date.now() - start < maxWait) {
-            const el = document.querySelector(sel);
-            if (el) return { found: true };
-            await new Promise(r => setTimeout(r, 200));
-          }
-          return { found: false };
-        },
-        args: [selector, timeout]
-      });
-      const found = waitResults.some(fr => fr?.result?.found);
-      if (found) {
-        return { success: true, action_type: 'wait_for_element', details: `元素已出现: ${selector}`, timestamp: Date.now() };
-      }
-      return { success: false, action_type: 'wait_for_element', error: `等待超时: ${selector}`, timestamp: Date.now() };
-    }
-
     const tab = await getActiveBrowserTab();
     if (!tab?.id) throw new Error('无法获取当前标签页');
 
     const execPromise = chrome.scripting.executeScript({
       target: { tabId: tab.id, allFrames: true },
       func: async (actionData) => {
-        function findByMethod(method, value) {
-          if (method === 'css') {
-            return document.querySelector(value);
-          }
-          if (method === 'text') {
-            const normalized = value.toLowerCase().trim();
-            const candidates = [];
-            // 搜索所有可见元素
-            for (const el of document.querySelectorAll('*')) {
-              const style = window.getComputedStyle(el);
-              if (style.display === 'none' || style.visibility === 'hidden') continue;
-              const rect = el.getBoundingClientRect();
-              if (rect.width <= 0 || rect.height <= 0) continue;
-              const elText = (el.textContent || el.value || el.getAttribute('aria-label') || '').trim().toLowerCase();
-              if (!elText.includes(normalized)) continue;
-
-              // 计算交互性权重
-              let score = 0;
-              const tag = el.tagName.toLowerCase();
-              // 标签权重
-              if (['button', 'a', 'input', 'select', 'textarea'].includes(tag)) score += 50;
-              if (el.getAttribute('role') === 'button' || el.getAttribute('role') === 'link') score += 45;
-              if (el.getAttribute('role') === 'option' || el.getAttribute('role') === 'menuitem') score += 40;
-              if (el.onclick || el.getAttribute('tabindex')) score += 30;
-              if (el.getAttribute('data-event-content') || el.getAttribute('data-event-name')) score += 35;
-              // 在可交互父元素内的叶子节点
-              if (el.closest('button, a, [role="button"]') && el.closest('button, a, [role="button"]') !== el) score += 15;
-              // 精确匹配 vs 包含匹配
-              if (elText === normalized) score += 40;
-              else if (elText.startsWith(normalized)) score += 20;
-              // 叶子节点优先（子元素越少越好）
-              score += Math.max(0, 10 - el.children.length);
-              // 尺寸合理（太大的通常是容器）
-              if (rect.width < 500 && rect.height < 100) score += 10;
-              // disabled 惩罚
-              if (el.disabled || el.classList.contains('disabled')) score -= 20;
-
-              candidates.push({ el, score });
-            }
-            if (!candidates.length) return null;
-            candidates.sort((a, b) => b.score - a.score);
-            return candidates[0].el;
-          }
-          if (method === 'annotation_id') {
-            const el = document.querySelector(`[data-agent-id="${value}"]`);
-            if (el) return el;
-            return null;
-          }
-          return null;
-        }
-
-        function resolveLocator(locator) {
-          if (!locator) return null;
-          let el = findByMethod(locator.method, locator.value);
-          // annotation_id 失效时：尝试 fallback，再尝试 text 匹配
-          if (!el && locator.fallback) {
-            el = findByMethod(locator.fallback.method, locator.fallback.value);
-          }
-          if (!el && locator.method === 'annotation_id' && locator.value) {
-            // 尝试用 css_selector 回退（如果前端之前存过）
-            el = findByMethod('text', locator.value);
-          }
-          if (!el && locator.method !== 'text' && locator.value) {
-            el = findByMethod('text', locator.value);
-          }
-          return el;
+        // 索引直连：唯一定位方式——按观察时打标的 data-agent-id 直取节点
+        function resolveByIndex(index) {
+          if (index === undefined || index === null) return null;
+          return document.querySelector(`[data-agent-id="${index}"]`);
         }
 
         function findBestScrollableContainer() {
@@ -3657,107 +3569,14 @@ document.addEventListener('DOMContentLoaded', async () => {
           return best;
         }
 
-        // 为回放构建定位级联：按稳定性排序，回放时逐个试直到唯一命中
-        function __buildSelectorCascade(el) {
-          if (!el || !el.tagName) return { tag: '', role: '', selectors: [] };
-          const tag = el.tagName.toLowerCase();
-          const isDynamicId = (id) =>
-            !id || /^[\d:]/.test(id) || id.includes('--')
-            || /jd-id-\d/.test(id) || /^[a-z]+-\d{4,}$/.test(id) || /:r[0-9a-z]+:/.test(id);
-          const esc = (v) => (window.CSS && CSS.escape) ? CSS.escape(v) : v.replace(/["\\]/g, '\\$&');
-          const sels = [];
-          if (el.id && !isDynamicId(el.id)) sels.push({ by: 'css', value: `#${esc(el.id)}` });
-          for (const attr of ['data-testid', 'data-cy', 'data-test']) {
-            const v = el.getAttribute(attr);
-            if (v) sels.push({ by: 'css', value: `[${attr}="${v}"]` });
-          }
-          const name = el.getAttribute('name');
-          if (name) sels.push({ by: 'css', value: `${tag}[name="${name}"]` });
-          const aria = el.getAttribute('aria-label');
-          if (aria) sels.push({ by: 'css', value: `${tag}[aria-label="${aria.slice(0, 40)}"]` });
-          // 表单元素专属：placeholder（转 css）+ 关联 label（by:'label'，R2 定位用）
-          const ph = el.getAttribute('placeholder');
-          if (ph) sels.push({ by: 'css', value: `${tag}[placeholder="${ph.slice(0, 40)}"]` });
-          let labelText = '';
-          if (el.id) {
-            const lbl = document.querySelector(`label[for="${esc(el.id)}"]`);
-            if (lbl) labelText = (lbl.textContent || '').trim().slice(0, 30);
-          }
-          if (!labelText) {
-            const wrap = el.closest('label');
-            if (wrap) labelText = (wrap.textContent || '').trim().slice(0, 30);
-          }
-          if (labelText) sels.push({ by: 'label', value: labelText });
-          if (el.classList && el.classList.length) {
-            const stable = Array.from(el.classList).filter(c =>
-              c.length <= 30 && !/\d{4,}/.test(c) && !c.includes('--') && !/^[a-f0-9]{8,}$/.test(c)
-            ).slice(0, 3);
-            if (stable.length) sels.push({ by: 'css', value: `${tag}.${stable.map(esc).join('.')}` });
-          }
-          const text = (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 30);
-          if (text) sels.push({ by: 'text', tag, value: text });
-          try {
-            const parts = [];
-            let node = el, depth = 0;
-            while (node && node.nodeType === 1 && depth < 4) {
-              let seg = node.tagName.toLowerCase();
-              const parent = node.parentElement;
-              if (node.id && !isDynamicId(node.id)) { parts.unshift(`#${esc(node.id)}`); break; }
-              if (parent) {
-                const sameTag = Array.from(parent.children).filter(c => c.tagName === node.tagName);
-                if (sameTag.length > 1) seg += `:nth-of-type(${sameTag.indexOf(node) + 1})`;
-              }
-              parts.unshift(seg);
-              node = parent; depth++;
-            }
-            if (parts.length) sels.push({ by: 'css', value: parts.join(' > ') });
-          } catch (e) { /* ignore */ }
-          // 定位质量分级（不再"不唯一就丢"，避免表单元素三信号全空）：
-          //   css 唯一命中目标 → 保留；命中多个但含目标 → 保留并标 ambiguous（回放时靠 sibling/文本消歧）；
-          //   命中的不是目标 / 报错 → 丢弃（会点错，留着有害）。非 css（text/label）一律保留。
-          const graded = [];
-          for (const s of sels) {
-            if (s.by === 'css') {
-              try {
-                const hits = document.querySelectorAll(s.value);
-                if (hits.length === 1 && hits[0] === el) {
-                  graded.push(s);
-                } else if (hits.length > 1 && Array.prototype.includes.call(hits, el)) {
-                  graded.push({ ...s, ambiguous: true });
-                }
-                // 命中 0 个或命中的非目标 → 丢弃
-              } catch (e) { /* 无效选择器，丢弃 */ }
-            } else {
-              graded.push(s);
-            }
-          }
-          return { tag, role: el.getAttribute('role') || '', selectors: graded };
+        const { type, index, params = {} } = actionData;
+        // 索引直连：按 data-agent-id 直取；编号失效（页面已重渲染）→ stale，交由外层重新观察
+        const needsEl = (type !== 'scroll' && type !== 'press_key' && type !== 'navigate' && type !== 'wait');
+        let element = needsEl ? resolveByIndex(index) : (index != null ? resolveByIndex(index) : null);
+
+        if (needsEl && !element) {
+          return { success: false, stale: true, error: `编号 ${index} 已失效（页面已更新）`, action_type: type };
         }
-
-        // 回放锚定用页面特征：靠 prev/next 兄弟文本 + anchor 区分同 URL 多步
-        // （filled_count/el_count 实测零区分度已砍——巨型低代码页两值恒定）
-        function __buildPageMarker(el) {
-          const marker = { prev_sibling: '', next_sibling: '', anchor_text: '' };
-          try {
-            if (el) {
-              const txt = (n) => n ? (n.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 20) : '';
-              marker.prev_sibling = txt(el.previousElementSibling);
-              marker.next_sibling = txt(el.nextElementSibling);
-              marker.anchor_text = txt(el);
-            }
-          } catch (e) { /* ignore */ }
-          return marker;
-        }
-
-        const { type, locator, params = {} } = actionData;
-        const element = (type !== 'scroll' && type !== 'press_key') ? resolveLocator(locator) : null;
-
-        if (type !== 'scroll' && type !== 'press_key' && !element) {
-          return { success: false, error: `找不到目标元素 (${locator?.method}:${locator?.value})`, action_type: type };
-        }
-
-        const __ei = element ? __buildSelectorCascade(element) : null;
-        const __pm = element ? __buildPageMarker(element) : null;
 
         // 高亮目标元素
         if (element) {
@@ -3795,11 +3614,9 @@ document.addEventListener('DOMContentLoaded', async () => {
               }
               return {
                 success: true,
-                details: `点击了 ${locator?.value || '元素'}`,
+                details: `点击了 [${index}]`,
                 action_type: type,
-                _clickCoords: { x: cx + offsetX, y: cy + offsetY },
-                _elementInfo: __ei,
-                _pageMarker: __pm
+                _clickCoords: { x: cx + offsetX, y: cy + offsetY }
               };
             }
 
@@ -3841,7 +3658,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 element.dispatchEvent(new Event('input', { bubbles: true }));
                 element.dispatchEvent(new Event('change', { bubbles: true }));
               }
-              return { success: true, details: `输入了 "${text.slice(0, 20)}"`, action_type: type, _elementInfo: __ei, _pageMarker: __pm };
+              return { success: true, details: `输入了 "${text.slice(0, 20)}"`, action_type: type };
             }
 
             case 'clear': {
@@ -3866,7 +3683,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 element.dispatchEvent(new Event('input', { bubbles: true }));
                 element.dispatchEvent(new Event('change', { bubbles: true }));
               }
-              return { success: true, details: `清空了 ${locator?.value || '元素'}`, action_type: type };
+              return { success: true, details: `清空了 [${index}]`, action_type: type };
             }
 
             case 'select': {
@@ -3917,7 +3734,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                   return { success: false, error: `下拉菜单中找不到选项: ${optionText}`, action_type: type };
                 }
               }
-              return { success: true, details: `选择了 ${params.value || params.option_text || '?'}`, action_type: type, _elementInfo: __ei, _pageMarker: __pm };
+              return { success: true, details: `选择了 ${params.option_text || params.value || '?'}`, action_type: type };
             }
 
             case 'scroll': {
@@ -3925,7 +3742,7 @@ document.addEventListener('DOMContentLoaded', async () => {
               const amount = params.amount || 300;
               const yDelta = (dir === 'down') ? amount : (dir === 'up' ? -amount : 0);
               const xDelta = (dir === 'right') ? amount : (dir === 'left' ? -amount : 0);
-              let scrollTarget = locator ? resolveLocator(locator) : null;
+              let scrollTarget = (index != null) ? resolveByIndex(index) : null;
               if (!scrollTarget) {
                 scrollTarget = findBestScrollableContainer();
               }
@@ -3965,8 +3782,8 @@ document.addEventListener('DOMContentLoaded', async () => {
               return {
                 success: true,
                 details: inViewport
-                  ? `已滚动到 ${locator?.value || '元素'}，元素现在在视口内`
-                  : `已尝试滚动到 ${locator?.value || '元素'}`,
+                  ? `已滚动到 [${index}]，元素现在在视口内`
+                  : `已尝试滚动到 [${index}]`,
                 action_type: type
               };
             }
@@ -3998,18 +3815,16 @@ document.addEventListener('DOMContentLoaded', async () => {
               element.dispatchEvent(new MouseEvent('mouseenter', evtOpts));
               return {
                 success: true,
-                details: `悬停在 ${locator?.value || '元素'}`,
+                details: `悬停在 [${index}]`,
                 action_type: type,
-                _hoverCoords: { x: cx + offsetX, y: cy + offsetY },
-                _elementInfo: __ei,
-                _pageMarker: __pm
+                _hoverCoords: { x: cx + offsetX, y: cy + offsetY }
               };
             }
 
             case 'focus':
               element.scrollIntoView({ block: 'center', behavior: 'smooth' });
               element.focus();
-              return { success: true, details: `聚焦到 ${locator?.value || '元素'}`, action_type: type };
+              return { success: true, details: `聚焦到 [${index}]`, action_type: type };
 
             case 'press_key': {
               const target = element || document.activeElement || document.body;
@@ -4072,29 +3887,12 @@ document.addEventListener('DOMContentLoaded', async () => {
       } catch (e) { /* debugger 不可用 */ }
 
       if (!debuggerOk) {
-        // 回退：合成事件，用完整 locator 逻辑查找元素
+        // 回退：合成事件，按 data-agent-id 直取目标
         await chrome.scripting.executeScript({
           target: { tabId: tab.id, allFrames: true },
-          func: (locatorData) => {
-            let el = null;
-            if (!locatorData) return;
-            if (locatorData.method === 'css') {
-              el = document.querySelector(locatorData.value);
-            } else if (locatorData.method === 'annotation_id') {
-              el = document.querySelector(`[data-agent-id="${locatorData.value}"]`);
-            } else if (locatorData.method === 'text') {
-              const normalized = locatorData.value.toLowerCase().trim();
-              for (const candidate of document.querySelectorAll('*')) {
-                const t = (candidate.textContent || '').trim().toLowerCase();
-                if (t === normalized || t.includes(normalized)) {
-                  const r = candidate.getBoundingClientRect();
-                  if (r.width > 0 && r.height > 0) { el = candidate; break; }
-                }
-              }
-            }
-            if (!el && locatorData.fallback) {
-              el = document.querySelector(`[data-agent-id="${locatorData.fallback.value}"]`);
-            }
+          func: (idx) => {
+            if (idx === undefined || idx === null) return;
+            const el = document.querySelector(`[data-agent-id="${idx}"]`);
             if (!el) return;
             const rect = el.getBoundingClientRect();
             const cx = rect.left + rect.width / 2;
@@ -4107,7 +3905,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             el.dispatchEvent(new MouseEvent('click', opts));
             el.click();
           },
-          args: [action.locator || null]
+          args: [action.index ?? null]
         }).catch(() => {});
       }
       delete result._clickCoords;
@@ -4227,7 +4025,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       const actionEl = document.createElement('div');
       actionEl.className = 'agent-action';
       let actionDesc = `🔧 [步骤${step}] ${action.type}`;
-      if (action.locator) actionDesc += ` → ${action.locator.value}`;
+      if (action.index != null) actionDesc += ` → [${action.index}]`;
       if (action.params?.text) actionDesc += ` (文本: "${action.params.text.slice(0, 20)}")`;
       if (action.params?.direction) actionDesc += ` (${action.params.direction})`;
       if (action.params?.key) actionDesc += ` (${action.params.key})`;
@@ -4275,166 +4073,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     scrollToBottom();
   }
 
-  function renderEvaluationCard(bubble, info) {
-    const card = document.createElement('div');
-    card.className = 'agent-eval-card';
-
-    const title = document.createElement('div');
-    title.className = 'agent-eval-title';
-    title.textContent = `本次执行是否成功？接受后存入知识库供下次参考（${info.executedSteps.length}步）`;
-    card.appendChild(title);
-
-    // 可折叠的待保存步骤 trace（默认隐藏）
-    const traceToggle = document.createElement('div');
-    traceToggle.className = 'agent-trace-toggle';
-    traceToggle.textContent = '▸ 查看待保存的操作步骤';
-    card.appendChild(traceToggle);
-
-    const traceList = document.createElement('div');
-    traceList.className = 'agent-record-steps';
-    traceList.style.display = 'none';
-    info.executedSteps.forEach((s, i) => {
-      const stepEl = document.createElement('div');
-      stepEl.className = 'agent-record-step';
-      let desc;
-      if (s.intent) {
-        desc = `${i + 1}. ${s.intent}`;
-      } else {
-        desc = `${i + 1}. ${s.action}`;
-        if (s.target_text) desc += ` → ${s.target_text}`;
-        if (s.value) desc += ` = ${s.value}`;
-        else if (s.text) desc += ` (输入: "${s.text.slice(0, 20)}")`;
-      }
-      stepEl.textContent = desc;
-      traceList.appendChild(stepEl);
-    });
-    card.appendChild(traceList);
-
-    traceToggle.addEventListener('click', () => {
-      const hidden = traceList.style.display === 'none';
-      traceList.style.display = hidden ? 'block' : 'none';
-      traceToggle.textContent = hidden ? '▾ 收起操作步骤' : '▸ 查看待保存的操作步骤';
-    });
-
-    const noteInput = document.createElement('textarea');
-    noteInput.className = 'agent-eval-note';
-    noteInput.placeholder = '备注（可选）：例如"第一步要先点Coding"';
-    card.appendChild(noteInput);
-
-    const btnRow = document.createElement('div');
-    btnRow.className = 'agent-eval-btns';
-
-    const acceptBtn = document.createElement('button');
-    acceptBtn.className = 'agent-btn-allow';
-    acceptBtn.textContent = '✓ 接受并保存';
-    acceptBtn.onclick = async () => {
-      acceptBtn.disabled = true;
-      // 引用回报：如果本次参照了知识库记录，回报成功
-      if (info.referencedId) {
-        await callAgentApi(info.safeApiUrl, '/v1/knowledge/usage',
-          { record_id: info.referencedId, success: true }, info.apiKey).catch(() => {});
-      }
-      // 保存新记录
-      try {
-        await callAgentApi(info.safeApiUrl, '/v1/knowledge/record', {
-          task_description: info.task,
-          trigger_prompt: info.task,
-          source: 'confirmed',
-          page_fingerprint: info.fingerprint,
-          steps: info.executedSteps,
-          user_note: noteInput.value.trim()
-        }, info.apiKey);
-        card.innerHTML = '<div class="agent-eval-done">✓ 已存入知识库</div>';
-      } catch (e) {
-        card.innerHTML = `<div class="agent-eval-done">保存失败: ${e.message || '未知错误'}</div>`;
-      }
-    };
-
-    const rejectBtn = document.createElement('button');
-    rejectBtn.className = 'agent-btn-deny';
-    rejectBtn.textContent = '✗ 不保存';
-    rejectBtn.onclick = async () => {
-      // 引用回报：如果参照了知识库但用户拒绝，回报失败
-      if (info.referencedId) {
-        await callAgentApi(info.safeApiUrl, '/v1/knowledge/usage',
-          { record_id: info.referencedId, success: false }, info.apiKey).catch(() => {});
-      }
-      card.remove();
-    };
-
-    btnRow.append(acceptBtn, rejectBtn);
-    card.appendChild(btnRow);
-    bubble.appendChild(card);
-    scrollToBottom();
-  }
-
-  function renderRecordingConfirmCard(info) {
-    const bubble = createMessageNode('ai');
-    const card = document.createElement('div');
-    card.className = 'agent-eval-card';
-
-    const title = document.createElement('div');
-    title.className = 'agent-eval-title';
-    title.textContent = `录制完成：「${info.task}」共 ${info.steps.length} 步。确认后存入知识库：`;
-    card.appendChild(title);
-
-    // 展示录制的步骤列表
-    const stepsList = document.createElement('div');
-    stepsList.className = 'agent-record-steps';
-    info.steps.forEach((s, i) => {
-      const stepEl = document.createElement('div');
-      stepEl.className = 'agent-record-step';
-      let desc = `${i + 1}. ${s.action}`;
-      if (s.target_text) desc += ` → ${s.target_text}`;
-      if (s.text) desc += ` (输入: "${s.text.slice(0, 20)}")`;
-      stepEl.textContent = desc;
-      stepsList.appendChild(stepEl);
-    });
-    card.appendChild(stepsList);
-
-    const noteInput = document.createElement('textarea');
-    noteInput.className = 'agent-eval-note';
-    noteInput.placeholder = '备注（可选）：例如"这个流程用于查询本月订单"';
-    card.appendChild(noteInput);
-
-    const btnRow = document.createElement('div');
-    btnRow.className = 'agent-eval-btns';
-
-    const acceptBtn = document.createElement('button');
-    acceptBtn.className = 'agent-btn-allow';
-    acceptBtn.textContent = '✓ 确认保存';
-    acceptBtn.onclick = async () => {
-      acceptBtn.disabled = true;
-      try {
-        const { apiKey, safeApiUrl, modelName } = await resolveApiRequestConfig();
-        await callAgentApi(safeApiUrl, '/v1/knowledge/record', {
-          task_description: info.task,
-          trigger_prompt: info.task,
-          source: 'recorded',
-          page_fingerprint: info.fingerprint,
-          steps: info.steps,
-          user_note: noteInput.value.trim(),
-          model: modelName || ''
-        }, apiKey);
-        card.innerHTML = `<div class="agent-eval-done">✓ 已保存 ${info.steps.length} 步到知识库</div>`;
-      } catch (e) {
-        card.innerHTML = `<div class="agent-eval-done">保存失败: ${e.message || '未知错误'}</div>`;
-      }
-    };
-
-    const rejectBtn = document.createElement('button');
-    rejectBtn.className = 'agent-btn-deny';
-    rejectBtn.textContent = '✗ 放弃';
-    rejectBtn.onclick = () => {
-      card.innerHTML = '<div class="agent-eval-done">已放弃本次录制</div>';
-    };
-
-    btnRow.append(acceptBtn, rejectBtn);
-    card.appendChild(btnRow);
-    bubble.appendChild(card);
-    scrollToBottom();
-  }
-
   function renderAgentError(bubble, error) {
     const errorEl = document.createElement('div');
     errorEl.className = 'agent-error';
@@ -4451,7 +4089,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       const msgEl = document.createElement('div');
       msgEl.className = 'agent-confirm-msg';
       let desc = `⚠️ 即将执行: ${action.type}`;
-      if (action.locator) desc += ` → ${action.locator.value}`;
+      if (action.index != null) desc += ` → [${action.index}]`;
       if (thought) desc += `\n原因: ${thought}`;
       msgEl.textContent = desc;
       confirmDiv.appendChild(msgEl);
@@ -4523,10 +4161,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     agentState.status = 'running';
     agentState.currentStep = 0;
 
-    // 记录本次执行的操作序列和页面指纹，供知识库保存
-    const executedSteps = [];
-    let firstFingerprint = null;
-
     let apiKey, modelName, safeApiUrl;
     try {
       ({ apiKey, modelName, safeApiUrl } = await resolveApiRequestConfig());
@@ -4550,7 +4184,6 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     try {
       let pageState = await observePageState();
-      firstFingerprint = pageState?.page_fingerprint || null;
       aiBubble.textContent = '';
 
       const headerEl = document.createElement('div');
@@ -4578,11 +4211,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         require_confirmation: []
       }, apiKey);
 
-      // 首次渲染计划面板
-      if (response.plan) {
-        renderAgentPlan(aiBubble, response.plan);
-      }
-
       const agentStartTime = Date.now();
       while (response.status === 'action_required' || response.status === 'confirm_required') {
         if (!agentState.active) break;
@@ -4591,22 +4219,9 @@ document.addEventListener('DOMContentLoaded', async () => {
           break;
         }
 
-        // 每步更新目标进度
-        if (response.plan) updateAgentPlan(aiBubble, response.plan);
-
         agentState.currentStep = response.step;
         const action = response.action;
-
-        // 子任务切换时 action 为 null，直接继续请求下一步
-        if (!action) {
-          const freshState = await observePageState();
-          response = await callAgentApi(safeApiUrl, '/v1/agent/step', {
-            session_id: sessionId,
-            action_result: { success: true, action_type: 'sub_task_switch', details: '子任务切换' },
-            page_state: freshState
-          }, apiKey);
-          continue;
-        }
+        if (!action) break;  // 无动作但非终态，异常，退出
 
         if (response.status === 'confirm_required') {
           const confirmed = await showAgentConfirmDialog(aiBubble, action, response.thought);
@@ -4625,23 +4240,27 @@ document.addEventListener('DOMContentLoaded', async () => {
         const preElementCount = (pageState?.interactive_elements || []).length;
 
         const actionResult = await executePageAction(action);
-
         renderAgentStepInBubble(aiBubble, response.step, null, null, actionResult);
 
-        if (!firstFingerprint && pageState?.page_fingerprint) {
-          firstFingerprint = pageState.page_fingerprint;
+        // 编号失效（stale）：页面已重渲染，重新观察后让 LLM 用新编号，不计失败
+        if (actionResult.stale) {
+          const freshState = await observePageState();
+          pageState = freshState;
+          response = await callAgentApi(safeApiUrl, '/v1/agent/step', {
+            session_id: sessionId,
+            action_result: { success: false, stale: true, action_type: action.type, details: actionResult.error || '编号失效' },
+            page_state: freshState
+          }, apiKey);
+          continue;
         }
 
-        // 智能等待页面稳定（替代固定延时）
+        // 智能等待页面稳定
         const activeTab = await getActiveBrowserTab().catch(() => null);
-        if (activeTab?.id) {
-          await waitForPageSettle(activeTab.id);
-        }
+        if (activeTab?.id) await waitForPageSettle(activeTab.id);
 
-        // 导航后先移鼠标到中性位收掉 hover 残留浮层，再观察，保证采集到收起后的干净页面
+        // 导航后移鼠标到中性位收残留浮层，再观察
         const preObserveTab = await getActiveBrowserTab().catch(() => null);
         if (preObserveTab?.id) {
-          // 仅当页面可能已导航时才重置（避免干扰 hover→click 链路）
           try {
             const curUrl = await chrome.scripting.executeScript({
               target: { tabId: preObserveTab.id, allFrames: false },
@@ -4656,8 +4275,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         const newPageState = await observePageState();
 
-        // 1b 兜底：采集端没识别出弹层，但本轮相对上轮"成簇新增"→ 判为就地展开的选项/复选组，
-        // 合成 active_popup，让 popup_appeared 信号成立、格式化置顶，避免 LLM 重复点触发器把组点没。
+        // inline 组兜底：成簇新增 → 合成 active_popup，让 popup_appeared 成立、格式化置顶
         if (!newPageState.active_popup) {
           const inlineGroup = detectInlineGroup(
             pageState?.interactive_elements || [],
@@ -4665,7 +4283,6 @@ document.addEventListener('DOMContentLoaded', async () => {
           );
           if (inlineGroup) {
             newPageState.active_popup = inlineGroup;
-            // 把该簇元素标记为 in_popup，使格式化时它们被置顶为"面板内元素"
             const sig = (e) => `${e.tag}|${e.role}|${(e.text || '').slice(0, 20)}|${e.name}`;
             const prevSet = new Set((pageState?.interactive_elements || []).map(sig));
             for (const e of newPageState.interactive_elements) {
@@ -4674,7 +4291,6 @@ document.addEventListener('DOMContentLoaded', async () => {
           }
         }
 
-        // 附加状态变化信息
         actionResult.state_changes = {
           url_changed: newPageState.url !== preUrl,
           popup_appeared: !prePopup && !!newPageState.active_popup,
@@ -4683,62 +4299,16 @@ document.addEventListener('DOMContentLoaded', async () => {
         };
         pageState = newPageState;
 
-        // 记录成功的操作步骤（供知识库精确回放：含 tag/selectors 级联 + 预期结果 expected）
-        if (actionResult.success && action.type !== 'wait') {
-          const ei = actionResult._elementInfo || null;
-          const sc = actionResult.state_changes;
-          const expected = {};
-          if (sc.url_changed) expected.url_after = newPageState.url ? new URL(newPageState.url).pathname : '';
-          if (sc.popup_appeared) expected.popup_appeared = true;
-          if (sc.popup_disappeared) expected.popup_disappeared = true;
-          executedSteps.push({
-            intent: response.thought || response.plan?.current_goal || '',
-            action: action.type,
-            tag: ei?.tag || '',
-            role: ei?.role || '',
-            target_text: action.locator?.value || '',
-            css_selector: action.locator?.method === 'css' ? action.locator.value : '',
-            selectors: ei?.selectors || [],
-            text: action.params?.text || '',
-            value: action.params?.option_text || action.params?.value || '',
-            url_before: preUrl ? new URL(preUrl).pathname : '',
-            page_marker: actionResult._pageMarker || null,
-            expected,
-            result: actionResult.details || ''
-          });
-        }
-
-        // 两阶段调用：先规划（快速更新目标面板），再执行
-        const planResponse = await callAgentApi(safeApiUrl, '/v1/agent/plan', {
+        // 单次调用：传上一步结果 + 新观察 → 下一个动作
+        response = await callAgentApi(safeApiUrl, '/v1/agent/step', {
           session_id: sessionId,
           action_result: actionResult,
           page_state: newPageState
         }, apiKey);
-
-        // 立即更新目标面板
-        if (planResponse.plan) updateAgentPlan(aiBubble, planResponse.plan);
-
-        // 如果规划阶段就完成/出错了，不再调执行
-        if (planResponse.status === 'completed' || planResponse.status === 'error') {
-          response = planResponse;
-        } else {
-          // 调执行 LLM 获取 action
-          response = await callAgentApi(safeApiUrl, '/v1/agent/action', {
-            session_id: sessionId
-          }, apiKey);
-        }
       }
 
       if (response.status === 'completed') {
-        if (response.plan) updateAgentPlan(aiBubble, response.plan);
         renderAgentComplete(aiBubble, response.summary, true);
-        // 弹出评价窗口，用户接受则存入知识库
-        if (executedSteps.length >= 2 && firstFingerprint) {
-          renderEvaluationCard(aiBubble, {
-            task, executedSteps, fingerprint: firstFingerprint,
-            safeApiUrl, apiKey, referencedId: response.plan?.referenced_id
-          });
-        }
       } else if (response.status === 'error') {
         renderAgentError(aiBubble, response.error || '未知错误');
       }
@@ -4859,339 +4429,5 @@ document.addEventListener('DOMContentLoaded', async () => {
   // ═══════════════════════════════════════════════════════════════════
   // 操作录制模块（存入知识库）
   // ═══════════════════════════════════════════════════════════════════
-  (function installRecorder() {
-    const recordBtn = document.getElementById('recordBtn');
-    if (!recordBtn) return;
-
-    let recording = false;
-    let recordedSteps = [];
-    let recordTask = '';
-    let recordFingerprint = null;
-    let recordTabId = null;
-    let pageEpoch = 0;              // 每次注入递增，用于跨页面步骤排序
-    let stepListener = null;
-    let reinjectListener = null;
-
-    // 注入到页面的录制拦截脚本（可重复注入，幂等）
-    function recorderScriptFn(epoch) {
-      // 已装过监听器：只重开标志 + 更新 epoch，不重复装（防风险2）
-      if (window.__agentRecorderInstalled) {
-        window.__agentRecording = true;
-        window.__agentRecordEpoch = epoch;
-        return;
-      }
-      window.__agentRecorderInstalled = true;
-      window.__agentRecording = true;
-      window.__agentRecordEpoch = epoch;
-      window.__agentSeq = 0;
-
-      function selectorOf(el) {
-        if (el.id && !el.id.match(/^[\d:]/) && !el.id.includes('--')) return `#${el.id}`;
-        const testId = el.getAttribute('data-testid') || el.getAttribute('data-cy');
-        if (testId) return `[data-testid="${testId}"]`;
-        return '';
-      }
-
-      // 回放定位级联（与 observePageState 的 __buildSelectorCascade 同源逻辑）
-      function selectorCascade(el) {
-        if (!el || !el.tagName) return { tag: '', role: '', selectors: [] };
-        const tag = el.tagName.toLowerCase();
-        const isDynamicId = (id) =>
-          !id || /^[\d:]/.test(id) || id.includes('--')
-          || /jd-id-\d/.test(id) || /^[a-z]+-\d{4,}$/.test(id) || /:r[0-9a-z]+:/.test(id);
-        const esc = (v) => (window.CSS && CSS.escape) ? CSS.escape(v) : v.replace(/["\\]/g, '\\$&');
-        const sels = [];
-        if (el.id && !isDynamicId(el.id)) sels.push({ by: 'css', value: `#${esc(el.id)}` });
-        for (const attr of ['data-testid', 'data-cy', 'data-test']) {
-          const v = el.getAttribute(attr);
-          if (v) sels.push({ by: 'css', value: `[${attr}="${v}"]` });
-        }
-        const nm = el.getAttribute('name');
-        if (nm) sels.push({ by: 'css', value: `${tag}[name="${nm}"]` });
-        const aria = el.getAttribute('aria-label');
-        if (aria) sels.push({ by: 'css', value: `${tag}[aria-label="${aria.slice(0, 40)}"]` });
-        // 表单元素专属：placeholder（转 css）+ 关联 label（by:'label'）
-        const ph = el.getAttribute('placeholder');
-        if (ph) sels.push({ by: 'css', value: `${tag}[placeholder="${ph.slice(0, 40)}"]` });
-        let labelText = '';
-        if (el.id) {
-          const lbl = document.querySelector(`label[for="${esc(el.id)}"]`);
-          if (lbl) labelText = (lbl.textContent || '').trim().slice(0, 30);
-        }
-        if (!labelText) {
-          const wrap = el.closest('label');
-          if (wrap) labelText = (wrap.textContent || '').trim().slice(0, 30);
-        }
-        if (labelText) sels.push({ by: 'label', value: labelText });
-        if (el.classList && el.classList.length) {
-          const stable = Array.from(el.classList).filter(c =>
-            c.length <= 30 && !/\d{4,}/.test(c) && !c.includes('--') && !/^[a-f0-9]{8,}$/.test(c)
-          ).slice(0, 3);
-          if (stable.length) sels.push({ by: 'css', value: `${tag}.${stable.map(esc).join('.')}` });
-        }
-        const txt = (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 30);
-        if (txt) sels.push({ by: 'text', tag, value: txt });
-        try {
-          const parts = [];
-          let node = el, depth = 0;
-          while (node && node.nodeType === 1 && depth < 4) {
-            let seg = node.tagName.toLowerCase();
-            const parent = node.parentElement;
-            if (node.id && !isDynamicId(node.id)) { parts.unshift(`#${esc(node.id)}`); break; }
-            if (parent) {
-              const sameTag = Array.from(parent.children).filter(c => c.tagName === node.tagName);
-              if (sameTag.length > 1) seg += `:nth-of-type(${sameTag.indexOf(node) + 1})`;
-            }
-            parts.unshift(seg);
-            node = parent; depth++;
-          }
-          if (parts.length) sels.push({ by: 'css', value: parts.join(' > ') });
-        } catch (e) { /* ignore */ }
-        // 定位质量分级：唯一命中→保留；命中多个含目标→标 ambiguous；命中非目标/报错→丢弃。非 css 保留。
-        const graded = [];
-        for (const s of sels) {
-          if (s.by === 'css') {
-            try {
-              const hits = document.querySelectorAll(s.value);
-              if (hits.length === 1 && hits[0] === el) {
-                graded.push(s);
-              } else if (hits.length > 1 && Array.prototype.includes.call(hits, el)) {
-                graded.push({ ...s, ambiguous: true });
-              }
-            } catch (e) { /* 无效选择器，丢弃 */ }
-          } else {
-            graded.push(s);
-          }
-        }
-        return { tag, role: el.getAttribute('role') || '', selectors: graded };
-      }
-
-      // 回放锚定用页面特征（与采集端 __buildPageMarker 同源；filled/el_count 已砍）
-      function pageMarker(el) {
-        const marker = { prev_sibling: '', next_sibling: '', anchor_text: '' };
-        try {
-          if (el) {
-            const t = (n) => n ? (n.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 20) : '';
-            marker.prev_sibling = t(el.previousElementSibling);
-            marker.next_sibling = t(el.nextElementSibling);
-            marker.anchor_text = t(el);
-          }
-        } catch (e) { /* ignore */ }
-        return marker;
-      }
-
-      function interactiveAncestor(el) {
-        return el.closest(
-          'button, a, [role="button"], [role="menuitem"], [role="option"], [role="tab"], [role="checkbox"], [role="radio"], li, td'
-        ) || el;
-      }
-
-      function labelTextOf(el) {
-        if (el.id) {
-          const lbl = document.querySelector(`label[for="${el.id}"]`);
-          if (lbl) return (lbl.textContent || '').trim().slice(0, 40);
-        }
-        const wrap = el.closest('label');
-        if (wrap) return (wrap.textContent || '').trim().slice(0, 40);
-        return el.name || el.getAttribute('aria-label') || '';
-      }
-
-      // 上报一步到侧边栏（导航不会丢，防风险1的持久化）
-      function sendStep(step) {
-        try {
-          chrome.runtime.sendMessage({
-            type: 'RECORD_STEP',
-            step: { ...step, epoch: window.__agentRecordEpoch, seq: window.__agentSeq++ }
-          });
-        } catch { /* 扩展上下文失效（导航中），忽略（防风险3） */ }
-      }
-
-      // click：向上找可交互祖先（防目标不准）
-      document.addEventListener('click', (e) => {
-        if (!window.__agentRecording) return;
-        const el = interactiveAncestor(e.target);
-        // checkbox/radio 交给 change 处理，避免重复
-        if (el.type === 'checkbox' || el.type === 'radio') return;
-        const ei = selectorCascade(el);
-        sendStep({
-          action: 'click',
-          tag: ei.tag,
-          role: ei.role,
-          target_text: (el.textContent || el.getAttribute('aria-label') || '').trim().slice(0, 40),
-          css_selector: selectorOf(el),
-          selectors: ei.selectors,
-          page_marker: pageMarker(el),
-          url_before: location.pathname
-        });
-      }, true);
-
-      // change：select下拉、checkbox、radio
-      document.addEventListener('change', (e) => {
-        if (!window.__agentRecording) return;
-        const el = e.target;
-        const tag = el.tagName.toLowerCase();
-        const ei = selectorCascade(el);
-        if (tag === 'select') {
-          sendStep({
-            action: 'select',
-            tag: ei.tag,
-            role: ei.role,
-            target_text: el.name || el.getAttribute('aria-label') || labelTextOf(el),
-            css_selector: selectorOf(el),
-            selectors: ei.selectors,
-            page_marker: pageMarker(el),
-            value: (el.options[el.selectedIndex] || {}).text || el.value || '',
-            url_before: location.pathname
-          });
-        } else if (el.type === 'checkbox' || el.type === 'radio') {
-          sendStep({
-            action: 'click',
-            tag: ei.tag,
-            role: ei.role,
-            target_text: labelTextOf(el),
-            css_selector: selectorOf(el),
-            selectors: ei.selectors,
-            page_marker: pageMarker(el),
-            value: el.checked ? '选中' : '取消',
-            url_before: location.pathname
-          });
-        }
-      }, true);
-
-      // keydown：只记录关键键
-      document.addEventListener('keydown', (e) => {
-        if (!window.__agentRecording) return;
-        if (['Enter', 'Escape', 'Tab'].includes(e.key)) {
-          sendStep({ action: 'press_key', key: e.key, url_before: location.pathname });
-        }
-      }, true);
-
-      // input：debounce + blur 兜底（防吞输入，风险处理）
-      let inputTimer = null;
-      let pendingInput = null;
-      function flushInput() {
-        clearTimeout(inputTimer);
-        if (!pendingInput) return;
-        sendStep(pendingInput);
-        pendingInput = null;
-      }
-      document.addEventListener('input', (e) => {
-        if (!window.__agentRecording) return;
-        const el = e.target;
-        const ei = selectorCascade(el);
-        const val = el.isContentEditable ? (el.textContent || '') : (el.value || '');
-        pendingInput = {
-          action: 'type',
-          tag: ei.tag,
-          role: ei.role,
-          target_text: el.placeholder || el.name || el.getAttribute('aria-label') || '',
-          css_selector: selectorOf(el),
-          selectors: ei.selectors,
-          page_marker: pageMarker(el),
-          text: val.slice(0, 50),
-          url_before: location.pathname
-        };
-        clearTimeout(inputTimer);
-        inputTimer = setTimeout(flushInput, 800);
-      }, true);
-      document.addEventListener('blur', () => {
-        if (window.__agentRecording) flushInput();
-      }, true);
-    }
-
-    async function injectRecorderScript(tabId, epoch) {
-      await chrome.scripting.executeScript({
-        target: { tabId, allFrames: true },
-        func: recorderScriptFn,
-        args: [epoch]
-      }).catch(() => {});
-    }
-
-    function startListeners() {
-      stepListener = (msg, sender) => {
-        if (msg.type === 'RECORD_STEP' && recording && sender.tab?.id === recordTabId) {
-          recordedSteps.push(msg.step);
-        }
-      };
-      reinjectListener = (tabId, info) => {
-        if (recording && tabId === recordTabId && info.status === 'complete') {
-          pageEpoch += 1;
-          injectRecorderScript(tabId, pageEpoch);  // 跳转后重注入（防风险3）
-        }
-      };
-      chrome.runtime.onMessage.addListener(stepListener);
-      chrome.tabs.onUpdated.addListener(reinjectListener);
-    }
-
-    function stopListeners() {
-      if (stepListener) chrome.runtime.onMessage.removeListener(stepListener);
-      if (reinjectListener) chrome.tabs.onUpdated.removeListener(reinjectListener);
-      stepListener = reinjectListener = null;
-    }
-
-    // 侧边栏关闭兜底，防 listener 泄漏（风险1）
-    window.addEventListener('beforeunload', () => { if (recording) stopListeners(); });
-
-    recordBtn.addEventListener('click', async () => {
-      if (!recording) {
-        // 开始录制
-        const desc = prompt('请输入这次操作的描述（如：在coding中搜索仓库）:');
-        if (!desc || !desc.trim()) return;
-        recordTask = desc.trim();
-        recordedSteps = [];
-        recordFingerprint = null;
-        pageEpoch = 1;
-
-        const tab = await getActiveBrowserTab().catch(() => null);
-        if (!tab?.id) { alert('无法获取当前标签页'); return; }
-        recordTabId = tab.id;
-
-        // 采集起始页面指纹（复用 observePageState，避免与其重复维护同一段指纹逻辑）
-        try {
-          const startState = await observePageState();
-          recordFingerprint = startState?.page_fingerprint || null;
-        } catch { /* ignore */ }
-
-        startListeners();
-        await injectRecorderScript(tab.id, pageEpoch);
-
-        recording = true;
-        recordBtn.classList.add('is-active');
-        recordBtn.textContent = '⏹️ 停止录制';
-      } else {
-        // 停止录制
-        recording = false;
-        recordBtn.classList.remove('is-active');
-        recordBtn.textContent = '⏺️ 录制';
-
-        // 关闭页面录制标志（尽力而为）
-        if (recordTabId != null) {
-          await chrome.scripting.executeScript({
-            target: { tabId: recordTabId, allFrames: true },
-            func: () => { window.__agentRecording = false; }
-          }).catch(() => {});
-        }
-        stopListeners();
-
-        if (recordedSteps.length === 0) {
-          alert('未录制到任何操作');
-          recordTabId = null;
-          return;
-        }
-
-        // 按 (epoch, seq) 排序，保证跨页面顺序正确（风险3/4）
-        recordedSteps.sort((a, b) =>
-          (a.epoch || 0) - (b.epoch || 0) || (a.seq || 0) - (b.seq || 0)
-        );
-
-        renderRecordingConfirmCard({
-          task: recordTask,
-          steps: recordedSteps,
-          fingerprint: recordFingerprint || {}
-        });
-        recordTabId = null;
-      }
-    });
-  })();
 });
 

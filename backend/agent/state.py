@@ -2,6 +2,9 @@
 
 描述一次 Agent 自动化会话中的所有数据结构：
 会话状态、页面观察、动作指令、执行结果。
+
+定位契约：索引直连——动作只带 index（观察时打标的 data-agent-id 编号），
+前端直取该节点。无 css/text 模糊匹配。
 """
 
 from dataclasses import dataclass, field
@@ -16,21 +19,14 @@ class AgentStatus(str, Enum):
     RUNNING = "running"
     ACTION_REQUIRED = "action_required"
     CONFIRM_REQUIRED = "confirm_required"
-    PLAN_READY = "plan_ready"
     COMPLETED = "completed"
     ERROR = "error"
     CANCELLED = "cancelled"
 
 
-class ElementLocator(BaseModel):
-    method: str  # "css" | "text" | "annotation_id"
-    value: str
-    fallback: Optional["ElementLocator"] = None
-
-
 class PageAction(BaseModel):
-    type: str  # click, type, select, scroll, hover, focus, clear, press_key, wait, task_complete
-    locator: Optional[ElementLocator] = None
+    type: str  # click, type, select, scroll, hover, focus, clear, press_key, wait, navigate, task_complete
+    index: Optional[int] = None          # 目标元素编号（data-agent-id）；无需元素的动作为 None
     params: dict[str, Any] = {}
 
 
@@ -40,6 +36,7 @@ class ActionResult(BaseModel):
     details: str = ""
     error: Optional[str] = None
     timestamp: int = 0
+    stale: bool = False                  # 编号失效（页面已重渲染）→ 需重新观察，不计失败
     state_changes: Optional[dict[str, Any]] = None
 
 
@@ -61,15 +58,8 @@ class PageState(BaseModel):
 
 
 @dataclass
-class FailedPath:
-    """一轮失败的归因记录（由评判 LLM 生成）。"""
-    failure_reason: str
-    avoid: str
-
-
-@dataclass
 class FailedAttempt:
-    """记录一次失败的操作尝试。"""
+    """记录一次失败的操作尝试（供反思黑名单）。"""
     action_type: str
     target: str
     error: str
@@ -78,7 +68,7 @@ class FailedAttempt:
 
 @dataclass
 class AgentSession:
-    """一次 Agent 自动化会话的完整状态。"""
+    """一次 Agent 自动化会话的完整状态（单 LLM 反应式循环）。"""
 
     session_id: str
     task: str
@@ -94,25 +84,15 @@ class AgentSession:
     error: Optional[str] = None
     call_mode: Optional[str] = None
 
-    # 时间戳
+    # 轻量进度（供前端展示；由 LLM 每步在 thought 里维护，可选）
+    progress: str = ""
+
     created_at: float = field(default_factory=time.time)
 
-    # 规划状态（每步由规划 LLM 刷新）
-    current_goal: str = ""
-    next_action_hint: str = ""
-    completed_goals: list[str] = field(default_factory=list)
-    remaining_goal: str = ""
-    goal_step_count: int = 0
-    goal_retry_count: int = 0
-    max_steps_per_goal: int = 10
-    max_retries_per_goal: int = 3
-    failed_paths: list[FailedPath] = field(default_factory=list)
-    _retrying: bool = False  # 本轮是超限重试（而非用户/规划切换目标）
+    # 步数与超时防护
+    max_steps: int = 40
+    stale_retries: int = 0               # 连续 stale 重观察次数（防打转）
 
     # 反思机制
     failed_attempts: list[FailedAttempt] = field(default_factory=list)
     blacklisted_approaches: list[str] = field(default_factory=list)
-
-    # 知识库引用（召回缓存 + 被引用记录 id）
-    _kb_hint_cache: str = ""
-    _kb_referenced_id: str = ""

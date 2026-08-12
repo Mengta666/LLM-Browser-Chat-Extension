@@ -1,27 +1,16 @@
 """工具注册表模块。
 
 定义 Agent 自动化可用的所有页面操作工具的 OpenAI function calling schema。
+定位契约：索引直连——LLM 只给元素编号 index（对应观察时打标的 data-agent-id），
+前端直取该节点，无 css/text 模糊匹配。
 """
 
 from typing import Any
 
-LOCATOR_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "description": "定位页面元素的方式。method 可选 css(CSS选择器)、text(可见文本匹配)、annotation_id(元素编号)",
-    "properties": {
-        "method": {"type": "string", "enum": ["css", "text", "annotation_id"]},
-        "value": {"type": "string", "description": "选择器值、文本内容或元素编号"},
-        "fallback": {
-            "type": "object",
-            "description": "主定位失败时的备选方案",
-            "properties": {
-                "method": {"type": "string", "enum": ["css", "text", "annotation_id"]},
-                "value": {"type": "string"},
-            },
-            "required": ["method", "value"],
-        },
-    },
-    "required": ["method", "value"],
+# 索引定位：index = 观察列表里的元素编号（data-agent-id）。这是唯一定位方式。
+INDEX_PARAM: dict[str, Any] = {
+    "type": "integer",
+    "description": "目标元素的编号（观察列表中每个元素前的 [N]）。只能使用当前这一轮观察里列出的编号。",
 }
 
 ACTION_SCHEMAS: list[dict[str, Any]] = [
@@ -29,13 +18,11 @@ ACTION_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "click",
-            "description": "点击页面上的元素（按钮、链接、复选框等）",
+            "description": "点击页面上的元素（按钮、链接、复选框、下拉/筛选选项等）。用观察列表里的编号定位。",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "locator": LOCATOR_SCHEMA,
-                },
-                "required": ["locator"],
+                "properties": {"index": INDEX_PARAM},
+                "required": ["index"],
             },
         },
     },
@@ -43,11 +30,11 @@ ACTION_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "type",
-            "description": "在输入框或文本域中输入文字",
+            "description": "在输入框或文本域中输入文字（支持普通输入框和富文本编辑器）。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "locator": LOCATOR_SCHEMA,
+                    "index": INDEX_PARAM,
                     "text": {"type": "string", "description": "要输入的文本"},
                     "clear": {
                         "type": "boolean",
@@ -55,7 +42,7 @@ ACTION_SCHEMAS: list[dict[str, Any]] = [
                         "default": True,
                     },
                 },
-                "required": ["locator", "text"],
+                "required": ["index", "text"],
             },
         },
     },
@@ -63,18 +50,17 @@ ACTION_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "select",
-            "description": "从下拉框中选择一个选项",
+            "description": "从下拉框选择选项。若为自定义下拉，通常先 click 触发器展开、再 click 选项编号。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "locator": LOCATOR_SCHEMA,
-                    "value": {"type": "string", "description": "选项的value属性值"},
+                    "index": INDEX_PARAM,
                     "option_text": {
                         "type": "string",
-                        "description": "选项的可见文本（当value未知时用此字段）",
+                        "description": "要选择的选项可见文本",
                     },
                 },
-                "required": ["locator"],
+                "required": ["index"],
             },
         },
     },
@@ -82,7 +68,7 @@ ACTION_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "scroll",
-            "description": "滚动页面",
+            "description": "滚动页面或容器。目标不在当前编号列表时用它找出更多元素。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -104,14 +90,24 @@ ACTION_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "hover",
-            "description": "悬停在元素上以展开悬浮菜单/下拉/tooltip。当任务需要的入口（如某个应用、菜单项）在当前元素列表中找不到时，它很可能藏在悬浮菜单里——先 hover『更多应用』『菜单』等触发器，展开后目标就会出现在下一次观察中。",
+            "name": "scroll_to_element",
+            "description": "滚动使指定编号的元素出现在视口中央。",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "locator": LOCATOR_SCHEMA,
-                },
-                "required": ["locator"],
+                "properties": {"index": INDEX_PARAM},
+                "required": ["index"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "hover",
+            "description": "悬停在元素上以展开悬浮菜单/下拉/tooltip。当任务需要的入口（某应用、菜单项）不在当前编号列表中时，它可能藏在悬浮菜单里——先 hover『更多应用』『菜单』等触发器，展开后目标会出现在下一次观察中。",
+            "parameters": {
+                "type": "object",
+                "properties": {"index": INDEX_PARAM},
+                "required": ["index"],
             },
         },
     },
@@ -122,10 +118,8 @@ ACTION_SCHEMAS: list[dict[str, Any]] = [
             "description": "聚焦到某个元素（不点击）",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "locator": LOCATOR_SCHEMA,
-                },
-                "required": ["locator"],
+                "properties": {"index": INDEX_PARAM},
+                "required": ["index"],
             },
         },
     },
@@ -136,10 +130,8 @@ ACTION_SCHEMAS: list[dict[str, Any]] = [
             "description": "清空输入框或文本域的内容",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "locator": LOCATOR_SCHEMA,
-                },
-                "required": ["locator"],
+                "properties": {"index": INDEX_PARAM},
+                "required": ["index"],
             },
         },
     },
@@ -151,9 +143,9 @@ ACTION_SCHEMAS: list[dict[str, Any]] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "locator": {
-                        **LOCATOR_SCHEMA,
-                        "description": "目标元素（可选，不填则作用于当前焦点元素）",
+                    "index": {
+                        **INDEX_PARAM,
+                        "description": "目标元素编号（可选，不填则作用于当前焦点元素）",
                     },
                     "key": {
                         "type": "string",
@@ -195,46 +187,9 @@ ACTION_SCHEMAS: list[dict[str, Any]] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "url": {
-                        "type": "string",
-                        "description": "要导航到的完整URL",
-                    },
+                    "url": {"type": "string", "description": "要导航到的完整URL"},
                 },
                 "required": ["url"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "wait_for_element",
-            "description": "等待某个元素出现在页面上（轮询检测，超时返回失败）",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "locator": LOCATOR_SCHEMA,
-                    "timeout": {
-                        "type": "integer",
-                        "description": "最大等待时间毫秒数（默认5000，最大10000）",
-                        "default": 5000,
-                        "maximum": 10000,
-                    },
-                },
-                "required": ["locator"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "scroll_to_element",
-            "description": "滚动页面使指定元素出现在视口中央。当你知道元素存在但不在当前可见区域时使用。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "locator": LOCATOR_SCHEMA,
-                },
-                "required": ["locator"],
             },
         },
     },
@@ -263,6 +218,5 @@ ACTION_SCHEMAS: list[dict[str, Any]] = [
 
 ALLOWED_ACTION_TYPES: set[str] = {
     "click", "type", "select", "scroll", "scroll_to_element", "hover",
-    "focus", "clear", "press_key", "wait", "navigate",
-    "wait_for_element", "task_complete",
+    "focus", "clear", "press_key", "wait", "navigate", "task_complete",
 }

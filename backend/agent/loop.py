@@ -1,15 +1,19 @@
-"""Agent 主循环模块。
+"""Agent 主循环模块（单 LLM 反应式架构）。
 
-支持两种 LLM 调用模式：
-1. tool_calls 模式 —— 适用于支持 function calling 的模型（GPT-4o、Claude 等）
-2. text_parse 模式 —— 适用于不支持 tool calling 的推理模型（DeepSeek 等），
-   通过 prompt 引导模型输出 JSON，再从文本中解析动作
+每一步：观察（编号元素列表）→ 单次 LLM 调用 → 一个动作。
+定位契约：索引直连——LLM 输出 index，前端直取 data-agent-id 节点。
+编号失效（stale）→ 重新观察再决策，不计失败。
+
+支持两种调用模式：
+- tool_calls：支持 function calling 的模型
+- text_parse：不支持的推理模型，靠 prompt 输出 JSON 再解析
 """
 
 import json
 import os
 import re
 import time
+import threading
 from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
@@ -18,22 +22,11 @@ from dotenv import load_dotenv
 from openai import OpenAI, APITimeoutError, RateLimitError, APIConnectionError, APIStatusError
 
 from agent.state import (
-    AgentSession,
-    AgentStatus,
-    PageAction,
-    PageState,
-    ActionResult,
-    ElementLocator,
-    FailedAttempt,
-    FailedPath,
+    AgentSession, AgentStatus, PageAction, PageState, ActionResult, FailedAttempt,
 )
 from agent.context_builder import (
-    build_initial_messages,
-    build_initial_messages_text_mode,
-    build_step_planning_messages,
-    build_execution_goal_context,
-    build_reflection_prompt,
-    append_step_messages,
+    SYSTEM_PROMPT, SYSTEM_PROMPT_TEXT_MODE, REFLECT_SENTINEL,
+    build_initial_messages, build_reflection_prompt, append_step_messages,
 )
 from agent.router import should_confirm_action
 from tools.tool_registry import ACTION_SCHEMAS, ALLOWED_ACTION_TYPES
@@ -41,26 +34,38 @@ from observability.logger import get_logger
 
 _agent_log = get_logger("agent")
 
-
 __env_path = Path(__file__).resolve().parents[1] / "config" / ".env"
 load_dotenv(dotenv_path=__env_path)
 
 MODEL_BASE_URL = os.getenv("MODEL_BASE_URL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-AGENT_MODE = os.getenv("AGENT_MODE", "auto")  # "tool_calls" | "text_parse" | "auto"
+AGENT_MODE = os.getenv("AGENT_MODE", "auto")  # tool_calls | text_parse | auto
 
 _llm_client = OpenAI(base_url=MODEL_BASE_URL, api_key=OPENAI_API_KEY)
 
-import threading
 _sessions: dict[str, AgentSession] = {}
 _sessions_lock = threading.Lock()
 _SESSION_TTL_SECONDS = 600
+_SESSION_ABSOLUTE_TTL = 1800
+
+MAX_LLM_RETRIES = 3
+RETRY_DELAYS = [0.5, 1, 2]
+MAX_STALE_RETRIES = 3   # 连续编号失效重观察上限，防打转
+
+try:
+    import tiktoken
+    _tok_enc = tiktoken.get_encoding("cl100k_base")
+except Exception:
+    _tok_enc = None
+
+
+class CallMode(str, Enum):
+    TOOL_CALLS = "tool_calls"
+    TEXT_PARSE = "text_parse"
 
 
 def _cleanup_expired_sessions():
-    """清理过期会话。终态会话 10 分钟过期，非终态会话 30 分钟强制过期。"""
     now = time.time()
-    _SESSION_ABSOLUTE_TTL = 1800  # 30 分钟绝对超时（防 RUNNING 状态泄漏）
     expired = [
         sid for sid, s in _sessions.items()
         if (now - s.created_at > _SESSION_TTL_SECONDS
@@ -71,34 +76,22 @@ def _cleanup_expired_sessions():
         del _sessions[sid]
 
 
-class CallMode(str, Enum):
-    TOOL_CALLS = "tool_calls"
-    TEXT_PARSE = "text_parse"
-
-
 def get_session(session_id: str) -> Optional[AgentSession]:
     with _sessions_lock:
         _cleanup_expired_sessions()
         return _sessions.get(session_id)
 
 
-def create_session(
-    session_id: str,
-    task: str,
-    model: str,
-    require_confirmation: Optional[list[str]] = None,
-) -> AgentSession:
+def create_session(session_id: str, task: str, model: str,
+                   require_confirmation: Optional[list[str]] = None) -> AgentSession:
     with _sessions_lock:
         _cleanup_expired_sessions()
         session = AgentSession(
-            session_id=session_id,
-            task=task,
-            model=model,
+            session_id=session_id, task=task, model=model,
             require_confirmation=require_confirmation or [],
         )
         _sessions[session_id] = session
-    _agent_log.info("session_create", session_id=session_id,
-                    data={"task": task, "model": model})
+    _agent_log.info("session_create", session_id=session_id, data={"task": task, "model": model})
     return session
 
 
@@ -108,133 +101,75 @@ def cancel_session(session_id: str) -> bool:
         if not session:
             return False
         session.status = AgentStatus.CANCELLED
-    _agent_log.info("session_cancel", session_id=session_id,
-                    data={"step": session.current_step})
+    _agent_log.info("session_cancel", session_id=session_id, data={"step": session.current_step})
     return True
 
 
-def run_plan(
-    session: AgentSession,
-    page_state: PageState,
-    action_result: Optional[ActionResult] = None,
-) -> dict[str, Any]:
-    """第一阶段：记录结果 + 调规划 LLM。返回 plan 信息。"""
+# ═══════════════════════════════════════════════════════════════════════════════
+# 主循环：单步（观察结果 → LLM → 下一个动作）
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    # 安全阀：步数超限 → 调评判 LLM 归因 → 重试
-    if session.goal_step_count >= session.max_steps_per_goal:
-        session.goal_retry_count += 1
-        if session.goal_retry_count >= session.max_retries_per_goal:
-            session.status = AgentStatus.ERROR
-            session.error = f"目标「{session.current_goal}」重试{session.max_retries_per_goal}次仍未完成"
-            _agent_log.error("goal_retry_exhausted", session_id=session.session_id,
-                             data={"goal": session.current_goal, "retries": session.goal_retry_count})
-            return _build_response(session)
+def run_step(session: AgentSession, page_state: PageState,
+             action_result: Optional[ActionResult] = None) -> dict[str, Any]:
+    """记录上一步结果 + 调 LLM 出下一个动作。stale 由前端处理（重新观察后再调本函数）。"""
+    mode = _resolve_call_mode(session)
 
-        judgment = _call_judgment_llm(session, page_state)
-        session.failed_paths.append(judgment)
-        _agent_log.warn("goal_step_limit", session_id=session.session_id,
-                        data={"goal": session.current_goal, "retry": session.goal_retry_count,
-                              "judgment": {"reason": judgment.failure_reason, "avoid": judgment.avoid}})
-
-        session.goal_step_count = 0
-        session.messages = []
-        session.failed_attempts = []
-        session.blacklisted_approaches = []
-        session._retrying = True
-
-    # 1. 记录上一步结果
-    if action_result and session.pending_action:
-        _track_attempt_result(session, session.pending_action, action_result)
-        append_step_messages(
-            session.messages, session.pending_action, action_result, page_state
-        )
-        if session.step_history:
-            session.step_history[-1]["result"] = {
-                "success": action_result.success,
-                "details": action_result.details[:50] if action_result.details else "",
-                "url_after": page_state.url,
-                "title_after": page_state.title[:30] if page_state.title else "",
-                "state_changes": action_result.state_changes or {},
-            }
+    # 1. 首步初始化 messages / 后续追加上一步结果+新观察
+    if not session.messages:
+        session.messages = build_initial_messages(
+            session.task, page_state, session, text_mode=(mode == CallMode.TEXT_PARSE))
+    elif action_result and session.pending_action:
+        # stale：不追加结果（避免污染），前端已重新观察，这里只刷新观察
+        if action_result.stale:
+            session.stale_retries += 1
+            if session.stale_retries >= MAX_STALE_RETRIES:
+                # 连续失效多次仍打转 → 追加一条提示，让 LLM 换策略
+                session.messages.append({"role": "user", "content":
+                    f"[编号多次失效] 页面在频繁变化。请基于下面最新观察重新选择编号。\n\n{_observe(page_state)}"})
+                session.stale_retries = 0
+            else:
+                session.messages.append({"role": "user", "content":
+                    f"[编号已失效，页面已更新] 请用下面最新观察里的编号。\n\n{_observe(page_state)}"})
+        else:
+            session.stale_retries = 0
+            _track_attempt_result(session, session.pending_action, action_result)
+            append_step_messages(session.messages, session.pending_action, action_result, page_state)
+            if session.step_history:
+                session.step_history[-1]["result"] = {
+                    "success": action_result.success,
+                    "details": (action_result.details or "")[:50],
+                    "url_after": page_state.url,
+                }
         session.pending_action = None
 
-    # 2. 规划 LLM
-    t0 = time.time()
-    plan = _call_planning_llm(session, page_state)
-    plan_ms = int((time.time() - t0) * 1000)
-    _agent_log.info("planning_result", session_id=session.session_id,
-                    data=plan or {"error": "parse_failed"}, duration_ms=plan_ms)
-
-    if plan and plan.get("task_done"):
-        session.status = AgentStatus.COMPLETED
-        session.summary = plan.get("summary", "任务完成")
-        session.completed_goals = plan.get("completed_goals", session.completed_goals)
-        if session.current_goal and session.current_goal not in session.completed_goals:
-            session.completed_goals.append(session.current_goal)
-        session.current_goal = ""
-        session.remaining_goal = ""
-        _agent_log.info("session_complete", session_id=session.session_id,
-                        data={"summary": session.summary, "total_steps": session.current_step})
-        return _build_response(session)
-
-    # 更新规划状态
-    if plan:
-        old_goal = session.current_goal
-        session.current_goal = plan.get("current_goal", session.current_goal)
-        session.next_action_hint = plan.get("next_action_hint", "")
-        session.completed_goals = plan.get("completed_goals", session.completed_goals)
-        session.remaining_goal = plan.get("remaining", "")
-
-        if session.current_goal != old_goal:
-            session.goal_step_count = 0
-            # 超限重试不清 retry 计数，否则 max_retries_per_goal 永远触发不了
-            if not session._retrying:
-                session.goal_retry_count = 0
-        session._retrying = False
-
-    session.status = AgentStatus.ACTION_REQUIRED
-    return _build_response(session)
-
-
-def run_action(
-    session: AgentSession,
-    page_state: PageState,
-) -> dict[str, Any]:
-    """第二阶段：调执行 LLM 返回 action。"""
-
-    mode = _resolve_call_mode(session)
-    goal_ctx = build_execution_goal_context(session)
-
-    if not session.messages:
-        if mode == CallMode.TOOL_CALLS:
-            session.messages = build_initial_messages(session.task, page_state, goal_ctx)
-        else:
-            session.messages = build_initial_messages_text_mode(session.task, page_state, goal_ctx)
-    else:
-        from agent.context_builder import SYSTEM_PROMPT, TEXT_MODE_FORMAT_APPENDIX
-        if session.messages and session.messages[0].get("role") == "system":
-            if mode == CallMode.TOOL_CALLS:
-                session.messages[0] = {"role": "system", "content": SYSTEM_PROMPT + goal_ctx}
-            else:
-                session.messages[0] = {"role": "system", "content": SYSTEM_PROMPT + goal_ctx + TEXT_MODE_FORMAT_APPENDIX}
-
+    # 2. 反思注入（去重，只留最新一条）
     reflection = build_reflection_prompt(session)
     if reflection:
-        # 剔除历史反思消息（首行哨兵），只保留最新一条，避免累积撑爆上下文
-        from agent.context_builder import REFLECT_SENTINEL
         session.messages = [
             m for m in session.messages
-            if not (m.get("role") == "user"
-                    and str(m.get("content", "")).startswith(REFLECT_SENTINEL))
+            if not (m.get("role") == "user" and str(m.get("content", "")).startswith(REFLECT_SENTINEL))
         ]
         session.messages.append({"role": "user", "content": reflection})
 
-    client = _llm_client
+    # 3. 步数上限
+    if session.current_step >= session.max_steps:
+        session.status = AgentStatus.ERROR
+        session.error = f"超过最大步数 {session.max_steps}，任务未完成"
+        _agent_log.error("max_steps_exceeded", session_id=session.session_id,
+                         data={"step": session.current_step})
+        return _build_response(session)
 
+    # 4. 刷新 system prompt（模式可能降级）
+    if session.messages and session.messages[0].get("role") == "system":
+        session.messages[0] = {"role": "system",
+            "content": SYSTEM_PROMPT_TEXT_MODE if mode == CallMode.TEXT_PARSE else SYSTEM_PROMPT}
+
+    # 5. 调 LLM
+    _log_tokens(session, mode)
     if mode == CallMode.TOOL_CALLS:
-        func_name, func_args, thought = _call_with_tools(client, session)
+        func_name, func_args, thought = _call_with_tools(_llm_client, session)
     else:
-        func_name, func_args, thought = _call_text_parse(client, session)
+        func_name, func_args, thought = _call_text_parse(_llm_client, session)
 
     if func_name is None:
         return _build_response(session, thought=thought)
@@ -242,10 +177,9 @@ def run_action(
     if func_name == "task_complete":
         session.status = AgentStatus.COMPLETED
         session.summary = func_args.get("summary", "任务完成")
-        if session.current_goal and session.current_goal not in session.completed_goals:
-            session.completed_goals.append(session.current_goal)
-        session.current_goal = ""
-        session.remaining_goal = ""
+        _agent_log.info("session_complete", session_id=session.session_id,
+                        data={"summary": session.summary, "success": func_args.get("success", True),
+                              "total_steps": session.current_step})
         return _build_response(session, thought=thought)
 
     if func_name not in ALLOWED_ACTION_TYPES:
@@ -256,56 +190,35 @@ def run_action(
     action = _parse_action(func_name, func_args)
     session.pending_action = action
     session.current_step += 1
-    session.goal_step_count += 1
+    session.progress = thought[:80] if thought else session.progress
     _agent_log.info("execution_result", session_id=session.session_id,
-                    data={"action_type": func_name, "target": action.locator.value if action.locator else "",
+                    data={"action_type": func_name, "index": action.index,
                           "thought": thought[:100], "step": session.current_step})
-
     session.step_history.append(
-        {"step": session.current_step, "thought": thought, "action": action.model_dump()}
-    )
+        {"step": session.current_step, "thought": thought, "action": action.model_dump()})
 
     if should_confirm_action(action, session.require_confirmation):
         session.status = AgentStatus.CONFIRM_REQUIRED
     else:
         session.status = AgentStatus.ACTION_REQUIRED
-
     return _build_response(session, thought=thought)
 
 
-def run_step(
-    session: AgentSession,
-    page_state: PageState,
-    action_result: Optional[ActionResult] = None,
-) -> dict[str, Any]:
-    """兼容接口：规划+执行合一调用。"""
-    plan_resp = run_plan(session, page_state, action_result)
-    if session.status in (AgentStatus.COMPLETED, AgentStatus.ERROR):
-        return plan_resp
-    return run_action(session, page_state)
+def _observe(page_state: PageState) -> str:
+    from agent.context_builder import build_observation_message
+    return build_observation_message(page_state)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 模式 1：tool_calls（标准 function calling）
+# LLM 调用
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _call_with_tools(
-    client: OpenAI, session: AgentSession
-) -> tuple[Optional[str], dict, str]:
-    """使用 tools 参数调用 LLM，解析 tool_calls 返回。"""
-    _tok = _estimate_tokens(session.messages, tools=ACTION_SCHEMAS)
-    _agent_log.info("exec_prompt_tokens", session_id=session.session_id,
-                    data={"step": session.current_step, "call": "tool_calls",
-                          "total": _tok["total"], "messages": _tok["messages"],
-                          "tools": _tok["tools"], "method": _tok["method"]})
-    response = _llm_call_with_retry(
-        client, session,
-        tools=ACTION_SCHEMAS,
-        tool_choice="auto",
-    )
+def _call_with_tools(client: OpenAI, session: AgentSession) -> tuple[Optional[str], dict, str]:
+    _log_exec_tokens(session, tools=ACTION_SCHEMAS, call="tool_calls")
+    response = _create_with_retry(client, session.model, session.messages,
+                                  tools=ACTION_SCHEMAS, tool_choice="auto", session=session)
     if response is None:
         return None, {}, ""
-
     message = response.choices[0].message
     raw_content = message.content or ""
     thought = _extract_thought(raw_content)
@@ -318,133 +231,47 @@ def _call_with_tools(
             func_args = json.loads(tool_call.function.arguments)
         except json.JSONDecodeError:
             func_args = {}
-        session.messages.append(
-            {
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "content": "已收到，等待执行结果。",
-            }
-        )
+        session.messages.append({"role": "tool", "tool_call_id": tool_call.id,
+                                 "content": "已收到，等待执行结果。"})
         return func_name, func_args, thought
 
     session.messages.append({"role": "assistant", "content": raw_content})
-    clean_content = _strip_think_tags(raw_content)
-    parsed = _try_parse_action_from_text(clean_content)
+    clean = _strip_think_tags(raw_content)
+    parsed = _try_parse_action_from_text(clean)
     if parsed:
         return parsed[0], parsed[1], thought
 
     if AGENT_MODE == "auto":
         session.call_mode = CallMode.TEXT_PARSE.value
-        # 保留上下文：将 messages 中的 system prompt 替换为 text_parse 版本，其余保留
         if session.messages and session.messages[0].get("role") == "system":
-            from agent.context_builder import SYSTEM_PROMPT_TEXT_MODE
             session.messages[0] = {"role": "system", "content": SYSTEM_PROMPT_TEXT_MODE}
-        session.current_step -= 1
         return _call_text_parse(client, session)
 
     session.status = AgentStatus.ERROR
-    session.error = f"LLM 未返回 tool_calls。回复: {clean_content[:200]}"
+    session.error = f"LLM 未返回 tool_calls。回复: {clean[:200]}"
     return None, {}, thought
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 模式 2：text_parse（文本解析，适用于不支持 function calling 的模型）
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _call_text_parse(
-    client: OpenAI, session: AgentSession
-) -> tuple[Optional[str], dict, str]:
-    """不使用 tools 参数，通过 prompt 引导模型输出 JSON 动作。"""
-    if not session.messages:
-        session.messages = build_initial_messages_text_mode(session.task, PageState(
-            url="", title="", elements=[]
-        ))
-
-    _tok = _estimate_tokens(session.messages)
-    _agent_log.info("exec_prompt_tokens", session_id=session.session_id,
-                    data={"step": session.current_step, "call": "text_parse",
-                          "total": _tok["total"], "messages": _tok["messages"],
-                          "tools": _tok["tools"], "method": _tok["method"]})
-    response = _llm_call_with_retry(client, session)
+def _call_text_parse(client: OpenAI, session: AgentSession) -> tuple[Optional[str], dict, str]:
+    _log_exec_tokens(session, tools=None, call="text_parse")
+    response = _create_with_retry(client, session.model, session.messages, session=session)
     if response is None:
         return None, {}, ""
-
     message = response.choices[0].message
     raw_content = message.content or ""
     thought = _extract_thought(raw_content)
-    clean_content = _strip_think_tags(raw_content)
-
+    clean = _strip_think_tags(raw_content)
     session.messages.append({"role": "assistant", "content": raw_content})
-
-    parsed = _try_parse_action_from_text(clean_content)
+    parsed = _try_parse_action_from_text(clean)
     if parsed:
         return parsed[0], parsed[1], thought
-
     session.status = AgentStatus.ERROR
-    session.error = f"无法从模型回复中解析动作。回复: {clean_content[:300]}"
+    session.error = f"无法从模型回复解析动作。回复: {clean[:300]}"
     return None, {}, thought
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 辅助函数
-# ═══════════════════════════════════════════════════════════════════════════════
-
-MAX_LLM_RETRIES = 3
-RETRY_DELAYS = [0.5, 1, 2]
-
-# token 估算：优先 tiktoken（精确），失败退回字符启发式（中文~1.5char/tok，其余~4char/tok）
-try:
-    import tiktoken
-    _tok_enc = tiktoken.get_encoding("cl100k_base")
-except Exception:
-    _tok_enc = None
-
-
-def _estimate_tokens(messages: list, tools=None) -> dict:
-    """估算一次 LLM 调用的输入 token。返回 {total, messages, tools, method}。"""
-    def _count(text: str) -> int:
-        if not text:
-            return 0
-        if _tok_enc is not None:
-            try:
-                return len(_tok_enc.encode(text))
-            except Exception:
-                pass
-        zh = sum(1 for c in text if ord(c) > 127)
-        return int((len(text) - zh) / 4 + zh / 1.5)
-
-    def _msg_text(m) -> str:
-        # messages 可能是 dict，content 可能是 str 或 None；tool_calls 也计入
-        parts = []
-        c = m.get("content") if isinstance(m, dict) else None
-        if isinstance(c, str):
-            parts.append(c)
-        elif isinstance(c, list):
-            parts.append(json.dumps(c, ensure_ascii=False))
-        tc = m.get("tool_calls") if isinstance(m, dict) else None
-        if tc:
-            parts.append(json.dumps(tc, ensure_ascii=False, default=str))
-        return "\n".join(parts)
-
-    msg_tok = sum(_count(_msg_text(m)) for m in (messages or []))
-    tools_tok = _count(json.dumps(tools, ensure_ascii=False)) if tools else 0
-    return {
-        "total": msg_tok + tools_tok,
-        "messages": msg_tok,
-        "tools": tools_tok,
-        "method": "tiktoken" if _tok_enc is not None else "heuristic",
-    }
-
-
-def _create_with_retry(
-    client: OpenAI, model: str, messages: list,
-    tools=None, tool_choice=None, session: Optional[AgentSession] = None,
-):
-    """带重试的底层 LLM 调用。区分可恢复/不可恢复错误。
-
-    session 非空时：401/404 等致命错误直接置会话为 ERROR 并返回 None；
-    session 为空时（规划/评判等辅助调用）：所有错误重试耗尽后返回 None，不改会话状态。
-    """
+def _create_with_retry(client: OpenAI, model: str, messages: list,
+                       tools=None, tool_choice=None, session: Optional[AgentSession] = None):
     last_error = None
     for attempt in range(MAX_LLM_RETRIES):
         try:
@@ -455,7 +282,7 @@ def _create_with_retry(
                 kwargs["tool_choice"] = tool_choice
             return client.chat.completions.create(**kwargs)
         except RateLimitError as e:
-            last_error = f"API 限流 (429): {e.message if hasattr(e, 'message') else str(e)}"
+            last_error = f"API 限流 (429): {getattr(e, 'message', str(e))}"
         except APITimeoutError:
             last_error = "API 请求超时"
         except APIConnectionError as e:
@@ -464,7 +291,7 @@ def _create_with_retry(
             if e.status_code == 401:
                 if session:
                     session.status = AgentStatus.ERROR
-                    session.error = "API 认证失败 (401): 请检查 OPENAI_API_KEY 配置"
+                    session.error = "API 认证失败 (401): 请检查 OPENAI_API_KEY"
                 return None
             if e.status_code == 404:
                 if session:
@@ -481,108 +308,70 @@ def _create_with_retry(
                 last_error = f"API 错误 ({e.status_code})"
         except Exception as e:
             last_error = f"未知错误: {type(e).__name__}: {str(e)[:100]}"
-
         if attempt < MAX_LLM_RETRIES - 1:
             time.sleep(RETRY_DELAYS[attempt])
-
     if session:
         session.status = AgentStatus.ERROR
-        session.error = f"LLM 调用失败（重试{MAX_LLM_RETRIES}次后放弃）: {last_error}"
+        session.error = f"LLM 调用失败（重试{MAX_LLM_RETRIES}次）: {last_error}"
     return None
 
 
-def _llm_call_with_retry(
-    client: OpenAI, session: AgentSession,
-    tools=None, tool_choice=None,
-):
-    """带重试的执行 LLM 调用（使用 session.messages）。"""
-    return _create_with_retry(
-        client, session.model, session.messages,
-        tools=tools, tool_choice=tool_choice, session=session,
-    )
-
 def _resolve_call_mode(session: AgentSession) -> CallMode:
-    """根据配置和会话状态决定调用模式。"""
-    if hasattr(session, "call_mode") and session.call_mode:
+    if getattr(session, "call_mode", None):
         return CallMode(session.call_mode)
-    if AGENT_MODE == "tool_calls":
-        return CallMode.TOOL_CALLS
     if AGENT_MODE == "text_parse":
         return CallMode.TEXT_PARSE
     return CallMode.TOOL_CALLS
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# 解析 / 反思 / 埋点
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def _extract_thought(text: str) -> str:
-    """从 <think> 标签中提取推理内容。"""
-    match = re.search(r'<think>(.*?)</think>', text, re.DOTALL)
-    return match.group(1).strip() if match else ""
+    m = re.search(r'<think>(.*?)</think>', text, re.DOTALL)
+    return m.group(1).strip() if m else ""
 
 
 def _strip_think_tags(text: str) -> str:
-    """移除 <think>...</think> 标签，返回剩余文本。"""
     return re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
 
 
 def _try_parse_action_from_text(text: str) -> Optional[tuple[str, dict[str, Any]]]:
-    """从文本中解析 JSON 动作。
-
-    支持格式:
-    1. ```json { ... } ``` 代码块
-    2. 裸 JSON 对象 { ... }
-    3. function_call: {"name": "click", "arguments": {...}}
-    """
     candidates = []
-
     for block in re.finditer(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL):
         candidates.append(block.group(1))
-
-    for obj in re.finditer(r'\{[^{}]*(?:\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}[^{}]*)*\}', text, re.DOTALL):
+    for obj in re.finditer(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text, re.DOTALL):
         candidates.append(obj.group(0))
-
     for raw in candidates:
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
             continue
-
         if "name" in data and "arguments" in data:
             func_name = data["name"]
             func_args = data["arguments"] if isinstance(data["arguments"], dict) else {}
         else:
-            func_name = data.get("type") or data.get("name") or data.get("action")
-            func_args = {k: v for k, v in data.items() if k not in ("type", "name", "action")}
-
+            func_name = data.get("action") or data.get("type") or data.get("name")
+            func_args = {k: v for k, v in data.items() if k not in ("action", "type", "name", "thought")}
         if func_name and (func_name in ALLOWED_ACTION_TYPES or func_name == "task_complete"):
             return func_name, func_args
-
     return None
 
 
 def _parse_action(func_name: str, args: dict[str, Any]) -> PageAction:
-    """从参数解析出 PageAction。"""
-    locator = None
+    index = args.get("index")
+    if index is not None:
+        try:
+            index = int(index)
+        except (ValueError, TypeError):
+            index = None
     params = {}
-
-    if "locator" in args:
-        loc_data = args["locator"]
-        fallback = None
-        if "fallback" in loc_data:
-            fb = loc_data["fallback"]
-            fallback = ElementLocator(method=fb["method"], value=str(fb["value"]))
-        locator = ElementLocator(
-            method=loc_data["method"],
-            value=str(loc_data["value"]),
-            fallback=fallback,
-        )
-
     if func_name == "type":
         params["text"] = args.get("text", "")
         params["clear"] = args.get("clear", True)
     elif func_name == "select":
-        if "value" in args:
-            params["value"] = args["value"]
-        if "option_text" in args:
-            params["option_text"] = args["option_text"]
+        params["option_text"] = args.get("option_text", "")
     elif func_name == "scroll":
         params["direction"] = args.get("direction", "down")
         params["amount"] = args.get("amount", 300)
@@ -593,185 +382,68 @@ def _parse_action(func_name: str, args: dict[str, Any]) -> PageAction:
         params["ms"] = min(args.get("ms", 1000), 5000)
     elif func_name == "navigate":
         params["url"] = args.get("url", "")
-    elif func_name == "wait_for_element":
-        params["selector"] = args.get("locator", {}).get("value", "") if "locator" in args else ""
-        params["timeout"] = min(args.get("timeout", 5000), 10000)
-
-    return PageAction(type=func_name, locator=locator, params=params)
+    return PageAction(type=func_name, index=index, params=params)
 
 
-def _track_attempt_result(
-    session: AgentSession, action: PageAction, result: ActionResult
-) -> None:
-    """追踪操作结果，检测重复失败并更新黑名单。"""
-    target = action.locator.value if action.locator else ""
-
+def _track_attempt_result(session: AgentSession, action: PageAction, result: ActionResult) -> None:
+    target = str(action.index) if action.index is not None else action.type
     if result.success:
-        # 成功时清除与当前目标相关的黑名单
-        session.blacklisted_approaches = [
-            a for a in session.blacklisted_approaches
-            if target not in a
-        ]
+        session.blacklisted_approaches = [a for a in session.blacklisted_approaches if target not in a]
         return
-
-    # 记录失败
     session.failed_attempts.append(FailedAttempt(
-        action_type=action.type,
-        target=target,
-        error=result.error or result.details or "",
-        step=session.current_step,
-    ))
-
-    # 检测最近 5 步中相同 (action_type + 相似 target) 出现 ≥ 2 次
+        action_type=action.type, target=target,
+        error=result.error or result.details or "", step=session.current_step))
     recent = session.failed_attempts[-5:]
-    similar = [
-        a for a in recent
-        if a.action_type == action.type and _is_similar_target(a.target, target)
-    ]
+    similar = [a for a in recent if a.action_type == action.type and a.target == target]
     if len(similar) >= 2:
-        approach_desc = f"{action.type} → {target}"
-        if approach_desc not in session.blacklisted_approaches:
-            session.blacklisted_approaches.append(approach_desc)
+        desc = f"{action.type} → [{target}]"
+        if desc not in session.blacklisted_approaches:
+            session.blacklisted_approaches.append(desc)
 
 
-def _is_similar_target(a: str, b: str) -> bool:
-    """判断两个 locator value 是否指向同一目标。"""
-    if not a or not b:
-        return a == b
-    if a == b:
-        return True
-    # 纯数字（annotation_id）必须精确相等，避免 "1" 命中 "10"
-    if a.isdigit() or b.isdigit():
-        return a == b
-    # 子串包含仅在较短串足够长（≥4）时才算相似，避免短 css 片段互相误判
-    if (a in b or b in a) and min(len(a), len(b)) >= 4:
-        return True
-    return False
+def _estimate_tokens(messages: list, tools=None) -> dict:
+    def _count(text: str) -> int:
+        if not text:
+            return 0
+        if _tok_enc is not None:
+            try:
+                return len(_tok_enc.encode(text))
+            except Exception:
+                pass
+        zh = sum(1 for c in text if ord(c) > 127)
+        return int((len(text) - zh) / 4 + zh / 1.5)
+
+    def _msg_text(m) -> str:
+        parts = []
+        c = m.get("content") if isinstance(m, dict) else None
+        if isinstance(c, str):
+            parts.append(c)
+        elif isinstance(c, list):
+            parts.append(json.dumps(c, ensure_ascii=False))
+        tc = m.get("tool_calls") if isinstance(m, dict) else None
+        if tc:
+            parts.append(json.dumps(tc, ensure_ascii=False, default=str))
+        return "\n".join(parts)
+
+    msg_tok = sum(_count(_msg_text(m)) for m in (messages or []))
+    tools_tok = _count(json.dumps(tools, ensure_ascii=False)) if tools else 0
+    return {"total": msg_tok + tools_tok, "messages": msg_tok, "tools": tools_tok,
+            "method": "tiktoken" if _tok_enc is not None else "heuristic"}
 
 
-def _call_judgment_llm(session: AgentSession, page_state: PageState) -> FailedPath:
-    """调用评判 LLM 对本轮失败进行归因。"""
-    from agent.context_builder import JUDGMENT_PROMPT
-
-    # 构建轨迹摘要
-    trajectory_lines = []
-    for s in session.step_history[-10:]:
-        action = s.get("action", {})
-        result = s.get("result", {})
-        a_type = action.get("type", "?")
-        target = (action.get("locator") or {}).get("value", "")[:20]
-        status = "✓" if result.get("success", True) else "✗"
-        url = result.get("url_after", "")[-40:] if result.get("url_after") else ""
-        line = f"{a_type}"
-        if target:
-            line += f" → {target}"
-        line += f" | {status}"
-        if url:
-            line += f" | {url}"
-        trajectory_lines.append(line)
-
-    user_content = (
-        f"## 用户任务\n{session.task}\n\n"
-        f"## 当前目标\n{session.current_goal}\n\n"
-        f"## 这一轮的操作轨迹\n" + "\n".join(trajectory_lines) + "\n\n"
-        f"## 最终页面\nURL: {page_state.url}\n标题: {page_state.title}"
-    )
-
-    messages = [
-        {"role": "system", "content": JUDGMENT_PROMPT},
-        {"role": "user", "content": user_content},
-    ]
-
-    try:
-        response = _create_with_retry(_llm_client, session.model, messages)
-    except Exception as e:
-        _agent_log.error("judgment_call_error", session_id=session.session_id,
-                         data={"error": f"{type(e).__name__}: {str(e)[:200]}"})
-        return FailedPath(failure_reason="评判调用失败", avoid="")
-
-    if not response or not response.choices:
-        return FailedPath(failure_reason="评判无响应", avoid="")
-
-    raw = response.choices[0].message.content or ""
-    clean = _strip_think_tags(raw)
-
-    # 解析 JSON
-    for block in re.finditer(r'```(?:json)?\s*(\{.*?\})\s*```', clean, re.DOTALL):
-        try:
-            data = json.loads(block.group(1))
-            return FailedPath(
-                failure_reason=data.get("failure_reason", "未知原因"),
-                avoid=data.get("avoid", ""),
-            )
-        except json.JSONDecodeError:
-            continue
-    for obj in re.finditer(r'\{[^{}]*\}', clean, re.DOTALL):
-        try:
-            data = json.loads(obj.group(0))
-            if "failure_reason" in data:
-                return FailedPath(
-                    failure_reason=data.get("failure_reason", "未知原因"),
-                    avoid=data.get("avoid", ""),
-                )
-        except json.JSONDecodeError:
-            continue
-
-    return FailedPath(failure_reason=clean[:200], avoid="")
+def _log_tokens(session: AgentSession, mode: CallMode) -> None:
+    pass  # 占位，实际在 _log_exec_tokens
 
 
-def _call_planning_llm(session: AgentSession, page_state: PageState) -> Optional[dict]:
-    """调用规划 LLM，返回解析后的 plan dict。失败返回 None。"""
-    messages = build_step_planning_messages(session, page_state)
-    # 埋点：记录规划 prompt 是否包含参考经验 + 完整消息 token 估算
-    user_msg = next((m["content"] for m in messages if m.get("role") == "user"), "")
-    has_kb = "📖 参考经验" in user_msg
-    _tok = _estimate_tokens(messages)
-    _agent_log.info("planning_prompt_debug", session_id=session.session_id,
-                    data={"step": session.current_step, "has_kb_hint": has_kb,
-                          "prompt_len": len(user_msg), "tokens": _tok["total"],
-                          "method": _tok["method"]})
-    try:
-        response = _create_with_retry(_llm_client, session.model, messages)
-    except Exception as e:
-        _agent_log.error("planning_call_error", session_id=session.session_id,
-                         data={"error": f"{type(e).__name__}: {str(e)[:200]}"})
-        return None
-
-    if not response or not response.choices:
-        return None
-
-    raw = response.choices[0].message.content or ""
-    clean = _strip_think_tags(raw)
-
-    # 解析 JSON
-    for block in re.finditer(r'```(?:json)?\s*(\{.*?\})\s*```', clean, re.DOTALL):
-        try:
-            return json.loads(block.group(1))
-        except json.JSONDecodeError:
-            continue
-    for obj in re.finditer(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', clean, re.DOTALL):
-        try:
-            data = json.loads(obj.group(0))
-            if "current_goal" in data or "task_done" in data:
-                return data
-        except json.JSONDecodeError:
-            continue
-    return None
+def _log_exec_tokens(session: AgentSession, tools, call: str) -> None:
+    t = _estimate_tokens(session.messages, tools=tools)
+    _agent_log.info("step_prompt_tokens", session_id=session.session_id,
+                    data={"step": session.current_step, "call": call,
+                          "total": t["total"], "messages": t["messages"],
+                          "tools": t["tools"], "method": t["method"]})
 
 
-def _build_response(
-    session: AgentSession, thought: str = "", plan: Optional[dict] = None
-) -> dict[str, Any]:
-    """构造返回给前端的标准响应。"""
-    # 构建 plan 信息
-    plan_info = plan or {
-        "current_goal": session.current_goal,
-        "completed_goals": session.completed_goals,
-        "remaining": session.remaining_goal,
-        "task_done": session.status == AgentStatus.COMPLETED,
-        "referenced_id": getattr(session, "_kb_referenced_id", ""),
-    } if session.current_goal or session.completed_goals else None
-
+def _build_response(session: AgentSession, thought: str = "") -> dict[str, Any]:
     resp: dict[str, Any] = {
         "session_id": session.session_id,
         "status": session.status.value,
@@ -780,10 +452,8 @@ def _build_response(
         "action": None,
         "summary": session.summary,
         "error": session.error,
-        "plan": plan_info,
+        "progress": session.progress,
     }
-
     if session.pending_action:
         resp["action"] = session.pending_action.model_dump()
-
     return resp

@@ -48,7 +48,16 @@ def _clean_selector(step: dict[str, Any]) -> None:
     elif tt:
         # 归一化动态数量短语（"250个提交" → "N个提交"）
         step["target_text"] = _normalize_dynamic_text(tt)
-    # 清洗回放定位级联：剔除动态 css 项、含动态数量的文本项，去重，保留稳定项
+    # 清洗 page_marker：sibling/anchor 文本归一化动态数量（filled/el_count 已在采集端砍除）
+    pm = step.get("page_marker")
+    if isinstance(pm, dict) and pm:
+        for k in ("prev_sibling", "next_sibling", "anchor_text"):
+            v = pm.get(k, "")
+            if _is_dynamic(v):
+                pm[k] = ""
+            elif v:
+                pm[k] = _normalize_dynamic_text(v)
+    # 清洗回放定位级联：剔除动态 css、含动态数量的文本/label 项，去重，保留稳定项（含 ambiguous 标记）
     sels = step.get("selectors")
     if isinstance(sels, list) and sels:
         cleaned_sels = []
@@ -60,8 +69,8 @@ def _clean_selector(step: dict[str, Any]) -> None:
             by = s.get("by", "")
             if by == "css" and _is_dynamic(val):
                 continue
-            # 含动态数量的文本选择器（"259 个提交"）无法字面回放，丢弃
-            if by == "text" and _COUNT_PHRASE.search(val):
+            # 含动态数量的文本/label 选择器（"259 个提交"）无法字面回放，丢弃
+            if by in ("text", "label") and _COUNT_PHRASE.search(val):
                 continue
             key = (by, val)
             if not val or key in seen:

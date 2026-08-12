@@ -22,6 +22,7 @@ class OperationStep:
     value: str = ""              # select 动作选中的值
     url_before: str = ""         # 操作前的 URL 路径
     expected: dict = field(default_factory=dict)   # 预期结果 {url_after/popup_appeared/...}，回放验证用
+    page_marker: dict = field(default_factory=dict)  # 回放锚定特征 {filled_count/el_count/prev_sibling/next_sibling/anchor_text}
     result: str = ""             # 操作结果描述
 
     def to_dict(self) -> dict[str, Any]:
@@ -42,6 +43,7 @@ class OperationStep:
             value=d.get("value", ""),
             url_before=d.get("url_before") or d.get("url_pattern", ""),
             expected=d.get("expected", {}) or {},
+            page_marker=d.get("page_marker", {}) or {},
             result=d.get("result", ""),
         )
 

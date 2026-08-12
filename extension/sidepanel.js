@@ -3675,6 +3675,19 @@ document.addEventListener('DOMContentLoaded', async () => {
           if (name) sels.push({ by: 'css', value: `${tag}[name="${name}"]` });
           const aria = el.getAttribute('aria-label');
           if (aria) sels.push({ by: 'css', value: `${tag}[aria-label="${aria.slice(0, 40)}"]` });
+          // 表单元素专属：placeholder（转 css）+ 关联 label（by:'label'，R2 定位用）
+          const ph = el.getAttribute('placeholder');
+          if (ph) sels.push({ by: 'css', value: `${tag}[placeholder="${ph.slice(0, 40)}"]` });
+          let labelText = '';
+          if (el.id) {
+            const lbl = document.querySelector(`label[for="${esc(el.id)}"]`);
+            if (lbl) labelText = (lbl.textContent || '').trim().slice(0, 30);
+          }
+          if (!labelText) {
+            const wrap = el.closest('label');
+            if (wrap) labelText = (wrap.textContent || '').trim().slice(0, 30);
+          }
+          if (labelText) sels.push({ by: 'label', value: labelText });
           if (el.classList && el.classList.length) {
             const stable = Array.from(el.classList).filter(c =>
               c.length <= 30 && !/\d{4,}/.test(c) && !c.includes('--') && !/^[a-f0-9]{8,}$/.test(c)
@@ -3699,18 +3712,41 @@ document.addEventListener('DOMContentLoaded', async () => {
             }
             if (parts.length) sels.push({ by: 'css', value: parts.join(' > ') });
           } catch (e) { /* ignore */ }
-          // 唯一性校验：css 候选必须在当前页面唯一命中目标，否则回放会点中同类的第一个（静默错点）
-          const uniq = [];
+          // 定位质量分级（不再"不唯一就丢"，避免表单元素三信号全空）：
+          //   css 唯一命中目标 → 保留；命中多个但含目标 → 保留并标 ambiguous（回放时靠 sibling/文本消歧）；
+          //   命中的不是目标 / 报错 → 丢弃（会点错，留着有害）。非 css（text/label）一律保留。
+          const graded = [];
           for (const s of sels) {
             if (s.by === 'css') {
               try {
                 const hits = document.querySelectorAll(s.value);
-                if (hits.length !== 1 || hits[0] !== el) continue;
-              } catch (e) { continue; }
+                if (hits.length === 1 && hits[0] === el) {
+                  graded.push(s);
+                } else if (hits.length > 1 && Array.prototype.includes.call(hits, el)) {
+                  graded.push({ ...s, ambiguous: true });
+                }
+                // 命中 0 个或命中的非目标 → 丢弃
+              } catch (e) { /* 无效选择器，丢弃 */ }
+            } else {
+              graded.push(s);
             }
-            uniq.push(s);
           }
-          return { tag, role: el.getAttribute('role') || '', selectors: uniq };
+          return { tag, role: el.getAttribute('role') || '', selectors: graded };
+        }
+
+        // 回放锚定用页面特征：靠 prev/next 兄弟文本 + anchor 区分同 URL 多步
+        // （filled_count/el_count 实测零区分度已砍——巨型低代码页两值恒定）
+        function __buildPageMarker(el) {
+          const marker = { prev_sibling: '', next_sibling: '', anchor_text: '' };
+          try {
+            if (el) {
+              const txt = (n) => n ? (n.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 20) : '';
+              marker.prev_sibling = txt(el.previousElementSibling);
+              marker.next_sibling = txt(el.nextElementSibling);
+              marker.anchor_text = txt(el);
+            }
+          } catch (e) { /* ignore */ }
+          return marker;
         }
 
         const { type, locator, params = {} } = actionData;
@@ -3721,6 +3757,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
 
         const __ei = element ? __buildSelectorCascade(element) : null;
+        const __pm = element ? __buildPageMarker(element) : null;
 
         // 高亮目标元素
         if (element) {
@@ -3761,7 +3798,8 @@ document.addEventListener('DOMContentLoaded', async () => {
                 details: `点击了 ${locator?.value || '元素'}`,
                 action_type: type,
                 _clickCoords: { x: cx + offsetX, y: cy + offsetY },
-                _elementInfo: __ei
+                _elementInfo: __ei,
+                _pageMarker: __pm
               };
             }
 
@@ -3803,7 +3841,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 element.dispatchEvent(new Event('input', { bubbles: true }));
                 element.dispatchEvent(new Event('change', { bubbles: true }));
               }
-              return { success: true, details: `输入了 "${text.slice(0, 20)}"`, action_type: type, _elementInfo: __ei };
+              return { success: true, details: `输入了 "${text.slice(0, 20)}"`, action_type: type, _elementInfo: __ei, _pageMarker: __pm };
             }
 
             case 'clear': {
@@ -3879,7 +3917,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                   return { success: false, error: `下拉菜单中找不到选项: ${optionText}`, action_type: type };
                 }
               }
-              return { success: true, details: `选择了 ${params.value || params.option_text || '?'}`, action_type: type, _elementInfo: __ei };
+              return { success: true, details: `选择了 ${params.value || params.option_text || '?'}`, action_type: type, _elementInfo: __ei, _pageMarker: __pm };
             }
 
             case 'scroll': {
@@ -3963,7 +4001,8 @@ document.addEventListener('DOMContentLoaded', async () => {
                 details: `悬停在 ${locator?.value || '元素'}`,
                 action_type: type,
                 _hoverCoords: { x: cx + offsetX, y: cy + offsetY },
-                _elementInfo: __ei
+                _elementInfo: __ei,
+                _pageMarker: __pm
               };
             }
 
@@ -4663,6 +4702,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             text: action.params?.text || '',
             value: action.params?.option_text || action.params?.value || '',
             url_before: preUrl ? new URL(preUrl).pathname : '',
+            page_marker: actionResult._pageMarker || null,
             expected,
             result: actionResult.details || ''
           });
@@ -4870,6 +4910,19 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (nm) sels.push({ by: 'css', value: `${tag}[name="${nm}"]` });
         const aria = el.getAttribute('aria-label');
         if (aria) sels.push({ by: 'css', value: `${tag}[aria-label="${aria.slice(0, 40)}"]` });
+        // 表单元素专属：placeholder（转 css）+ 关联 label（by:'label'）
+        const ph = el.getAttribute('placeholder');
+        if (ph) sels.push({ by: 'css', value: `${tag}[placeholder="${ph.slice(0, 40)}"]` });
+        let labelText = '';
+        if (el.id) {
+          const lbl = document.querySelector(`label[for="${esc(el.id)}"]`);
+          if (lbl) labelText = (lbl.textContent || '').trim().slice(0, 30);
+        }
+        if (!labelText) {
+          const wrap = el.closest('label');
+          if (wrap) labelText = (wrap.textContent || '').trim().slice(0, 30);
+        }
+        if (labelText) sels.push({ by: 'label', value: labelText });
         if (el.classList && el.classList.length) {
           const stable = Array.from(el.classList).filter(c =>
             c.length <= 30 && !/\d{4,}/.test(c) && !c.includes('--') && !/^[a-f0-9]{8,}$/.test(c)
@@ -4894,18 +4947,37 @@ document.addEventListener('DOMContentLoaded', async () => {
           }
           if (parts.length) sels.push({ by: 'css', value: parts.join(' > ') });
         } catch (e) { /* ignore */ }
-        // 唯一性校验：css 候选须唯一命中目标，否则回放会点中同类第一个（静默错点）
-        const uniq = [];
+        // 定位质量分级：唯一命中→保留；命中多个含目标→标 ambiguous；命中非目标/报错→丢弃。非 css 保留。
+        const graded = [];
         for (const s of sels) {
           if (s.by === 'css') {
             try {
               const hits = document.querySelectorAll(s.value);
-              if (hits.length !== 1 || hits[0] !== el) continue;
-            } catch (e) { continue; }
+              if (hits.length === 1 && hits[0] === el) {
+                graded.push(s);
+              } else if (hits.length > 1 && Array.prototype.includes.call(hits, el)) {
+                graded.push({ ...s, ambiguous: true });
+              }
+            } catch (e) { /* 无效选择器，丢弃 */ }
+          } else {
+            graded.push(s);
           }
-          uniq.push(s);
         }
-        return { tag, role: el.getAttribute('role') || '', selectors: uniq };
+        return { tag, role: el.getAttribute('role') || '', selectors: graded };
+      }
+
+      // 回放锚定用页面特征（与采集端 __buildPageMarker 同源；filled/el_count 已砍）
+      function pageMarker(el) {
+        const marker = { prev_sibling: '', next_sibling: '', anchor_text: '' };
+        try {
+          if (el) {
+            const t = (n) => n ? (n.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 20) : '';
+            marker.prev_sibling = t(el.previousElementSibling);
+            marker.next_sibling = t(el.nextElementSibling);
+            marker.anchor_text = t(el);
+          }
+        } catch (e) { /* ignore */ }
+        return marker;
       }
 
       function interactiveAncestor(el) {
@@ -4948,6 +5020,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           target_text: (el.textContent || el.getAttribute('aria-label') || '').trim().slice(0, 40),
           css_selector: selectorOf(el),
           selectors: ei.selectors,
+          page_marker: pageMarker(el),
           url_before: location.pathname
         });
       }, true);
@@ -4966,6 +5039,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             target_text: el.name || el.getAttribute('aria-label') || labelTextOf(el),
             css_selector: selectorOf(el),
             selectors: ei.selectors,
+            page_marker: pageMarker(el),
             value: (el.options[el.selectedIndex] || {}).text || el.value || '',
             url_before: location.pathname
           });
@@ -4977,6 +5051,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             target_text: labelTextOf(el),
             css_selector: selectorOf(el),
             selectors: ei.selectors,
+            page_marker: pageMarker(el),
             value: el.checked ? '选中' : '取消',
             url_before: location.pathname
           });
@@ -5012,6 +5087,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           target_text: el.placeholder || el.name || el.getAttribute('aria-label') || '',
           css_selector: selectorOf(el),
           selectors: ei.selectors,
+          page_marker: pageMarker(el),
           text: val.slice(0, 50),
           url_before: location.pathname
         };

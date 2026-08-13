@@ -58,6 +58,11 @@ try:
 except Exception:
     _tok_enc = None
 
+# 无效点击提示的首行哨兵（供下一步注入前去重，只留最新一条）
+INEFFECTIVE_SENTINEL = "[[ineffective]]"
+# element_count 变化小于此值视为"无变化"（小面板展开可能只增 1 个）
+INEFFECTIVE_COUNT_DELTA = 2
+
 
 class CallMode(str, Enum):
     TOOL_CALLS = "tool_calls"
@@ -122,6 +127,9 @@ def run_step(session: AgentSession, page_state: PageState,
         # stale：不追加结果（避免污染），前端已重新观察，这里只刷新观察
         if action_result.stale:
             session.stale_retries += 1
+            _agent_log.info("step_result", session_id=session.session_id,
+                            data={"step": session.current_step, "outcome": "stale",
+                                  "stale_retries": session.stale_retries, "url": page_state.url})
             if session.stale_retries >= MAX_STALE_RETRIES:
                 # 连续失效多次仍打转 → 追加一条提示，让 LLM 换策略
                 session.messages.append({"role": "user", "content":
@@ -132,6 +140,16 @@ def run_step(session: AgentSession, page_state: PageState,
                     f"[编号已失效，页面已更新] 请用下面最新观察里的编号。\n\n{_observe(page_state)}"})
         else:
             session.stale_retries = 0
+            changes = action_result.state_changes or {}
+            _agent_log.info("step_result", session_id=session.session_id,
+                            data={"step": session.current_step,
+                                  "outcome": "ok" if action_result.success else "fail",
+                                  "details": (action_result.details or "")[:80],
+                                  "error": (action_result.error or "")[:80],
+                                  "url": page_state.url,
+                                  "changes": changes})
+            # 打转检测：click/select 成功但页面无任何变化 = 成功但无效
+            _detect_ineffective(session, action_result, changes, page_state)
             append_step_messages(session.messages, session.pending_action, action_result, page_state)
             if session.step_history:
                 session.step_history[-1]["result"] = {
@@ -141,12 +159,31 @@ def run_step(session: AgentSession, page_state: PageState,
                 }
         session.pending_action = None
 
+    # 1b. 无效点击提示注入（哨兵去重，只留最新一条）
+    if session.last_ineffective:
+        idx, tgt = session.last_ineffective
+        streak = session.ineffective_clicks.get(idx, 0)
+        if streak >= 2:
+            warn = (f"{INEFFECTIVE_SENTINEL}⚠️ 你已连续 {streak} 次点击 [{idx}]『{tgt}』但页面毫无变化——"
+                    f"这个操作无效，**禁止再点 [{idx}]**。换一种方式：换其他编号、先 hover 展开菜单、"
+                    f"或 scroll 找目标，或用 navigate 直接跳转 URL。")
+        else:
+            warn = (f"{INEFFECTIVE_SENTINEL}⚠️ 上一步点击 [{idx}]『{tgt}』后页面无变化，该操作可能无效。"
+                    f"不要重复点它，换个思路（换编号/hover 展开/scroll/navigate）。")
+        session.messages = [
+            m for m in session.messages
+            if not (m.get("role") == "user" and str(m.get("content", "")).startswith(INEFFECTIVE_SENTINEL))
+        ]
+        session.messages.append({"role": "user", "content": warn})
+        session.last_ineffective = None
+
     # 2. 步数上限
     if session.current_step >= session.max_steps:
         session.status = AgentStatus.ERROR
         session.error = f"超过最大步数 {session.max_steps}，任务未完成"
         _agent_log.error("max_steps_exceeded", session_id=session.session_id,
-                         data={"step": session.current_step})
+                         data={"step": session.current_step,
+                               "url": page_state.url, "title": (page_state.title or "")[:60]})
         return _build_response(session)
 
     # 3. 刷新 system prompt（模式可能降级）
@@ -154,8 +191,8 @@ def run_step(session: AgentSession, page_state: PageState,
         session.messages[0] = {"role": "system",
             "content": SYSTEM_PROMPT_TEXT_MODE if mode == CallMode.TEXT_PARSE else SYSTEM_PROMPT}
 
-    # 4. 调 LLM
-    _log_tokens(session, mode)
+    # 4. 调 LLM（先记录本步 LLM 看到的观察上下文，用于诊断"是否看得到目标内容"）
+    _log_observation(session, page_state)
     if mode == CallMode.TOOL_CALLS:
         func_name, func_args, thought = _call_with_tools(_llm_client, session)
     else:
@@ -169,7 +206,8 @@ def run_step(session: AgentSession, page_state: PageState,
         session.summary = func_args.get("summary", "任务完成")
         _agent_log.info("session_complete", session_id=session.session_id,
                         data={"summary": session.summary, "success": func_args.get("success", True),
-                              "total_steps": session.current_step})
+                              "total_steps": session.current_step,
+                              "url": page_state.url, "title": (page_state.title or "")[:60]})
         return _build_response(session, thought=thought)
 
     if func_name not in ALLOWED_ACTION_TYPES:
@@ -181,9 +219,29 @@ def run_step(session: AgentSession, page_state: PageState,
     session.pending_action = action
     session.current_step += 1
     session.progress = thought[:80] if thought else session.progress
-    _agent_log.info("execution_result", session_id=session.session_id,
-                    data={"action_type": func_name, "index": action.index,
-                          "thought": thought[:100], "step": session.current_step})
+    # 富日志：把 index 解析成目标元素信息（tag/text/role），并带上动作参数、当前页面
+    target = _describe_target(action.index, page_state)
+    log_data = {
+        "step": session.current_step,
+        "action": func_name,
+        "index": action.index,
+        "target": target,                       # 点了什么（tag "文本" role）
+        "thought": thought[:200],
+        "url": page_state.url,
+        "title": (page_state.title or "")[:60],
+        "elements": len(page_state.interactive_elements or []),
+    }
+    if func_name == "type":
+        log_data["text"] = (action.params.get("text", "") or "")[:60]
+    elif func_name == "select":
+        log_data["option"] = action.params.get("option_text", "")
+    elif func_name == "press_key":
+        log_data["key"] = action.params.get("key", "")
+    elif func_name == "scroll":
+        log_data["direction"] = action.params.get("direction", "")
+    elif func_name == "navigate":
+        log_data["nav_url"] = action.params.get("url", "")
+    _agent_log.info("execution_result", session_id=session.session_id, data=log_data)
     session.step_history.append(
         {"step": session.current_step, "thought": thought, "action": action.model_dump()})
 
@@ -375,6 +433,54 @@ def _parse_action(func_name: str, args: dict[str, Any]) -> PageAction:
     return PageAction(type=func_name, index=index, params=params)
 
 
+def _detect_ineffective(session: AgentSession, result: ActionResult,
+                        changes: dict, page_state: PageState) -> None:
+    """检测"成功但无效"的点击：click/select outcome=ok 但页面无任何变化。
+
+    索引直连下的真实失败模式——点中了、成功了，但页面没反应。累加连续次数，
+    供下一步注入"别再点它"的提示。任何有效变化则清零该 index。
+    """
+    action = session.pending_action
+    if not action or action.index is None:
+        return
+    if action.type not in ("click", "select"):
+        return
+    idx = action.index
+    no_change = (
+        not changes.get("url_changed")
+        and not changes.get("popup_appeared")
+        and not changes.get("popup_disappeared")
+        and abs(changes.get("element_count_delta", 0)) < INEFFECTIVE_COUNT_DELTA
+    )
+    if result.success and no_change:
+        session.ineffective_clicks[idx] = session.ineffective_clicks.get(idx, 0) + 1
+        session.last_ineffective = (idx, _describe_target(idx, page_state)[:40])
+    else:
+        # 有效变化 → 清零该 index 的无效计数
+        session.ineffective_clicks.pop(idx, None)
+        session.last_ineffective = None
+
+
+def _describe_target(index: Optional[int], page_state: PageState) -> str:
+    """把动作的 index 解析成人类可读的目标描述：tag "文本" role。日志诊断用。"""
+    if index is None:
+        return ""
+    for el in (page_state.interactive_elements or []):
+        if el.get("id") == index:
+            tag = el.get("tag", "?")
+            text = (el.get("text") or el.get("aria_label") or el.get("placeholder") or "").strip()[:40]
+            role = el.get("role", "")
+            parts = [f"<{tag}>"]
+            if text:
+                parts.append(f'"{text}"')
+            if role:
+                parts.append(f"role={role}")
+            if el.get("occluded"):
+                parts.append("[被遮挡]")
+            return " ".join(parts)
+    return f"(编号{index}不在当前观察中)"
+
+
 def _estimate_tokens(messages: list, tools=None) -> dict:
     def _count(text: str) -> int:
         if not text:
@@ -405,8 +511,20 @@ def _estimate_tokens(messages: list, tools=None) -> dict:
             "method": "tiktoken" if _tok_enc is not None else "heuristic"}
 
 
-def _log_tokens(session: AgentSession, mode: CallMode) -> None:
-    pass  # 占位，实际在 _log_exec_tokens
+def _log_observation(session: AgentSession, page_state: PageState) -> None:
+    """记录本步 LLM 看到的观察上下文，诊断"是否看得到目标内容/完成判断依据"。"""
+    txt = page_state.text_content_summary or ""
+    els = page_state.interactive_elements or []
+    popup = page_state.active_popup or {}
+    _agent_log.info("observation", session_id=session.session_id,
+                    data={"step": session.current_step,
+                          "url": page_state.url,
+                          "title": (page_state.title or "")[:60],
+                          "elements": len(els),
+                          "popup": popup.get("type", "") if popup else "",
+                          "text_len": len(txt),          # 前端采集的正文长度（注入 LLM 时会被截断）
+                          "text_head": txt[:160],        # 正文开头（看是否全是导航/菜单）
+                          "text_tail": txt[-160:] if len(txt) > 320 else ""})  # 正文结尾（目标内容常在此）
 
 
 def _log_exec_tokens(session: AgentSession, tools, call: str) -> None:

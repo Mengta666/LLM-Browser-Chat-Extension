@@ -214,7 +214,7 @@ def build_observation_message(page_state: PageState) -> str:
         for w in words:
             if w != prev:
                 deduped.append(w); prev = w
-        parts.append(f"\n## 页面文本摘要\n{' '.join(deduped)[:800]}")
+        parts.append(f"\n## 页面文本摘要\n{' '.join(deduped)[:2200]}")
 
     return "\n".join(parts)
 

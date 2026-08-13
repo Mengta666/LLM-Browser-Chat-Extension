@@ -83,3 +83,7 @@ class AgentSession:
     # 步数与超时防护
     max_steps: int = 40
     stale_retries: int = 0               # 连续 stale 重观察次数（防打转）
+
+    # 打转检测：点击 outcome=ok 但页面无变化（成功但无效）
+    ineffective_clicks: dict = field(default_factory=dict)   # {index: 连续无效次数}
+    last_ineffective: Optional[tuple] = None                 # (index, target_text) 供下一步提示

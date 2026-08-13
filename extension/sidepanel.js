@@ -3474,7 +3474,28 @@ document.addEventListener('DOMContentLoaded', async () => {
           focused_element: document.activeElement?.id ? `#${document.activeElement.id}` : null,
           interactive_elements: elements,
           element_count_truncated: truncated,
-          text_content_summary: (document.body?.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 3000),
+          text_content_summary: (() => {
+            // 去导航化正文提取：剔除全局导航/页头/侧栏，取主内容，避免每页重复的菜单噪音挤占注入额度
+            const NAV_SEL = 'nav, header, aside, footer, [role="navigation"], [role="banner"],'
+              + '[class*="sidebar"], [class*="side-bar"], [class*="navbar"], [class*="nav-bar"],'
+              + '[class*="menu"]:not([class*="content"]), [class*="header"]:not([class*="content"]),'
+              + '[class*="breadcrumb"], [class*="topbar"], [class*="top-bar"], [class*="footer"]';
+            const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
+            // 1) 优先标准主内容容器
+            let main = document.querySelector('main, [role="main"], article, .main-content, [class*="main-content"]');
+            if (main && clean(main.textContent).length >= 80) {
+              return clean(main.textContent).slice(0, 3500);
+            }
+            // 2) 启发式：clone body，删掉导航类节点，取剩余文本
+            try {
+              const clone = document.body.cloneNode(true);
+              clone.querySelectorAll(NAV_SEL + ', script, style, noscript').forEach(n => n.remove());
+              const txt = clean(clone.textContent);
+              if (txt.length >= 80) return txt.slice(0, 3500);
+            } catch (e) { /* 回退 */ }
+            // 3) 兜底：全 body
+            return clean(document.body?.textContent).slice(0, 3500);
+          })(),
           forms: Array.from(document.forms).slice(0, 10).map(f => ({
             action: f.action,
             method: f.method,

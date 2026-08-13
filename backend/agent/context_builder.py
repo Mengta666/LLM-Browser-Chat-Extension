@@ -14,9 +14,6 @@ if TYPE_CHECKING:
     from agent.state import AgentSession
 
 
-# 反思消息首行哨兵：run_step 据此在追加新反思前剔除旧反思，防止累积
-REFLECT_SENTINEL = "[[reflect]]"
-
 MAX_FULL_OBSERVATION_STEPS = 3
 
 
@@ -121,22 +118,6 @@ def append_step_messages(
         ),
     })
     return messages
-
-
-def build_reflection_prompt(session: "AgentSession") -> str:
-    """重复失败时生成反思提示（首行哨兵，供去重）。"""
-    if not session.blacklisted_approaches and len(session.failed_attempts) < 3:
-        return ""
-    parts = [REFLECT_SENTINEL]
-    if session.blacklisted_approaches:
-        parts.append("## ⚠️ 反思提醒")
-        parts.append("以下方式已多次失败，**换一种**：")
-        for approach in session.blacklisted_approaches[-5:]:
-            parts.append(f"  ✗ {approach}")
-    recent_fails = [a for a in session.failed_attempts[-3:] if a.step >= session.current_step - 3]
-    if len(recent_fails) >= 3:
-        parts.append("连续多次失败，请换一种完全不同的方式（scroll 找、hover 展开、或换目标编号）。")
-    return "\n".join(parts) if len(parts) > 1 else ""
 
 
 def _compress_old_observations(messages: list[dict[str, Any]]) -> None:

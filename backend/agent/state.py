@@ -58,15 +58,6 @@ class PageState(BaseModel):
 
 
 @dataclass
-class FailedAttempt:
-    """记录一次失败的操作尝试（供反思黑名单）。"""
-    action_type: str
-    target: str
-    error: str
-    step: int
-
-
-@dataclass
 class AgentSession:
     """一次 Agent 自动化会话的完整状态（单 LLM 反应式循环）。"""
 
@@ -92,7 +83,3 @@ class AgentSession:
     # 步数与超时防护
     max_steps: int = 40
     stale_retries: int = 0               # 连续 stale 重观察次数（防打转）
-
-    # 反思机制
-    failed_attempts: list[FailedAttempt] = field(default_factory=list)
-    blacklisted_approaches: list[str] = field(default_factory=list)

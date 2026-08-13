@@ -22,11 +22,11 @@ from dotenv import load_dotenv
 from openai import OpenAI, APITimeoutError, RateLimitError, APIConnectionError, APIStatusError
 
 from agent.state import (
-    AgentSession, AgentStatus, PageAction, PageState, ActionResult, FailedAttempt,
+    AgentSession, AgentStatus, PageAction, PageState, ActionResult,
 )
 from agent.context_builder import (
-    SYSTEM_PROMPT, SYSTEM_PROMPT_TEXT_MODE, REFLECT_SENTINEL,
-    build_initial_messages, build_reflection_prompt, append_step_messages,
+    SYSTEM_PROMPT, SYSTEM_PROMPT_TEXT_MODE,
+    build_initial_messages, append_step_messages,
 )
 from agent.router import should_confirm_action
 from tools.tool_registry import ACTION_SCHEMAS, ALLOWED_ACTION_TYPES
@@ -132,7 +132,6 @@ def run_step(session: AgentSession, page_state: PageState,
                     f"[编号已失效，页面已更新] 请用下面最新观察里的编号。\n\n{_observe(page_state)}"})
         else:
             session.stale_retries = 0
-            _track_attempt_result(session, session.pending_action, action_result)
             append_step_messages(session.messages, session.pending_action, action_result, page_state)
             if session.step_history:
                 session.step_history[-1]["result"] = {
@@ -142,16 +141,7 @@ def run_step(session: AgentSession, page_state: PageState,
                 }
         session.pending_action = None
 
-    # 2. 反思注入（去重，只留最新一条）
-    reflection = build_reflection_prompt(session)
-    if reflection:
-        session.messages = [
-            m for m in session.messages
-            if not (m.get("role") == "user" and str(m.get("content", "")).startswith(REFLECT_SENTINEL))
-        ]
-        session.messages.append({"role": "user", "content": reflection})
-
-    # 3. 步数上限
+    # 2. 步数上限
     if session.current_step >= session.max_steps:
         session.status = AgentStatus.ERROR
         session.error = f"超过最大步数 {session.max_steps}，任务未完成"
@@ -159,12 +149,12 @@ def run_step(session: AgentSession, page_state: PageState,
                          data={"step": session.current_step})
         return _build_response(session)
 
-    # 4. 刷新 system prompt（模式可能降级）
+    # 3. 刷新 system prompt（模式可能降级）
     if session.messages and session.messages[0].get("role") == "system":
         session.messages[0] = {"role": "system",
             "content": SYSTEM_PROMPT_TEXT_MODE if mode == CallMode.TEXT_PARSE else SYSTEM_PROMPT}
 
-    # 5. 调 LLM
+    # 4. 调 LLM
     _log_tokens(session, mode)
     if mode == CallMode.TOOL_CALLS:
         func_name, func_args, thought = _call_with_tools(_llm_client, session)
@@ -383,22 +373,6 @@ def _parse_action(func_name: str, args: dict[str, Any]) -> PageAction:
     elif func_name == "navigate":
         params["url"] = args.get("url", "")
     return PageAction(type=func_name, index=index, params=params)
-
-
-def _track_attempt_result(session: AgentSession, action: PageAction, result: ActionResult) -> None:
-    target = str(action.index) if action.index is not None else action.type
-    if result.success:
-        session.blacklisted_approaches = [a for a in session.blacklisted_approaches if target not in a]
-        return
-    session.failed_attempts.append(FailedAttempt(
-        action_type=action.type, target=target,
-        error=result.error or result.details or "", step=session.current_step))
-    recent = session.failed_attempts[-5:]
-    similar = [a for a in recent if a.action_type == action.type and a.target == target]
-    if len(similar) >= 2:
-        desc = f"{action.type} → [{target}]"
-        if desc not in session.blacklisted_approaches:
-            session.blacklisted_approaches.append(desc)
 
 
 def _estimate_tokens(messages: list, tools=None) -> dict:

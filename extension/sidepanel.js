@@ -3155,6 +3155,56 @@ document.addEventListener('DOMContentLoaded', async () => {
           return true;
         }
 
+        // Shadow DOM 穿透：收集 root 下所有 open shadowRoot（含嵌套），供逐个 querySelector。
+        // querySelectorAll 无法跨 shadow 边界，Web Component 内的元素只能进 shadowRoot 才能采到。
+        const MAX_SHADOW_ROOTS = 400;   // 性能保护：超大页面限制递归数量
+        function collectShadowRoots(root, acc) {
+          if (acc.length >= MAX_SHADOW_ROOTS) return acc;
+          let hosts;
+          try { hosts = root.querySelectorAll('*'); } catch (e) { return acc; }
+          for (const el of hosts) {
+            const sr = el.shadowRoot;
+            if (sr && sr.mode === 'open') {
+              acc.push(sr);
+              collectShadowRoots(sr, acc);
+              if (acc.length >= MAX_SHADOW_ROOTS) break;
+            }
+          }
+          return acc;
+        }
+
+        // 在 root 及其所有 open shadowRoot 内查询选择器，合并结果（穿透 shadow DOM）
+        function queryAllDeep(root, selector) {
+          const out = [];
+          const roots = [root, ...collectShadowRoots(root, [])];
+          for (const r of roots) {
+            let hits;
+            try { hits = r.querySelectorAll(selector); } catch (e) { continue; }
+            for (const el of hits) out.push(el);
+          }
+          return out;
+        }
+
+        // 遮挡命中测试：元素中心点最上层是否是它自己/其后代。被遮罩/固定层挡住的"假可见"标 occluded。
+        function isOccluded(el, rect) {
+          try {
+            const cx = rect.left + rect.width / 2;
+            const cy = rect.top + rect.height / 2;
+            if (cx < 0 || cy < 0 || cx > window.innerWidth || cy > window.innerHeight) return false;
+            let top = document.elementFromPoint(cx, cy);
+            // 穿透 shadow：elementFromPoint 只返回宿主，用 shadowRoot 再取一层
+            while (top && top.shadowRoot) {
+              const inner = top.shadowRoot.elementFromPoint(cx, cy);
+              if (!inner || inner === top) break;
+              top = inner;
+            }
+            if (!top) return false;
+            return !(top === el || el.contains(top) || top.contains(el));
+          } catch (e) {
+            return false;
+          }
+        }
+
         function buildCssSelector(el) {
           if (el.id && !el.id.match(/^[\d:]/) && !el.id.includes('--')) {
             return `#${CSS.escape(el.id)}`;
@@ -3211,6 +3261,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             css_selector: buildCssSelector(el),
             bounding_box: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) },
             visible: true,
+            occluded: isOccluded(el, rect),
             enabled: !el.disabled && !el.classList.contains('jmtd-date-picker-cell-disabled'),
             checked: el.checked !== undefined ? el.checked : null,
             contenteditable: el.isContentEditable || false,
@@ -3272,9 +3323,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           const collected = [];
           let annotationId = annotationIdStart;
           for (const selector of selectors) {
-            const candidates = root === document
-              ? document.querySelectorAll(selector)
-              : root.querySelectorAll(selector);
+            const candidates = queryAllDeep(root, selector);
             for (const el of candidates) {
               if (collected.length >= maxCount) break;
               if (seen.has(el)) continue;
@@ -3301,8 +3350,8 @@ document.addEventListener('DOMContentLoaded', async () => {
           return { collected, nextId: annotationId };
         }
 
-        // 清除旧标记
-        document.querySelectorAll('[data-agent-id]').forEach(el => el.removeAttribute('data-agent-id'));
+        // 清除旧标记（穿透 shadow DOM）
+        queryAllDeep(document, '[data-agent-id]').forEach(el => el.removeAttribute('data-agent-id'));
 
         const seen = new Set();
         let elements = [];
@@ -3517,10 +3566,29 @@ document.addEventListener('DOMContentLoaded', async () => {
     const execPromise = chrome.scripting.executeScript({
       target: { tabId: tab.id, allFrames: true },
       func: async (actionData) => {
-        // 索引直连：唯一定位方式——按观察时打标的 data-agent-id 直取节点
+        // 索引直连：按观察时打标的 data-agent-id 直取节点（穿透 open shadow DOM）
         function resolveByIndex(index) {
           if (index === undefined || index === null) return null;
-          return document.querySelector(`[data-agent-id="${index}"]`);
+          const sel = `[data-agent-id="${index}"]`;
+          let el = document.querySelector(sel);
+          if (el) return el;
+          // 穿透 shadow：递归所有 open shadowRoot 查找
+          const stack = [document];
+          let guard = 0;
+          while (stack.length && guard < 500) {
+            guard++;
+            const root = stack.pop();
+            let hosts;
+            try { hosts = root.querySelectorAll('*'); } catch (e) { continue; }
+            for (const h of hosts) {
+              if (h.shadowRoot && h.shadowRoot.mode === 'open') {
+                const hit = h.shadowRoot.querySelector(sel);
+                if (hit) return hit;
+                stack.push(h.shadowRoot);
+              }
+            }
+          }
+          return null;
         }
 
         function findBestScrollableContainer() {

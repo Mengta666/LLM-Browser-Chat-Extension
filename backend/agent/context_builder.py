@@ -260,6 +260,8 @@ def _format_element(el: dict[str, Any]) -> str:
     if el.get("type") and tag == "input":
         parts.append(el["type"])
     status = " [禁用]" if not el.get("enabled", True) else ""
+    if el.get("occluded"):
+        status += " [被遮挡]"
     return f"  [{eid}] <{tag}> {' '.join(parts)}{status}"
 
 

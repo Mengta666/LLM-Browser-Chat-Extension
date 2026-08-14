@@ -196,6 +196,45 @@ ACTION_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "update_plan",
+            "description": (
+                "维护任务计划清单（可选，仅复杂任务用）：\n"
+                "- 简单任务（1-2步可完成）：不要用，直接执行动作。\n"
+                "- 清晰的多步任务（约10步以上）：一开始就调用，列出 3-10 个步骤。\n"
+                "- 任务不清晰：先探索几步了解情况，再调用规划。\n"
+                "完成某步后再次调用更新其状态。"
+                "重要：完成所有计划项 ≠ 任务完成，仍需确认最终目标已达成。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "description": "3-10 个任务步骤",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {"type": "string", "description": "步骤描述"},
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["pending", "current", "done", "skipped"],
+                                },
+                            },
+                            "required": ["content", "status"],
+                        },
+                    },
+                    "current": {
+                        "type": "integer",
+                        "description": "当前进行的步骤序号（0-indexed）",
+                    },
+                },
+                "required": ["items"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "task_complete",
             "description": "标记任务已完成或无法完成。必须在任务结束时调用此工具。",
             "parameters": {
@@ -218,5 +257,5 @@ ACTION_SCHEMAS: list[dict[str, Any]] = [
 
 ALLOWED_ACTION_TYPES: set[str] = {
     "click", "type", "select", "scroll", "scroll_to_element", "hover",
-    "focus", "clear", "press_key", "wait", "navigate", "task_complete",
+    "focus", "clear", "press_key", "wait", "navigate", "update_plan", "task_complete",
 }

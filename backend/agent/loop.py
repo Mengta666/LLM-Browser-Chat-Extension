@@ -63,6 +63,10 @@ INEFFECTIVE_SENTINEL = "[[ineffective]]"
 # element_count 变化小于此值视为"无变化"（小面板展开可能只增 1 个）
 INEFFECTIVE_COUNT_DELTA = 2
 
+# 停滞：连续停在同一页（url+title 未变）达此步数 → 给 LLM 看最近轨迹（不强制反思）
+STALL_THRESHOLD = 4
+TRAIL_SENTINEL = "[[trail]]"
+
 
 class CallMode(str, Enum):
     TOOL_CALLS = "tool_calls"
@@ -150,6 +154,8 @@ def run_step(session: AgentSession, page_state: PageState,
                                   "changes": changes})
             # 打转检测：click/select 成功但页面无任何变化 = 成功但无效
             _detect_ineffective(session, action_result, changes, page_state)
+            # 停滞检测：连续停在同一页 → 累加计数，下面据此给 LLM 看最近轨迹
+            _detect_stall(session, page_state)
             append_step_messages(session.messages, session.pending_action, action_result, page_state)
             if session.step_history:
                 session.step_history[-1]["result"] = {
@@ -177,6 +183,19 @@ def run_step(session: AgentSession, page_state: PageState,
         session.messages.append({"role": "user", "content": warn})
         session.last_ineffective = None
 
+    # 1c. 停滞（连续停在同一页 ≥ 阈值）→ 给 LLM 看最近轨迹，让它自己判断要不要换思路（不强制）
+    if session.no_progress_count >= STALL_THRESHOLD:
+        from agent.context_builder import build_trail_hint
+        hint = build_trail_hint(session, page_state)
+        session.messages = [
+            m for m in session.messages
+            if not (m.get("role") == "user" and str(m.get("content", "")).startswith(TRAIL_SENTINEL))
+        ]
+        session.messages.append({"role": "user", "content": hint})
+        session.no_progress_count = 0   # 提醒一次后重置，避免每步刷屏
+        _agent_log.info("stall_hint", session_id=session.session_id,
+                        data={"step": session.current_step, "url": page_state.url})
+
     # 2. 步数上限
     if session.current_step >= session.max_steps:
         session.status = AgentStatus.ERROR
@@ -191,7 +210,15 @@ def run_step(session: AgentSession, page_state: PageState,
         session.messages[0] = {"role": "system",
             "content": SYSTEM_PROMPT_TEXT_MODE if mode == CallMode.TEXT_PARSE else SYSTEM_PROMPT}
 
-    # 4. 调 LLM（先记录本步 LLM 看到的观察上下文，用于诊断"是否看得到目标内容"）
+    # 4. 调 LLM（先注入当前计划 + 记录观察上下文）
+    from agent.context_builder import build_plan_block, PLAN_SENTINEL
+    plan_block = build_plan_block(session)
+    if plan_block:
+        session.messages = [
+            m for m in session.messages
+            if not (m.get("role") == "user" and str(m.get("content", "")).startswith(PLAN_SENTINEL))
+        ]
+        session.messages.append({"role": "user", "content": plan_block})
     _log_observation(session, page_state)
     if mode == CallMode.TOOL_CALLS:
         func_name, func_args, thought = _call_with_tools(_llm_client, session)
@@ -210,6 +237,24 @@ def run_step(session: AgentSession, page_state: PageState,
                               "url": page_state.url, "title": (page_state.title or "")[:60]})
         return _build_response(session, thought=thought)
 
+    # update_plan：LLM 自维护的计划，是"思考"不操作页面 → 更新后递归让它接着出真正的页面动作
+    if func_name == "update_plan":
+        session.plan_items = _sanitize_plan(func_args.get("items", []))
+        if "current" in func_args:
+            try:
+                session.current_plan_item = int(func_args.get("current", -1))
+            except (ValueError, TypeError):
+                pass
+        session.plan_calls_this_step += 1
+        _agent_log.info("plan_update", session_id=session.session_id,
+                        data={"step": session.current_step, "items": len(session.plan_items),
+                              "current": session.current_plan_item})
+        if session.plan_calls_this_step >= 2:
+            # 连调防护：已记录计划，强制要求出页面动作，避免只规划不干活
+            session.messages.append({"role": "user",
+                "content": "计划已记录。现在请执行一个具体的页面动作（不要再调 update_plan）。"})
+        return run_step(session, page_state)   # 同一观察递归，出页面动作
+
     if func_name not in ALLOWED_ACTION_TYPES:
         session.status = AgentStatus.ERROR
         session.error = f"未知的操作类型: {func_name}"
@@ -218,6 +263,7 @@ def run_step(session: AgentSession, page_state: PageState,
     action = _parse_action(func_name, func_args)
     session.pending_action = action
     session.current_step += 1
+    session.plan_calls_this_step = 0   # 真正的页面动作 → 清零 update_plan 连调计数
     session.progress = thought[:80] if thought else session.progress
     # 富日志：把 index 解析成目标元素信息（tag/text/role），并带上动作参数、当前页面
     target = _describe_target(action.index, page_state)
@@ -459,6 +505,41 @@ def _detect_ineffective(session: AgentSession, result: ActionResult,
         # 有效变化 → 清零该 index 的无效计数
         session.ineffective_clicks.pop(idx, None)
         session.last_ineffective = None
+
+
+def _detect_stall(session: AgentSession, page_state: PageState) -> bool:
+    """停滞检测（对齐 browser-use：只判"连续停在同一页"，用最稳的 url+title）。
+
+    换页即清零；连续 STALL_THRESHOLD 步没换页 → 返回 True（调用方给 LLM 看轨迹，不强制反思）。
+    刻意不看正文指纹、不区分动作类型——那些规则补不完（打字/自动刷新/动画各种例外）。
+    判断"是否在原地打转"交给 LLM，代码只保证它看得到历史。
+    """
+    sig = f"{page_state.url}|{page_state.title}"
+    if sig != session.last_page_sig:
+        session.last_page_sig = sig
+        session.no_progress_count = 0
+        return False
+    session.no_progress_count += 1
+    return session.no_progress_count >= STALL_THRESHOLD
+
+
+def _sanitize_plan(items) -> list[dict]:
+    """校验/规整 LLM 传来的计划：限 ≤10 条，content 截断，status 非法归 pending。"""
+    if not isinstance(items, list):
+        return []
+    out = []
+    valid = {"pending", "current", "done", "skipped"}
+    for it in items[:10]:
+        if not isinstance(it, dict):
+            continue
+        content = str(it.get("content", "")).strip()[:80]
+        if not content:
+            continue
+        status = it.get("status", "pending")
+        if status not in valid:
+            status = "pending"
+        out.append({"content": content, "status": status})
+    return out
 
 
 def _describe_target(index: Optional[int], page_state: PageState) -> str:

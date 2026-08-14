@@ -54,6 +54,13 @@ SYSTEM_PROMPT = """你是一个浏览器自动化助手。用户给你一个任�
 7. 最大化理解任务意图：查看类任务要真正看到内容（如进入详情页/看到 diff），不是看到标题就算完；
    操作类任务要看到结果确认（成功提示/页面跳转/列表变化）。不确定是否完成时，倾向"未完成"。
 8. 任务完成或确认无法完成时，必须调用 task_complete。
+
+## 任务规划（update_plan）
+- 简单任务（1-2 步可完成）：直接执行，不要用 update_plan。
+- 复杂任务（约 10 步以上）：第一步先用 update_plan 列出 3-10 个步骤，之后每完成一步就更新它的状态。
+- 任务不清晰时：先探索几步，了解情况后再规划。
+- 始终对照计划行动，避免偏离整体目标。
+- 重要：完成所有计划项不代表任务完成——仍需确认最终目标真正达成。
 """
 
 
@@ -76,6 +83,10 @@ TEXT_MODE_FORMAT_APPENDIX = """
 任务完成：
 ```json
 {"action": "task_complete", "summary": "完成了什么", "success": true, "thought": "..."}
+```
+更新计划（复杂任务用）：
+```json
+{"action": "update_plan", "items": [{"content": "进入Coding", "status": "done"}, {"content": "切换分支", "status": "current"}], "current": 1, "thought": "..."}
 ```
 
 ## 附加规则
@@ -100,6 +111,55 @@ def build_initial_messages(task: str, page_state: PageState, session: "AgentSess
         {"role": "system", "content": system},
         {"role": "user", "content": user},
     ]
+
+
+PLAN_SENTINEL = "[[plan]]"
+
+
+def build_plan_block(session: "AgentSession") -> str:
+    """渲染 LLM 自维护的任务计划（对齐 browser-use 标记）。为空返回空串。首行哨兵供去重。"""
+    if not session.plan_items:
+        return ""
+    marks = {"done": "[x]", "current": "[>]", "pending": "[ ]", "skipped": "[-]"}
+    lines = [f"{PLAN_SENTINEL}## 📋 任务计划（你维护的）"]
+    for i, it in enumerate(session.plan_items):
+        m = marks.get(it.get("status", "pending"), "[ ]")
+        cur = "  ← 进行中" if i == session.current_plan_item else ""
+        lines.append(f"  {m} {it.get('content', '')[:50]}{cur}")
+    lines.append("（完成所有项 ≠ 任务完成，仍需确认最终目标已达成）")
+    return "\n".join(lines)
+
+
+TRAIL_SENTINEL = "[[trail]]"
+
+
+def build_trail_hint(session: "AgentSession", page_state: PageState) -> str:
+    """停滞时把"最近走过的路"摆给 LLM，让它自己判断是否在原地打转（给信息，不下命令）。
+
+    对齐 browser-use：代码只保证历史可见，"要不要换思路"交给 LLM。首行哨兵供去重。
+    """
+    trail = []
+    for s in session.step_history[-6:]:
+        act = s.get("action", {}) or {}
+        res = s.get("result", {}) or {}
+        a = act.get("type", "?")
+        idx = act.get("index")
+        status = "✓" if res.get("success", True) else "✗"
+        line = f"  s{s.get('step','?')} {a}" + (f"[{idx}]" if idx is not None else "") + f" {status}"
+        det = (res.get("details", "") or "")[:30]
+        if det:
+            line += f" {det}"
+        trail.append(line)
+    trajectory = "\n".join(trail) if trail else "  （无）"
+
+    return (
+        f"{TRAIL_SENTINEL}## 📍 提示：你已连续多步停留在同一页面（{page_state.url}）\n"
+        f"最近几步的操作轨迹：\n{trajectory}\n"
+        f"如果这些操作没有让你更接近目标「{session.task}」，考虑换个思路："
+        f"用 navigate 直接跳转 URL、hover 展开可能藏着目标的菜单、scroll 找目标、"
+        f"或关掉干扰的弹层（Escape）。如果判断当前页面确实无法完成任务，调用 task_complete(success=false)。"
+        f"（若你正在正常推进，忽略此提示继续即可。）"
+    )
 
 
 def append_step_messages(

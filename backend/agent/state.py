@@ -87,3 +87,12 @@ class AgentSession:
     # 打转检测：点击 outcome=ok 但页面无变化（成功但无效）
     ineffective_clicks: dict = field(default_factory=dict)   # {index: 连续无效次数}
     last_ineffective: Optional[tuple] = None                 # (index, target_text) 供下一步提示
+
+    # 停滞检测（对齐 browser-use：只数"连续停在同一页"，达阈值给 LLM 看轨迹，不强制反思）
+    no_progress_count: int = 0                               # 连续 url+title 未变的步数
+    last_page_sig: str = ""                                  # 上一步 url|title（判是否换页）
+
+    # 任务计划（LLM 自维护，对齐 browser-use plan_update/current_plan_item）
+    plan_items: list[dict] = field(default_factory=list)     # [{content, status}]
+    current_plan_item: int = -1                              # 当前进行的步骤序号(0-indexed)
+    plan_calls_this_step: int = 0                            # 同一观察内 update_plan 连调次数（防死循环）

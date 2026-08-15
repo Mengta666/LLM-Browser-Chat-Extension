@@ -430,7 +430,7 @@ def _describe_target(index: Optional[int], page_state: PageState) -> str:
 
 
 def _action_summary(action: PageAction, page_state: PageState) -> str:
-    """把已执行动作压成一行摘要，进 HistoryItem（如 'click [7] 某选项'）。"""
+    """把已执行动作压成一行摘要，进 HistoryItem（如 'click [7] 提交'）。"""
     if action is None:
         return ""
     parts = [action.type]

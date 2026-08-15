@@ -68,7 +68,7 @@ class HistoryItem:
     evaluation: str = ""        # 对上一步的自评
     memory: str = ""            # 跨步记忆
     next_goal: str = ""         # 当步意图
-    action: str = ""            # 执行的动作摘要（如 "click [7] 某选项"）
+    action: str = ""            # 执行的动作摘要（如 "click [7] 提交"）
     result: str = ""            # 动作结果摘要（成功/失败 + 关键变化）
 
     def to_string(self) -> str:

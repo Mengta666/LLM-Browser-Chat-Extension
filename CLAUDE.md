@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Chrome MV3 side-panel AI assistant with **two largely independent subsystems** that share one FastAPI backend and one extension frontend:
 
-1. **Browser automation agent** — drives web pages from natural-language commands (click/type/scroll/hover/select). This is the actively developed core. Tested against JD internal enterprise platforms (xingyun.jd.com / coding.jd.com; jmtd / Ant Design / Element UI component libraries).
+1. **Browser automation agent** — drives web pages from natural-language commands (click/type/scroll/hover/select). This is the actively developed core. Targeted at internal enterprise platforms (Ant Design / Element UI and similar component libraries).
 2. **Page RAG + chat** — OpenAI-compatible chat, current-page RAG, snapshot indexing into Qdrant, SQLite metadata. Documented in `README.md`.
 
 These do not depend on each other. Work on the agent rarely touches RAG and vice versa. `app.py` mounts RAG/search/pages routers inside a `try/except` so the agent + logs routers still load when RAG deps (qdrant-client, numpy, trafilatura) are absent.

@@ -58,6 +58,35 @@ class PageState(BaseModel):
 
 
 @dataclass
+class HistoryItem:
+    """一步的结构化历史（对齐 browser-use HistoryItem）。
+
+    每步只留这几个字段，不留 LLM 原始回复/完整观察——这是 token 定长的关键。
+    渲染时拼成一行短文本，老步骤靠 max_history_items 滑动窗口省略。
+    """
+    step: int
+    evaluation: str = ""        # 对上一步的自评
+    memory: str = ""            # 跨步记忆
+    next_goal: str = ""         # 当步意图
+    action: str = ""            # 执行的动作摘要（如 "click [7] 某选项"）
+    result: str = ""            # 动作结果摘要（成功/失败 + 关键变化）
+
+    def to_string(self) -> str:
+        parts = []
+        if self.evaluation:
+            parts.append(f"评估:{self.evaluation}")
+        if self.action:
+            parts.append(f"动作:{self.action}")
+        if self.result:
+            parts.append(f"结果:{self.result}")
+        if self.memory:
+            parts.append(f"记忆:{self.memory}")
+        if self.next_goal:
+            parts.append(f"目标:{self.next_goal}")
+        return f"[步骤{self.step}] " + " | ".join(parts)
+
+
+@dataclass
 class AgentSession:
     """一次 Agent 自动化会话的完整状态（单 LLM 反应式循环）。"""
 
@@ -68,7 +97,8 @@ class AgentSession:
     status: AgentStatus = AgentStatus.RUNNING
     require_confirmation: list[str] = field(default_factory=list)
 
-    messages: list[dict[str, Any]] = field(default_factory=list)
+    messages: list[dict[str, Any]] = field(default_factory=list)   # 每步重建（system+任务+历史+观察），不累积
+    history_items: list[HistoryItem] = field(default_factory=list)  # 结构化历史（对齐 browser-use），token 定长的核心
     step_history: list[dict[str, Any]] = field(default_factory=list)
     pending_action: Optional[PageAction] = None
     summary: Optional[str] = None

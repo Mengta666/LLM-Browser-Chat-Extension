@@ -14,9 +14,6 @@ if TYPE_CHECKING:
     from agent.state import AgentSession
 
 
-MAX_FULL_OBSERVATION_STEPS = 3
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # 结构化输出 verify-first 架构（对齐 browser-use）
 # 每步 LLM 返回一个 JSON：先自评上一步(对照观察) → 记忆进度 → 声明意图 → 可选计划 → 动作
@@ -51,8 +48,14 @@ SYSTEM_PROMPT = """你是一个浏览器自动化助手。用户给你一个任�
 6. 目标不在列表 → scroll 或 hover，不要瞎猜编号。
 7. 最大化理解任务意图：查看类任务要真正看到内容（进详情页/看到 diff），不是看到标题就算完。
 
+## 每步对照原始任务（重要：防走错大方向）
+- 每一步都把【当前所在位置】和【原始任务真正要的东西】对比一次：现在这个页面/入口，是通往任务目标的路吗？
+- 如果发现当前所在的区域和任务目标无关，**立刻停止在此处深挖**——这通常说明入口选错了，应回到起点换一条完全不同的路径。
+- 反复操作仍无进展，往往不是"再换个相邻入口"能解决的，而是**最初选的大方向就错了**。
+
 ## 避免死循环（重要）
-- 同一个失败的动作，**绝不重复超过 2-3 次**——立刻换一种方式（换入口 / 换分支 / navigate 直达 / 换关键词 / hover 展开）。
+- 判断你是否卡住：连续多步都没有接近目标，就是卡住了。卡住时**质疑你最初选的大方向/入口是否根本错了**，回起点换路，而不是在错误方向里继续换招。
+- 同一个失败的动作，**绝不重复超过 2-3 次**——立刻换一种方式（换入口 / navigate 直达 / 换关键词 / hover 展开等）。
 - 如果连续 3 步以上停在同一页面、没有实质进展，必须换完全不同的思路，不要小修小补地重试。
 
 ## 弹窗/遮挡优先处理
@@ -112,75 +115,97 @@ SYSTEM_PROMPT_TEXT_MODE = SYSTEM_PROMPT
 # 消息构建
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def build_initial_messages(task: str, page_state: PageState, session: "AgentSession",
-                           text_mode: bool = False) -> list[dict[str, str]]:
-    """构造首步 messages：system + (任务 + 首屏观察)。"""
-    user = f"## 任务\n{task}\n\n{build_observation_message(page_state)}"
+# ═══════════════════════════════════════════════════════════════════════════════
+# 消息构建（每步从 history_items 重建，token 定长；对齐 browser-use）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# 历史滑动窗口：保留 首项 + 最近 (N-1) 项，中间用一行省略标记（对齐 browser-use max_history_items）
+MAX_HISTORY_ITEMS = 12
+
+
+def build_messages(session: "AgentSession", page_state: PageState) -> list[dict[str, str]]:
+    """每步重建完整 messages：system + (任务 + 历史块 + 计划 + 当前观察)。
+
+    不累积对话、不留 LLM 原始回复——历史只由 history_items 结构化渲染，
+    因此 token 随步数增长有上界（首项 + 最近 N 项 + 省略标记）。
+    """
+    parts = [f"## 任务\n{session.task}"]
+
+    hist = render_history_block(session)
+    if hist:
+        parts.append(hist)
+
+    plan = build_plan_block(session)
+    if plan:
+        parts.append(plan)
+
+    if session.force_done:
+        parts.append(_force_done_note(session))
+
+    parts.append(build_observation_message(page_state))
+
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user},
+        {"role": "user", "content": "\n\n".join(parts)},
     ]
+
+
+def render_history_block(session: "AgentSession") -> str:
+    """把结构化历史渲染成定长文本块：首项 + 最近 N 项，中间省略。"""
+    items = session.history_items
+    if not items:
+        return ""
+    lines = ["## 历史轨迹（你之前每步的自评/动作/结果/记忆）"]
+
+    if len(items) <= MAX_HISTORY_ITEMS:
+        kept = items
+        omitted = 0
+    else:
+        recent = MAX_HISTORY_ITEMS - 1                 # -1 给首项
+        kept = [items[0]] + items[-recent:]
+        omitted = len(items) - 1 - recent
+
+    rendered_first = False
+    for it in kept:
+        lines.append("  " + it.to_string())
+        if not rendered_first and omitted > 0:
+            lines.append(f"  <... 中间省略 {omitted} 步 ...>")
+            rendered_first = True
+    return "\n".join(lines)
+
+
+def _force_done_note(session: "AgentSession") -> str:
+    return (
+        "[收尾] 这一步**只能输出 action.type = task_complete**。\n"
+        "若任务尚未完全完成，设 success=false，并在 summary 里如实写清：你查到了什么、"
+        "尝试了哪些方式、为什么没完成。把你为最终任务查到的一切都写进 summary。"
+    )
+
+
+def maybe_compact_history(session: "AgentSession") -> None:
+    """[占位] 历史 compaction：超过阈值时用 LLM 把旧步骤总结成一条摘要（对齐 browser-use maybe_compact_messages）。
+
+    暂未实现——当前靠 render_history_block 的滑动窗口（首项+最近N项）控制 token。
+    后续实现：当 history_items 超过阈值，调 LLM 把 items[1:-keep] 总结成一个
+    <compacted_memory> 摘要项，替换中间段，只留 首项 + 摘要 + 最近 keep 项。
+    """
+    return
 
 
 PLAN_SENTINEL = "[[plan]]"
 
 
 def build_plan_block(session: "AgentSession") -> str:
-    """渲染 LLM 自维护的任务计划（对齐 browser-use 标记）。为空返回空串。首行哨兵供去重。"""
+    """渲染 LLM 自维护的任务计划（对齐 browser-use 标记）。为空返回空串。"""
     if not session.plan_items:
         return ""
     marks = {"done": "[x]", "current": "[>]", "pending": "[ ]", "skipped": "[-]"}
-    lines = [f"{PLAN_SENTINEL}## 📋 当前计划（你维护的，本轮可在 plan 字段更新）"]
+    lines = ["## 📋 当前计划（你维护的，本轮可在 plan 字段更新）"]
     for i, it in enumerate(session.plan_items):
         m = marks.get(it.get("status", "pending"), "[ ]")
         cur = "  ← 进行中" if i == session.current_plan_item else ""
         lines.append(f"  {m} {it.get('content', '')[:50]}{cur}")
     return "\n".join(lines)
-
-
-def append_step_messages(
-    messages: list[dict[str, Any]],
-    action: PageAction,
-    result: ActionResult,
-    new_page_state: PageState,
-    prev_eval: str = "",
-    prev_memory: str = "",
-) -> list[dict[str, Any]]:
-    """追加一轮：LLM 上一步的自评/记忆（assistant）+ 动作结果+新观察（user）。滑动窗口压缩旧步骤。"""
-    _compress_old_observations(messages)
-    # 把 LLM 上一步的判断记进历史（结构化架构：eval/memory 是状态在无状态调用间流动的载体）
-    if prev_eval or prev_memory:
-        note = []
-        if prev_eval:
-            note.append(f"评估: {prev_eval[:120]}")
-        if prev_memory:
-            note.append(f"记忆: {prev_memory[:150]}")
-        messages.append({"role": "assistant", "content": " | ".join(note)})
-    messages.append({
-        "role": "user",
-        "content": (
-            f"## 动作执行结果\n{build_action_result_message(action, result)}\n\n"
-            f"{build_observation_message(new_page_state)}"
-        ),
-    })
-    return messages
-
-
-def _compress_old_observations(messages: list[dict[str, Any]]) -> None:
-    """压缩旧观察步骤，只保留最近 N 步完整内容。"""
-    observation_indices = [
-        i for i, msg in enumerate(messages)
-        if msg.get("role") == "user" and "## 动作执行结果" in msg.get("content", "")
-    ]
-    if len(observation_indices) <= MAX_FULL_OBSERVATION_STEPS:
-        return
-    for idx in observation_indices[:-MAX_FULL_OBSERVATION_STEPS]:
-        content = messages[idx]["content"]
-        lines = content.split("\n")
-        result_line = next((l.strip() for l in lines if l.startswith("[") and ("✓" in l or "✗" in l)), "")
-        if not result_line:
-            result_line = lines[1] if len(lines) > 1 else "已执行"
-        messages[idx] = {"role": "user", "content": f"[历史步骤] {result_line}"}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -263,25 +288,6 @@ def build_observation_message(page_state: PageState) -> str:
         parts.append(f"\n## 页面文本摘要\n{' '.join(deduped)[:2200]}")
 
     return "\n".join(parts)
-
-
-def build_action_result_message(action: PageAction, result: ActionResult) -> str:
-    status = "✓ 成功" if result.success else ("↻ 编号失效，已重新观察" if result.stale else "✗ 失败")
-    msg = f"[{status}] {action.type}"
-    if action.index is not None:
-        msg += f" [{action.index}]"
-    if result.details:
-        msg += f" | {result.details}"
-    if result.error:
-        msg += f" | 错误: {result.error}"
-    changes = result.state_changes or {}
-    if changes.get("url_changed"):
-        msg += "\n⚡ 页面URL已变化。"
-    if changes.get("popup_disappeared"):
-        msg += "\n⚡ 弹出面板已关闭。"
-    if changes.get("popup_appeared"):
-        msg += "\n⚡ 弹出面板已出现。"
-    return msg
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

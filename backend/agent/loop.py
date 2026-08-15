@@ -19,10 +19,10 @@ from dotenv import load_dotenv
 from openai import OpenAI, APITimeoutError, RateLimitError, APIConnectionError, APIStatusError
 
 from agent.state import (
-    AgentSession, AgentStatus, PageAction, PageState, ActionResult,
+    AgentSession, AgentStatus, PageAction, PageState, ActionResult, HistoryItem,
 )
 from agent.context_builder import (
-    SYSTEM_PROMPT, build_initial_messages, append_step_messages, build_plan_block, PLAN_SENTINEL,
+    SYSTEM_PROMPT, build_messages, build_plan_block, maybe_compact_history,
 )
 from agent.router import should_confirm_action
 from tools.tool_registry import ALLOWED_ACTION_TYPES
@@ -108,21 +108,22 @@ def run_step(session: AgentSession, page_state: PageState,
     force_done=True（前端整轮超时触发）：强制本步只接受 task_complete，给用户一个交代。
     """
 
-    # 1. 首步初始化 / 后续追加上一步结果+新观察（含 LLM 上一步的自评+记忆）
-    if not session.messages:
-        session.messages = build_initial_messages(session.task, page_state, session)
-    elif action_result and session.pending_action:
+    # 1. 记录上一步结果为一条结构化 HistoryItem（不累积 messages；messages 每步重建）
+    if action_result and session.pending_action:
         if action_result.stale:
             session.stale_retries += 1
             _agent_log.info("step_result", session_id=session.session_id,
                             data={"step": session.current_step, "outcome": "stale",
                                   "stale_retries": session.stale_retries, "url": page_state.url})
-            note = ("[编号多次失效] 页面在频繁变化，请基于下面最新观察重新选择编号。"
-                    if session.stale_retries >= MAX_STALE_RETRIES
-                    else "[编号已失效，页面已更新] 请用下面最新观察里的编号。")
+            stale_note = ("页面频繁变化，编号多次失效，请基于最新观察重新选择编号"
+                          if session.stale_retries >= MAX_STALE_RETRIES
+                          else "编号已失效，页面已更新，请用最新观察里的编号")
             if session.stale_retries >= MAX_STALE_RETRIES:
                 session.stale_retries = 0
-            session.messages.append({"role": "user", "content": f"{note}\n\n{_observe(page_state)}"})
+            session.history_items.append(HistoryItem(
+                step=session.current_step,
+                action=_action_summary(session.pending_action, page_state),
+                result=f"↻ {stale_note}"))
         else:
             session.stale_retries = 0
             changes = action_result.state_changes or {}
@@ -132,8 +133,13 @@ def run_step(session: AgentSession, page_state: PageState,
                                   "details": (action_result.details or "")[:80],
                                   "error": (action_result.error or "")[:80],
                                   "url": page_state.url, "changes": changes})
-            append_step_messages(session.messages, session.pending_action, action_result, page_state,
-                                 prev_eval=session.last_evaluation, prev_memory=session.last_memory)
+            session.history_items.append(HistoryItem(
+                step=session.current_step,
+                evaluation=session.last_evaluation,
+                memory=session.last_memory,
+                next_goal=session.progress,
+                action=_action_summary(session.pending_action, page_state),
+                result=_result_summary(action_result, page_state)))
             if session.step_history:
                 session.step_history[-1]["result"] = {
                     "success": action_result.success,
@@ -151,26 +157,16 @@ def run_step(session: AgentSession, page_state: PageState,
                          data={"step": session.current_step,
                                "url": page_state.url, "title": (page_state.title or "")[:60]})
         return _build_response(session)
-    #    最后一步（步数到上限前一步）或前端超时触发 → 强制只接受 task_complete，给用户交代。
+    #    最后一步（步数到上限前一步）或前端超时触发 → 强制只接受 task_complete。
     session.force_done = force_done or (session.current_step >= session.max_steps - 1)
-    if session.force_done:
-        reason = "前端整轮超时" if force_done else f"已到最后一步（max_steps={session.max_steps}）"
-        session.messages.append({"role": "user", "content":
-            f"[{reason}] 这一步**只能调用 task_complete**。\n"
-            "若任务尚未完全完成，设 success=false，并在 summary 里如实写清：你查到了什么、"
-            "尝试了哪些方式、为什么没完成（例如'经多次尝试，在 codex/run 各分支均未找到某贡献者的提交，"
-            "该分支可能无此人提交'）。把你为最终任务查到的一切都写进 summary。"})
 
-    # 3. 注入当前计划（LLM 可在本轮 plan 字段更新它）
-    plan_block = build_plan_block(session)
-    if plan_block:
-        session.messages = [
-            m for m in session.messages
-            if not (m.get("role") == "user" and str(m.get("content", "")).startswith(PLAN_SENTINEL))
-        ]
-        session.messages.append({"role": "user", "content": plan_block})
+    # 3. compaction 占位（对齐 browser-use；当前靠 render_history_block 滑动窗口控 token）
+    maybe_compact_history(session)
 
-    # 4. 调 LLM（结构化 JSON）
+    # 4. 每步重建 messages（system + 任务 + 历史块 + 计划 + 当前观察）
+    session.messages = build_messages(session, page_state)
+
+    # 5. 调 LLM（结构化 JSON）
     _log_observation(session, page_state)
     _log_exec_tokens(session)
     parsed = _call_llm(session)
@@ -261,11 +257,6 @@ def run_step(session: AgentSession, page_state: PageState,
     return _build_response(session)
 
 
-def _observe(page_state: PageState) -> str:
-    from agent.context_builder import build_observation_message
-    return build_observation_message(page_state)
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # LLM 调用（结构化 JSON）
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -276,7 +267,7 @@ def _call_llm(session: AgentSession) -> Optional[dict]:
     if response is None:
         return None
     raw = response.choices[0].message.content or ""
-    session.messages.append({"role": "assistant", "content": raw})
+    # 不把原始回复存回 messages——messages 每步由 build_messages 重建，历史只走 history_items
     parsed = _parse_structured(raw)
     if parsed is None or not parsed.get("action"):
         session.status = AgentStatus.ERROR
@@ -436,6 +427,43 @@ def _describe_target(index: Optional[int], page_state: PageState) -> str:
                 parts.append("[被遮挡]")
             return " ".join(parts)
     return f"(编号{index}不在当前观察中)"
+
+
+def _action_summary(action: PageAction, page_state: PageState) -> str:
+    """把已执行动作压成一行摘要，进 HistoryItem（如 'click [7] 某选项'）。"""
+    if action is None:
+        return ""
+    parts = [action.type]
+    if action.index is not None:
+        parts.append(f"[{action.index}]")
+    tgt = _describe_target(action.index, page_state)
+    if tgt and not tgt.startswith("(编号"):
+        parts.append(tgt.replace("<", "").replace(">", ""))
+    p = action.params or {}
+    if p.get("text"):
+        parts.append(f'输入"{str(p["text"])[:30]}"')
+    if p.get("option_text"):
+        parts.append(f'选"{p["option_text"]}"')
+    if p.get("key"):
+        parts.append(p["key"])
+    if p.get("url"):
+        parts.append(str(p["url"])[:50])
+    return " ".join(parts)[:120]
+
+
+def _result_summary(result: ActionResult, page_state: PageState) -> str:
+    """把动作结果压成一行摘要，进 HistoryItem。"""
+    tag = "✓" if result.success else "✗"
+    bits = [tag]
+    if result.details:
+        bits.append(str(result.details)[:50])
+    if result.error:
+        bits.append(f"错误:{str(result.error)[:40]}")
+    ch = result.state_changes or {}
+    flags = [k for k in ("url_changed", "popup_appeared", "popup_disappeared") if ch.get(k)]
+    if flags:
+        bits.append("+".join(flags))
+    return " ".join(bits)[:120]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

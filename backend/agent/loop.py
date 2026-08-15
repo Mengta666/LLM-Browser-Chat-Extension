@@ -1,12 +1,10 @@
-"""Agent 主循环模块（单 LLM 反应式架构）。
+"""Agent 主循环模块（结构化输出 verify-first 架构，对齐 browser-use）。
 
-每一步：观察（编号元素列表）→ 单次 LLM 调用 → 一个动作。
-定位契约：索引直连——LLM 输出 index，前端直取 data-agent-id 节点。
+每一步：观察（编号元素列表 + 上一步结果）→ 单次 LLM 调用返回一个结构化 JSON：
+  { evaluation_previous_goal, memory, next_goal, plan?, current_plan_item?, action }
+LLM 必须先自评上一步是否成功（对照观察），再决定下一个动作。
+定位契约：索引直连——action.index 对应 data-agent-id，前端直取节点。
 编号失效（stale）→ 重新观察再决策，不计失败。
-
-支持两种调用模式：
-- tool_calls：支持 function calling 的模型
-- text_parse：不支持的推理模型，靠 prompt 输出 JSON 再解析
 """
 
 import json
@@ -14,7 +12,6 @@ import os
 import re
 import time
 import threading
-from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
 
@@ -25,11 +22,10 @@ from agent.state import (
     AgentSession, AgentStatus, PageAction, PageState, ActionResult,
 )
 from agent.context_builder import (
-    SYSTEM_PROMPT, SYSTEM_PROMPT_TEXT_MODE,
-    build_initial_messages, append_step_messages,
+    SYSTEM_PROMPT, build_initial_messages, append_step_messages, build_plan_block, PLAN_SENTINEL,
 )
 from agent.router import should_confirm_action
-from tools.tool_registry import ACTION_SCHEMAS, ALLOWED_ACTION_TYPES
+from tools.tool_registry import ALLOWED_ACTION_TYPES
 from observability.logger import get_logger
 
 _agent_log = get_logger("agent")
@@ -39,7 +35,6 @@ load_dotenv(dotenv_path=__env_path)
 
 MODEL_BASE_URL = os.getenv("MODEL_BASE_URL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-AGENT_MODE = os.getenv("AGENT_MODE", "auto")  # tool_calls | text_parse | auto
 
 _llm_client = OpenAI(base_url=MODEL_BASE_URL, api_key=OPENAI_API_KEY)
 
@@ -51,26 +46,13 @@ _SESSION_ABSOLUTE_TTL = 1800
 MAX_LLM_RETRIES = 3
 RETRY_DELAYS = [0.5, 1, 2]
 MAX_STALE_RETRIES = 3   # 连续编号失效重观察上限，防打转
+LLM_CALL_TIMEOUT = 90   # 单次 LLM 调用超时秒数（对齐 browser-use llm_timeout 75-90s，防单点卡死）
 
 try:
     import tiktoken
     _tok_enc = tiktoken.get_encoding("cl100k_base")
 except Exception:
     _tok_enc = None
-
-# 无效点击提示的首行哨兵（供下一步注入前去重，只留最新一条）
-INEFFECTIVE_SENTINEL = "[[ineffective]]"
-# element_count 变化小于此值视为"无变化"（小面板展开可能只增 1 个）
-INEFFECTIVE_COUNT_DELTA = 2
-
-# 停滞：连续停在同一页（url+title 未变）达此步数 → 给 LLM 看最近轨迹（不强制反思）
-STALL_THRESHOLD = 4
-TRAIL_SENTINEL = "[[trail]]"
-
-
-class CallMode(str, Enum):
-    TOOL_CALLS = "tool_calls"
-    TEXT_PARSE = "text_parse"
 
 
 def _cleanup_expired_sessions():
@@ -115,33 +97,32 @@ def cancel_session(session_id: str) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 主循环：单步（观察结果 → LLM → 下一个动作）
+# 主循环：单步（观察 → 结构化 LLM → 一个动作）
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def run_step(session: AgentSession, page_state: PageState,
-             action_result: Optional[ActionResult] = None) -> dict[str, Any]:
-    """记录上一步结果 + 调 LLM 出下一个动作。stale 由前端处理（重新观察后再调本函数）。"""
-    mode = _resolve_call_mode(session)
+             action_result: Optional[ActionResult] = None,
+             force_done: bool = False) -> dict[str, Any]:
+    """记录上一步结果 + 调 LLM 出下一个动作。stale 由前端处理（重新观察后再调本函数）。
 
-    # 1. 首步初始化 messages / 后续追加上一步结果+新观察
+    force_done=True（前端整轮超时触发）：强制本步只接受 task_complete，给用户一个交代。
+    """
+
+    # 1. 首步初始化 / 后续追加上一步结果+新观察（含 LLM 上一步的自评+记忆）
     if not session.messages:
-        session.messages = build_initial_messages(
-            session.task, page_state, session, text_mode=(mode == CallMode.TEXT_PARSE))
+        session.messages = build_initial_messages(session.task, page_state, session)
     elif action_result and session.pending_action:
-        # stale：不追加结果（避免污染），前端已重新观察，这里只刷新观察
         if action_result.stale:
             session.stale_retries += 1
             _agent_log.info("step_result", session_id=session.session_id,
                             data={"step": session.current_step, "outcome": "stale",
                                   "stale_retries": session.stale_retries, "url": page_state.url})
+            note = ("[编号多次失效] 页面在频繁变化，请基于下面最新观察重新选择编号。"
+                    if session.stale_retries >= MAX_STALE_RETRIES
+                    else "[编号已失效，页面已更新] 请用下面最新观察里的编号。")
             if session.stale_retries >= MAX_STALE_RETRIES:
-                # 连续失效多次仍打转 → 追加一条提示，让 LLM 换策略
-                session.messages.append({"role": "user", "content":
-                    f"[编号多次失效] 页面在频繁变化。请基于下面最新观察重新选择编号。\n\n{_observe(page_state)}"})
                 session.stale_retries = 0
-            else:
-                session.messages.append({"role": "user", "content":
-                    f"[编号已失效，页面已更新] 请用下面最新观察里的编号。\n\n{_observe(page_state)}"})
+            session.messages.append({"role": "user", "content": f"{note}\n\n{_observe(page_state)}"})
         else:
             session.stale_retries = 0
             changes = action_result.state_changes or {}
@@ -150,13 +131,9 @@ def run_step(session: AgentSession, page_state: PageState,
                                   "outcome": "ok" if action_result.success else "fail",
                                   "details": (action_result.details or "")[:80],
                                   "error": (action_result.error or "")[:80],
-                                  "url": page_state.url,
-                                  "changes": changes})
-            # 打转检测：click/select 成功但页面无任何变化 = 成功但无效
-            _detect_ineffective(session, action_result, changes, page_state)
-            # 停滞检测：连续停在同一页 → 累加计数，下面据此给 LLM 看最近轨迹
-            _detect_stall(session, page_state)
-            append_step_messages(session.messages, session.pending_action, action_result, page_state)
+                                  "url": page_state.url, "changes": changes})
+            append_step_messages(session.messages, session.pending_action, action_result, page_state,
+                                 prev_eval=session.last_evaluation, prev_memory=session.last_memory)
             if session.step_history:
                 session.step_history[-1]["result"] = {
                     "success": action_result.success,
@@ -165,38 +142,8 @@ def run_step(session: AgentSession, page_state: PageState,
                 }
         session.pending_action = None
 
-    # 1b. 无效点击提示注入（哨兵去重，只留最新一条）
-    if session.last_ineffective:
-        idx, tgt = session.last_ineffective
-        streak = session.ineffective_clicks.get(idx, 0)
-        if streak >= 2:
-            warn = (f"{INEFFECTIVE_SENTINEL}⚠️ 你已连续 {streak} 次点击 [{idx}]『{tgt}』但页面毫无变化——"
-                    f"这个操作无效，**禁止再点 [{idx}]**。换一种方式：换其他编号、先 hover 展开菜单、"
-                    f"或 scroll 找目标，或用 navigate 直接跳转 URL。")
-        else:
-            warn = (f"{INEFFECTIVE_SENTINEL}⚠️ 上一步点击 [{idx}]『{tgt}』后页面无变化，该操作可能无效。"
-                    f"不要重复点它，换个思路（换编号/hover 展开/scroll/navigate）。")
-        session.messages = [
-            m for m in session.messages
-            if not (m.get("role") == "user" and str(m.get("content", "")).startswith(INEFFECTIVE_SENTINEL))
-        ]
-        session.messages.append({"role": "user", "content": warn})
-        session.last_ineffective = None
-
-    # 1c. 停滞（连续停在同一页 ≥ 阈值）→ 给 LLM 看最近轨迹，让它自己判断要不要换思路（不强制）
-    if session.no_progress_count >= STALL_THRESHOLD:
-        from agent.context_builder import build_trail_hint
-        hint = build_trail_hint(session, page_state)
-        session.messages = [
-            m for m in session.messages
-            if not (m.get("role") == "user" and str(m.get("content", "")).startswith(TRAIL_SENTINEL))
-        ]
-        session.messages.append({"role": "user", "content": hint})
-        session.no_progress_count = 0   # 提醒一次后重置，避免每步刷屏
-        _agent_log.info("stall_hint", session_id=session.session_id,
-                        data={"step": session.current_step, "url": page_state.url})
-
-    # 2. 步数上限
+    # 2. 收尾控制（对齐 browser-use _force_done_after_last_step）
+    #    硬兜底：真到 max_steps 仍没 done → ERROR。
     if session.current_step >= session.max_steps:
         session.status = AgentStatus.ERROR
         session.error = f"超过最大步数 {session.max_steps}，任务未完成"
@@ -204,14 +151,17 @@ def run_step(session: AgentSession, page_state: PageState,
                          data={"step": session.current_step,
                                "url": page_state.url, "title": (page_state.title or "")[:60]})
         return _build_response(session)
+    #    最后一步（步数到上限前一步）或前端超时触发 → 强制只接受 task_complete，给用户交代。
+    session.force_done = force_done or (session.current_step >= session.max_steps - 1)
+    if session.force_done:
+        reason = "前端整轮超时" if force_done else f"已到最后一步（max_steps={session.max_steps}）"
+        session.messages.append({"role": "user", "content":
+            f"[{reason}] 这一步**只能调用 task_complete**。\n"
+            "若任务尚未完全完成，设 success=false，并在 summary 里如实写清：你查到了什么、"
+            "尝试了哪些方式、为什么没完成（例如'经多次尝试，在 codex/run 各分支均未找到某贡献者的提交，"
+            "该分支可能无此人提交'）。把你为最终任务查到的一切都写进 summary。"})
 
-    # 3. 刷新 system prompt（模式可能降级）
-    if session.messages and session.messages[0].get("role") == "system":
-        session.messages[0] = {"role": "system",
-            "content": SYSTEM_PROMPT_TEXT_MODE if mode == CallMode.TEXT_PARSE else SYSTEM_PROMPT}
-
-    # 4. 调 LLM（先注入当前计划 + 记录观察上下文）
-    from agent.context_builder import build_plan_block, PLAN_SENTINEL
+    # 3. 注入当前计划（LLM 可在本轮 plan 字段更新它）
     plan_block = build_plan_block(session)
     if plan_block:
         session.messages = [
@@ -219,62 +169,75 @@ def run_step(session: AgentSession, page_state: PageState,
             if not (m.get("role") == "user" and str(m.get("content", "")).startswith(PLAN_SENTINEL))
         ]
         session.messages.append({"role": "user", "content": plan_block})
-    _log_observation(session, page_state)
-    if mode == CallMode.TOOL_CALLS:
-        func_name, func_args, thought = _call_with_tools(_llm_client, session)
-    else:
-        func_name, func_args, thought = _call_text_parse(_llm_client, session)
 
-    if func_name is None:
-        return _build_response(session, thought=thought)
+    # 4. 调 LLM（结构化 JSON）
+    _log_observation(session, page_state)
+    _log_exec_tokens(session)
+    parsed = _call_llm(session)
+    if parsed is None:
+        return _build_response(session)
+
+    # 5. 消化结构化输出：自评/记忆/意图/计划
+    session.last_evaluation = str(parsed.get("evaluation_previous_goal", ""))[:300]
+    session.last_memory = str(parsed.get("memory", ""))[:300]
+    session.progress = str(parsed.get("next_goal", ""))[:120] or session.progress
+    if isinstance(parsed.get("plan"), list) and parsed["plan"]:
+        session.plan_items = _sanitize_plan(parsed["plan"])
+    if parsed.get("current_plan_item") is not None:
+        try:
+            session.current_plan_item = int(parsed["current_plan_item"])
+        except (ValueError, TypeError):
+            pass
+
+    action_obj = parsed.get("action") or {}
+    func_name = action_obj.get("type") or action_obj.get("action")
+
+    _agent_log.info("llm_step", session_id=session.session_id,
+                    data={"step": session.current_step,
+                          "eval": session.last_evaluation[:100],
+                          "memory": session.last_memory[:100],
+                          "next_goal": session.progress[:80],
+                          "action": func_name,
+                          "plan_items": len(session.plan_items),
+                          "current_plan": session.current_plan_item})
+
+    if not func_name:
+        session.status = AgentStatus.ERROR
+        session.error = f"LLM 输出缺少 action。回复片段: {json.dumps(parsed, ensure_ascii=False)[:200]}"
+        return _build_response(session)
 
     if func_name == "task_complete":
         session.status = AgentStatus.COMPLETED
-        session.summary = func_args.get("summary", "任务完成")
+        session.summary = action_obj.get("summary", "任务完成")
         _agent_log.info("session_complete", session_id=session.session_id,
-                        data={"summary": session.summary, "success": func_args.get("success", True),
+                        data={"summary": session.summary, "success": action_obj.get("success", True),
                               "total_steps": session.current_step,
                               "url": page_state.url, "title": (page_state.title or "")[:60]})
-        return _build_response(session, thought=thought)
+        return _build_response(session)
 
-    # update_plan：LLM 自维护的计划，是"思考"不操作页面 → 更新后递归让它接着出真正的页面动作
-    if func_name == "update_plan":
-        session.plan_items = _sanitize_plan(func_args.get("items", []))
-        if "current" in func_args:
-            try:
-                session.current_plan_item = int(func_args.get("current", -1))
-            except (ValueError, TypeError):
-                pass
-        session.plan_calls_this_step += 1
-        _agent_log.info("plan_update", session_id=session.session_id,
-                        data={"step": session.current_step, "items": len(session.plan_items),
-                              "current": session.current_plan_item})
-        if session.plan_calls_this_step >= 2:
-            # 连调防护：已记录计划，强制要求出页面动作，避免只规划不干活
-            session.messages.append({"role": "user",
-                "content": "计划已记录。现在请执行一个具体的页面动作（不要再调 update_plan）。"})
-        return run_step(session, page_state)   # 同一观察递归，出页面动作
+    # 强制收尾时 LLM 仍出页面动作（不听话）→ 代码用其记忆替它体面收尾（对齐 browser-use force-done）
+    if session.force_done:
+        session.status = AgentStatus.COMPLETED
+        session.summary = (f"已达步数/时间上限，未完全完成任务。最后进展：{session.last_memory[:180]}"
+                           if session.last_memory else "已达步数/时间上限，任务未完成。")
+        _agent_log.warn("forced_done_at_limit", session_id=session.session_id,
+                        data={"step": session.current_step, "wanted_action": func_name,
+                              "url": page_state.url})
+        return _build_response(session)
 
     if func_name not in ALLOWED_ACTION_TYPES:
         session.status = AgentStatus.ERROR
         session.error = f"未知的操作类型: {func_name}"
-        return _build_response(session, thought=thought)
+        return _build_response(session)
 
-    action = _parse_action(func_name, func_args)
+    action = _parse_action(func_name, action_obj)
     session.pending_action = action
     session.current_step += 1
-    session.plan_calls_this_step = 0   # 真正的页面动作 → 清零 update_plan 连调计数
-    session.progress = thought[:80] if thought else session.progress
-    # 富日志：把 index 解析成目标元素信息（tag/text/role），并带上动作参数、当前页面
+
     target = _describe_target(action.index, page_state)
     log_data = {
-        "step": session.current_step,
-        "action": func_name,
-        "index": action.index,
-        "target": target,                       # 点了什么（tag "文本" role）
-        "thought": thought[:200],
-        "url": page_state.url,
-        "title": (page_state.title or "")[:60],
+        "step": session.current_step, "action": func_name, "index": action.index,
+        "target": target, "url": page_state.url, "title": (page_state.title or "")[:60],
         "elements": len(page_state.interactive_elements or []),
     }
     if func_name == "type":
@@ -289,13 +252,13 @@ def run_step(session: AgentSession, page_state: PageState,
         log_data["nav_url"] = action.params.get("url", "")
     _agent_log.info("execution_result", session_id=session.session_id, data=log_data)
     session.step_history.append(
-        {"step": session.current_step, "thought": thought, "action": action.model_dump()})
+        {"step": session.current_step, "thought": session.progress, "action": action.model_dump()})
 
     if should_confirm_action(action, session.require_confirmation):
         session.status = AgentStatus.CONFIRM_REQUIRED
     else:
         session.status = AgentStatus.ACTION_REQUIRED
-    return _build_response(session, thought=thought)
+    return _build_response(session)
 
 
 def _observe(page_state: PageState) -> str:
@@ -304,77 +267,29 @@ def _observe(page_state: PageState) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# LLM 调用
+# LLM 调用（结构化 JSON）
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _call_with_tools(client: OpenAI, session: AgentSession) -> tuple[Optional[str], dict, str]:
-    _log_exec_tokens(session, tools=ACTION_SCHEMAS, call="tool_calls")
-    response = _create_with_retry(client, session.model, session.messages,
-                                  tools=ACTION_SCHEMAS, tool_choice="auto", session=session)
+def _call_llm(session: AgentSession) -> Optional[dict]:
+    """调 LLM，解析出结构化 JSON。失败置 session.error 并返回 None。"""
+    response = _create_with_retry(_llm_client, session.model, session.messages, session=session)
     if response is None:
-        return None, {}, ""
-    message = response.choices[0].message
-    raw_content = message.content or ""
-    thought = _extract_thought(raw_content)
-
-    if message.tool_calls:
-        session.messages.append(message.model_dump())
-        tool_call = message.tool_calls[0]
-        func_name = tool_call.function.name
-        try:
-            func_args = json.loads(tool_call.function.arguments)
-        except json.JSONDecodeError:
-            func_args = {}
-        session.messages.append({"role": "tool", "tool_call_id": tool_call.id,
-                                 "content": "已收到，等待执行结果。"})
-        return func_name, func_args, thought
-
-    session.messages.append({"role": "assistant", "content": raw_content})
-    clean = _strip_think_tags(raw_content)
-    parsed = _try_parse_action_from_text(clean)
-    if parsed:
-        return parsed[0], parsed[1], thought
-
-    if AGENT_MODE == "auto":
-        session.call_mode = CallMode.TEXT_PARSE.value
-        if session.messages and session.messages[0].get("role") == "system":
-            session.messages[0] = {"role": "system", "content": SYSTEM_PROMPT_TEXT_MODE}
-        return _call_text_parse(client, session)
-
-    session.status = AgentStatus.ERROR
-    session.error = f"LLM 未返回 tool_calls。回复: {clean[:200]}"
-    return None, {}, thought
+        return None
+    raw = response.choices[0].message.content or ""
+    session.messages.append({"role": "assistant", "content": raw})
+    parsed = _parse_structured(raw)
+    if parsed is None or not parsed.get("action"):
+        session.status = AgentStatus.ERROR
+        session.error = f"无法解析结构化输出。回复: {_strip_think_tags(raw)[:300]}"
+        return None
+    return parsed
 
 
-def _call_text_parse(client: OpenAI, session: AgentSession) -> tuple[Optional[str], dict, str]:
-    _log_exec_tokens(session, tools=None, call="text_parse")
-    response = _create_with_retry(client, session.model, session.messages, session=session)
-    if response is None:
-        return None, {}, ""
-    message = response.choices[0].message
-    raw_content = message.content or ""
-    thought = _extract_thought(raw_content)
-    clean = _strip_think_tags(raw_content)
-    session.messages.append({"role": "assistant", "content": raw_content})
-    parsed = _try_parse_action_from_text(clean)
-    if parsed:
-        return parsed[0], parsed[1], thought
-    session.status = AgentStatus.ERROR
-    session.error = f"无法从模型回复解析动作。回复: {clean[:300]}"
-    return None, {}, thought
-
-
-def _create_with_retry(client: OpenAI, model: str, messages: list,
-                       tools=None, tool_choice=None, session: Optional[AgentSession] = None):
+def _create_with_retry(client: OpenAI, model: str, messages: list, session: Optional[AgentSession] = None):
     last_error = None
     for attempt in range(MAX_LLM_RETRIES):
         try:
-            kwargs = {"model": model, "messages": messages}
-            if tools:
-                kwargs["tools"] = tools
-            if tool_choice:
-                kwargs["tool_choice"] = tool_choice
-            return client.chat.completions.create(**kwargs)
+            return client.chat.completions.create(model=model, messages=messages, timeout=LLM_CALL_TIMEOUT)
         except RateLimitError as e:
             last_error = f"API 限流 (429): {getattr(e, 'message', str(e))}"
         except APITimeoutError:
@@ -410,46 +325,49 @@ def _create_with_retry(client: OpenAI, model: str, messages: list,
     return None
 
 
-def _resolve_call_mode(session: AgentSession) -> CallMode:
-    if getattr(session, "call_mode", None):
-        return CallMode(session.call_mode)
-    if AGENT_MODE == "text_parse":
-        return CallMode.TEXT_PARSE
-    return CallMode.TOOL_CALLS
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
-# 解析 / 反思 / 埋点
+# 解析
 # ═══════════════════════════════════════════════════════════════════════════════
-
-def _extract_thought(text: str) -> str:
-    m = re.search(r'<think>(.*?)</think>', text, re.DOTALL)
-    return m.group(1).strip() if m else ""
-
 
 def _strip_think_tags(text: str) -> str:
     return re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
 
 
-def _try_parse_action_from_text(text: str) -> Optional[tuple[str, dict[str, Any]]]:
+def _parse_structured(text: str) -> Optional[dict]:
+    """从 LLM 回复中解析结构化 JSON（含 evaluation/memory/next_goal/action 等）。
+
+    容错：优先 ```json 代码块；否则找含 "action" 的最外层 JSON 对象。
+    """
+    clean = _strip_think_tags(text)
     candidates = []
-    for block in re.finditer(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL):
+    for block in re.finditer(r'```(?:json)?\s*(\{.*?\})\s*```', clean, re.DOTALL):
         candidates.append(block.group(1))
-    for obj in re.finditer(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text, re.DOTALL):
-        candidates.append(obj.group(0))
+    # 最外层大对象（贪婪）——结构化输出是单个大 JSON
+    m = re.search(r'\{.*\}', clean, re.DOTALL)
+    if m:
+        candidates.append(m.group(0))
+
     for raw in candidates:
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
             continue
-        if "name" in data and "arguments" in data:
-            func_name = data["name"]
-            func_args = data["arguments"] if isinstance(data["arguments"], dict) else {}
-        else:
-            func_name = data.get("action") or data.get("type") or data.get("name")
-            func_args = {k: v for k, v in data.items() if k not in ("action", "type", "name", "thought")}
-        if func_name and (func_name in ALLOWED_ACTION_TYPES or func_name == "task_complete"):
-            return func_name, func_args
+        if not isinstance(data, dict):
+            continue
+        # 兼容：action 可能是对象，也可能被平铺（旧格式 {"action":"click","index":7}）
+        if "action" in data:
+            if isinstance(data["action"], str):
+                # 平铺格式 → 收拢成 action 对象
+                atype = data["action"]
+                aobj = {k: v for k, v in data.items()
+                        if k not in ("action", "evaluation_previous_goal", "memory",
+                                     "next_goal", "plan", "current_plan_item", "thought")}
+                aobj["type"] = atype
+                data["action"] = aobj
+            return data
+        # 无 action 键但像动作（极端兜底）
+        if data.get("type") in ALLOWED_ACTION_TYPES or data.get("type") == "task_complete":
+            return {"action": data}
     return None
 
 
@@ -479,57 +397,15 @@ def _parse_action(func_name: str, args: dict[str, Any]) -> PageAction:
     return PageAction(type=func_name, index=index, params=params)
 
 
-def _detect_ineffective(session: AgentSession, result: ActionResult,
-                        changes: dict, page_state: PageState) -> None:
-    """检测"成功但无效"的点击：click/select outcome=ok 但页面无任何变化。
-
-    索引直连下的真实失败模式——点中了、成功了，但页面没反应。累加连续次数，
-    供下一步注入"别再点它"的提示。任何有效变化则清零该 index。
-    """
-    action = session.pending_action
-    if not action or action.index is None:
-        return
-    if action.type not in ("click", "select"):
-        return
-    idx = action.index
-    no_change = (
-        not changes.get("url_changed")
-        and not changes.get("popup_appeared")
-        and not changes.get("popup_disappeared")
-        and abs(changes.get("element_count_delta", 0)) < INEFFECTIVE_COUNT_DELTA
-    )
-    if result.success and no_change:
-        session.ineffective_clicks[idx] = session.ineffective_clicks.get(idx, 0) + 1
-        session.last_ineffective = (idx, _describe_target(idx, page_state)[:40])
-    else:
-        # 有效变化 → 清零该 index 的无效计数
-        session.ineffective_clicks.pop(idx, None)
-        session.last_ineffective = None
-
-
-def _detect_stall(session: AgentSession, page_state: PageState) -> bool:
-    """停滞检测（对齐 browser-use：只判"连续停在同一页"，用最稳的 url+title）。
-
-    换页即清零；连续 STALL_THRESHOLD 步没换页 → 返回 True（调用方给 LLM 看轨迹，不强制反思）。
-    刻意不看正文指纹、不区分动作类型——那些规则补不完（打字/自动刷新/动画各种例外）。
-    判断"是否在原地打转"交给 LLM，代码只保证它看得到历史。
-    """
-    sig = f"{page_state.url}|{page_state.title}"
-    if sig != session.last_page_sig:
-        session.last_page_sig = sig
-        session.no_progress_count = 0
-        return False
-    session.no_progress_count += 1
-    return session.no_progress_count >= STALL_THRESHOLD
-
-
 def _sanitize_plan(items) -> list[dict]:
-    """校验/规整 LLM 传来的计划：限 ≤10 条，content 截断，status 非法归 pending。"""
+    """校验/规整 LLM 的计划：限 ≤10 条，content 截断，status 非法归 pending。"""
     if not isinstance(items, list):
         return []
     out = []
     valid = {"pending", "current", "done", "skipped"}
     for it in items[:10]:
+        if isinstance(it, str):
+            it = {"content": it, "status": "pending"}
         if not isinstance(it, dict):
             continue
         content = str(it.get("content", "")).strip()[:80]
@@ -562,7 +438,11 @@ def _describe_target(index: Optional[int], page_state: PageState) -> str:
     return f"(编号{index}不在当前观察中)"
 
 
-def _estimate_tokens(messages: list, tools=None) -> dict:
+# ═══════════════════════════════════════════════════════════════════════════════
+# 埋点
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _estimate_tokens(messages: list) -> dict:
     def _count(text: str) -> int:
         if not text:
             return 0
@@ -575,45 +455,33 @@ def _estimate_tokens(messages: list, tools=None) -> dict:
         return int((len(text) - zh) / 4 + zh / 1.5)
 
     def _msg_text(m) -> str:
-        parts = []
         c = m.get("content") if isinstance(m, dict) else None
         if isinstance(c, str):
-            parts.append(c)
-        elif isinstance(c, list):
-            parts.append(json.dumps(c, ensure_ascii=False))
-        tc = m.get("tool_calls") if isinstance(m, dict) else None
-        if tc:
-            parts.append(json.dumps(tc, ensure_ascii=False, default=str))
-        return "\n".join(parts)
+            return c
+        if isinstance(c, list):
+            return json.dumps(c, ensure_ascii=False)
+        return ""
 
-    msg_tok = sum(_count(_msg_text(m)) for m in (messages or []))
-    tools_tok = _count(json.dumps(tools, ensure_ascii=False)) if tools else 0
-    return {"total": msg_tok + tools_tok, "messages": msg_tok, "tools": tools_tok,
-            "method": "tiktoken" if _tok_enc is not None else "heuristic"}
+    tok = sum(_count(_msg_text(m)) for m in (messages or []))
+    return {"total": tok, "method": "tiktoken" if _tok_enc is not None else "heuristic"}
 
 
 def _log_observation(session: AgentSession, page_state: PageState) -> None:
-    """记录本步 LLM 看到的观察上下文，诊断"是否看得到目标内容/完成判断依据"。"""
     txt = page_state.text_content_summary or ""
     els = page_state.interactive_elements or []
     popup = page_state.active_popup or {}
     _agent_log.info("observation", session_id=session.session_id,
-                    data={"step": session.current_step,
-                          "url": page_state.url,
-                          "title": (page_state.title or "")[:60],
-                          "elements": len(els),
+                    data={"step": session.current_step, "url": page_state.url,
+                          "title": (page_state.title or "")[:60], "elements": len(els),
                           "popup": popup.get("type", "") if popup else "",
-                          "text_len": len(txt),          # 前端采集的正文长度（注入 LLM 时会被截断）
-                          "text_head": txt[:160],        # 正文开头（看是否全是导航/菜单）
-                          "text_tail": txt[-160:] if len(txt) > 320 else ""})  # 正文结尾（目标内容常在此）
+                          "text_len": len(txt), "text_head": txt[:160],
+                          "text_tail": txt[-160:] if len(txt) > 320 else ""})
 
 
-def _log_exec_tokens(session: AgentSession, tools, call: str) -> None:
-    t = _estimate_tokens(session.messages, tools=tools)
+def _log_exec_tokens(session: AgentSession) -> None:
+    t = _estimate_tokens(session.messages)
     _agent_log.info("step_prompt_tokens", session_id=session.session_id,
-                    data={"step": session.current_step, "call": call,
-                          "total": t["total"], "messages": t["messages"],
-                          "tools": t["tools"], "method": t["method"]})
+                    data={"step": session.current_step, "total": t["total"], "method": t["method"]})
 
 
 def _build_response(session: AgentSession, thought: str = "") -> dict[str, Any]:
@@ -621,11 +489,11 @@ def _build_response(session: AgentSession, thought: str = "") -> dict[str, Any]:
         "session_id": session.session_id,
         "status": session.status.value,
         "step": session.current_step,
-        "thought": thought,
+        "thought": session.last_evaluation,   # 前端展示：上一步自评
         "action": None,
         "summary": session.summary,
         "error": session.error,
-        "progress": session.progress,
+        "progress": session.progress,          # 前端展示：next_goal
     }
     if session.pending_action:
         resp["action"] = session.pending_action.model_dump()

@@ -29,6 +29,7 @@ class AgentStepRequest(BaseModel):
     action_result: dict[str, Any] = {}
     page_state: dict[str, Any]
     user_confirmed: bool = False
+    force_done: bool = False   # 前端整轮超时触发：强制本步只出 task_complete 收尾
 
 
 class AgentCancelRequest(BaseModel):
@@ -84,7 +85,7 @@ def agent_step(item: AgentStepRequest) -> dict[str, Any]:
     except (ValidationError, TypeError) as e:
         raise HTTPException(400, f"page_state 格式错误: {str(e)[:200]}")
     try:
-        return run_step(session, page_state, action_result)
+        return run_step(session, page_state, action_result, force_done=item.force_done)
     except Exception as exc:
         raise HTTPException(502, f"Agent 执行出错: {exc}") from exc
 

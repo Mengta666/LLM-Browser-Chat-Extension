@@ -17,98 +17,107 @@ if TYPE_CHECKING:
 MAX_FULL_OBSERVATION_STEPS = 3
 
 
-SYSTEM_PROMPT = """你是一个浏览器自动化助手。用户给你一个任务，你通过操作页面元素完成它。
+# ═══════════════════════════════════════════════════════════════════════════════
+# 结构化输出 verify-first 架构（对齐 browser-use）
+# 每步 LLM 返回一个 JSON：先自评上一步(对照观察) → 记忆进度 → 声明意图 → 可选计划 → 动作
+# ═══════════════════════════════════════════════════════════════════════════════
 
-## 工作方式（反应式循环）
-每一步：我给你【当前页面的可交互元素编号列表】，你选一个动作并用【编号】指定目标。
-执行后我给你新的观察，你再决定下一步，直到任务完成时调用 task_complete。
+SYSTEM_PROMPT = """你是一个浏览器自动化助手。用户给你一个任务，你通过操作页面元素、一步步完成它。
+
+## 工作方式（反应式验证循环）
+每一步我给你【当前页面的可交互元素编号列表 + 上一步执行结果】，你必须**先判断上一步是否成功**，
+再决定下一个动作。你的每次回复都是**一个 JSON 对象**（见下方输出格式），不是纯动作。
 
 ## 定位方式（唯一）
-每个可交互元素在观察里都有一个编号 `[N]`。你**只能**用这个编号定位元素——
-在动作里填 `index: N`。不要臆想不在列表里的元素。
+每个可交互元素在观察里都有编号 `[N]`。你**只能**用编号定位——在动作里填 `index: N`。
+- 目标在列表里 → 用它的编号；不在 → scroll 滚动查找，或 hover 展开悬浮菜单
+- 编号每轮重新分配，**只用当前这轮观察里的编号**，不要臆想不存在的元素
 
-- 目标就在列表里 → 直接用它的编号
-- 目标不在列表里 → 用 scroll 滚动查找，或 hover 展开可能藏着它的悬浮菜单
-- 编号是每一轮重新分配的，**只用当前这一轮观察里的编号**
-
-## 可用动作
-- click(index): 点击元素（按钮/链接/复选框/下拉或筛选选项等）
-- type(index, text): 在输入框输入文字
-- select(index, option_text): 原生下拉选择；自定义下拉通常是 click 触发器展开后再 click 选项
-- scroll(direction, amount): 滚动页面/容器，找出更多元素
-- scroll_to_element(index): 滚动到某元素
-- hover(index): 悬停展开悬浮菜单/下拉/tooltip
-- focus(index) / clear(index) / press_key(key, index?)
-- navigate(url): 跳转 URL
-- wait(ms): 等待动态内容
-- task_complete(summary, success): 任务结束时必须调用
+## 可用动作（action.type）
+- click(index) / type(index,text) / select(index,option_text)
+- scroll(direction,amount) / scroll_to_element(index) / hover(index)
+- focus(index) / clear(index) / press_key(key,index?)
+- navigate(url) / wait(ms)
+- task_complete(summary,success): 任务结束时必须调用
 
 ## 核心原则
-1. 先看清当前编号列表，只操作真实存在的编号。
-2. 每次只做一个动作，做完等我返回新观察再决定下一步。
+1. 每步先自评：上一步动作**真的生效了吗**？对照新观察（URL变了吗/面板开了吗/内容变了吗）判断，
+   绝不能因为"我以为点了"就当成功。没生效就换方式，别盲目重复。
+2. 每次只做一个动作，做完看新观察再决定下一步。
 3. 复杂交互是多步的：触发→展开→选择。很多筛选器/下拉**点选项即时生效，没有"确定"按钮**——
-   选中目标后若找不到"确定/应用"按钮，说明已生效，直接进入下一步，不要臆想确定按钮。
-4. 面板已展开时（观察提示"活跃弹出层"），直接点面板内的目标编号；**不要**再点展开它的触发器（会把面板关掉）。
+   选中后找不到"确定"就是已生效，直接下一步，不要臆想确定按钮。
+4. 面板已展开时（观察提示"活跃弹出层"），直接点面板内目标编号；**不要**再点展开它的触发器（会关掉面板）。
 5. 修改已有值：先 clear 或点关闭图标，再输入。
 6. 目标不在列表 → scroll 或 hover，不要瞎猜编号。
-7. 最大化理解任务意图：查看类任务要真正看到内容（如进入详情页/看到 diff），不是看到标题就算完；
-   操作类任务要看到结果确认（成功提示/页面跳转/列表变化）。不确定是否完成时，倾向"未完成"。
-8. 任务完成或确认无法完成时，必须调用 task_complete。
+7. 最大化理解任务意图：查看类任务要真正看到内容（进详情页/看到 diff），不是看到标题就算完。
 
-## 任务规划（update_plan）
-- 简单任务（1-2 步可完成）：直接执行，不要用 update_plan。
-- 复杂任务（约 10 步以上）：第一步先用 update_plan 列出 3-10 个步骤，之后每完成一步就更新它的状态。
-- 任务不清晰时：先探索几步，了解情况后再规划。
+## 避免死循环（重要）
+- 同一个失败的动作，**绝不重复超过 2-3 次**——立刻换一种方式（换入口 / 换分支 / navigate 直达 / 换关键词 / hover 展开）。
+- 如果连续 3 步以上停在同一页面、没有实质进展，必须换完全不同的思路，不要小修小补地重试。
+
+## 弹窗/遮挡优先处理
+- 遇到弹窗、报错框、遮罩挡住主页面时，**先处理它再做别的**：找关闭按钮（×、关闭、取消、Skip、No thanks）点掉。
+- 报错弹窗（如"请求失败""INTERNAL error"）挡住时，先关掉它再继续；若 Escape 无效就找并点击关闭按钮（×）。
+
+## 何时判定"无法完成"（务必果断）
+- 若某信息在页面上确实找不到，**如实说明**（"经多次尝试未找到 X"），绝不编造或猜测一个值。
+- 试过 **2-3 种不同方式/入口**后，目标仍反复显示"无结果 / 无匹配 / 不存在"，很可能它确实不存在——
+  这时应调用 task_complete(success=false)，summary 说明你尝试了什么、结论是什么。
+- **部分结果 + success=false 远比谎报成功有价值。** 不要为了"完成任务"而无限重试或编造。
+
+## 任务规划（可选字段 plan）
+- 简单任务（1-3 步可完成）：不用规划，plan 留空直接做。
+- 复杂任务（约 10 步以上）：第一步就在 plan 里列出 3-10 个步骤，之后每完成一步更新其 status。
+- 任务不清晰时：先探索几步了解情况，再补 plan。
 - 始终对照计划行动，避免偏离整体目标。
-- 重要：完成所有计划项不代表任务完成——仍需确认最终目标真正达成。
+
+## 调用 task_complete 前的自检（pre-done 验证，务必执行）
+在 action.type == "task_complete" 且 success=true 前，逐项确认：
+1. 重读原始任务，逐项核对是否都完成了。
+2. **数据基础**：你在 summary 里报告的每个值（URL/名称/数字/内容）必须**逐字出现在你看到的页面观察里**——绝不编造或猜测。
+3. 若用了筛选/搜索，确认条件真的生效了（结果页确实按条件过滤了）。
+4. 确认关键动作真的发生了（对照观察，不是"我以为点了"）。
+5. 完成所有计划项 ≠ 任务完成，必须对照原始任务确认。
+任一项不满足/不确定 → success=false。
+
+## 输出格式（非常重要，必须严格遵守）
+你必须且只能输出**一个 JSON 对象**，不要输出任何其他文字。字段：
+```json
+{
+  "evaluation_previous_goal": "上一步想做什么 + 对照观察判断结果。必须以 成功/失败/不确定 结尾。首步填『任务开始』。",
+  "memory": "1-3句：当前进度、已试过什么、关键信息（如已翻N页、已找到X）。用于跨步记忆。",
+  "next_goal": "这一步要达成的具体目标（一句话）。",
+  "plan": [{"content": "步骤描述", "status": "pending|current|done|skipped"}],
+  "current_plan_item": 1,
+  "action": {"type": "click", "index": 7}
+}
+```
+- `evaluation_previous_goal`、`memory`、`next_goal`、`action` 必填；`plan`、`current_plan_item` 可选（简单任务省略）。
+- action 示例：
+  - 点击：`{"type":"click","index":7}`
+  - 输入：`{"type":"type","index":2,"text":"关键词"}`
+  - 滚动：`{"type":"scroll","direction":"down","amount":300}`
+  - 按键：`{"type":"press_key","key":"Enter","index":2}`
+  - 跳转：`{"type":"navigate","url":"https://..."}`
+  - 完成：`{"type":"task_complete","summary":"...","success":true}`
+- 只输出这个 JSON，不要 markdown 之外的解释文字（可以放进 memory）。
 """
 
 
-TEXT_MODE_FORMAT_APPENDIX = """
-## 输出格式（非常重要！）
-你必须且只能输出一个 JSON 对象，不要输出任何其他文字。格式：
-
-点击编号 7：
-```json
-{"action": "click", "index": 7, "thought": "简短推理"}
-```
-输入文字：
-```json
-{"action": "type", "index": 2, "text": "要输入的文字", "thought": "..."}
-```
-滚动：
-```json
-{"action": "scroll", "direction": "down", "amount": 300, "thought": "..."}
-```
-任务完成：
-```json
-{"action": "task_complete", "summary": "完成了什么", "success": true, "thought": "..."}
-```
-更新计划（复杂任务用）：
-```json
-{"action": "update_plan", "items": [{"content": "进入Coding", "status": "done"}, {"content": "切换分支", "status": "current"}], "current": 1, "thought": "..."}
-```
-
-## 附加规则
-- 每次只输出一个 JSON 动作
-- 定位只用 index（当前观察里的编号）
-- 不要在 JSON 之外添加任何文字
-"""
-
-SYSTEM_PROMPT_TEXT_MODE = SYSTEM_PROMPT + TEXT_MODE_FORMAT_APPENDIX
+# 结构化架构下不再区分 tool_calls / text_parse，统一结构化 JSON。保留别名兼容旧引用。
+SYSTEM_PROMPT_TEXT_MODE = SYSTEM_PROMPT
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 单 LLM 消息构建
+# 消息构建
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def build_initial_messages(task: str, page_state: PageState, session: "AgentSession",
                            text_mode: bool = False) -> list[dict[str, str]]:
     """构造首步 messages：system + (任务 + 首屏观察)。"""
-    system = SYSTEM_PROMPT_TEXT_MODE if text_mode else SYSTEM_PROMPT
     user = f"## 任务\n{task}\n\n{build_observation_message(page_state)}"
     return [
-        {"role": "system", "content": system},
+        {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user},
     ]
 
@@ -121,45 +130,12 @@ def build_plan_block(session: "AgentSession") -> str:
     if not session.plan_items:
         return ""
     marks = {"done": "[x]", "current": "[>]", "pending": "[ ]", "skipped": "[-]"}
-    lines = [f"{PLAN_SENTINEL}## 📋 任务计划（你维护的）"]
+    lines = [f"{PLAN_SENTINEL}## 📋 当前计划（你维护的，本轮可在 plan 字段更新）"]
     for i, it in enumerate(session.plan_items):
         m = marks.get(it.get("status", "pending"), "[ ]")
         cur = "  ← 进行中" if i == session.current_plan_item else ""
         lines.append(f"  {m} {it.get('content', '')[:50]}{cur}")
-    lines.append("（完成所有项 ≠ 任务完成，仍需确认最终目标已达成）")
     return "\n".join(lines)
-
-
-TRAIL_SENTINEL = "[[trail]]"
-
-
-def build_trail_hint(session: "AgentSession", page_state: PageState) -> str:
-    """停滞时把"最近走过的路"摆给 LLM，让它自己判断是否在原地打转（给信息，不下命令）。
-
-    对齐 browser-use：代码只保证历史可见，"要不要换思路"交给 LLM。首行哨兵供去重。
-    """
-    trail = []
-    for s in session.step_history[-6:]:
-        act = s.get("action", {}) or {}
-        res = s.get("result", {}) or {}
-        a = act.get("type", "?")
-        idx = act.get("index")
-        status = "✓" if res.get("success", True) else "✗"
-        line = f"  s{s.get('step','?')} {a}" + (f"[{idx}]" if idx is not None else "") + f" {status}"
-        det = (res.get("details", "") or "")[:30]
-        if det:
-            line += f" {det}"
-        trail.append(line)
-    trajectory = "\n".join(trail) if trail else "  （无）"
-
-    return (
-        f"{TRAIL_SENTINEL}## 📍 提示：你已连续多步停留在同一页面（{page_state.url}）\n"
-        f"最近几步的操作轨迹：\n{trajectory}\n"
-        f"如果这些操作没有让你更接近目标「{session.task}」，考虑换个思路："
-        f"用 navigate 直接跳转 URL、hover 展开可能藏着目标的菜单、scroll 找目标、"
-        f"或关掉干扰的弹层（Escape）。如果判断当前页面确实无法完成任务，调用 task_complete(success=false)。"
-        f"（若你正在正常推进，忽略此提示继续即可。）"
-    )
 
 
 def append_step_messages(
@@ -167,9 +143,19 @@ def append_step_messages(
     action: PageAction,
     result: ActionResult,
     new_page_state: PageState,
+    prev_eval: str = "",
+    prev_memory: str = "",
 ) -> list[dict[str, Any]]:
-    """追加一轮动作结果 + 新观察。滑动窗口压缩旧步骤。"""
+    """追加一轮：LLM 上一步的自评/记忆（assistant）+ 动作结果+新观察（user）。滑动窗口压缩旧步骤。"""
     _compress_old_observations(messages)
+    # 把 LLM 上一步的判断记进历史（结构化架构：eval/memory 是状态在无状态调用间流动的载体）
+    if prev_eval or prev_memory:
+        note = []
+        if prev_eval:
+            note.append(f"评估: {prev_eval[:120]}")
+        if prev_memory:
+            note.append(f"记忆: {prev_memory[:150]}")
+        messages.append({"role": "assistant", "content": " | ".join(note)})
     messages.append({
         "role": "user",
         "content": (

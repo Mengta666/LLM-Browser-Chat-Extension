@@ -73,26 +73,19 @@ class AgentSession:
     pending_action: Optional[PageAction] = None
     summary: Optional[str] = None
     error: Optional[str] = None
-    call_mode: Optional[str] = None
 
-    # 轻量进度（供前端展示；由 LLM 每步在 thought 里维护，可选）
-    progress: str = ""
+    # 结构化输出：LLM 上一步的自评/记忆/意图（记进 history 供下一步参考）
+    last_evaluation: str = ""
+    last_memory: str = ""
+    progress: str = ""                   # 供前端展示（= 最近 next_goal）
 
     created_at: float = field(default_factory=time.time)
 
     # 步数与超时防护
     max_steps: int = 40
     stale_retries: int = 0               # 连续 stale 重观察次数（防打转）
+    force_done: bool = False             # 最后一步/前端超时：本步只接受 task_complete（对齐 browser-use _force_done_after_last_step）
 
-    # 打转检测：点击 outcome=ok 但页面无变化（成功但无效）
-    ineffective_clicks: dict = field(default_factory=dict)   # {index: 连续无效次数}
-    last_ineffective: Optional[tuple] = None                 # (index, target_text) 供下一步提示
-
-    # 停滞检测（对齐 browser-use：只数"连续停在同一页"，达阈值给 LLM 看轨迹，不强制反思）
-    no_progress_count: int = 0                               # 连续 url+title 未变的步数
-    last_page_sig: str = ""                                  # 上一步 url|title（判是否换页）
-
-    # 任务计划（LLM 自维护，对齐 browser-use plan_update/current_plan_item）
+    # 任务计划（LLM 自维护，作为结构化输出的 plan 字段；对齐 browser-use）
     plan_items: list[dict] = field(default_factory=list)     # [{content, status}]
     current_plan_item: int = -1                              # 当前进行的步骤序号(0-indexed)
-    plan_calls_this_step: int = 0                            # 同一观察内 update_plan 连调次数（防死循环）

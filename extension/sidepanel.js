@@ -2998,7 +2998,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const AGENT_COMMAND = '/browser-operation ';
   const AGENT_SETTLE_TIMEOUT_MS = 3000;
   const AGENT_ACTION_TIMEOUT_MS = 10000;
-  const AGENT_TOTAL_TIMEOUT_MS = 300000;
+  const AGENT_TOTAL_TIMEOUT_MS = 900000;   // 15分钟：整轮墙钟仅作"防真死"极粗兜底（browser-use 无整轮墙钟，只靠步数+单步超时）；到点走 force_done 收尾
 
   const agentState = {
     active: false,
@@ -3682,12 +3682,47 @@ document.addEventListener('DOMContentLoaded', async () => {
         try {
           switch (type) {
             case 'click': {
+              // Phase 1: 先滚进视口（对齐 browser-use scrollIntoViewIfNeeded）
               element.scrollIntoView({ block: 'center', behavior: 'smooth' });
               await new Promise(r => setTimeout(r, 300));
               const rect = element.getBoundingClientRect();
               const cx = rect.left + rect.width / 2;
               const cy = rect.top + rect.height / 2;
-              // 计算在顶层视口中的绝对坐标（处理 iframe 偏移）
+
+              // Phase 2: 遮挡检测——中心点最上层是不是目标本身/其后代/关联
+              let occluded = false;
+              try {
+                let top = document.elementFromPoint(cx, cy);
+                while (top && top.shadowRoot) {
+                  const inner = top.shadowRoot.elementFromPoint(cx, cy);
+                  if (!inner || inner === top) break;
+                  top = inner;
+                }
+                if (top) {
+                  occluded = !(top === element || element.contains(top) || top.contains(element));
+                }
+              } catch (e) { /* 检测失败当未遮挡 */ }
+
+              // Phase 3b: 遮挡 → 直接 element.click() 绕过遮挡层（DOM 原生，不受视觉遮挡影响）
+              if (occluded) {
+                try {
+                  const opts = { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy };
+                  element.dispatchEvent(new PointerEvent('pointerdown', opts));
+                  element.dispatchEvent(new MouseEvent('mousedown', opts));
+                  element.dispatchEvent(new PointerEvent('pointerup', opts));
+                  element.dispatchEvent(new MouseEvent('mouseup', opts));
+                  element.dispatchEvent(new MouseEvent('click', opts));
+                  element.click();
+                } catch (e) { /* ignore */ }
+                return {
+                  success: true,
+                  details: `点击了 [${index}]（遮挡，已用DOM点击绕过）`,
+                  action_type: type
+                  // 不返回 _clickCoords → 外层跳过 debugger 坐标点击
+                };
+              }
+
+              // Phase 3a: 未遮挡 → 计算顶层视口绝对坐标，交外层 debugger 派发真实鼠标事件
               let offsetX = 0, offsetY = 0;
               let win = window;
               while (win !== win.parent) {
@@ -4304,7 +4339,23 @@ document.addEventListener('DOMContentLoaded', async () => {
       while (response.status === 'action_required' || response.status === 'confirm_required') {
         if (!agentState.active) break;
         if (Date.now() - agentStartTime > AGENT_TOTAL_TIMEOUT_MS) {
-          renderAgentError(aiBubble, '执行超时（5分钟）');
+          // 整轮超时：不硬杀，让后端 force_done 逼 LLM 出 task_complete 给交代（对齐 browser-use 收尾）
+          try {
+            const freshState = await observePageState().catch(() => pageState);
+            const finalResp = await callAgentApi(safeApiUrl, '/v1/agent/step', {
+              session_id: sessionId,
+              action_result: { success: true, action_type: 'timeout_finish', details: '整轮超时，强制收尾' },
+              page_state: freshState,
+              force_done: true
+            }, apiKey);
+            if (finalResp.status === 'completed') {
+              renderAgentComplete(aiBubble, finalResp.summary, false);
+            } else {
+              renderAgentError(aiBubble, '执行超时，未能生成收尾总结');
+            }
+          } catch (e) {
+            renderAgentError(aiBubble, '执行超时');
+          }
           break;
         }
 

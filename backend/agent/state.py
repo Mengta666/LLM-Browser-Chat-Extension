@@ -55,6 +55,7 @@ class PageState(BaseModel):
     element_count_truncated: bool = False
     text_content_summary: str = ""
     forms: list[dict[str, Any]] = []
+    screenshot: str = ""        # data:image/... base64（多模态截图 ground truth；不进 history，仅当步用）
 
 
 @dataclass
@@ -72,6 +73,8 @@ class HistoryItem:
     result: str = ""            # 动作结果摘要（成功/失败 + 关键变化）
 
     def to_string(self) -> str:
+        if self.step == -1:                       # compacted 摘要项
+            return f"[前序步骤摘要] {self.memory}"
         parts = []
         if self.evaluation:
             parts.append(f"评估:{self.evaluation}")

@@ -2998,6 +2998,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const AGENT_COMMAND = '/browser-operation ';
   const AGENT_SETTLE_TIMEOUT_MS = 3000;
   const AGENT_ACTION_TIMEOUT_MS = 10000;
+  const AGENT_STEP_TIMEOUT_MS = 120000;   // 单个 step（执行+等稳+观察）总超时；对齐 browser-use step_timeout（它 180s），防非 LLM 环节卡死拖到整轮墙钟
   const AGENT_TOTAL_TIMEOUT_MS = 900000;   // 15分钟：整轮墙钟仅作"防真死"极粗兜底（browser-use 无整轮墙钟，只靠步数+单步超时）；到点走 force_done 收尾
 
   const agentState = {
@@ -3054,6 +3055,113 @@ document.addEventListener('DOMContentLoaded', async () => {
     } catch {
       await new Promise(r => setTimeout(r, 500));
       return true;
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Set-of-Marks 截图标注（对齐 browser-use python_highlights.py）
+  // 在裸截图上叠加"元素编号框"，让 LLM 看到的视觉元素与它能填的 index 一一对应。
+  // 没有这层标注，多模态反而有害：模型看得见按钮却猜不准编号，会反复点错。
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // 按 tag 分色（同 browser-use ELEMENT_COLORS）
+  const SOM_ELEMENT_COLORS = {
+    button: '#FF6B6B', input: '#4ECDC4', select: '#45B7D1',
+    a: '#96CEB4', textarea: '#FF8C42', default: '#DDA0DD',
+  };
+
+  function somElementColor(tag, type) {
+    if (tag === 'input' && (type === 'button' || type === 'submit')) return SOM_ELEMENT_COLORS.button;
+    return SOM_ELEMENT_COLORS[tag] || SOM_ELEMENT_COLORS.default;
+  }
+
+  // 画一个元素的虚线框 + 编号方块（对齐 draw_enhanced_bounding_box_with_text）
+  function drawSomBox(ctx, box, color, label, imgW, imgH, dpr) {
+    // CSS 视口坐标 → 设备像素（截图是设备像素图；漏掉这步框会整体偏移）
+    const x1 = Math.max(0, Math.min(Math.round(box.x * dpr), imgW));
+    const y1 = Math.max(0, Math.min(Math.round(box.y * dpr), imgH));
+    const x2 = Math.max(x1, Math.min(Math.round((box.x + box.width) * dpr), imgW));
+    const y2 = Math.max(y1, Math.min(Math.round((box.y + box.height) * dpr), imgH));
+    if (x2 - x1 < 2 || y2 - y1 < 2) return;
+
+    // 虚线框：dash=4 gap=8 width=2
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.setLineDash([4, 8]);
+    ctx.strokeRect(x1 + 1, y1 + 1, x2 - x1 - 2, y2 - y1 - 2);
+    ctx.restore();
+
+    if (!label) return;
+
+    // 编号方块：字号随图宽缩放(10~20)，元素色底 + 白边 + 白字
+    const fontSize = Math.max(10, Math.min(20, Math.round(imgW * 0.01)));
+    const padding = Math.max(4, Math.min(10, Math.round(imgW * 0.005)));
+    ctx.save();
+    ctx.font = `bold ${fontSize}px Arial, sans-serif`;
+    ctx.textBaseline = 'top';
+    const textW = Math.ceil(ctx.measureText(label).width);
+    const textH = fontSize;
+    const cw = textW + padding * 2;
+    const ch = textH + padding * 2;
+    const elW = x2 - x1, elH = y2 - y1;
+
+    let bx = x1 + Math.floor((elW - cw) / 2);
+    // 小元素：编号放框上方，避免遮住图标内容；大元素：放框内顶部
+    let by = (elW < 60 || elH < 30) ? Math.max(0, y1 - ch - 5) : y1 + 2;
+    // 夹取到图像边界内
+    if (bx < 0) bx = 0;
+    if (by < 0) by = 0;
+    if (bx + cw > imgW) bx = imgW - cw;
+    if (by + ch > imgH) by = imgH - ch;
+
+    ctx.fillStyle = color;
+    ctx.strokeStyle = 'white';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([]);
+    ctx.fillRect(bx, by, cw, ch);
+    ctx.strokeRect(bx, by, cw, ch);
+    ctx.fillStyle = 'white';
+    ctx.fillText(label, bx + padding, by + padding);
+    ctx.restore();
+  }
+
+  // 在裸截图上叠加所有可见元素的 SoM 标注，返回新 dataURL（失败回退原图）
+  async function annotateScreenshotSoM(dataUrl, elements, viewport) {
+    try {
+      if (!dataUrl || !elements?.length) return dataUrl;
+      const img = await new Promise((resolve, reject) => {
+        const im = new Image();
+        im.onload = () => resolve(im);
+        im.onerror = reject;
+        im.src = dataUrl;
+      });
+      const imgW = img.naturalWidth, imgH = img.naturalHeight;
+      // DPR = 截图设备像素宽 / CSS 视口宽（captureVisibleTab 截的是设备像素图）
+      const vpW = viewport?.width || imgW;
+      const dpr = vpW > 0 ? imgW / vpW : 1;
+
+      const canvas = document.createElement('canvas');
+      canvas.width = imgW; canvas.height = imgH;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0);
+
+      for (const el of elements) {
+        const box = el.bounding_box;
+        if (!box) continue;
+        // 只标视口内可见元素（框在截图范围内）
+        if (box.x + box.width <= 0 || box.x >= vpW) continue;
+        if (box.y + box.height <= 0 || box.y >= (viewport?.height || imgH)) continue;
+        // filter_highlight_ids：有足够文字的元素不画编号(文字本身可定位)，只画框
+        const meaningful = (el.text || el.aria_label || el.placeholder || '').trim();
+        const label = meaningful.length >= 3 ? '' : String(el.id);
+        const color = somElementColor(el.tag, el.type);
+        drawSomBox(ctx, box, color, label, imgW, imgH, dpr);
+      }
+      return canvas.toDataURL('image/jpeg', 0.6);
+    } catch (e) {
+      console.warn('[SoM] 标注失败，回退裸图:', e);
+      return dataUrl;
     }
   }
 
@@ -3185,21 +3293,47 @@ document.addEventListener('DOMContentLoaded', async () => {
           return out;
         }
 
-        // 遮挡命中测试：元素中心点最上层是否是它自己/其后代。被遮罩/固定层挡住的"假可见"标 occluded。
+        // 遮挡命中测试：多点采样（中心+4内角），全部被挡才算遮挡；含 label/input 关联救援。
+        // 对齐 browser-use elementFromPoint + 包含判断 + label 关联，比单点中心更准（角落可点、半透明遮罩不误判）。
         function isOccluded(el, rect) {
           try {
-            const cx = rect.left + rect.width / 2;
-            const cy = rect.top + rect.height / 2;
-            if (cx < 0 || cy < 0 || cx > window.innerWidth || cy > window.innerHeight) return false;
-            let top = document.elementFromPoint(cx, cy);
-            // 穿透 shadow：elementFromPoint 只返回宿主，用 shadowRoot 再取一层
-            while (top && top.shadowRoot) {
-              const inner = top.shadowRoot.elementFromPoint(cx, cy);
-              if (!inner || inner === top) break;
-              top = inner;
+            const ok = (px, py) => {
+              if (px < 0 || py < 0 || px > window.innerWidth || py > window.innerHeight) return null; // 点在视口外，忽略
+              let top = document.elementFromPoint(px, py);
+              while (top && top.shadowRoot) {
+                const inner = top.shadowRoot.elementFromPoint(px, py);
+                if (!inner || inner === top) break;
+                top = inner;
+              }
+              if (!top) return null;
+              // 命中自己/后代/祖先 → 该点不遮挡
+              if (top === el || el.contains(top) || top.contains(el)) return true;
+              // label/input 关联救援：命中的是与目标关联的 label，或目标 label 内的控件
+              if (top.tagName === 'LABEL') {
+                const forId = top.getAttribute('for');
+                if (forId && el.id && forId === el.id) return true;
+                if (top.contains(el)) return true;
+              }
+              return false;
+            };
+            const insetX = Math.min(rect.width / 4, 8);
+            const insetY = Math.min(rect.height / 4, 8);
+            const pts = [
+              [rect.left + rect.width / 2, rect.top + rect.height / 2],   // 中心
+              [rect.left + insetX, rect.top + insetY],                     // 左上内角
+              [rect.right - insetX, rect.top + insetY],                    // 右上
+              [rect.left + insetX, rect.bottom - insetY],                  // 左下
+              [rect.right - insetX, rect.bottom - insetY],                 // 右下
+            ];
+            let anyClickable = false, anyInViewport = false;
+            for (const [px, py] of pts) {
+              const r = ok(px, py);
+              if (r === null) continue;      // 视口外
+              anyInViewport = true;
+              if (r) { anyClickable = true; break; }
             }
-            if (!top) return false;
-            return !(top === el || el.contains(top) || top.contains(el));
+            if (!anyInViewport) return false;  // 所有采样点都在视口外 → 不判遮挡（交给 scroll）
+            return !anyClickable;              // 没有一个采样点可点 → 遮挡
           } catch (e) {
             return false;
           }
@@ -3537,6 +3671,17 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (!mainResult.element_count_truncated && frameResult.element_count_truncated) {
         mainResult.element_count_truncated = true;
       }
+    }
+
+    // 多模态：截当前可见区 + Set-of-Marks 编号标注，作为 LLM 自评的 ground truth（失败不阻断）
+    // 关键：必须叠加编号框，否则模型看得见元素却猜不准 index，会反复点错（对齐 browser-use）
+    try {
+      const raw = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'jpeg', quality: 60 });
+      mainResult.screenshot = await annotateScreenshotSoM(
+        raw, mainResult.interactive_elements, mainResult.viewport
+      );
+    } catch (e) {
+      mainResult.screenshot = '';
     }
     return mainResult;
   }
@@ -4379,7 +4524,12 @@ document.addEventListener('DOMContentLoaded', async () => {
         const prePopup = pageState?.active_popup || null;
         const preElementCount = (pageState?.interactive_elements || []).length;
 
-        const actionResult = await executePageAction(action);
+        const actionResult = await Promise.race([
+          executePageAction(action),
+          new Promise((resolve) => setTimeout(
+            () => resolve({ success: false, action_type: action.type, details: 'step 超时（执行未在时限内返回）', _stepTimeout: true }),
+            AGENT_STEP_TIMEOUT_MS))
+        ]);
         renderAgentStepInBubble(aiBubble, response.step, null, null, actionResult);
 
         // 编号失效（stale）：页面已重渲染，重新观察后让 LLM 用新编号，不计失败
@@ -4389,6 +4539,18 @@ document.addEventListener('DOMContentLoaded', async () => {
           response = await callAgentApi(safeApiUrl, '/v1/agent/step', {
             session_id: sessionId,
             action_result: { success: false, stale: true, action_type: action.type, details: actionResult.error || '编号失效' },
+            page_state: freshState
+          }, apiKey);
+          continue;
+        }
+
+        // step 超时：执行卡住未在时限内返回，重新观察后把失败反馈给 LLM 换策略，不拖到整轮墙钟
+        if (actionResult._stepTimeout) {
+          const freshState = await observePageState().catch(() => pageState);
+          pageState = freshState;
+          response = await callAgentApi(safeApiUrl, '/v1/agent/step', {
+            session_id: sessionId,
+            action_result: { success: false, action_type: action.type, details: '本步超时，请换一种方式' },
             page_state: freshState
           }, apiKey);
           continue;

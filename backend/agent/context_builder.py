@@ -38,8 +38,13 @@ SYSTEM_PROMPT = """你是一个浏览器自动化助手。用户给你一个任�
 - task_complete(summary,success): 任务结束时必须调用
 
 ## 核心原则
-1. 每步先自评：上一步动作**真的生效了吗**？对照新观察（URL变了吗/面板开了吗/内容变了吗）判断，
+1. 每步先自评：上一步动作**真的生效了吗**？**如果提供了页面截图，以截图为准（ground truth）**——
+   看截图确认页面实际状态，再结合文本观察（URL变了吗/面板开了吗/内容变了吗）判断；
    绝不能因为"我以为点了"就当成功。没生效就换方式，别盲目重复。
+   - 截图上每个可交互元素都用**彩色虚线框**标出，框内/框上方的**数字**就是该元素的编号 `[N]`——
+     这数字和文本列表里的 `[N]` 是同一个，动作 `index` 就填它。
+   - 有文字的元素（按钮/链接文字≥3字）框上可能不重复标数字——用文本列表里它的编号即可。
+   - **只操作截图里真的有框、或文本列表里真的有编号的元素**；截图里看着像按钮但没有框/没有编号的，不能凭空猜一个 index 去点（这是点错的主因）。
 2. 每次只做一个动作，做完看新观察再决定下一步。
 3. 复杂交互是多步的：触发→展开→选择。很多筛选器/下拉**点选项即时生效，没有"确定"按钮**——
    选中后找不到"确定"就是已生效，直接下一步，不要臆想确定按钮。
@@ -143,10 +148,21 @@ def build_messages(session: "AgentSession", page_state: PageState) -> list[dict[
         parts.append(_force_done_note(session))
 
     parts.append(build_observation_message(page_state))
+    user_text = "\n\n".join(parts)
 
+    # 多模态：当前观察带截图时，user 消息用 [文本 + image_url]（对齐 browser-use 截图 ground truth）
+    screenshot = getattr(page_state, "screenshot", "") or ""
+    if screenshot:
+        return [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": [
+                {"type": "text", "text": user_text},
+                {"type": "image_url", "image_url": {"url": screenshot}},
+            ]},
+        ]
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": "\n\n".join(parts)},
+        {"role": "user", "content": user_text},
     ]
 
 
@@ -180,16 +196,6 @@ def _force_done_note(session: "AgentSession") -> str:
         "若任务尚未完全完成，设 success=false，并在 summary 里如实写清：你查到了什么、"
         "尝试了哪些方式、为什么没完成。把你为最终任务查到的一切都写进 summary。"
     )
-
-
-def maybe_compact_history(session: "AgentSession") -> None:
-    """[占位] 历史 compaction：超过阈值时用 LLM 把旧步骤总结成一条摘要（对齐 browser-use maybe_compact_messages）。
-
-    暂未实现——当前靠 render_history_block 的滑动窗口（首项+最近N项）控制 token。
-    后续实现：当 history_items 超过阈值，调 LLM 把 items[1:-keep] 总结成一个
-    <compacted_memory> 摘要项，替换中间段，只留 首项 + 摘要 + 最近 keep 项。
-    """
-    return
 
 
 PLAN_SENTINEL = "[[plan]]"

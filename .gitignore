@@ -24,6 +24,7 @@ backend/config/.env
 backend/logs/
 *.jsonl
 backend/backend_run.log
+backend/backend_err.log
 backend/knowledge/records/operations.json
 
 # 本地临时/脚本产物

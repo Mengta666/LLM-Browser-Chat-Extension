@@ -22,7 +22,7 @@ from agent.state import (
     AgentSession, AgentStatus, PageAction, PageState, ActionResult, HistoryItem,
 )
 from agent.context_builder import (
-    SYSTEM_PROMPT, build_messages, build_plan_block, maybe_compact_history,
+    SYSTEM_PROMPT, build_messages, build_plan_block,
 )
 from agent.router import should_confirm_action
 from tools.tool_registry import ALLOWED_ACTION_TYPES
@@ -47,6 +47,8 @@ MAX_LLM_RETRIES = 3
 RETRY_DELAYS = [0.5, 1, 2]
 MAX_STALE_RETRIES = 3   # 连续编号失效重观察上限，防打转
 LLM_CALL_TIMEOUT = 90   # 单次 LLM 调用超时秒数（对齐 browser-use llm_timeout 75-90s，防单点卡死）
+COMPACT_TRIGGER_STEPS = 24   # history 超过此条数才触发 compaction（保守，短任务不触发）
+COMPACT_KEEP_RECENT = 8      # 摘要后保留的最近步数（首项 + <摘要> + 最近 N 项）
 
 try:
     import tiktoken
@@ -160,8 +162,9 @@ def run_step(session: AgentSession, page_state: PageState,
     #    最后一步（步数到上限前一步）或前端超时触发 → 强制只接受 task_complete。
     session.force_done = force_done or (session.current_step >= session.max_steps - 1)
 
-    # 3. compaction 占位（对齐 browser-use；当前靠 render_history_block 滑动窗口控 token）
-    maybe_compact_history(session)
+    # 3. compaction（对齐 browser-use maybe_compact_messages）：步数很多时把中间段 LLM 总结成一条摘要，
+    #    保留 首项 + <摘要> + 最近若干项。超长任务防止滑动窗口丢失中间进展。
+    _maybe_compact_history(session)
 
     # 4. 每步重建 messages（system + 任务 + 历史块 + 计划 + 当前观察）
     session.messages = build_messages(session, page_state)
@@ -255,6 +258,60 @@ def run_step(session: AgentSession, page_state: PageState,
     else:
         session.status = AgentStatus.ACTION_REQUIRED
     return _build_response(session)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 历史 compaction（对齐 browser-use maybe_compact_messages）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _maybe_compact_history(session: AgentSession) -> None:
+    """步数很多时，把中间段历史 LLM 总结成一条 compacted_memory，保留 首项 + 摘要 + 最近 N 项。
+
+    仅超长任务触发（COMPACT_TRIGGER_STEPS）。摘要失败则不动历史（滑动窗口兜底）。
+    已压过的历史（首项后紧跟 compacted 项）不重复压，避免每步都调 LLM。
+    """
+    items = session.history_items
+    if len(items) <= COMPACT_TRIGGER_STEPS:
+        return
+    # 已有摘要项（step=-1 标记）紧跟首项 → 说明刚压过，暂不重复压
+    if len(items) > 1 and items[1].step == -1:
+        # 只有当摘要后又堆积了足够多新步骤才再次压缩
+        if len(items) - 2 <= COMPACT_TRIGGER_STEPS:
+            return
+        head, mid, recent = items[:1], items[2:-COMPACT_KEEP_RECENT], items[-COMPACT_KEEP_RECENT:]
+        prev_summary = items[1].memory
+    else:
+        head, mid, recent = items[:1], items[1:-COMPACT_KEEP_RECENT], items[-COMPACT_KEEP_RECENT:]
+        prev_summary = ""
+    if not mid:
+        return
+
+    mid_text = "\n".join(it.to_string() for it in mid)
+    prompt = (
+        "把以下浏览器自动化的中间步骤压缩成一段简短进度摘要（3-5句），"
+        "保留：已完成什么、试过哪些无效路径、发现的关键信息（数字/名称/状态）。丢弃冗余细节。\n"
+    )
+    if prev_summary:
+        prompt += f"\n【已有摘要，需合并】\n{prev_summary}\n"
+    prompt += f"\n【要压缩的步骤】\n{mid_text}\n\n只输出摘要文本，不要其他。"
+
+    try:
+        resp = _create_with_retry(
+            _llm_client, session.model,
+            [{"role": "user", "content": prompt}], session=None)
+        summary = (resp.choices[0].message.content or "").strip() if resp else ""
+        summary = _strip_think_tags(summary)
+    except Exception:
+        summary = ""
+    if not summary:
+        return  # 摘要失败 → 保持原历史，滑动窗口兜底
+
+    compacted = HistoryItem(step=-1, memory=summary[:800],
+                            evaluation="", next_goal="", action="", result="（以上为前序步骤摘要）")
+    session.history_items = head + [compacted] + recent
+    _agent_log.info("history_compacted", session_id=session.session_id,
+                    data={"compacted_steps": len(mid), "kept_recent": len(recent),
+                          "summary_len": len(summary)})
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -487,11 +544,29 @@ def _estimate_tokens(messages: list) -> dict:
         if isinstance(c, str):
             return c
         if isinstance(c, list):
-            return json.dumps(c, ensure_ascii=False)
+            # 多模态：只计文本部分；图片按固定成本估（不把 base64 dataURL 算进去）
+            texts = []
+            for part in c:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    texts.append(part.get("text", ""))
+            return "\n".join(texts)
         return ""
 
-    tok = sum(_count(_msg_text(m)) for m in (messages or []))
-    return {"total": tok, "method": "tiktoken" if _tok_enc is not None else "heuristic"}
+    def _img_count(m) -> int:
+        c = m.get("content") if isinstance(m, dict) else None
+        if isinstance(c, list):
+            return sum(1 for p in c if isinstance(p, dict) and p.get("type") == "image_url")
+        return 0
+
+    IMG_TOKEN = 1100   # 单张截图估算 token（粗略，避免 base64 撑爆计数）
+    text_tok = sum(_count(_msg_text(m)) for m in (messages or []))
+    n_img = sum(_img_count(m) for m in (messages or []))
+    return {
+        "total": text_tok + n_img * IMG_TOKEN,
+        "text": text_tok,
+        "images": n_img,
+        "method": "tiktoken" if _tok_enc is not None else "heuristic",
+    }
 
 
 def _log_observation(session: AgentSession, page_state: PageState) -> None:
@@ -509,7 +584,8 @@ def _log_observation(session: AgentSession, page_state: PageState) -> None:
 def _log_exec_tokens(session: AgentSession) -> None:
     t = _estimate_tokens(session.messages)
     _agent_log.info("step_prompt_tokens", session_id=session.session_id,
-                    data={"step": session.current_step, "total": t["total"], "method": t["method"]})
+                    data={"step": session.current_step, "total": t["total"],
+                          "text": t["text"], "images": t["images"], "method": t["method"]})
 
 
 def _build_response(session: AgentSession, thought: str = "") -> dict[str, Any]:

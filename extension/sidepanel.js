@@ -3373,6 +3373,18 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         function buildElementInfo(el, id, inPopup) {
           const rect = el.getBoundingClientRect();
+          // iframe 偏移累加 → 顶层视口绝对坐标（与点击路径 hover/click 同一套逻辑）。
+          // 采集在各 frame 自身上下文执行，此刻 window.frameElement 可用；合并阶段（主 frame）拿不到子 window 做不了。
+          // 坐标"出厂即绝对"后，SoM 画框 / 后端 _split_by_viewport / 点击裁剪三处消费者的坐标系才统一。
+          // 跨源 iframe：frameElement 访问抛 SecurityError → catch break，偏移停在边界层（与点击路径同限制，非新增缺陷）。
+          let offX = 0, offY = 0, w = window;
+          while (w !== w.parent) {
+            try {
+              const f = w.frameElement;
+              if (f) { const fr = f.getBoundingClientRect(); offX += fr.left; offY += fr.top; }
+              w = w.parent;
+            } catch (e) { break; }
+          }
           // 父节点轻量指纹：用于跨轮 diff 时判断"新增元素是否成组"（同父=同一簇）
           let parentSig = '';
           const p = el.parentElement;
@@ -3393,7 +3405,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             data_testid: el.getAttribute('data-testid') || '',
             component: el.getAttribute('data-component-name') || '',
             css_selector: buildCssSelector(el),
-            bounding_box: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) },
+            bounding_box: { x: Math.round(rect.x + offX), y: Math.round(rect.y + offY), width: Math.round(rect.width), height: Math.round(rect.height) },
             visible: true,
             occluded: isOccluded(el, rect),
             enabled: !el.disabled && !el.classList.contains('jmtd-date-picker-cell-disabled'),

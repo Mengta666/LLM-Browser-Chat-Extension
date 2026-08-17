@@ -3669,14 +3669,20 @@ document.addEventListener('DOMContentLoaded', async () => {
         idMapping.push({ original: originalId, newId: el.id });
         mainResult.interactive_elements.push(el);
       }
-      // 更新 iframe 内的 data-agent-id 属性以匹配 offset 后的值
+      // 更新 iframe 内的 data-agent-id 属性以匹配 offset 后的值。
+      // 关键：offset 后的新 id 区间(N+1..N+M)会与子 frame 内仍存活的原 id 区间(1..M)重叠，
+      // 若边查边改会让 querySelector 命中刚改过的节点，产生重复 id → resolveByIndex 点错元素。
+      // 因此先一次性把所有原 id 解析成节点引用（此时 DOM 未改），再统一写入。
       chrome.scripting.executeScript({
         target: { tabId: tab.id, frameIds: [results[i].frameId || i] },
         func: (mapping) => {
-          for (const { original, newId } of mapping) {
-            const el = document.querySelector(`[data-agent-id="${original}"]`);
-            if (el) el.setAttribute('data-agent-id', newId);
-          }
+          const pairs = mapping
+            .map(({ original, newId }) => ({
+              el: document.querySelector(`[data-agent-id="${original}"]`),
+              newId
+            }))
+            .filter(p => p.el);
+          for (const { el, newId } of pairs) el.setAttribute('data-agent-id', String(newId));
         },
         args: [idMapping]
       }).catch(() => {});
@@ -3991,7 +3997,10 @@ document.addEventListener('DOMContentLoaded', async () => {
                 element.dispatchEvent(new MouseEvent('mouseup', evtOpts));
                 element.dispatchEvent(new MouseEvent('click', evtOpts));
                 await new Promise(r => setTimeout(r, 500));
-                // 在下拉弹出层中查找选项
+                // 在下拉弹出层中查找选项。仅用精确文本相等（去空白、小写），
+                // 不用子串匹配：substring 会让 option_text="1" 命中 "10"/"100"，
+                // 正是 CLAUDE.md 明令删除的模糊匹配 wrong-click 模式。找不到则明确失败，
+                // 让 LLM 重新决策，而不是猜一个错的。
                 const optionText = (params.option_text || params.value || '').toLowerCase().trim();
                 const dropdownItems = document.querySelectorAll(
                   '[role="option"], [role="listbox"] li, .ant-select-item, .el-select-dropdown__item, ' +
@@ -4000,7 +4009,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 let targetOption = null;
                 for (const item of dropdownItems) {
                   const t = (item.textContent || '').trim().toLowerCase();
-                  if (t === optionText || t.includes(optionText)) {
+                  if (t === optionText) {
                     targetOption = item;
                     break;
                   }
@@ -4622,7 +4631,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
 
       if (response.status === 'completed') {
-        renderAgentComplete(aiBubble, response.summary, true);
+        renderAgentComplete(aiBubble, response.summary, response.success !== false);
       } else if (response.status === 'error') {
         renderAgentError(aiBubble, response.error || '未知错误');
       }

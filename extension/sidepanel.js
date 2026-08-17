@@ -4177,12 +4177,33 @@ document.addEventListener('DOMContentLoaded', async () => {
       } catch (e) { /* debugger 不可用 */ }
 
       if (!debuggerOk) {
-        // 回退：合成事件，按 data-agent-id 直取目标
+        // 回退：合成事件，按 data-agent-id 直取目标。
+        // 注意：必须穿透 open shadow DOM 解析节点——裸 document.querySelector 找不到
+        // shadow root 内的元素，会静默不派发任何事件却让外层仍报 success:true。
         await chrome.scripting.executeScript({
           target: { tabId: tab.id, allFrames: true },
           func: (idx) => {
             if (idx === undefined || idx === null) return;
-            const el = document.querySelector(`[data-agent-id="${idx}"]`);
+            const sel = `[data-agent-id="${idx}"]`;
+            let el = document.querySelector(sel);
+            if (!el) {
+              // 递归穿透所有 open shadowRoot（对齐 resolveByIndex）
+              const stack = [document];
+              let guard = 0;
+              while (stack.length && guard < 500 && !el) {
+                guard++;
+                const root = stack.pop();
+                let hosts;
+                try { hosts = root.querySelectorAll('*'); } catch (e) { continue; }
+                for (const h of hosts) {
+                  if (h.shadowRoot && h.shadowRoot.mode === 'open') {
+                    const hit = h.shadowRoot.querySelector(sel);
+                    if (hit) { el = hit; break; }
+                    stack.push(h.shadowRoot);
+                  }
+                }
+              }
+            }
             if (!el) return;
             const rect = el.getBoundingClientRect();
             const cx = rect.left + rect.width / 2;

@@ -15,47 +15,26 @@
     <button class="tab-btn" data-target="settings">⚙️设置</button>
   </div>
 
-  <!-- 聊天 Tab：承载历史/记忆/计划面板、消息区、任务状态和输入区。 -->
+<!-- 聊天 Tab -->
   <div id="chat" class="tab-content active">
-    <!-- 聊天头部工具栏：切换历史、长期记忆，以及清空当前会话。 -->
+    <!-- 新增：聊天头部工具栏 -->
     <div class="chat-header">
       <span class="chat-title">当前对话</span>
-      <div class="chat-header-actions">
-        <button id="toggleChatHistoryBtn" class="clear-btn" type="button" title="查看历史对话">历史</button>
-        <button id="toggleMemoryBtn" class="clear-btn" type="button" title="查看长期记忆">记忆</button>
-        <button id="clearChatBtn" class="clear-btn" type="button" title="清空对话记录">🗑️ 清空</button>
-      </div>
+      <button id="clearChatBtn" class="clear-btn" title="清空对话记录">🗑️ 清空</button>
     </div>
     
-    <!-- 历史对话、长期记忆和计划面板默认隐藏，由对应按钮按需加载。 -->
-    <div id="chatHistoryList" class="chat-history-list" hidden></div>
-    <div id="memoryControls" class="memory-controls" hidden>
-      <label class="memory-filter-label" for="memoryTypeFilter">类型</label>
-      <select id="memoryTypeFilter" class="memory-type-filter">
-        <option value="">全部</option>
-        <option value="user_profile">user_profile</option>
-        <option value="project_state">project_state</option>
-        <option value="task_state">task_state</option>
-        <option value="procedural_feedback">procedural_feedback</option>
-        <option value="episodic_lesson">episodic_lesson</option>
-        <option value="external_knowledge_ref">external_knowledge_ref</option>
-      </select>
-    </div>
-    <div id="memoryList" class="chat-history-list memory-list" hidden></div>
-    <div id="planPanel" class="plan-panel drawer-panel" hidden></div>
+    <!-- 在 sidepanel.html 中，替换掉原有的 <div class="input-area"> 前后的代码 -->
   
     <div class="chat-history" id="chatHistory"></div>
     
-    <!-- 快捷指令栏：任务按钮改变当前输入模式，普通 prompt 按钮只填充输入框。 -->
+    <!-- 新增：快捷功能指令栏 -->
     <div class="quick-prompts">
       <button class="pill-btn task-btn" data-task-type="translate">🌐 翻译</button>
       <button class="pill-btn task-btn" data-task-type="explain">💻 解释</button>
-      <button class="pill-btn task-btn" data-task-type="plan">计划</button>
       <button class="pill-btn prompt-btn" data-prompt="请帮我提取图片中的公式，并把它转换为严格的 LaTeX 代码">✍️ 公式提取</button>
     </div>
 
     <div class="task-state-panel drawer-panel">
-      <!-- 当前任务抽屉：展示右键划词带入的翻译/解释对象。 -->
       <div class="drawer-head">
         <button id="toggleTaskDrawerBtn" class="drawer-toggle" type="button" aria-expanded="false">
           <span class="drawer-toggle-text">
@@ -73,7 +52,6 @@
     </div>
 
     <div class="page-context-panel drawer-panel">
-      <!-- 网页快照抽屉：控制当前页正文采集、锁定和联网搜索开关。 -->
       <div class="drawer-head">
         <button id="togglePageContextDrawerBtn" class="drawer-toggle" type="button" aria-expanded="false">
           <span class="drawer-toggle-text">
@@ -97,13 +75,8 @@
             <input id="lockCurrentPageToggle" type="checkbox">
             <span>锁定当前页</span>
           </label>
-          <label class="page-context-toggle">
-            <input id="useWebSearchToggle" type="checkbox">
-            <span>联网搜索</span>
-          </label>
         </div>
         <div id="pageContextChatIdInline" class="page-context-debug">Chat ID：未创建</div>
-        <div id="webSearchStatusInline" class="page-context-debug">联网搜索：未启用</div>
       </div>
       <div id="pageContextDrawerBody" class="drawer-body" hidden>
         <div class="page-context-status">
@@ -117,7 +90,6 @@
     </div>
 
     <div class="input-area">
-      <!-- 聊天输入区：文本、图片附件和框选截图都会从这里进入发送流程。 -->
       <div class="composer">
         <textarea id="chatInput" placeholder="输入问题 (Enter发送, Shift+Enter换行)..."></textarea>
         <div class="attachment-toolbar">
@@ -143,7 +115,7 @@
     </div>
   </div> <!-- 聊天 Tab 结束 -->
 
-  <!-- 图片工具 Tab：把远程或本地图片规范化为 PNG Base64。 -->
+  <!-- 图片工具 Tab -->
   <div id="imageTool" class="tab-content image-tool-tab">
     <div class="tool-stack">
       <section class="tool-hero">
@@ -190,7 +162,7 @@
     </div>
   </div>
 
-  <!-- 设置 Tab：保存 API 地址、模型名和会话级 API Key。 -->
+  <!-- 设置 Tab (删除了 hidden) -->
   <div id="settings" class="tab-content">
     <label>API Base URL:</label>
     <input type="text" id="apiUrl" placeholder="https://api.openai.com/v1">
@@ -209,7 +181,6 @@
     <div id="saveMsg"></div>
   </div>
 
-  <!-- 依赖顺序：先加载 KaTeX 和 Markdown，再启动侧边栏主脚本。 -->
   <script src="vendor/katex/katex.min.js"></script>
   <script src="vendor/katex/contrib/auto-render.min.js"></script>
   <script src="vendor/marked.umd.js"></script>

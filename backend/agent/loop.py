@@ -49,6 +49,7 @@ MAX_SESSIONS = 200               # dict 容量上限：防高并发/刷 /execute
 
 MAX_LLM_RETRIES = 3
 RETRY_DELAYS = [0.5, 1, 2]
+MAX_PARSE_RETRIES = 3   # 结构化输出解析失败（多为网关输出截断）时，重试整次 LLM 调用的上限
 MAX_STALE_RETRIES = 3   # 连续编号失效重观察上限，防打转
 LLM_CALL_TIMEOUT = 90   # 单次 LLM 调用超时秒数（对齐 browser-use llm_timeout 75-90s，防单点卡死）
 COMPACT_TRIGGER_STEPS = 24   # history 超过此条数才触发 compaction（保守，短任务不触发）
@@ -393,18 +394,35 @@ def _maybe_compact_history(session: AgentSession) -> None:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _call_llm(session: AgentSession) -> Optional[dict]:
-    """调 LLM，解析出结构化 JSON。失败置 session.error 并返回 None。"""
-    response = _create_with_retry(_llm_client, session.model, session.messages, session=session)
-    if response is None:
-        return None
-    raw = response.choices[0].message.content or ""
-    # 不把原始回复存回 messages——messages 每步由 build_messages 重建，历史只走 history_items
-    parsed = _parse_structured(raw)
-    if parsed is None or not parsed.get("action"):
-        session.status = AgentStatus.ERROR
-        session.error = f"无法解析结构化输出。回复: {_strip_think_tags(raw)[:300]}"
-        return None
-    return parsed
+    """调 LLM，解析出结构化 JSON。失败置 session.error 并返回 None。
+
+    解析层重试：LLM 偶发输出截断（网关流式中断返回半截 JSON）会导致解析失败。
+    这类是可自愈的抖动，不该让整个多步任务前功尽弃——重试整次调用，最多 MAX_PARSE_RETRIES 次。
+    （网络层 429/超时/5xx 已由 _create_with_retry 内部重试；这里补的是"HTTP 200 但内容非法"。）
+    """
+    last_raw = ""
+    for attempt in range(MAX_PARSE_RETRIES):
+        response = _create_with_retry(_llm_client, session.model, session.messages, session=session)
+        if response is None:
+            return None            # 网络层重试已耗尽 / 认证等硬错误：session.error 已置
+        raw = response.choices[0].message.content or ""
+        last_raw = raw
+        # 不把原始回复存回 messages——messages 每步由 build_messages 重建，历史只走 history_items
+        parsed = _parse_structured(raw)
+        if parsed is not None and parsed.get("action"):
+            return parsed
+        # 解析失败（多为输出截断）→ 记一条 JSONL 便于排查，然后重试整次调用
+        _agent_log.warn("llm_parse_failed", session_id=session.session_id,
+                        data={"step": session.current_step, "attempt": attempt + 1,
+                              "max": MAX_PARSE_RETRIES, "raw_len": len(raw),
+                              "raw_tail": _strip_think_tags(raw)[-160:]})
+
+    session.status = AgentStatus.ERROR
+    session.error = f"结构化输出连续 {MAX_PARSE_RETRIES} 次解析失败（疑似输出截断）。最后回复: {_strip_think_tags(last_raw)[:300]}"
+    _agent_log.error("llm_parse_failed_final", session_id=session.session_id,
+                     data={"step": session.current_step, "retries": MAX_PARSE_RETRIES,
+                           "raw_len": len(last_raw)})
+    return None
 
 
 def _create_with_retry(client: OpenAI, model: str, messages: list, session: Optional[AgentSession] = None):

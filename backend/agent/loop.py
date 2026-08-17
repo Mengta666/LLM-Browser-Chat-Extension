@@ -283,8 +283,9 @@ def run_step(session: AgentSession, page_state: PageState,
     if func_name == "task_complete":
         session.status = AgentStatus.COMPLETED
         session.summary = action_obj.get("summary", "任务完成")
+        session.success = bool(action_obj.get("success", True))
         _agent_log.info("session_complete", session_id=session.session_id,
-                        data={"summary": session.summary, "success": action_obj.get("success", True),
+                        data={"summary": session.summary, "success": session.success,
                               "total_steps": session.current_step,
                               "url": page_state.url, "title": (page_state.title or "")[:60]})
         return _build_response(session)
@@ -292,6 +293,7 @@ def run_step(session: AgentSession, page_state: PageState,
     # 强制收尾时 LLM 仍出页面动作（不听话）→ 代码用其记忆替它体面收尾（对齐 browser-use force-done）
     if session.force_done:
         session.status = AgentStatus.COMPLETED
+        session.success = False
         session.summary = (f"已达步数/时间上限，未完全完成任务。最后进展：{session.last_memory[:180]}"
                            if session.last_memory else "已达步数/时间上限，任务未完成。")
         _agent_log.warn("forced_done_at_limit", session_id=session.session_id,
@@ -688,6 +690,7 @@ def _build_response(session: AgentSession, thought: str = "") -> dict[str, Any]:
         "thought": session.last_evaluation,   # 前端展示：上一步自评
         "action": None,
         "summary": session.summary,
+        "success": session.success,            # 完成时是否真正成功（force_done/失败为 False）
         "error": session.error,
         "progress": session.progress,          # 前端展示：next_goal
     }

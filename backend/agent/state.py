@@ -105,6 +105,7 @@ class AgentSession:
     step_history: list[dict[str, Any]] = field(default_factory=list)
     pending_action: Optional[PageAction] = None
     summary: Optional[str] = None
+    success: bool = True                  # 任务完成时是否真正成功（LLM task_complete 的 success；force_done 收尾为 False）
     error: Optional[str] = None
 
     # 结构化输出：LLM 上一步的自评/记忆/意图（记进 history 供下一步参考）

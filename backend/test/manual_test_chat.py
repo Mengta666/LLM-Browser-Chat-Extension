@@ -9,7 +9,7 @@ from typing import Any
 
 DEFAULT_ENDPOINT = "http://127.0.0.1:8000/v1/chat/completions"
 DEFAULT_MODEL = "cyankiwi/gemma-4-31B-it-AWQ-4bit"
-SOURCE_REQUIRED_KEYS = {"source_id", "url", "title", "content", "score"}
+SOURCE_REQUIRED_KEYS = {"source_id", "url", "title", "score"}
 
 
 def build_payload(model: str, stream: bool) -> dict[str, Any]:

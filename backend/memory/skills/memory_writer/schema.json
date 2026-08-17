@@ -1,0 +1,45 @@
+{
+  "policy_version": "memory_writer_skill_v1",
+  "actions": ["insert", "update", "supersede", "noop"],
+  "memory_types": [
+    "user_profile",
+    "project_state",
+    "task_state",
+    "procedural_feedback",
+    "episodic_lesson",
+    "external_knowledge_ref"
+  ],
+  "tags_by_type": {
+    "user_profile": ["answer_style", "language_preference", "detail_level", "interaction_preference"],
+    "project_state": ["project_goal", "tech_stack", "architecture_decision", "progress", "constraint"],
+    "task_state": ["todo", "next_step", "blocker", "pending_decision"],
+    "procedural_feedback": ["code_design_rule", "review_rule", "debugging_rule", "planning_rule", "workflow_rule"],
+    "episodic_lesson": ["bug_cause", "retrieval_issue", "citation_issue", "ui_issue", "backend_issue"],
+    "external_knowledge_ref": ["doc_reference", "article_reference", "framework_reference", "benchmark_reference"]
+  },
+  "task_statuses": ["open", "in_progress", "blocked", "done", "reopened", "cancelled"],
+  "task_updated_by_values": ["user", "assistant", "system"],
+  "required_decision_fields": [
+    "action",
+    "memory_type",
+    "content",
+    "evidence",
+    "classification_reason",
+    "mode_affinity",
+    "tags",
+    "importance",
+    "confidence",
+    "stability",
+    "target_memory_id",
+    "related_memory_ids"
+  ],
+  "optional_decision_fields": [
+    "task_status",
+    "task_updated_by"
+  ],
+  "number_range": {
+    "importance": [0.0, 1.0],
+    "confidence": [0.0, 1.0],
+    "stability": [0.0, 1.0]
+  }
+}

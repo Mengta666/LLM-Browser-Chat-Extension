@@ -9,6 +9,7 @@ const DEFAULT_ALLOWED_CHAT_URLS = new Set([
   'https://api.openai.com/v1/chat/completions'
 ]);
 
+// 生成一次右键菜单动作的唯一 ID，用于侧边栏去重处理。
 function createActionId() {
   if (crypto?.randomUUID) return crypto.randomUUID();
 
@@ -17,11 +18,13 @@ function createActionId() {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
+// 截断右键选中的文本，避免把过长内容塞进 session storage。
 function sanitizeActionText(text) {
   const value = String(text || '').trim();
   return value.length > MAX_PROMPT_LENGTH ? `${value.slice(0, MAX_PROMPT_LENGTH - 1)}…` : value;
 }
 
+// 构造传给侧边栏的待处理动作，统一记录来源、时间和用户手势。
 function createContextMenuAction(type, payload) {
   return {
     ...payload,
@@ -33,11 +36,13 @@ function createContextMenuAction(type, payload) {
   };
 }
 
+// 规范化 OpenAI-compatible chat completions URL，去掉尾斜杠方便白名单比较。
 function normalizeChatUrl(value) {
   const url = new URL(String(value || ''));
   return `${url.origin}${url.pathname.replace(/\/$/, '')}`;
 }
 
+// 从 /v1 API base 推导 Browser Agent 后端根路径，用于 pages/chats/memory/plans API。
 function buildBackendRootFromApiBase(apiBaseUrl) {
   const normalizedApiBaseUrl = normalizeApiBaseUrl(apiBaseUrl);
   const url = new URL(normalizedApiBaseUrl);
@@ -65,6 +70,7 @@ async function getAllowedChatUrls() {
   ]);
 }
 
+// 获取允许调用“刷新当前页快照”的后端 URL 集合。
 async function getAllowedPageRefreshUrls() {
   const { [CUSTOM_API_BASE_URLS_KEY]: customUrls = [] } = await chrome.storage.local.get([CUSTOM_API_BASE_URLS_KEY]);
   return new Set(
@@ -80,6 +86,23 @@ async function getAllowedPageRefreshUrls() {
   );
 }
 
+// 获取允许访问的后端根地址集合，供历史、记忆和计划 API 共享。
+async function getAllowedBackendApiRoots() {
+  const { [CUSTOM_API_BASE_URLS_KEY]: customUrls = [] } = await chrome.storage.local.get([CUSTOM_API_BASE_URLS_KEY]);
+  return new Set(
+    customUrls
+      .map((url) => {
+        try {
+          return buildBackendRootFromApiBase(url);
+        } catch {
+          return '';
+        }
+      })
+      .filter(Boolean)
+  );
+}
+
+// 判断一次聊天请求 URL 是否严格命中白名单。
 async function isAllowedChatUrl(value) {
   try {
     const url = new URL(String(value || ''));
@@ -92,6 +115,7 @@ async function isAllowedChatUrl(value) {
   }
 }
 
+// 判断页面快照刷新 URL 是否严格命中白名单。
 async function isAllowedPageRefreshUrl(value) {
   try {
     const url = new URL(String(value || ''));
@@ -127,16 +151,19 @@ function sendLlmError(msgId, error) {
   chrome.runtime.sendMessage({ type: 'LLM_ERROR', msgId, error });
 }
 
+// 通知侧边栏当前流式请求结束。
 function sendLlmDone(msgId) {
   chrome.runtime.sendMessage({ type: 'LLM_DONE', msgId });
 }
 
+// 发送一段流式文本增量。
 function sendLlmChunk(msgId, chunk) {
   if (chunk) {
     chrome.runtime.sendMessage({ type: 'LLM_CHUNK', msgId, chunk });
   }
 }
 
+// 发送最终可展示的引用来源列表。
 function sendLlmSources(msgId, sources) {
   chrome.runtime.sendMessage({
     type: 'LLM_SOURCES',
@@ -145,6 +172,16 @@ function sendLlmSources(msgId, sources) {
   });
 }
 
+// 发送服务端清洗后的最终文本，覆盖前端本地拼接结果。
+function sendLlmFinalText(msgId, content) {
+  chrome.runtime.sendMessage({
+    type: 'LLM_FINAL_TEXT',
+    msgId,
+    content: String(content || '')
+  });
+}
+
+// 兼容 OpenAI、部分兼容服务和本地后端的多种文本字段形态。
 function extractChunkText(dataObj) {
   return dataObj?.choices?.[0]?.delta?.content
     || dataObj?.choices?.[0]?.message?.content
@@ -155,6 +192,7 @@ function extractChunkText(dataObj) {
     || '';
 }
 
+// 尽量从错误响应体中提取可读错误，提取失败则回退 HTTP 状态。
 async function getResponseErrorMessage(response) {
   const fallbackMessage = `${response.status} ${response.statusText}`.trim() || '未知错误';
 
@@ -182,6 +220,7 @@ async function getResponseErrorMessage(response) {
   }
 }
 
+// 打开侧边栏，并把待处理动作放入 session storage 供侧边栏启动后读取。
 function openSidePanelWithAction(windowId, action) {
   if (!windowId) return Promise.resolve();
 
@@ -191,6 +230,7 @@ function openSidePanelWithAction(windowId, action) {
   return openPromise;
 }
 
+// 把右键划词动作转成解释/翻译任务，等待用户在侧边栏确认发送。
 function queueAutoTask(windowId, taskType, focusText) {
   const action = createContextMenuAction('AUTO_SEND_PROMPT', {
     taskType,
@@ -201,6 +241,7 @@ function queueAutoTask(windowId, taskType, focusText) {
   return openSidePanelWithAction(windowId, action);
 }
 
+// 把右键图片动作转成图片工具输入，打开侧边栏的图片工具页签。
 function openImageToolTab(tab, info) {
   if (!tab?.windowId) return Promise.resolve();
 
@@ -215,6 +256,7 @@ function openImageToolTab(tab, info) {
   return openSidePanelWithAction(tab.windowId, action);
 }
 
+// 处理右键菜单点击，按菜单 ID 分发到文本任务或图片工具。
 chrome.contextMenus.onClicked.addListener((info, tab) => {
   if (info.menuItemId === 'send-to-copilot') {
     if (!tab?.windowId) return;
@@ -233,6 +275,7 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
   }
 });
 
+// 安装或更新扩展时重建右键菜单，避免重复菜单项。
 chrome.runtime.onInstalled.addListener(() => {
   chrome.contextMenus.removeAll(() => {
     chrome.contextMenus.create({
@@ -255,6 +298,7 @@ chrome.runtime.onInstalled.addListener(() => {
   });
 });
 
+// 转发聊天请求：校验 URL、鉴权和请求体后，兼容 SSE 与非流式 JSON 响应。
 async function handleCallLlmStream(request) {
   const { url, options, msgId } = request;
 
@@ -362,6 +406,10 @@ async function handleCallLlmStream(request) {
 
       try {
         const dataObj = JSON.parse(dataStr);
+        if (dataObj?.type === 'final_answer') {
+          sendLlmFinalText(msgId, dataObj.content);
+          continue;
+        }
         if (dataObj?.type === 'sources') {
           sendLlmSources(msgId, dataObj.sources);
           continue;
@@ -374,6 +422,7 @@ async function handleCallLlmStream(request) {
   }
 }
 
+// 转发后端 JSON API：只允许 Browser Agent 自己的 pages/chats/memory/plans 路径。
 async function handleCallApiJson(request) {
   const { url, options } = request;
 
@@ -388,19 +437,23 @@ async function handleCallApiJson(request) {
   const authHeader = options?.headers?.Authorization || options?.headers?.authorization || '';
   const authToken = String(authHeader).replace(/^Bearer\s+/i, '').trim();
   const hasBearerAuth = String(authHeader).startsWith('Bearer ') && !!authToken;
-  if (options?.method !== 'POST' || (!hasBearerAuth && !allowMissingAuth)) {
+  const method = String(options?.method || 'GET').toUpperCase();
+  if (!['GET', 'POST', 'PATCH', 'DELETE'].includes(method) || (!hasBearerAuth && !allowMissingAuth)) {
     throw new Error('API 请求配置无效');
   }
 
-  const body = String(options?.body || '');
-  if (!body || body.length > MAX_LLM_BODY_BYTES) {
-    throw new Error('API 请求体为空或过大');
-  }
+  const methodAllowsBody = ['POST', 'PATCH'].includes(method);
+  const body = methodAllowsBody ? String(options?.body || '') : '';
+  if (methodAllowsBody) {
+    if (!body || body.length > MAX_LLM_BODY_BYTES) {
+      throw new Error('API 请求体为空或过大');
+    }
 
-  try {
-    JSON.parse(body);
-  } catch {
-    throw new Error('API 请求体不是有效 JSON');
+    try {
+      JSON.parse(body);
+    } catch {
+      throw new Error('API 请求体不是有效 JSON');
+    }
   }
 
   const requestHeaders = {
@@ -411,7 +464,7 @@ async function handleCallApiJson(request) {
   }
 
   const response = await fetch(url, {
-    method: 'POST',
+    method,
     credentials: 'omit',
     redirect: 'error',
     headers: requestHeaders,
@@ -427,6 +480,7 @@ async function handleCallApiJson(request) {
   return response.json();
 }
 
+// 接收侧边栏消息，并用异步 sendResponse 模式返回结果。
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === 'CALL_LLM_STREAM') {
     handleCallLlmStream(request).catch((error) => {

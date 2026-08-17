@@ -1,3 +1,4 @@
+/* 全局主题变量：浅色和深色模式共用同一套语义色，组件只引用变量。 */
 :root {
   color-scheme: light dark;
   --app-bg: #ffffff;
@@ -25,6 +26,7 @@
   --app-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
 }
 
+/* 跟随系统深色模式覆盖语义色，不改变组件结构。 */
 @media (prefers-color-scheme: dark) {
   :root {
     --app-bg: #0f172a;
@@ -53,6 +55,7 @@
   }
 }
 
+/* 侧边栏使用全高纵向布局，三个 Tab 内容共用同一视口高度。 */
 body { 
   font-family: -apple-system, sans-serif; 
   margin: 0; 
@@ -65,9 +68,9 @@ body {
 
 [hidden] { display: none !important; }
 
+/* 顶部 Tab 导航，active 状态只用下划线和强调色区分。 */
 .tabs { display: flex; border-bottom: 1px solid var(--app-border); background: var(--app-surface); }
 
-/* 增加了 color: #666，让未选中的文字清晰可见 */
 .tab-btn { flex: 1; padding: 10px; border: none; background: none; cursor: pointer; color: var(--app-muted); font-size: 14px;}
 .tab-btn.active { border-bottom: 2px solid var(--app-accent); font-weight: bold; color: var(--app-accent); }
 
@@ -75,6 +78,7 @@ body {
 .tab-content { display: none; flex: 1; flex-direction: column; padding: 12px; overflow: hidden; }
 .tab-content.active { display: flex; }
 
+/* 图片工具页：输入、操作和预览纵向排列，便于在窄侧边栏中滚动使用。 */
 .image-tool-tab { overflow-y: auto; gap: 14px; }
 .tool-stack { display: flex; flex-direction: column; gap: 14px; }
 .tool-hero { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
@@ -124,8 +128,9 @@ body {
   transform: none;
 }
 
-/* 聊天区域 */
+/* 聊天区域：聊天记录占满剩余空间，底部输入区固定在可见范围内。 */
 .chat-history { flex: 1; overflow-y: auto; margin-bottom: 10px; border: 1px solid var(--app-border); padding: 10px; border-radius: 4px; background: var(--app-surface-2);}
+/* 抽屉面板承载任务状态和网页上下文，默认保持紧凑摘要。 */
 .drawer-panel { margin-bottom: 8px; border: 1px solid var(--app-border); border-radius: 12px; background: var(--app-surface); overflow: hidden; }
 .drawer-head { display: flex; align-items: center; gap: 6px; padding: 6px 10px; }
 .drawer-toggle { flex: 1; min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 0; background: transparent; color: var(--app-text); border: none; border-radius: 0; cursor: pointer; font-weight: 400; text-align: left; }
@@ -139,6 +144,7 @@ body {
 .task-state-title { flex-shrink: 0; font-size: 12px; line-height: 1.2; font-weight: 700; color: var(--app-text); white-space: nowrap; }
 .task-state-focus { font-size: 12px; line-height: 1.35; color: var(--app-text); word-break: break-word; white-space: pre-wrap; }
 .task-state-meta { font-size: 12px; line-height: 1.35; color: var(--app-muted); }
+/* 网页上下文状态区同时展示采集开关、锁定状态、Chat ID 和最近快照。 */
 .page-context-panel { display: flex; flex-direction: column; }
 .page-context-controls { padding: 0 12px 6px; }
 .page-context-row { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: center; }
@@ -152,11 +158,13 @@ body {
 .page-context-status-value { font-size: 12px; line-height: 1.3; color: var(--app-text); word-break: break-all; }
 .page-context-panel .tool-btn:disabled,
 .task-state-panel .tool-btn:disabled { opacity: 0.65; cursor: not-allowed; }
+/* 输入区包含文本框、图片附件工具栏和发送按钮。 */
 .input-area { display: flex; gap: 8px; align-items: flex-end; }
 .composer { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 8px; }
 textarea#chatInput { min-height: 88px; }
 .attachment-toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .floating-tip-wrap { position: relative; display: inline-flex; align-items: center; }
+/* 悬浮提示用于解释图标按钮，不占用常驻布局空间。 */
 .floating-tip {
   position: absolute;
   left: 0;
@@ -208,7 +216,7 @@ textarea { width: 100%; resize: none; padding: 8px; border: 1px solid var(--app-
 button { padding: 8px 15px; background: var(--app-accent); color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold;}
 button:hover { background: var(--app-accent-hover); }
 
-/* 设置和翻译区域 */
+/* 设置区域：API 地址、密钥状态和模型名配置。 */
 label { font-size: 13px; margin-top: 15px; display: block; font-weight: bold;}
 input { width: 100%; padding: 8px; margin-top: 5px; box-sizing: border-box; border: 1px solid var(--app-border-strong); border-radius: 4px; background: var(--app-surface-3); color: var(--app-text);}
 .settings-hint { margin-top: 6px; font-size: 12px; color: var(--app-muted); }
@@ -271,6 +279,7 @@ input { width: 100%; padding: 8px; margin-top: 5px; box-sizing: border-box; bord
 .bubble th { background: var(--app-surface); font-weight: 600; }
 .message.user .bubble code { background: rgba(255,255,255,0.2); }
 .message.user .bubble .user-upload-preview { display: block; max-width: 180px; margin-top: 8px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.35); }
+/* 来源引用：正文里的 [S1] 被渲染成可点击按钮，下面展开对应来源详情。 */
 .source-citation-group { display: inline-flex; align-items: center; gap: 0; flex-wrap: wrap; }
 .source-citation { padding: 0; border: 0; background: transparent; color: var(--app-accent); font: inherit; font-weight: 600; cursor: pointer; text-decoration: underline; }
 .source-citation:hover { color: var(--app-accent-hover); background: transparent; }
@@ -320,6 +329,11 @@ input { width: 100%; padding: 8px; margin-top: 5px; box-sizing: border-box; bord
   font-size: 13px; 
   font-weight: bold; 
   color: var(--app-muted); 
+}
+.chat-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 .clear-btn { 
   padding: 4px 8px; 
@@ -645,6 +659,232 @@ input { width: 100%; padding: 8px; margin-top: 5px; box-sizing: border-box; bord
 .slash-menu-desc {
   font-size: 12px;
   color: var(--app-text-muted, #666);
+}
+/* 历史对话和长期记忆共用列表容器，通过不同 item 类名区分内容密度。 */
+.chat-history-list {
+  flex-shrink: 0;
+  margin-bottom: 8px;
+  border: 1px solid var(--app-border);
+  border-radius: 8px;
+  background: var(--app-surface);
+  max-height: min(42vh, 360px);
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.chat-history-list::-webkit-scrollbar { width: 6px; }
+.chat-history-list::-webkit-scrollbar-thumb { background: var(--app-border-strong); border-radius: 3px; }
+.chat-history-item {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px 10px;
+  border: 0;
+  border-bottom: 1px solid var(--app-border);
+  border-radius: 0;
+  background: transparent;
+  color: var(--app-text);
+  text-align: left;
+  cursor: pointer;
+}
+.chat-history-item:last-child { border-bottom: 0; }
+.chat-history-item:hover { background: var(--app-accent-soft); }
+.chat-history-entry {
+  flex-direction: row;
+  align-items: stretch;
+  gap: 0;
+  padding: 0;
+  cursor: default;
+}
+.chat-history-item-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px 10px;
+  border: 0;
+  background: transparent;
+  color: var(--app-text);
+  text-align: left;
+  cursor: pointer;
+}
+.chat-history-delete-btn {
+  flex: 0 0 auto;
+  align-self: center;
+  margin-right: 8px;
+  padding: 4px 7px;
+  border: 1px solid var(--app-border);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--app-muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+.chat-history-delete-btn:hover {
+  border-color: var(--app-danger);
+  background: var(--app-danger-soft);
+  color: var(--app-danger);
+}
+.chat-history-item-title {
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.chat-history-item-meta {
+  font-size: 11px;
+  color: var(--app-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* 长期记忆列表展示内容、证据、策略版本和最近使用信息。 */
+.memory-item {
+  text-align: left;
+}
+.memory-list {
+  max-height: min(46vh, 420px);
+}
+/* 计划面板嵌在聊天页内，展示草稿、修订、执行和取消状态。 */
+.plan-panel {
+  padding: 10px;
+  max-height: min(42vh, 380px);
+  overflow-y: auto;
+}
+.plan-panel-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.plan-panel-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--app-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.plan-panel-status {
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  border: 1px solid var(--app-border);
+  border-radius: 999px;
+  font-size: 11px;
+  color: var(--app-muted);
+  background: var(--app-surface-2);
+}
+.plan-panel-toggle {
+  flex: 0 0 auto;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--app-accent);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.plan-panel-toggle:hover {
+  color: var(--app-accent-hover);
+  background: transparent;
+}
+.plan-panel-body {
+  display: block;
+}
+.plan-panel-objective,
+.plan-panel-meta {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--app-muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.plan-panel-list {
+  margin: 8px 0;
+  padding-left: 20px;
+  font-size: 12px;
+  line-height: 1.45;
+}
+.plan-panel-step-title {
+  font-weight: 600;
+  color: var(--app-text);
+}
+.plan-panel-step-detail {
+  color: var(--app-muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.plan-panel-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+.memory-controls {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--app-border);
+  border-radius: 8px;
+  background: var(--app-surface);
+}
+.memory-filter-label {
+  font-size: 12px;
+  color: var(--app-muted);
+}
+.memory-type-filter {
+  min-width: 0;
+  flex: 1;
+  padding: 4px 6px;
+  border: 1px solid var(--app-border);
+  border-radius: 4px;
+  background: var(--app-surface-2);
+  color: var(--app-text);
+  font-size: 12px;
+}
+.memory-item-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.memory-item-content {
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--app-text);
+  white-space: normal;
+}
+.memory-delete-btn {
+  flex-shrink: 0;
+  border: 1px solid var(--app-border);
+  border-radius: 6px;
+  background: var(--app-surface-2);
+  color: var(--app-muted);
+  font-size: 11px;
+  line-height: 1.2;
+  padding: 3px 6px;
+  cursor: pointer;
+}
+.memory-delete-btn:hover {
+  color: var(--app-danger, #b91c1c);
+  border-color: var(--app-danger, #b91c1c);
+}
+.memory-item-reason,
+.memory-item-policy,
+.memory-item-evidence,
+.memory-item-source,
+.memory-item-debug {
+  white-space: normal;
 }
 
 /* ========== 快捷指令胶囊按钮 ========== */

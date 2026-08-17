@@ -1,5 +1,7 @@
 """FastAPI 应用入口，负责挂载当前启用的后端路由。"""
 
+from contextlib import asynccontextmanager
+
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware

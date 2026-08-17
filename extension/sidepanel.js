@@ -1,5 +1,7 @@
+// 侧边栏主脚本：管理聊天 UI、网页上下文、长期记忆、计划模式、图片附件和图片工具。
 document.addEventListener('DOMContentLoaded', async () => {
-  let conversationHistory = []; // 存储上下文记忆
+  // 页面内状态集中放在 DOMContentLoaded 闭包里，避免暴露到扩展页面全局。
+  let conversationHistory = []; // 仅保存当前侧边栏会话的短期上下文。
   const handledAutoSendActionIds = new Set();
   let attachedImage = null;
   let imageToolCurrentDataUrl = '';
@@ -7,7 +9,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   const TASK_TYPE_LABELS = {
     chat: '普通问答',
     explain: '解释',
-    translate: '翻译'
+    translate: '翻译',
+    plan: '计划'
   };
   const PAGE_CONTEXT_CANCELLED_MESSAGE = '已取消读取当前网页上下文。';
   const taskState = {
@@ -30,6 +33,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     lastError: '',
     lastRefreshMessage: ''
   };
+  const webSearchState = {
+    enabled: false
+  };
   const markdownParser = window.marked;
   const MAX_HISTORY_MESSAGES = 12;
   const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
@@ -39,10 +45,28 @@ document.addEventListener('DOMContentLoaded', async () => {
   const PRIVACY_NOTICE_KEY = 'privacyNoticeAccepted';
   const CURRENT_CHAT_ID_KEY = 'currentChatId';
   const PAGE_REFRESH_ENDPOINT_PATH = '/api/pages/refresh_snapshot';
+  const CHAT_HISTORY_ENDPOINT_PATH = '/api/chats';
+  const MEMORY_ENDPOINT_PATH = '/api/memories';
+  const PLAN_ENDPOINT_PREFIX = '/api/plans';
+  const PLAN_AUTO_EXECUTE_PROMPT = '开始执行当前计划。请一次性完成已批准计划中的全部未完成步骤，并输出完整结果。不要只执行第一步，也不要只复述计划。';
+  const MEMORY_TYPE_FILTER_OPTIONS = new Set([
+    'user_profile',
+    'project_state',
+    'task_state',
+    'procedural_feedback',
+    'episodic_lesson',
+    'external_knowledge_ref'
+  ]);
   const ALLOWED_IMAGE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
   const SOURCE_BLOCK_PATTERN = /\[([^\[\]]+)\]/g;
   const SOURCE_ID_PATTERN = /^S\d+$/i;
   let currentChatId = '';
+  const planState = {
+    activePlan: null,
+    revising: false,
+    collapsed: false,
+    actionPending: false
+  };
   const DEFAULT_API_BASE_URLS = new Set([
     'https://api.openai.com/v1'
   ]);
@@ -61,6 +85,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     td: new Set(['align', 'colspan', 'rowspan'])
   };
 
+  // Markdown/HTML 安全渲染工具。模型输出先经过白名单清洗，再进入气泡 DOM。
   function escapeHtml(text) {
     return String(text).replace(/[&<>"']/g, (character) => ({
       '&': '&amp;',
@@ -107,6 +132,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   async function normalizeDataUrlToPng(dataUrl) {
+    // 统一转成 PNG，避免后续发送和预览链路处理多种浏览器编码差异。
     if (!isAllowedDataImageUrl(dataUrl)) {
       throw new Error('仅允许 10MB 以内的 PNG、JPG/JPEG、WebP 或 GIF 图片');
     }
@@ -282,6 +308,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function createMessageId() {
+    // 优先使用浏览器原生 UUID；旧环境用 crypto 随机字节兜底。
     if (crypto?.randomUUID) return crypto.randomUUID();
 
     const bytes = new Uint8Array(16);
@@ -294,6 +321,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   async function getOrCreateCurrentChatId() {
+    // chat_id 存在 session storage，刷新侧边栏后仍能继续当前会话。
     if (currentChatId) return currentChatId;
 
     const stored = await chrome.storage.session.get([CURRENT_CHAT_ID_KEY]);
@@ -318,6 +346,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function buildBackendEndpointUrl(apiBaseUrl, endpointPath) {
+    // 后端兼容 OpenAI 风格的 /v1 地址，这里把业务接口统一映射回服务根路径。
     const normalizedApiBaseUrl = normalizeApiBaseUrl(apiBaseUrl);
     const parsedUrl = new URL(normalizedApiBaseUrl);
     let basePath = parsedUrl.pathname.replace(/\/$/, '');
@@ -328,6 +357,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   async function getAllowedApiBaseUrls() {
+    // 默认只信任官方 OpenAI 地址；用户确认过的自定义地址持久化到本地白名单。
     const { [CUSTOM_API_BASE_URLS_KEY]: customUrls = [] } = await chrome.storage.local.get([CUSTOM_API_BASE_URLS_KEY]);
     return new Set([
       ...DEFAULT_API_BASE_URLS,
@@ -368,6 +398,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (allowedUrls.has(apiUrl)) return;
 
     const hostname = new URL(apiUrl).hostname;
+    // 自定义服务会接收聊天内容与密钥，首次添加必须让用户显式确认风险。
     const ok = confirm([
       `确认添加自定义 API 地址：${apiUrl}`,
       '',
@@ -386,6 +417,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   async function validateOpenAIApiConfig(apiUrl, apiKey) {
+    // OpenAI 官方地址要求 sk- 前缀；本机/内网后端允许不带 Authorization。
     const normalizedApiUrl = normalizeApiBaseUrl(apiUrl);
     const allowedUrls = await getAllowedApiBaseUrls();
 
@@ -407,6 +439,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   async function resolveApiRequestConfig({ requireBackendApi = false } = {}) {
+    // 每次发送前重新读取设置，避免侧边栏长时间打开后使用过期的模型或 API 地址。
     const { apiUrl, modelName } = await chrome.storage.local.get(['apiUrl', 'modelName']);
     const { apiKey, apiKeyApiUrl } = await getStoredApiCredential();
     const safeApiUrl = await validateOpenAIApiConfig(apiUrl || DEFAULT_API_URL, apiKey);
@@ -418,7 +451,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     if (requireBackendApi && DEFAULT_API_BASE_URLS.has(safeApiUrl)) {
-      throw new Error('刷新快照需要连接 browser-agent 后端 API 地址，不能使用 OpenAI 官方 API 地址');
+      throw new Error('该功能需要连接 browser-agent 后端 API 地址，不能使用 OpenAI 官方 API 地址');
     }
 
     return {
@@ -429,6 +462,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function buildMessagesPayload(history) {
+    // 直连 Chat Completions 时只发送压缩后的近期上下文，最后一轮图片按需保留。
     return [
       {
         role: 'system',
@@ -466,6 +500,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function normalizeTaskType(value) {
+    // 前端只接受固定任务类型，未知值回退普通聊天。
     return TASK_TYPE_LABELS[value] ? value : 'chat';
   }
 
@@ -526,10 +561,18 @@ document.addEventListener('DOMContentLoaded', async () => {
       return;
     }
 
+    if (taskState.taskType === 'plan') {
+      input.placeholder = planState.revising
+        ? '说明你希望怎么修改当前计划...'
+        : '描述你要形成计划的目标...';
+      return;
+    }
+
     input.placeholder = '输入问题 (Enter发送, Shift+Enter换行)...';
   }
 
   function updateTaskUi() {
+    // 任务条只反映当前输入模式，真正发送时仍会重新校验 focusText 和图片状态。
     const {
       title,
       summary,
@@ -549,7 +592,11 @@ document.addEventListener('DOMContentLoaded', async () => {
       ? `当前选中：${taskState.focusText}`
       : '当前选中：未设置';
 
-    if (taskState.taskType === 'chat') {
+    if (taskState.taskType === 'plan') {
+      meta.textContent = planState.activePlan
+        ? '计划模式会基于当前计划生成修订；点击“同意开始”后才会创建任务状态。'
+        : '计划模式只生成计划草稿，不会直接开始执行。';
+    } else if (taskState.taskType === 'chat') {
       meta.textContent = taskState.focusText
         ? '当前已保留一段选中文本；右键新文本会覆盖它，也可以清空后回到纯聊天。'
         : '右键划词后可直接进入翻译或解释任务。';
@@ -573,7 +620,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     taskState.focusText = String(focusText || '').trim();
     taskState.source = source || 'manual';
 
-    if (!taskState.focusText && taskState.taskType !== 'chat') {
+    if (!taskState.focusText && !['chat', 'plan'].includes(taskState.taskType)) {
       taskState.taskType = 'chat';
     }
 
@@ -635,6 +682,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   async function readCurrentPageContext() {
+    // 当前页正文来自用户显式启用/锁定，不在后台持续读取网页内容。
     const hasPermission = await ensurePageContextPermission();
     if (!hasPermission) {
       throw createPageContextError('需要先允许扩展访问当前网页，才能读取网页上下文。');
@@ -674,14 +722,18 @@ document.addEventListener('DOMContentLoaded', async () => {
     try {
       const [injectionResult] = await chrome.scripting.executeScript({
         target: { tabId: tab.id },
-        func: () => {
-          const content = String(document.body?.innerText || '').trim().slice(0, 5000);
+        func: (maxChars) => {
+          const rawContent = String(document.body?.innerText || '').trim();
+          const content = rawContent.slice(0, maxChars);
           return {
             url: location.href,
             title: document.title || '',
-            content
+            content,
+            contentCharCount: rawContent.length,
+            contentTruncated: rawContent.length > maxChars
           };
-        }
+        },
+        args: [MAX_PAGE_CONTEXT_CHARS]
       });
       result = injectionResult?.result || null;
     } catch (error) {
@@ -709,7 +761,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     return {
       url: String(result.url || tab.url),
       title: String(result.title || tab.title || '').trim(),
-      content
+      content,
+      contentCharCount: Number(result.contentCharCount || content.length),
+      contentTruncated: Boolean(result.contentTruncated)
     };
   }
 
@@ -717,9 +771,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     return {
       useToggle: document.getElementById('useCurrentPageToggle'),
       lockToggle: document.getElementById('lockCurrentPageToggle'),
+      webSearchToggle: document.getElementById('useWebSearchToggle'),
       refreshButton: document.getElementById('refreshPageContextBtn'),
       clearButton: document.getElementById('clearPageSnapshotBtn'),
       summary: document.getElementById('pageContextSummary'),
+      webSearchStatus: document.getElementById('webSearchStatusInline'),
       statusTitle: document.getElementById('pageContextStatusTitle'),
       statusMeta: document.getElementById('pageContextStatusMeta'),
       chatId: document.getElementById('pageContextChatId'),
@@ -742,11 +798,24 @@ document.addEventListener('DOMContentLoaded', async () => {
   function clonePageContext(currentPage) {
     if (!currentPage) return null;
 
+    const content = String(currentPage.content || '').trim();
     return {
       url: String(currentPage.url || '').trim(),
       title: String(currentPage.title || '').trim(),
-      content: String(currentPage.content || '').trim()
+      content,
+      contentCharCount: Number(currentPage.contentCharCount || content.length),
+      contentTruncated: Boolean(currentPage.contentTruncated)
     };
+  }
+
+  function formatPageContextSize(currentPage) {
+    if (!currentPage) return '';
+
+    const contentLength = Number(currentPage.contentCharCount || currentPage.content?.length || 0);
+    if (!contentLength) return '';
+
+    const truncatedText = currentPage.contentTruncated ? '，已截断' : '';
+    return `已读取 ${contentLength.toLocaleString()} 字${truncatedText}`;
   }
 
   function getPageContextValidationError(currentPage, fallbackError = '') {
@@ -762,12 +831,15 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function updatePageContextUi() {
+    // 网页上下文 UI 同时展示采集状态、锁定状态和最近一次后端刷新结果。
     const {
       useToggle,
       lockToggle,
+      webSearchToggle,
       refreshButton,
       clearButton,
       summary,
+      webSearchStatus,
       statusTitle,
       statusMeta,
       chatId,
@@ -782,6 +854,14 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     useToggle.checked = pageContextState.enabled;
     lockToggle.checked = pageContextState.locked;
+    if (webSearchToggle) {
+      webSearchToggle.checked = webSearchState.enabled;
+    }
+    if (webSearchStatus) {
+      webSearchStatus.textContent = webSearchState.enabled
+        ? '联网搜索：发送时会检索外部网页'
+        : '联网搜索：未启用';
+    }
     lockToggle.disabled = !pageContextState.enabled;
     refreshButton.disabled = !pageContextState.enabled || pageContextState.refreshing;
     clearButton.disabled = !pageContextState.snapshot && !pageContextState.lastError;
@@ -823,6 +903,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     } else {
       statusTitle.textContent = '网页上下文已启用（未锁定）';
       statusMeta.textContent = '发送时会重新读取当前活动页。';
+    }
+    const pageSizeText = formatPageContextSize(pageContextState.snapshot);
+    if (pageSizeText) {
+      statusMeta.textContent += ` ${pageSizeText}。`;
     }
 
     summary.textContent = `${pageContextState.locked ? '已锁定' : '未锁定'} · ${summarizeInlineText(pageContextState.snapshot.title || pageContextState.snapshot.url, '(无标题)', 20)}`;
@@ -866,6 +950,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   async function refreshPageContextSnapshot({ silent = false, forceRefresh = false } = {}) {
+    // 读取当前活动页正文，并把结果保存成侧边栏内存快照。
     try {
       const currentPage = await readCurrentPageContext();
       pageContextState.lastError = '';
@@ -891,6 +976,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   async function resolvePageContextForSend() {
+    // 发送前统一解析网页上下文：锁定则复用快照，未锁定则重新读取当前页。
     if (!pageContextState.enabled) {
       return {
         currentPage: null,
@@ -934,6 +1020,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   async function getStoredApiCredential() {
+    // 旧版本曾把 API Key 写入 local storage；读取时迁移到 session storage，减少长期落盘。
     const [{ apiKey: sessionApiKey, apiKeyApiUrl }, { apiKey: localApiKey }] = await Promise.all([
       chrome.storage.session.get(['apiKey', 'apiKeyApiUrl']),
       chrome.storage.local.get(['apiKey'])
@@ -957,6 +1044,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function callApiJson(url, options) {
+    // 所有后端 JSON API 都经 background 转发，统一做 URL 白名单和鉴权校验。
     return new Promise((resolve, reject) => {
       chrome.runtime.sendMessage(
         {
@@ -983,6 +1071,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   async function refreshPageContextIndexNow({ silent = false } = {}) {
+    // 手动刷新会把当前页正文送到后端重建该 chat 的网页索引。
     if (!pageContextState.enabled || pageContextState.refreshing) {
       return null;
     }
@@ -1052,6 +1141,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function compactMessageForHistory(message) {
+    // 本地上下文只保留文本，历史图片用占位文本替换，避免重复携带大体积或隐私图片。
     if (!Array.isArray(message.content)) {
       return {
         ...message,
@@ -1095,6 +1185,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function isAllowedDataImageUrl(value) {
+    // Data URL 只接受明确图片 MIME 与 base64 内容，并按 base64 长度预估大小上限。
     const text = String(value || '').trim();
     const match = text.match(/^data:(image\/(?:png|jpe?g|webp|gif));base64,([A-Za-z0-9+/=]+)$/i);
     if (!match) return false;
@@ -1105,6 +1196,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function parseImageHttpUrl(value) {
+    // 外部图片地址只接受 HTTP(S) 且禁止 URL 内嵌用户名密码。
     try {
       const rawValue = String(value || '').trim();
       if (!rawValue || rawValue.length > MAX_URL_LENGTH) return null;
@@ -1150,6 +1242,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (!parsed) return false;
     if (parsed.protocol === 'https:' && !isPrivateOrLocalHost(parsed.hostname)) return true;
 
+    // HTTP、本机和内网图片可能泄露内网资源，加载前需要再次确认。
     return confirm([
       `确认加载图片地址：${parsed.href}`,
       '',
@@ -1198,6 +1291,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   async function ensurePrivacyNoticeAccepted() {
+    // 首次发送前统一展示隐私说明，之后用 local storage 记录用户已确认。
     const { [PRIVACY_NOTICE_KEY]: accepted } = await chrome.storage.local.get([PRIVACY_NOTICE_KEY]);
     if (accepted) return true;
 
@@ -1264,6 +1358,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function applyAttachedImage(image) {
+    // 附件状态和预览 UI 同步更新；真正发送后会立即清除本地附件。
     attachedImage = image;
 
     const imagePreview = document.getElementById('imagePreview');
@@ -1319,6 +1414,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   async function requestPageRegionSelection(tabId) {
+    // 框选层注入到当前页中执行，只返回矩形坐标，不读取页面 DOM 内容。
     const [{ result }] = await chrome.scripting.executeScript({
       target: { tabId },
       func: () => new Promise((resolve) => {
@@ -1390,6 +1486,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         let resolved = false;
 
         function cleanup(result) {
+          // 无论确认或取消，都移除事件监听与覆盖层，避免干扰原页面。
           if (resolved) return;
           resolved = true;
           overlay.removeEventListener('mousedown', onMouseDown, true);
@@ -1491,6 +1588,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   async function cropDataUrlToSelection(dataUrl, selection) {
+    // captureVisibleTab 返回整张可视区截图，这里按用户框选区域裁剪成独立 PNG。
     const image = await loadImageElement(dataUrl);
     const imageWidth = image.naturalWidth || image.width;
     const imageHeight = image.naturalHeight || image.height;
@@ -1526,6 +1624,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   async function captureSelectedRegionAsImage() {
+    // 截图流程分三步：请求权限、注入框选层、裁剪并作为聊天附件。
     if (!(await ensurePrivacyNoticeAccepted())) return;
 
     const tab = await getActiveBrowserTab();
@@ -1568,6 +1667,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function getImageToolElements() {
+    // 图片工具页的 DOM 查询集中在这里，减少各流程直接散落选择器。
     return {
       statusPill: document.getElementById('imageToolStatus'),
       sourceUrlInput: document.getElementById('imageSourceUrl'),
@@ -1617,6 +1717,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function setImageToolResult(dataUrl, meta = {}) {
+    // 转换结果同时用于预览、复制和下载链接，三处必须保持同一份 data URL。
     imageToolCurrentDataUrl = dataUrl;
     if (meta.downloadName) {
       imageToolCurrentFileName = meta.downloadName;
@@ -1653,6 +1754,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   async function fetchImageToolDataUrl(srcUrl, pageUrl) {
+    // 图片工具把 Data URL 或远程图片规范化为 PNG Data URL，供复制给其他模型入口。
     const value = String(srcUrl || '').trim();
 
     if (value.startsWith('data:')) {
@@ -1675,6 +1777,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     try {
       const response = await fetch(value, {
+        // 不携带 cookie、不跟随跳转，降低把用户登录态带到第三方图片请求的风险。
         credentials: 'omit',
         redirect: 'error',
         referrerPolicy: 'no-referrer',
@@ -1900,6 +2003,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function validatePendingAction(action) {
+    // 右键菜单写入 session 的动作必须带来源、用户手势和时效，避免旧动作被误执行。
     if (!action || typeof action !== 'object') return false;
     if (!['AUTO_SEND_PROMPT', 'AUTO_IMAGE_TOOL'].includes(action.type)) return false;
     if (typeof action.actionId !== 'string' || !action.actionId) return false;
@@ -1968,6 +2072,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   async function handlePendingAction(action) {
+    // 同一个 actionId 只处理一次，防止 onMessage 与 storage 监听同时触发造成重复填充。
     if (!validatePendingAction(action)) return false;
     if (handledAutoSendActionIds.has(action.actionId)) return true;
     handledAutoSendActionIds.add(action.actionId);
@@ -1978,14 +2083,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     return false;
   }
 
-  // 1. Tab 切换逻辑
+  // 顶部标签只负责切换可见面板，不重置各面板内部状态。
   document.querySelectorAll('.tab-btn').forEach(btn => {
     btn.addEventListener('click', (e) => {
       activateTab(e.currentTarget.dataset.target);
     });
   });
 
-  // 2. 加载与保存设置
+  // 设置页初始化：API Key 只显示保存状态，不回填明文。
   const config = await chrome.storage.local.get(['apiUrl', 'modelName']);
   const storedCredential = await getStoredApiCredential();
   const apiUrlInput = document.getElementById('apiUrl');
@@ -1995,6 +2100,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const saveMsg = document.getElementById('saveMsg');
 
   function updateApiKeyStatus(hasKey, apiKeyUrl = '') {
+    // 输入框留空表示保留已保存密钥，避免无意中把密钥暴露到页面 DOM。
     apiKeyInput.value = '';
     apiKeyInput.placeholder = hasKey ? '已保存 API Key，留空则保留' : 'sk-...';
     if (apiKeyStatus) {
@@ -2018,6 +2124,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   updateApiKeyStatus(Boolean(storedCredential.apiKey), storedCredential.apiKeyApiUrl);
 
   document.getElementById('saveSettingsBtn').addEventListener('click', async () => {
+    // 保存前先校验 URL 白名单与 API Key 绑定关系，防止把旧密钥发往新服务。
     const apiUrl = apiUrlInput.value.replace(/\/$/, '');
     const enteredApiKey = apiKeyInput.value.trim();
     const modelName = modelNameInput.value.trim() || 'gpt-3.5-turbo';
@@ -2061,7 +2168,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     showSettingsMessage('API Key 已清除', 'ok');
   });
 
-  // 3. UI 辅助函数
+  // 聊天气泡与 Markdown 渲染辅助函数。
   function createMessageNode(role) {
     const msgDiv = document.createElement('div');
     msgDiv.className = `message ${role}`;
@@ -2088,12 +2195,14 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function setRenderedMarkdown(container, markdown) {
+    // 所有模型输出都经 Markdown 渲染与 HTML 白名单过滤，再替换到气泡中。
     const template = document.createElement('template');
     template.innerHTML = renderMarkdown(markdown);
     container.replaceChildren(template.content.cloneNode(true));
   }
 
   function extractSourceIds(text) {
+    // 后端引用格式形如 [S1] 或 [S1, S2]，前端只识别固定来源编号。
     return String(text || '')
       .split(/[\s,，]+/)
       .map((token) => token.trim().toUpperCase())
@@ -2101,6 +2210,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function normalizeSourceCitationText(text, sources) {
+    // 流式输出可能引用不存在的来源；最终渲染前剔除无效编号。
     const rawText = String(text || '');
     if (!rawText) {
       return '';
@@ -2173,6 +2283,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function decorateSourceCitations(container) {
+    // 把正文中的来源编号替换成可点击按钮；代码块、链接和来源面板内文本保持原样。
     const textNodes = [];
     const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
       acceptNode(node) {
@@ -2235,10 +2346,11 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   function buildSourceSummaryPreview(source) {
     const previewText = String(source?.preview || source?.content || '').replace(/\s+/g, ' ').trim();
-    return summarizeInlineText(previewText, '无预览', 56);
+    return previewText ? summarizeInlineText(previewText, '', 56) : '';
   }
 
   function setSourcePanelOpen(container, isOpen) {
+    // 同一时间只展开一个回答的来源面板，避免侧边栏空间被多个面板占满。
     const wrapper = container.querySelector('.message-sources');
     const toggleButton = container.querySelector('.message-sources-toggle');
     const body = container.querySelector('.message-sources-body');
@@ -2340,6 +2452,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function bindSourceInteractions(container) {
+    // 每个回答气泡只绑定一次委托事件，后续流式重渲染不会重复绑定。
     if (container.dataset.sourceInteractionsBound === 'true') {
       return;
     }
@@ -2395,6 +2508,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   });
 
   function renderCitedSources(container, sources) {
+    // 来源列表由摘要区和详情区组成，点击正文引用或摘要按钮都会定位到同一来源。
     const existing = container.querySelector('.message-sources');
     if (existing) {
       existing.remove();
@@ -2440,9 +2554,13 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       const summaryPreview = document.createElement('div');
       summaryPreview.className = 'message-source-summary-preview';
-      summaryPreview.textContent = buildSourceSummaryPreview(source);
+      const previewText = buildSourceSummaryPreview(source);
+      summaryPreview.textContent = previewText;
 
-      summaryButton.append(summaryHeader, summaryMeta, summaryPreview);
+      summaryButton.append(summaryHeader, summaryMeta);
+      if (previewText) {
+        summaryButton.appendChild(summaryPreview);
+      }
       summaryList.appendChild(summaryButton);
     });
 
@@ -2457,7 +2575,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     const detailTitle = document.createElement('div');
     detailTitle.className = 'message-source-detail-title';
-    detailTitle.textContent = '引用内容';
+    detailTitle.textContent = '来源信息';
 
     const closeButton = document.createElement('button');
     closeButton.type = 'button';
@@ -2489,13 +2607,597 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (meta.textContent) {
         item.appendChild(meta);
       }
-      item.appendChild(preview);
+      if (preview.textContent) {
+        item.appendChild(preview);
+      }
       detailPanel.appendChild(item);
     });
 
     body.appendChild(detailPanel);
     wrapper.appendChild(body);
     container.appendChild(wrapper);
+  }
+
+  function renderStoredMessage(message) {
+    // 从历史记录恢复消息时只重建可见 UI，不重新触发后端请求。
+    const role = message?.role === 'user' ? 'user' : 'ai';
+    const bubble = createMessageNode(role);
+    bindSourceInteractions(bubble);
+    const content = String(message?.display_content || '').trim();
+
+    if (role === 'user') {
+      bubble.textContent = content;
+      return;
+    }
+
+    const sources = Array.isArray(message?.sources) ? message.sources : [];
+    setRenderedMarkdown(bubble, normalizeSourceCitationText(content, sources));
+    enhanceCodeBlocks(bubble);
+    renderMathInContainer(bubble);
+    decorateSourceCitations(bubble);
+    renderCitedSources(bubble, sources);
+  }
+
+  function renderChatHistoryItems(chats) {
+    // 历史列表只展示摘要元信息；点击后再按 chat_id 拉取完整消息。
+    const list = document.getElementById('chatHistoryList');
+    if (!list) return;
+
+    list.replaceChildren();
+    if (!Array.isArray(chats) || !chats.length) {
+      const empty = document.createElement('div');
+      empty.className = 'chat-history-item-meta';
+      empty.textContent = '暂无历史对话';
+      empty.style.padding = '10px';
+      list.appendChild(empty);
+      return;
+    }
+
+    chats.forEach((chat) => {
+      const item = document.createElement('div');
+      item.className = 'chat-history-item chat-history-entry';
+      item.dataset.chatId = String(chat.chat_id || '').trim();
+
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'chat-history-item-main';
+      button.dataset.chatId = item.dataset.chatId;
+
+      const title = document.createElement('div');
+      title.className = 'chat-history-item-title';
+      title.textContent = chat.title || chat.chat_id || '未命名对话';
+
+      const meta = document.createElement('div');
+      meta.className = 'chat-history-item-meta';
+      const turnCount = Number(chat.turn_count || 0);
+      meta.textContent = `${turnCount} 轮 · ${chat.latest_summary || chat.updated_at || ''}`;
+
+      button.append(title, meta);
+      const deleteButton = document.createElement('button');
+      deleteButton.type = 'button';
+      deleteButton.className = 'chat-history-delete-btn';
+      deleteButton.dataset.chatId = item.dataset.chatId;
+      deleteButton.title = '删除历史对话';
+      deleteButton.textContent = '删除';
+
+      item.append(button, deleteButton);
+      list.appendChild(item);
+    });
+  }
+
+  function normalizePlan(plan) {
+    return plan && typeof plan === 'object' ? plan : null;
+  }
+
+  function getPlanRevision(plan) {
+    return normalizePlan(plan)?.current_revision || null;
+  }
+
+  function getPlanExecutionSteps(plan) {
+    // 执行计划优先使用服务端 steps；老数据没有 steps 时退回当前 revision 的 checklist。
+    const normalizedPlan = normalizePlan(plan);
+    if (!normalizedPlan) return [];
+    const steps = Array.isArray(normalizedPlan.steps) ? normalizedPlan.steps : [];
+    if (steps.length) {
+      return steps
+        .filter((step) => !['done', 'skipped'].includes(String(step.status || '').trim()))
+        .map((step) => ({
+          title: String(step.title || '').trim(),
+          detail: String(step.detail || '').trim()
+        }))
+        .filter((step) => step.title || step.detail);
+    }
+
+    const revision = getPlanRevision(normalizedPlan) || {};
+    const checklist = Array.isArray(revision.checklist) ? revision.checklist : [];
+    return checklist
+      .map((step) => ({
+        title: String(step.title || '').trim(),
+        detail: String(step.detail || '').trim()
+      }))
+      .filter((step) => step.title || step.detail);
+  }
+
+  function buildPlanExecutionPrompt(plan) {
+    // 用户同意计划后，前端生成一条合成用户消息，让后端进入实际执行回合。
+    const normalizedPlan = normalizePlan(plan);
+    if (!normalizedPlan) return PLAN_AUTO_EXECUTE_PROMPT;
+    const steps = getPlanExecutionSteps(normalizedPlan);
+    const lines = [
+      PLAN_AUTO_EXECUTE_PROMPT,
+      '',
+      `计划目标：${String(normalizedPlan.objective || '').trim()}`
+    ];
+    if (steps.length) {
+      lines.push('执行步骤：');
+      steps.forEach((step, index) => {
+        const detail = step.detail ? `：${step.detail}` : '';
+        lines.push(`${index + 1}. ${step.title}${detail}`);
+      });
+    }
+    return lines.filter((line) => line !== '').join('\n');
+  }
+
+  function buildPlanExecutionSearchQuery(plan) {
+    const normalizedPlan = normalizePlan(plan);
+    if (!normalizedPlan) return '';
+    const steps = getPlanExecutionSteps(normalizedPlan);
+    return [
+      String(normalizedPlan.objective || '').trim(),
+      ...steps.flatMap((step) => [step.title, step.detail])
+    ]
+      .filter(Boolean)
+      .join(' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 600);
+  }
+
+  function renderPlanPanel(plan) {
+    // 计划面板跟随当前 chat 的 active plan，同一面板承载草稿、修订、执行和取消状态。
+    const panel = document.getElementById('planPanel');
+    if (!panel) return;
+    const previousPlanId = planState.activePlan?.plan_id || '';
+    const previousStatus = planState.activePlan?.status || '';
+    const nextPlan = normalizePlan(plan);
+    const nextPlanId = nextPlan?.plan_id || '';
+    const nextStatus = nextPlan?.status || '';
+    if (nextPlan && (nextPlanId !== previousPlanId || nextStatus !== previousStatus)) {
+      planState.collapsed = nextStatus === 'executing';
+    }
+    planState.activePlan = nextPlan;
+    planState.revising = false;
+    panel.replaceChildren();
+    if (!planState.activePlan) {
+      panel.hidden = true;
+      updateTaskUi();
+      return;
+    }
+
+    const currentPlan = planState.activePlan;
+    const revision = getPlanRevision(currentPlan) || {};
+    const checklist = Array.isArray(revision.checklist) ? revision.checklist : [];
+    const risks = Array.isArray(revision.risks) ? revision.risks : [];
+    const acceptanceCriteria = Array.isArray(revision.acceptance_criteria) ? revision.acceptance_criteria : [];
+
+    const head = document.createElement('div');
+    head.className = 'plan-panel-head';
+    const title = document.createElement('div');
+    title.className = 'plan-panel-title';
+    title.textContent = currentPlan.title || '当前计划';
+    const status = document.createElement('div');
+    status.className = 'plan-panel-status';
+    status.textContent = currentPlan.status || 'draft';
+    const toggle = document.createElement('button');
+    toggle.type = 'button';
+    toggle.className = 'plan-panel-toggle';
+    toggle.dataset.planAction = 'toggle';
+    toggle.textContent = planState.collapsed ? '展开' : '收起';
+    head.append(title, status, toggle);
+
+    const body = document.createElement('div');
+    body.className = 'plan-panel-body';
+    body.hidden = Boolean(planState.collapsed);
+    const objective = document.createElement('div');
+    objective.className = 'plan-panel-objective';
+    objective.textContent = currentPlan.objective || '';
+
+    const list = document.createElement('ol');
+    list.className = 'plan-panel-list';
+    checklist.forEach((step) => {
+      const item = document.createElement('li');
+      const stepTitle = document.createElement('div');
+      stepTitle.className = 'plan-panel-step-title';
+      stepTitle.textContent = step.title || '';
+      const detail = document.createElement('div');
+      detail.className = 'plan-panel-step-detail';
+      detail.textContent = step.detail || '';
+      item.append(stepTitle);
+      if (detail.textContent) item.append(detail);
+      list.appendChild(item);
+    });
+
+    const meta = document.createElement('div');
+    meta.className = 'plan-panel-meta';
+    if (risks.length) {
+      meta.appendChild(document.createTextNode(`风险：${risks.join('；')}`));
+    }
+    if (acceptanceCriteria.length) {
+      if (meta.textContent) meta.appendChild(document.createElement('br'));
+      meta.appendChild(document.createTextNode(`验收：${acceptanceCriteria.join('；')}`));
+    }
+
+    const actions = document.createElement('div');
+    actions.className = 'plan-panel-actions';
+    if (['draft', 'needs_revision', 'executing'].includes(currentPlan.status)) {
+      const reviseButton = document.createElement('button');
+      reviseButton.type = 'button';
+      reviseButton.className = 'tool-btn secondary';
+      reviseButton.dataset.planAction = 'revise';
+      reviseButton.textContent = '要求修改';
+      actions.appendChild(reviseButton);
+    }
+    if (['draft', 'needs_revision'].includes(currentPlan.status)) {
+      const approveButton = document.createElement('button');
+      approveButton.type = 'button';
+      approveButton.className = 'tool-btn';
+      approveButton.dataset.planAction = 'approve';
+      approveButton.textContent = '同意开始';
+      actions.appendChild(approveButton);
+    }
+    if (!['done', 'cancelled'].includes(currentPlan.status)) {
+      const cancelButton = document.createElement('button');
+      cancelButton.type = 'button';
+      cancelButton.className = 'tool-btn secondary';
+      cancelButton.dataset.planAction = 'cancel';
+      cancelButton.textContent = '取消';
+      actions.appendChild(cancelButton);
+    }
+
+    body.appendChild(objective);
+    if (checklist.length) body.appendChild(list);
+    if (meta.textContent) body.appendChild(meta);
+    if (actions.childElementCount) body.appendChild(actions);
+    panel.append(head, body);
+    panel.hidden = false;
+    updateTaskUi();
+  }
+
+  async function fetchBackendJson(safeApiUrl, apiKey, endpointPath, requestOptions = {}) {
+    // 业务后端接口统一走 background 转发，避免侧边栏直接跨域请求。
+    const requestHeaders = {
+      'Content-Type': 'application/json'
+    };
+    if (String(apiKey || '').trim()) {
+      requestHeaders.Authorization = `Bearer ${String(apiKey).trim()}`;
+    }
+    const method = String(requestOptions.method || 'GET').toUpperCase();
+    const body = requestOptions.body === undefined
+      ? (['POST', 'PATCH'].includes(method) ? '{}' : undefined)
+      : JSON.stringify(requestOptions.body);
+
+    return callApiJson(
+      buildBackendEndpointUrl(safeApiUrl, endpointPath),
+      {
+        method,
+        headers: requestHeaders,
+        body
+      }
+    );
+  }
+
+  async function loadChatHistoryList() {
+    const list = document.getElementById('chatHistoryList');
+    if (!list) return;
+
+    const { apiKey, safeApiUrl } = await resolveApiRequestConfig({ requireBackendApi: true });
+    list.hidden = false;
+    list.textContent = '正在加载历史对话...';
+    const result = await fetchBackendJson(safeApiUrl, apiKey, CHAT_HISTORY_ENDPOINT_PATH);
+    renderChatHistoryItems(result?.chats || []);
+  }
+
+  async function loadChatMessages(chatId) {
+    // 切换历史对话会重置当前输入态与本地上下文，再按后端记录重建 UI。
+    const normalizedChatId = String(chatId || '').trim();
+    if (!normalizedChatId) return;
+
+    const { apiKey, safeApiUrl } = await resolveApiRequestConfig({ requireBackendApi: true });
+    const result = await fetchBackendJson(
+      safeApiUrl,
+      apiKey,
+      `${CHAT_HISTORY_ENDPOINT_PATH}/${encodeURIComponent(normalizedChatId)}/messages`
+    );
+
+    currentChatId = normalizedChatId;
+    await chrome.storage.session.set({ [CURRENT_CHAT_ID_KEY]: currentChatId });
+    updatePageContextUi();
+    conversationHistory = [];
+    document.getElementById('chatHistory').replaceChildren();
+    clearAttachedImage();
+
+    const messages = Array.isArray(result?.messages) ? result.messages : [];
+    messages.forEach((message) => {
+      renderStoredMessage(message);
+      conversationHistory.push({
+        role: message.role === 'user' ? 'user' : 'assistant',
+        content: String(message.display_content || '')
+      });
+    });
+    conversationHistory = compactConversationHistory(conversationHistory);
+    await loadActivePlanForChat(normalizedChatId);
+    scrollToBottom();
+  }
+
+  async function loadActivePlanForChat(chatId) {
+    const normalizedChatId = String(chatId || '').trim();
+    if (!normalizedChatId) {
+      renderPlanPanel(null);
+      return;
+    }
+    try {
+      const { apiKey, safeApiUrl } = await resolveApiRequestConfig({ requireBackendApi: true });
+      const result = await fetchBackendJson(
+        safeApiUrl,
+        apiKey,
+        `${CHAT_HISTORY_ENDPOINT_PATH}/${encodeURIComponent(normalizedChatId)}/plans/active`
+      );
+      renderPlanPanel(result?.plan || null);
+    } catch {
+      renderPlanPanel(null);
+    }
+  }
+
+  async function deleteChatHistoryItem(chatId) {
+    const normalizedChatId = String(chatId || '').trim();
+    if (!normalizedChatId) return;
+    const ok = confirm('删除这条历史对话？删除后不会再出现在历史列表中。');
+    if (!ok) return;
+
+    const { apiKey, safeApiUrl } = await resolveApiRequestConfig({ requireBackendApi: true });
+    await fetchBackendJson(
+      safeApiUrl,
+      apiKey,
+      `${CHAT_HISTORY_ENDPOINT_PATH}/${encodeURIComponent(normalizedChatId)}`,
+      { method: 'DELETE' }
+    );
+
+    if (currentChatId === normalizedChatId) {
+      conversationHistory = [];
+      document.getElementById('chatHistory').replaceChildren();
+      document.getElementById('chatInput').value = '';
+      renderPlanPanel(null);
+      clearAttachedImage();
+      await resetCurrentChatId();
+      updatePageContextUi();
+    }
+    await loadChatHistoryList();
+  }
+
+  function formatMemoryDebug(memory) {
+    // 调试信息只用于侧边栏排查记忆写入任务，不参与对话上下文。
+    const latestJob = memory?.debug?.latest_job;
+    if (!latestJob) return '';
+
+    const parts = [];
+    if (latestJob.status) {
+      parts.push(`job ${latestJob.status}`);
+    }
+    const warnings = Array.isArray(latestJob.validation_warnings)
+      ? latestJob.validation_warnings.filter(Boolean)
+      : [];
+    if (warnings.length) {
+      parts.push(`warnings: ${warnings.join(', ')}`);
+    }
+    const applied = Array.isArray(latestJob.applied)
+      ? latestJob.applied
+        .map((item) => [item?.action, item?.memory_id].filter(Boolean).join(':'))
+        .filter(Boolean)
+      : [];
+    if (applied.length) {
+      parts.push(`applied: ${applied.join(', ')}`);
+    }
+    return parts.join(' · ');
+  }
+
+  function renderMemoryItems(memories) {
+    // 记忆列表展示类型、范围、证据和策略版本，方便判断某条记忆为什么会被保留。
+    const list = document.getElementById('memoryList');
+    if (!list) return;
+
+    list.replaceChildren();
+    if (!Array.isArray(memories) || !memories.length) {
+      const empty = document.createElement('div');
+      empty.className = 'chat-history-item-meta';
+      empty.textContent = '暂无长期记忆';
+      empty.style.padding = '10px';
+      list.appendChild(empty);
+      return;
+    }
+
+    memories.forEach((memory) => {
+      const item = document.createElement('div');
+      item.className = 'chat-history-item memory-item';
+      item.dataset.memoryId = String(memory.memory_id || '').trim();
+
+      const head = document.createElement('div');
+      head.className = 'memory-item-head';
+
+      const title = document.createElement('div');
+      title.className = 'chat-history-item-title';
+      const memoryType = String(memory.memory_type || 'memory');
+      const taskStatus = String(memory.task_status || '').trim();
+      title.textContent = memoryType === 'task_state' && taskStatus
+        ? `${memoryType} · ${taskStatus}`
+        : memoryType;
+
+      const deleteBtn = document.createElement('button');
+      deleteBtn.type = 'button';
+      deleteBtn.className = 'memory-delete-btn';
+      deleteBtn.title = '删除记忆';
+      deleteBtn.textContent = '删除';
+
+      head.append(title, deleteBtn);
+
+      const content = document.createElement('div');
+      content.className = 'memory-item-content';
+      content.textContent = String(memory.content || '').trim();
+
+      const meta = document.createElement('div');
+      meta.className = 'chat-history-item-meta';
+      const tags = Array.isArray(memory.tags) && memory.tags.length ? ` · ${memory.tags.join(', ')}` : '';
+      const lastUsed = String(memory.last_used_at || '').trim();
+      meta.textContent = `重要度 ${Number(memory.importance || 0).toFixed(2)}${tags}${lastUsed ? ` · 最近使用 ${lastUsed}` : ''}`;
+
+      const evidence = document.createElement('div');
+      evidence.className = 'chat-history-item-meta memory-item-evidence';
+      evidence.textContent = String(memory.evidence || '').trim()
+        ? `证据：${String(memory.evidence || '').trim()}`
+        : '';
+
+      const reason = document.createElement('div');
+      reason.className = 'chat-history-item-meta memory-item-reason';
+      reason.textContent = String(memory.classification_reason || '').trim()
+        ? `分类原因：${String(memory.classification_reason || '').trim()}`
+        : '';
+
+      const policy = document.createElement('div');
+      policy.className = 'chat-history-item-meta memory-item-policy';
+      policy.textContent = String(memory.policy_version || '').trim()
+        ? `策略版本：${String(memory.policy_version || '').trim()}`
+        : '';
+
+      const source = document.createElement('div');
+      source.className = 'chat-history-item-meta memory-item-source';
+      const sourceTurnId = String(memory.source_turn_id || '').trim();
+      const scope = String(memory.scope || '').trim();
+      const scopeChatId = String(memory.scope_chat_id || '').trim();
+      const taskUpdatedBy = String(memory.task_updated_by || '').trim();
+      const sourceParts = [];
+      if (scope) sourceParts.push(`范围：${scope}${scopeChatId ? `/${scopeChatId}` : ''}`);
+      if (taskStatus) sourceParts.push(`任务状态：${taskStatus}${taskUpdatedBy ? `/${taskUpdatedBy}` : ''}`);
+      if (sourceTurnId) sourceParts.push(`来源轮次：${sourceTurnId}`);
+      source.textContent = sourceParts.join(' · ');
+
+      const debug = document.createElement('div');
+      debug.className = 'chat-history-item-meta memory-item-debug';
+      const debugText = formatMemoryDebug(memory);
+      debug.textContent = debugText ? `调试：${debugText}` : '';
+
+      item.append(head, content, meta);
+      if (evidence.textContent) item.appendChild(evidence);
+      if (reason.textContent) item.appendChild(reason);
+      if (source.textContent) item.appendChild(source);
+      if (debug.textContent) item.appendChild(debug);
+      if (policy.textContent) item.appendChild(policy);
+      list.appendChild(item);
+    });
+  }
+
+  async function handlePlanSend(queryText) {
+    // 计划模式不直接调用普通聊天接口，而是创建或修订后端计划对象。
+    const input = document.getElementById('chatInput');
+    const objective = String(queryText || '').trim();
+    if (!objective) return;
+    let apiKey = '';
+    let modelName = '';
+    let safeApiUrl = '';
+    try {
+      ({ apiKey, modelName, safeApiUrl } = await resolveApiRequestConfig({ requireBackendApi: true }));
+    } catch (error) {
+      alert(error.message || 'API 配置无效');
+      return;
+    }
+    if (!(await ensurePrivacyNoticeAccepted())) return;
+
+    const pageContextResult = await resolvePageContextForSend();
+    if (!pageContextResult) return;
+    const currentPage = pageContextResult.currentPage;
+    const safeModelName = String(modelName || '').trim() || 'gpt-3.5-turbo';
+    const isRevision = Boolean(planState.activePlan && ['draft', 'needs_revision', 'executing'].includes(planState.activePlan.status));
+    const chatId = isRevision ? await getOrCreateCurrentChatId() : await resetCurrentChatId();
+
+    input.value = '';
+    if (!isRevision) {
+      document.getElementById('chatHistory').replaceChildren();
+      conversationHistory = [];
+      renderPlanPanel(null);
+      const historyList = document.getElementById('chatHistoryList');
+      if (historyList) {
+        historyList.hidden = true;
+        historyList.replaceChildren();
+      }
+    }
+    const userBubble = createMessageNode('user');
+    userBubble.textContent = objective;
+    scrollToBottom();
+
+    const aiBubble = createMessageNode('ai');
+    showTypingIndicator(aiBubble);
+    scrollToBottom();
+
+    const endpointPath = isRevision
+      ? `${PLAN_ENDPOINT_PREFIX}/${encodeURIComponent(planState.activePlan.plan_id)}/revise`
+      : `${CHAT_HISTORY_ENDPOINT_PATH}/${encodeURIComponent(chatId)}/plans`;
+    const body = isRevision
+      ? {
+          model: safeModelName,
+          feedback: objective
+        }
+      : {
+          model: safeModelName,
+          objective,
+          context_options: {
+            use_current_page: pageContextState.enabled,
+            use_web_search: webSearchState.enabled,
+            force_refresh_page: Boolean(pageContextState.enabled && pageContextState.forceRefreshPage),
+            web_search_query: ''
+          },
+          current_page: currentPage || null
+        };
+
+    try {
+      const result = await fetchBackendJson(safeApiUrl, apiKey, endpointPath, {
+        method: 'POST',
+        body
+      });
+      aiBubble.remove();
+      renderPlanPanel(result?.plan || null);
+    } catch (error) {
+      aiBubble.textContent = error.message || '计划生成失败';
+    }
+  }
+
+  async function loadMemoryList() {
+    const list = document.getElementById('memoryList');
+    if (!list) return;
+
+    const { apiKey, safeApiUrl } = await resolveApiRequestConfig({ requireBackendApi: true });
+    const controls = document.getElementById('memoryControls');
+    if (controls) controls.hidden = false;
+    list.hidden = false;
+    list.textContent = '正在加载长期记忆...';
+    const selectedType = String(document.getElementById('memoryTypeFilter')?.value || '').trim();
+    const params = new URLSearchParams({ include_debug: 'true' });
+    if (MEMORY_TYPE_FILTER_OPTIONS.has(selectedType)) {
+      params.set('memory_type', selectedType);
+    }
+    const result = await fetchBackendJson(safeApiUrl, apiKey, `${MEMORY_ENDPOINT_PATH}?${params.toString()}`);
+    renderMemoryItems(result?.memories || []);
+  }
+
+  async function deleteMemoryItem(memoryId) {
+    const normalizedMemoryId = String(memoryId || '').trim();
+    if (!normalizedMemoryId) return;
+
+    const { apiKey, safeApiUrl } = await resolveApiRequestConfig({ requireBackendApi: true });
+    await fetchBackendJson(
+      safeApiUrl,
+      apiKey,
+      `${MEMORY_ENDPOINT_PATH}/${encodeURIComponent(normalizedMemoryId)}`,
+      { method: 'DELETE' }
+    );
+    await loadMemoryList();
   }
 
   function scrollToBottom() {
@@ -2545,12 +3247,31 @@ document.addEventListener('DOMContentLoaded', async () => {
       alert('当前网页上下文只支持文本提问，请先移除图片附件。');
       return;
     }
+    if (webSearchState.enabled && hasImage) {
+      alert('联网搜索只支持文本提问，请先移除图片附件。');
+      return;
+    }
+    if (taskType === 'plan') {
+      await handlePlanSend(queryText);
+      return;
+    }
+    if (!hasImage) {
+      await sendStatefulTextChat({
+        queryText,
+        taskType,
+        focusText,
+        clearInput: true
+      });
+      return;
+    }
 
     let apiKey = '';
     let modelName = '';
     let safeApiUrl = '';
     try {
-      ({ apiKey, modelName, safeApiUrl } = await resolveApiRequestConfig());
+      ({ apiKey, modelName, safeApiUrl } = await resolveApiRequestConfig({
+        requireBackendApi: pageContextState.enabled || webSearchState.enabled
+      }));
     } catch (error) {
       alert(error.message || 'API 配置无效');
       return;
@@ -2564,7 +3285,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const safeModelName = String(modelName || '').trim() || 'gpt-3.5-turbo';
     input.value = '';
 
-    // 绘制用户消息
+    // 先把用户消息画到页面上，后台流式响应再逐块填充 AI 气泡。
     const userBubble = createMessageNode('user');
     if (!hasImage && taskType !== 'chat') {
       renderUserTaskSummary(userBubble, taskType, focusText, queryText);
@@ -2583,7 +3304,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
     scrollToBottom();
 
-    // 推入上下文记忆
+    // conversationHistory 是发给直连模型的短期上下文，不等同于后端长期记忆。
     const userMessage = {
       role: 'user',
       content: hasImage
@@ -2599,33 +3320,52 @@ document.addEventListener('DOMContentLoaded', async () => {
       clearAttachedImage();
     }
 
-    // 创建 AI 等待气泡
+    // 创建 AI 等待气泡后开始监听 background 传回的流式消息。
     const aiBubble = createMessageNode('ai');
     bindSourceInteractions(aiBubble);
     showTypingIndicator(aiBubble);
     scrollToBottom();
 
-    // 构造带历史记录的请求数据
-    const messagesPayload = buildMessagesPayload(conversationHistory);
-    conversationHistory = compactConversationHistory(conversationHistory);
-
-    const msgId = createMessageId(); // 唯一请求ID
+    const msgId = createMessageId(); // 唯一请求 ID，用于匹配本次流式响应。
     const chatId = await getOrCreateCurrentChatId();
-    let fullReply = ''; // 用于拼接流式文本
+    let fullReply = ''; // 用于拼接流式文本。
     let citedSources = [];
     let isStreamDone = false;
     let finalizeTimer = null;
-    const requestBody = {
-      model: safeModelName,
-      messages: messagesPayload,
-      stream: true,
-      task_type: taskType,
-      focus_text: focusText,
-      query_text: queryText,
-      chat_id: chatId,
-      use_current_page: pageContextState.enabled,
-      force_refresh_page: Boolean(pageContextState.enabled && pageContextState.forceRefreshPage)
-    };
+    const safeApiHost = new URL(safeApiUrl).hostname;
+    const useStatefulBackend = !hasImage
+      && (pageContextState.enabled || webSearchState.enabled || isPrivateOrLocalHost(safeApiHost));
+    const requestBody = useStatefulBackend
+      ? {
+          model: safeModelName,
+          stream: true,
+          chat_id: chatId,
+          current_turn: {
+            task_type: taskType,
+            query_text: queryText,
+            focus_text: focusText
+          },
+          context_options: {
+            use_current_page: pageContextState.enabled,
+            use_web_search: webSearchState.enabled,
+            force_refresh_page: Boolean(pageContextState.enabled && pageContextState.forceRefreshPage),
+            web_search_query: ''
+          }
+        }
+      : {
+          model: safeModelName,
+          messages: buildMessagesPayload(conversationHistory),
+          stream: true,
+          task_type: taskType,
+          focus_text: focusText,
+          query_text: queryText,
+          chat_id: chatId,
+          use_current_page: pageContextState.enabled,
+          force_refresh_page: Boolean(pageContextState.enabled && pageContextState.forceRefreshPage),
+          use_web_search: webSearchState.enabled,
+          web_search_query: ''
+        };
+    conversationHistory = compactConversationHistory(conversationHistory);
     if (pageContextResult.pageContextId) {
       requestBody.page_context_id = pageContextResult.pageContextId;
     }
@@ -2644,7 +3384,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       requestHeaders.Authorization = `Bearer ${String(apiKey).trim()}`;
     }
 
-    // 向 background.js 发出流式请求指令
+    // 向 background.js 发出流式请求指令；真正的 fetch 在后台脚本中执行。
     chrome.runtime.sendMessage({
       type: 'CALL_LLM_STREAM',
       msgId: msgId,
@@ -2703,6 +3443,17 @@ document.addEventListener('DOMContentLoaded', async () => {
           }, 100);
         }
       }
+      else if (msg.type === 'LLM_FINAL_TEXT') {
+        fullReply = String(msg.content || '');
+        setRenderedMarkdown(aiBubble, fullReply);
+        enhanceCodeBlocks(aiBubble);
+        renderMathInContainer(aiBubble);
+        decorateSourceCitations(aiBubble);
+        if (citedSources.length) {
+          renderCitedSources(aiBubble, citedSources);
+        }
+        scrollToBottom();
+      }
       else if (msg.type === 'LLM_SOURCES') {
         citedSources = Array.isArray(msg.sources) ? msg.sources : [];
         fullReply = normalizeSourceCitationText(fullReply, citedSources);
@@ -2748,10 +3499,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
-  // 5. 绑定各种交互事件
+  // 页面初始化与交互事件绑定。
   updateTaskUi();
   updatePageContextUi();
-  getOrCreateCurrentChatId().catch(console.error);
+  getOrCreateCurrentChatId()
+    .then((chatId) => loadActivePlanForChat(chatId))
+    .catch(console.error);
 
   document.getElementById('useCurrentPageToggle')?.addEventListener('change', async (event) => {
     pageContextState.enabled = Boolean(event.currentTarget?.checked);
@@ -2763,6 +3516,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     pageContextState.lastError = '';
     updatePageContextUi();
     await refreshPageContextSnapshot();
+  });
+
+  document.getElementById('useWebSearchToggle')?.addEventListener('change', (event) => {
+    webSearchState.enabled = Boolean(event.currentTarget?.checked);
+    updatePageContextUi();
   });
 
   document.getElementById('lockCurrentPageToggle')?.addEventListener('change', async (event) => {
@@ -2831,10 +3589,84 @@ document.addEventListener('DOMContentLoaded', async () => {
     resetTaskState();
   });
 
+  document.getElementById('planPanel')?.addEventListener('click', async (event) => {
+    // 计划面板使用事件委托处理折叠、修订、同意和取消四类动作。
+    const button = event.target.closest('[data-plan-action]');
+    if (!button || !planState.activePlan?.plan_id) return;
+    const action = button.dataset.planAction;
+    if (action === 'toggle') {
+      planState.collapsed = !planState.collapsed;
+      renderPlanPanel(planState.activePlan);
+      return;
+    }
+    if (action === 'revise') {
+      planState.revising = true;
+      setTaskState('plan', '', 'manual');
+      document.getElementById('chatInput')?.focus();
+      updateTaskUi();
+      return;
+    }
+
+    try {
+      if (planState.actionPending) return;
+      planState.actionPending = true;
+      button.disabled = true;
+      const { apiKey, safeApiUrl } = await resolveApiRequestConfig({ requireBackendApi: true });
+      const endpoint = `${PLAN_ENDPOINT_PREFIX}/${encodeURIComponent(planState.activePlan.plan_id)}/${action}`;
+      const result = await fetchBackendJson(safeApiUrl, apiKey, endpoint, { method: 'POST' });
+      const userText = action === 'approve' ? '同意开始执行计划' : '取消计划';
+      const assistantText = String(result?.display_message || (action === 'approve' ? '计划已进入执行。' : '计划已取消。'));
+      const userBubble = createMessageNode('user');
+      userBubble.textContent = userText;
+      const aiBubble = createMessageNode('ai');
+      setRenderedMarkdown(aiBubble, assistantText);
+      renderPlanPanel(result?.plan || null);
+      scrollToBottom();
+      if (action === 'approve') {
+        const executionPlan = planState.activePlan || result?.plan || null;
+        const executionResult = await sendStatefulTextChat({
+          queryText: buildPlanExecutionPrompt(executionPlan),
+          taskType: 'chat',
+          focusText: '',
+          displayUserText: '开始执行当前计划',
+          contextOptions: {
+            use_current_page: pageContextState.enabled,
+            use_web_search: webSearchState.enabled,
+            force_refresh_page: Boolean(pageContextState.enabled && pageContextState.forceRefreshPage),
+            web_search_query: buildPlanExecutionSearchQuery(executionPlan)
+          },
+          currentTurnMeta: {
+            origin: 'plan_auto_execution',
+            synthetic_user: true,
+            plan_id: String(planState.activePlan?.plan_id || '')
+          },
+          requireBackendApi: true,
+          forceStatefulBackend: true
+        });
+        if (executionResult?.ok) {
+          const completed = await fetchBackendJson(
+            safeApiUrl,
+            apiKey,
+            `${PLAN_ENDPOINT_PREFIX}/${encodeURIComponent(planState.activePlan.plan_id)}/complete`,
+            { method: 'POST' }
+          );
+          renderPlanPanel(completed?.plan || null);
+        }
+      }
+    } catch (error) {
+      alert(error.message || '计划操作失败');
+    } finally {
+      planState.actionPending = false;
+      if (button.isConnected) {
+        button.disabled = false;
+      }
+    }
+  });
+
   document.querySelectorAll('.task-btn').forEach((btn) => {
     btn.addEventListener('click', () => {
       const nextTaskType = normalizeTaskType(btn.dataset.taskType);
-      if (!taskState.focusText) {
+      if (!taskState.focusText && !['chat', 'plan'].includes(nextTaskType)) {
         alert('请先通过右键划词提供一段选中文本。');
         return;
       }
@@ -2921,13 +3753,129 @@ document.addEventListener('DOMContentLoaded', async () => {
   // 清空对话只开启新 chat，保留当前网页快照和锁定状态。
   document.getElementById('clearChatBtn')?.addEventListener('click', async () => {
     document.getElementById('chatHistory').replaceChildren();
-    conversationHistory = []; // 清除记忆！
+    const historyList = document.getElementById('chatHistoryList');
+    if (historyList) {
+      historyList.hidden = true;
+      historyList.replaceChildren();
+    }
+    const memoryList = document.getElementById('memoryList');
+    if (memoryList) {
+      memoryList.hidden = true;
+      memoryList.replaceChildren();
+    }
+    const memoryControls = document.getElementById('memoryControls');
+    if (memoryControls) {
+      memoryControls.hidden = true;
+    }
+    conversationHistory = []; // 清除当前侧边栏短期上下文。
     document.getElementById('chatInput').value = '';
+    renderPlanPanel(null);
     clearAttachedImage();
     await resetCurrentChatId();
   });
 
-  // 快捷指令填入
+  document.getElementById('toggleChatHistoryBtn')?.addEventListener('click', async () => {
+    const historyList = document.getElementById('chatHistoryList');
+    if (!historyList) return;
+
+    if (!historyList.hidden) {
+      historyList.hidden = true;
+      return;
+    }
+
+    try {
+      const memoryList = document.getElementById('memoryList');
+      if (memoryList) {
+        memoryList.hidden = true;
+      }
+      const memoryControls = document.getElementById('memoryControls');
+      if (memoryControls) {
+        memoryControls.hidden = true;
+      }
+      await loadChatHistoryList();
+    } catch (error) {
+      historyList.hidden = false;
+      historyList.textContent = error.message || '加载历史对话失败';
+    }
+  });
+
+  document.getElementById('toggleMemoryBtn')?.addEventListener('click', async () => {
+    const memoryList = document.getElementById('memoryList');
+    if (!memoryList) return;
+
+    if (!memoryList.hidden) {
+      memoryList.hidden = true;
+      const memoryControls = document.getElementById('memoryControls');
+      if (memoryControls) {
+        memoryControls.hidden = true;
+      }
+      return;
+    }
+
+    try {
+      const historyList = document.getElementById('chatHistoryList');
+      if (historyList) {
+        historyList.hidden = true;
+      }
+      await loadMemoryList();
+    } catch (error) {
+      memoryList.hidden = false;
+      const memoryControls = document.getElementById('memoryControls');
+      if (memoryControls) {
+        memoryControls.hidden = false;
+      }
+      memoryList.textContent = error.message || '加载长期记忆失败';
+    }
+  });
+
+  document.getElementById('memoryTypeFilter')?.addEventListener('change', async () => {
+    const memoryList = document.getElementById('memoryList');
+    if (!memoryList || memoryList.hidden) return;
+    try {
+      await loadMemoryList();
+    } catch (error) {
+      memoryList.textContent = error.message || '加载长期记忆失败';
+    }
+  });
+
+  document.getElementById('memoryList')?.addEventListener('click', async (event) => {
+    const target = event.target instanceof Element ? event.target : null;
+    const deleteButton = target?.closest('.memory-delete-btn');
+    if (!deleteButton) return;
+
+    const item = deleteButton.closest('.memory-item');
+    try {
+      await deleteMemoryItem(item?.dataset.memoryId || '');
+    } catch (error) {
+      alert(error.message || '删除记忆失败');
+    }
+  });
+
+  document.getElementById('chatHistoryList')?.addEventListener('click', async (event) => {
+    const target = event.target instanceof Element ? event.target : null;
+    const deleteButton = target?.closest('.chat-history-delete-btn');
+    if (deleteButton) {
+      const item = deleteButton.closest('.chat-history-item');
+      try {
+        await deleteChatHistoryItem(item?.dataset.chatId || '');
+      } catch (error) {
+        alert(error.message || '删除历史对话失败');
+      }
+      return;
+    }
+
+    const item = target?.closest('.chat-history-item');
+    if (!item) return;
+
+    try {
+      await loadChatMessages(item.dataset.chatId || '');
+      document.getElementById('chatHistoryList').hidden = true;
+    } catch (error) {
+      alert(error.message || '加载历史消息失败');
+    }
+  });
+
+  // 快捷指令只填入输入框，让用户仍可编辑后再发送。
   document.querySelectorAll('.prompt-btn').forEach(btn => {
     btn.addEventListener('click', () => {
       setChatInputText(btn.dataset.prompt || '');
@@ -2943,6 +3891,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function looksSensitivePageUrl(url) {
+    // 常见办公/账号域名或敏感关键词页面读取前会弹出额外确认。
     try {
       const hostname = new URL(url).hostname.toLowerCase();
       return [
@@ -2958,7 +3907,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
-  // 接收右键划词传来的文本
+  // 接收右键菜单传来的划词或图片动作；storage 监听覆盖侧边栏尚未打开的情况。
   chrome.runtime.onMessage.addListener((msg, sender) => {
     if (sender?.id && sender.id !== chrome.runtime.id) return;
 

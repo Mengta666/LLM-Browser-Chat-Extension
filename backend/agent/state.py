@@ -113,9 +113,11 @@ class AgentSession:
     progress: str = ""                   # 供前端展示（= 最近 next_goal）
 
     created_at: float = field(default_factory=time.time)
+    last_activity: float = field(default_factory=time.time)  # 每次 /step 刷新；空闲 TTL 依据（活跃任务不被误清）
+    in_flight: bool = False              # 忙标志：该会话有请求正在 run_step 处理中，拒绝同会话并发（防 current_step 竞态）
 
     # 步数与超时防护
-    max_steps: int = 40
+    max_steps: int = 200                 # 单任务最大步数（第 199 步自动 force_done 收尾，第 200 步硬兜底 ERROR）
     stale_retries: int = 0               # 连续 stale 重观察次数（防打转）
     force_done: bool = False             # 最后一步/前端超时：本步只接受 task_complete（对齐 browser-use _force_done_after_last_step）
 

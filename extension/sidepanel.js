@@ -2999,7 +2999,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const AGENT_SETTLE_TIMEOUT_MS = 3000;
   const AGENT_ACTION_TIMEOUT_MS = 10000;
   const AGENT_STEP_TIMEOUT_MS = 120000;   // 单个 step（执行+等稳+观察）总超时；对齐 browser-use step_timeout（它 180s），防非 LLM 环节卡死拖到整轮墙钟
-  const AGENT_TOTAL_TIMEOUT_MS = 900000;   // 15分钟：整轮墙钟仅作"防真死"极粗兜底（browser-use 无整轮墙钟，只靠步数+单步超时）；到点走 force_done 收尾
+  const AGENT_TOTAL_TIMEOUT_MS = 3600000;   // 1小时：整轮墙钟仅作"防真死"极粗兜底（browser-use 无整轮墙钟，只靠步数+单步超时）；到点走 force_done 收尾。配合 max_steps=200 长任务放宽
 
   const agentState = {
     active: false,

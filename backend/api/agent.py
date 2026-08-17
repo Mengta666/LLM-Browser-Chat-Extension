@@ -9,7 +9,10 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ValidationError
 
-from agent.loop import create_session, get_session, run_step, cancel_session
+from agent.loop import (
+    create_session, get_session, run_step, cancel_session,
+    acquire_session, release_session,
+)
 from agent.state import PageState, ActionResult
 
 
@@ -59,10 +62,13 @@ def agent_execute(item: AgentExecuteRequest) -> dict[str, Any]:
     if get_session(item.session_id):
         raise HTTPException(409, f"会话 {item.session_id} 已存在")
 
-    session = create_session(
-        session_id=item.session_id, task=item.task, model=item.model,
-        require_confirmation=item.require_confirmation,
-    )
+    try:
+        session = create_session(
+            session_id=item.session_id, task=item.task, model=item.model,
+            require_confirmation=item.require_confirmation,
+        )
+    except RuntimeError as e:                       # 活跃会话到达容量上限
+        raise HTTPException(503, str(e)) from e
     try:
         page_state = PageState(**item.page_state)
     except (ValidationError, TypeError) as e:
@@ -76,18 +82,26 @@ def agent_execute(item: AgentExecuteRequest) -> dict[str, Any]:
 @router.post("/step")
 def agent_step(item: AgentStepRequest) -> dict[str, Any]:
     """继续会话：传入上一步执行结果 + 新页面观察，返回下一个动作。"""
-    session = get_session(item.session_id)
-    if not session:
+    # 原子取会话 + 占用忙标志：拒绝同会话并发 /step（防 current_step 读-改-写竞态）
+    session, acquired = acquire_session(item.session_id)
+    if session is None:
         raise HTTPException(404, f"会话 {item.session_id} 不存在")
-    action_result = _parse_result(item.action_result)
+    if not acquired:
+        raise HTTPException(409, f"会话 {item.session_id} 有请求正在处理中")
     try:
-        page_state = PageState(**item.page_state)
-    except (ValidationError, TypeError) as e:
-        raise HTTPException(400, f"page_state 格式错误: {str(e)[:200]}")
-    try:
-        return run_step(session, page_state, action_result, force_done=item.force_done)
-    except Exception as exc:
-        raise HTTPException(502, f"Agent 执行出错: {exc}") from exc
+        action_result = _parse_result(item.action_result)
+        try:
+            page_state = PageState(**item.page_state)
+        except (ValidationError, TypeError) as e:
+            raise HTTPException(400, f"page_state 格式错误: {str(e)[:200]}")
+        try:
+            return run_step(session, page_state, action_result, force_done=item.force_done)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(502, f"Agent 执行出错: {exc}") from exc
+    finally:
+        release_session(session)               # 无论成功/异常/校验失败都释放忙标志
 
 
 @router.post("/cancel")

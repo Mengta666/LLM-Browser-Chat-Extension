@@ -40,8 +40,12 @@ _llm_client = OpenAI(base_url=MODEL_BASE_URL, api_key=OPENAI_API_KEY)
 
 _sessions: dict[str, AgentSession] = {}
 _sessions_lock = threading.Lock()
-_SESSION_TTL_SECONDS = 600
-_SESSION_ABSOLUTE_TTL = 1800
+# 空闲 TTL：基于 last_activity（每步 /step 刷新）。活跃任务不断刷新→永不误清；
+# 只回收真正卡死/被遗弃（很久无 /step）的会话。取代旧的"绝对创建时间 TTL"（会误杀长任务）。
+_SESSION_IDLE_TTL = 1800         # 30min 无任何活动 = 死会话，回收（须 ≥ 最慢单步耗时；配合 max_steps=200 长任务，留足单步余量）
+_SESSION_DONE_IDLE_TTL = 120     # 已收尾（完成/错误/取消）会话空闲 2min 即回收（更快腾内存）
+_SESSION_JANITOR_INTERVAL = 60   # 后台清理线程轮询间隔
+MAX_SESSIONS = 200               # dict 容量上限：防高并发/刷 /execute 撑爆内存
 
 MAX_LLM_RETRIES = 3
 RETRY_DELAYS = [0.5, 1, 2]
@@ -58,15 +62,56 @@ except Exception:
 
 
 def _cleanup_expired_sessions():
+    """回收空闲会话。基于 last_activity（非创建时间）：活跃任务不断刷新，永不被误清。
+
+    两档：已收尾会话空闲 120s 即清（快腾内存）；其余（含 RUNNING）空闲 900s 清（真卡死才回收）。
+    调用方必须已持有 _sessions_lock。
+    """
     now = time.time()
+    done_states = (AgentStatus.COMPLETED, AgentStatus.ERROR, AgentStatus.CANCELLED)
     expired = [
         sid for sid, s in _sessions.items()
-        if (now - s.created_at > _SESSION_TTL_SECONDS
-            and s.status in (AgentStatus.COMPLETED, AgentStatus.ERROR, AgentStatus.CANCELLED))
-        or (now - s.created_at > _SESSION_ABSOLUTE_TTL)
+        if (now - s.last_activity > _SESSION_DONE_IDLE_TTL and s.status in done_states)
+        or (now - s.last_activity > _SESSION_IDLE_TTL)
     ]
     for sid in expired:
         del _sessions[sid]
+    return expired
+
+
+def _evict_if_full():
+    """容量到顶时腾位：优先淘汰"空闲最久的已收尾会话"；没有可淘汰的收尾会话则不动。
+
+    调用方必须已持有 _sessions_lock。返回被淘汰的 sid（无则 None）。
+    """
+    if len(_sessions) < MAX_SESSIONS:
+        return None
+    done_states = (AgentStatus.COMPLETED, AgentStatus.ERROR, AgentStatus.CANCELLED)
+    victims = [(s.last_activity, sid) for sid, s in _sessions.items() if s.status in done_states]
+    if not victims:
+        return None                        # 全在跑：不牺牲活跃会话，交由 create_session 决定拒绝
+    victims.sort()                         # 最久未活动的排前
+    sid = victims[0][1]
+    del _sessions[sid]
+    return sid
+
+
+def _janitor_loop():
+    """后台守护线程：定时主动清理，不依赖请求触发（否则无新请求时过期会话一直躺内存）。"""
+    while True:
+        time.sleep(_SESSION_JANITOR_INTERVAL)
+        try:
+            with _sessions_lock:
+                removed = _cleanup_expired_sessions()
+            if removed:
+                _agent_log.info("sessions_janitor_cleaned",
+                                data={"removed": len(removed), "remaining": len(_sessions)})
+        except Exception as e:
+            _agent_log.warn("sessions_janitor_error", data={"error": str(e)[:120]})
+
+
+_janitor_thread = threading.Thread(target=_janitor_loop, daemon=True, name="sessions-janitor")
+_janitor_thread.start()
 
 
 def get_session(session_id: str) -> Optional[AgentSession]:
@@ -79,12 +124,18 @@ def create_session(session_id: str, task: str, model: str,
                    require_confirmation: Optional[list[str]] = None) -> AgentSession:
     with _sessions_lock:
         _cleanup_expired_sessions()
+        _evict_if_full()
+        # 容量仍到顶（全是活跃会话，无可淘汰）→ 拒绝新建，避免无上限撑爆内存
+        if len(_sessions) >= MAX_SESSIONS:
+            raise RuntimeError(
+                f"活跃会话数已达上限 {MAX_SESSIONS}，暂时无法新建，请稍后重试")
         session = AgentSession(
             session_id=session_id, task=task, model=model,
             require_confirmation=require_confirmation or [],
         )
         _sessions[session_id] = session
-    _agent_log.info("session_create", session_id=session_id, data={"task": task, "model": model})
+    _agent_log.info("session_create", session_id=session_id,
+                    data={"task": task, "model": model, "active_sessions": len(_sessions)})
     return session
 
 
@@ -98,6 +149,28 @@ def cancel_session(session_id: str) -> bool:
     return True
 
 
+def acquire_session(session_id: str) -> tuple[Optional[AgentSession], bool]:
+    """原子地取会话并占用忙标志（check-and-set 在锁内，杜绝同会话并发 /step 竞态）。
+
+    返回 (session, acquired)：
+      (None, False)  会话不存在
+      (session, False)  会话存在但正忙 → 调用方应回 409，且不要 release
+      (session, True)   已成功占用 → 调用方处理完必须 release_session
+    """
+    with _sessions_lock:
+        session = _sessions.get(session_id)
+        if not session:
+            return None, False
+        if session.in_flight:
+            return session, False
+        session.in_flight = True
+        return session, True
+
+
+def release_session(session: AgentSession) -> None:
+    session.in_flight = False
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # 主循环：单步（观察 → 结构化 LLM → 一个动作）
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -109,6 +182,7 @@ def run_step(session: AgentSession, page_state: PageState,
 
     force_done=True（前端整轮超时触发）：强制本步只接受 task_complete，给用户一个交代。
     """
+    session.last_activity = time.time()   # 刷新活动时间：活跃任务不会被空闲 TTL 误清
 
     # 1. 记录上一步结果为一条结构化 HistoryItem（不累积 messages；messages 每步重建）
     if action_result and session.pending_action:

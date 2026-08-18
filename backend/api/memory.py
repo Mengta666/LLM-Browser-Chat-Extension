@@ -3,12 +3,12 @@
 后续用于提供用户记忆的查看、保存、删除和召回接口。
 当前记忆能力尚未接入主聊天链路。
 """
-import json
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from core.utils import safe_json_loads
 from memory.policy_v2 import normalize_memory_row
 from memory.store import create_manual_memory, delete_memory, patch_memory, rerun_memory_job
 from storage.db import db
@@ -51,23 +51,11 @@ class MemoryPatchRequest(BaseModel):
     plan_id: str | None = None
 
 
-def _safe_json_loads(value: Any, default: Any) -> Any:
-    """宽松解析 JSON 字段，兼容已经是 dict/list 的调用方。"""
-    if isinstance(value, (dict, list)):
-        return value
-    if not isinstance(value, str) or not value.strip():
-        return default
-    try:
-        return json.loads(value)
-    except json.JSONDecodeError:
-        return default
-
-
 def _summarize_memory_job(job: dict[str, Any] | None) -> dict[str, Any] | None:
     """把后台记忆抽取任务压缩成前端调试面板需要的摘要。"""
     if not job:
         return None
-    output = _safe_json_loads(job.get("output_json"), {})
+    output = safe_json_loads(job.get("output_json"), {})
     return {
         "job_id": job.get("job_id", ""),
         "status": job.get("status", ""),
@@ -186,8 +174,8 @@ def get_memory_job(job_id: str):
     return {
         "job": {
             **job,
-            "input": _safe_json_loads(job.get("input_json"), {}),
-            "output": _safe_json_loads(job.get("output_json"), {}),
+            "input": safe_json_loads(job.get("input_json"), {}),
+            "output": safe_json_loads(job.get("output_json"), {}),
         }
     }
 

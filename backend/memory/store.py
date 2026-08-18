@@ -3,17 +3,21 @@
 封装长期记忆的抽取、校验、SQLite 落库、Qdrant 向量同步和聊天上下文召回。
 SQLite 是事实来源，向量库只作为语义检索索引。
 """
-import json
 import os
 import re
 import threading
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
 from dotenv import load_dotenv
 from openai import OpenAI
 
+from core.utils import (
+    extract_first_json_object,
+    json_dumps,
+    make_id,
+    safe_json_loads,
+)
 from memory.policy_v2 import (
     ACTIVE_TASK_STATUSES,
     ENABLED_MEMORY_TYPES,
@@ -21,7 +25,6 @@ from memory.policy_v2 import (
     WRITER_SYSTEM_PROMPT,
     build_memory_context_messages,
     derive_memory_mode,
-    json_dumps,
     memory_types_for_mode,
     normalize_decision,
     normalize_memory_row,
@@ -62,43 +65,6 @@ def delete_memory_vector(memory_id: str) -> None:
     vector_delete_memory(memory_id)
 
 
-def make_id(prefix: str) -> str:
-    """生成带业务前缀的随机 ID。"""
-    return f"{prefix}_{uuid4().hex}"
-
-
-def _safe_json_loads(value: Any, default: Any) -> Any:
-    """宽松解析 JSON 字段，无法解析时返回默认值。"""
-    if isinstance(value, (dict, list)):
-        return value
-    if not isinstance(value, str) or not value.strip():
-        return default
-    try:
-        return json.loads(value)
-    except json.JSONDecodeError:
-        return default
-
-
-def _extract_first_json_object(text: str) -> dict[str, Any]:
-    """从模型自由输出中抽取第一个 JSON 对象。"""
-    decoder = json.JSONDecoder()
-    value = str(text or "").strip()
-    if not value:
-        return {}
-    if value.startswith("```"):
-        value = re.sub(r"^```(?:json)?\s*", "", value)
-        value = re.sub(r"\s*```$", "", value)
-    for index, char in enumerate(value):
-        if char != "{":
-            continue
-        try:
-            parsed, _ = decoder.raw_decode(value[index:])
-        except json.JSONDecodeError:
-            continue
-        return parsed if isinstance(parsed, dict) else {}
-    return {}
-
-
 def _call_writer_json(model: str, messages: list[dict[str, str]]) -> dict[str, Any]:
     """调用 memory writer 模型，并解析其 JSON 输出。"""
     resolved_model = MEMORY_WRITER_MODEL or model
@@ -114,7 +80,7 @@ def _call_writer_json(model: str, messages: list[dict[str, str]]) -> dict[str, A
         stream=False,
     )
     content = response.choices[0].message.content if response.choices else ""
-    return _extract_first_json_object(content or "")
+    return extract_first_json_object(content or "")
 
 
 def _turn_payload_for_writer(job: dict[str, Any], turn: dict[str, Any]) -> dict[str, Any]:
@@ -124,7 +90,7 @@ def _turn_payload_for_writer(job: dict[str, Any], turn: dict[str, Any]) -> dict[
     assistant_messages = [message for message in messages if message.get("role") == "assistant"]
     user_message_ids = [message["message_id"] for message in user_messages if message.get("message_id")]
     assistant_message = assistant_messages[-1] if assistant_messages else {}
-    sources = _safe_json_loads(assistant_message.get("sources_json"), [])
+    sources = safe_json_loads(assistant_message.get("sources_json"), [])
 
     compact_sources = []
     for source in (sources if isinstance(sources, list) else []):
@@ -868,7 +834,7 @@ def run_memory_extraction_job(job_id: str) -> dict[str, Any]:
     if turn["status"] != "complete":
         raise ValueError("memory writer only accepts complete turns")
 
-    input_data = _safe_json_loads(job.get("input_json"), {})
+    input_data = safe_json_loads(job.get("input_json"), {})
     turn_payload = _turn_payload_for_writer(job, turn)
     if _should_skip_writer_for_origin(turn_payload):
         output = _skipped_writer_output(turn_payload)

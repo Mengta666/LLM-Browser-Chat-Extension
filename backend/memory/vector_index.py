@@ -41,18 +41,6 @@ def _point_id(memory_id: str) -> str:
     return str(uuid5(NAMESPACE_URL, f"browser-agent-memory:{memory_id}"))
 
 
-def build_memory_embedding_text(memory_item: dict[str, Any]) -> str:
-    """构造写入记忆向量库的 embedding 文本。"""
-    return "\n".join([
-        f"记忆内容：{memory_item.get('content', '')}",
-        f"类型：{memory_item.get('memory_type', '')}",
-        f"计划：{memory_item.get('plan_id', '')}",
-        f"任务状态：{memory_item.get('task_status', '')}",
-        f"适用模式：{', '.join(memory_item.get('mode_affinity', []) or [])}",
-        f"标签：{', '.join(memory_item.get('tags', []) or [])}",
-    ]).strip()
-
-
 def ensure_memory_collection(vector_size: int | None = None) -> None:
     """确保记忆 collection 存在，并校验向量维度和距离配置。"""
     resolved_size = vector_size or QDRANT_VECTOR_SIZE

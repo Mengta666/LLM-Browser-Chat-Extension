@@ -8,37 +8,10 @@ import re
 from pathlib import Path
 from typing import Any
 
+from core.utils import clamp_float, json_dumps, parse_json_list
+
 POLICY_VERSION = "memory_writer_skill_v1"
 MEMORY_WRITER_SKILL_DIR = Path(__file__).resolve().parent / "skills" / "memory_writer"
-
-
-def json_dumps(value: Any) -> str:
-    """用紧凑 UTF-8 JSON 保存结构化字段。"""
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-
-
-def parse_json_list(value: Any) -> list[Any]:
-    """把列表或 JSON 字符串统一转换成列表。"""
-    if isinstance(value, list):
-        return value
-    if value is None or value == "":
-        return []
-    if isinstance(value, str):
-        try:
-            parsed = json.loads(value)
-        except json.JSONDecodeError:
-            return []
-        return parsed if isinstance(parsed, list) else []
-    return []
-
-
-def clamp_float(value: Any, default: float = 0.5) -> float:
-    """把 importance/confidence/stability 限制到 0 到 1。"""
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        number = default
-    return max(0.0, min(1.0, number))
 
 
 INTERNAL_ID_PATTERN = re.compile(

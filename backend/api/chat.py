@@ -6,7 +6,6 @@ import re
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
-from uuid import uuid4
 
 from dotenv import load_dotenv
 from fastapi import APIRouter, HTTPException
@@ -14,6 +13,7 @@ from fastapi.responses import StreamingResponse
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
+from core.utils import json_dumps, make_id, safe_float, safe_json_loads
 from common.page_identity import canonicalize_url
 from memory.store import (
     create_memory_extraction_job,
@@ -147,14 +147,6 @@ def extract_domain(url: str) -> str:
         return (urlsplit(url).hostname or "").lower()
     except ValueError:
         return ""
-
-
-def safe_float(value: Any, default: float = 0.0) -> float:
-    """把外部搜索/召回分数转成可比较数值。"""
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
 
 
 def append_missing_terms(query: str, terms: list[str]) -> str:
@@ -522,16 +514,6 @@ def select_page_sources(candidates: list[dict[str, Any]]) -> list[dict[str, Any]
     return selected
 
 
-def json_dumps(value: Any) -> str:
-    """统一输出紧凑 UTF-8 JSON，便于写入 SQLite 文本字段。"""
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-
-
-def make_id(prefix: str) -> str:
-    """生成业务 ID。"""
-    return f"{prefix}_{uuid4().hex}"
-
-
 def strip_source_citations(text: str) -> str:
     """清理旧回答里的 S 编号，避免下一轮模型误用旧引用。"""
     cleaned = re.sub(r"\s*\[(?:S\d+)(?:\s*[,，]\s*S\d+)*\]", "", text)
@@ -564,17 +546,6 @@ def build_answer_constraint_messages(answer_constraints: str) -> list[dict[str, 
     if not constraints:
         return []
     return [{"role": "system", "content": f"本轮回答约束：\n{constraints}"}]
-
-def safe_json_loads(value: Any, default: Any) -> Any:
-    """宽松解析 JSON 字段，解析失败时返回调用方给定默认值。"""
-    if isinstance(value, (dict, list)):
-        return value
-    if not isinstance(value, str) or not value.strip():
-        return default
-    try:
-        return json.loads(value)
-    except json.JSONDecodeError:
-        return default
 
 
 def build_active_plan_context_messages(chat_id: str) -> tuple[list[dict[str, str]], dict[str, Any]]:

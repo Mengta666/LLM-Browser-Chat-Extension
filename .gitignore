@@ -20,6 +20,12 @@ backend/config/.env
 *.sqlite3-wal
 *.sqlite3-shm
 
+# 运行时产物（日志等，不进仓库）
+backend/logs/
+backend/backend_run.log
+backend/backend_err.log
+*.jsonl
+
 # 编辑器与系统文件
 .idea/
 .vscode/

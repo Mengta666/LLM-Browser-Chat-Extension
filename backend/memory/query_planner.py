@@ -3,14 +3,14 @@
 尽力把当前用户输入拆成“用于检索的事实需求”和“只影响回答方式的约束”，
 避免把“请专业全面回答”这类风格要求带进联网搜索或向量召回 query。
 """
-import json
 import os
-import re
 from pathlib import Path
 from typing import Any, TypedDict
 
 from dotenv import load_dotenv
 from openai import OpenAI
+
+from core.utils import extract_first_json_object, json_dumps
 
 __env_path = Path(__file__).resolve().parents[1] / "config" / ".env"
 load_dotenv(dotenv_path=__env_path)
@@ -46,31 +46,6 @@ def _fallback_information_need(task_type: str, query_text: str, focus_text: str)
     if task_type == "chat":
         return query
     return "\n".join(part for part in [focus, query] if part).strip()
-
-
-def _extract_first_json_object(text: str) -> dict[str, Any]:
-    """从模型输出中容错抽取第一个 JSON 对象。"""
-    decoder = json.JSONDecoder()
-    value = str(text or "").strip()
-    if not value:
-        return {}
-    if value.startswith("```"):
-        value = re.sub(r"^```(?:json)?\s*", "", value)
-        value = re.sub(r"\s*```$", "", value)
-    for index, char in enumerate(value):
-        if char != "{":
-            continue
-        try:
-            parsed, _ = decoder.raw_decode(value[index:])
-        except json.JSONDecodeError:
-            continue
-        return parsed if isinstance(parsed, dict) else {}
-    return {}
-
-
-def _json_dumps(value: Any) -> str:
-    """序列化成紧凑 UTF-8 JSON，便于嵌入 prompt。"""
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
 def _truncate(value: str, limit: int) -> str:
@@ -145,7 +120,7 @@ def _build_planner_messages(
                 '{"information_need":"Qwen3 Embedding 8B和Qwen3 Embedding 4B区别 对比 优缺点",'
                 '"answer_constraints":"从专业角度、深度聚合搜索到的信息，给出全面的回答",'
                 '"memory_candidate_hint":false}\n\n'
-                f"Input: {_json_dumps(payload)}"
+                f"Input: {json_dumps(payload)}"
             ),
         },
     ]
@@ -163,7 +138,7 @@ def _call_planner_json(model: str, messages: list[dict[str, str]]) -> dict[str, 
         stream=False,
     )
     content = response.choices[0].message.content if response.choices else ""
-    return _extract_first_json_object(content or "")
+    return extract_first_json_object(content or "")
 
 
 def plan_current_turn(

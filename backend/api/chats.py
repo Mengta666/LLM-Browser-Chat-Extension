@@ -1,23 +1,14 @@
 """聊天历史 API，负责列出对话、读取历史消息和软删除对话。"""
 
-import json
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
 
+from core.utils import parse_json_list
 from storage.db import db
 
 
 router = APIRouter(prefix="/api/chats", tags=["chat history"])
-
-
-def parse_json_array(value: str) -> list[Any]:
-    """解析 SQLite 文本字段里的 JSON 数组，失败时返回空列表。"""
-    try:
-        parsed = json.loads(value or "[]")
-    except json.JSONDecodeError:
-        return []
-    return parsed if isinstance(parsed, list) else []
 
 
 @router.get("")
@@ -36,7 +27,7 @@ def list_chat_messages(chat_id: str) -> dict[str, Any]:
             "turn_id": message["turn_id"],
             "role": message["role"],
             "display_content": message["display_content"],
-            "sources": parse_json_array(message["sources_json"]),
+            "sources": parse_json_list(message["sources_json"]),
             "content_format": message["content_format"],
             "status": message["status"],
             "created_at": message["created_at"],

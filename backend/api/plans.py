@@ -14,13 +14,12 @@ from fastapi import APIRouter, HTTPException
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
+from core.utils import json_dumps, make_id, safe_json_loads
 from api.chat import (
     BASE_SYSTEM_PROMPT,
     CurrentPage,
     build_page_context_messages,
     build_web_context_messages,
-    json_dumps,
-    make_id,
     strip_source_citations,
 )
 from memory.store import create_manual_memory, patch_memory, retrieve_memory_context
@@ -63,18 +62,6 @@ class PlanReviseRequest(BaseModel):
 
     model: str = ""
     feedback: str
-
-
-def _safe_json_loads(value: Any, default: Any) -> Any:
-    """宽松解析 SQLite 文本 JSON 字段。"""
-    if isinstance(value, (dict, list)):
-        return value
-    if not isinstance(value, str) or not value.strip():
-        return default
-    try:
-        return json.loads(value)
-    except json.JSONDecodeError:
-        return default
 
 
 def _extract_first_json_object(text: str) -> dict[str, Any]:
@@ -316,11 +303,11 @@ def _serialize_revision(row: dict[str, Any] | None) -> dict[str, Any] | None:
         return None
     return {
         **row,
-        "checklist": _safe_json_loads(row.get("checklist_json"), []),
-        "risks": _safe_json_loads(row.get("risks_json"), []),
-        "assumptions": _safe_json_loads(row.get("assumptions_json"), []),
-        "acceptance_criteria": _safe_json_loads(row.get("acceptance_criteria_json"), []),
-        "open_questions": _safe_json_loads(row.get("open_questions_json"), []),
+        "checklist": safe_json_loads(row.get("checklist_json"), []),
+        "risks": safe_json_loads(row.get("risks_json"), []),
+        "assumptions": safe_json_loads(row.get("assumptions_json"), []),
+        "acceptance_criteria": safe_json_loads(row.get("acceptance_criteria_json"), []),
+        "open_questions": safe_json_loads(row.get("open_questions_json"), []),
     }
 
 
@@ -543,7 +530,7 @@ def approve_plan(plan_id: str) -> dict[str, Any]:
 
     chat_id = plan["chat_id"]
     turn_id, _ = _create_plan_turn(chat_id, "", "同意开始执行计划", False, False)
-    checklist = _safe_json_loads(revision.get("checklist_json"), [])
+    checklist = safe_json_loads(revision.get("checklist_json"), [])
     content_lines = [plan["objective"]]
     for index, step in enumerate(checklist[:5], start=1):
         content_lines.append(f"{index}. {step.get('title', '')}")

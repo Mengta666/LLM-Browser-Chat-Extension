@@ -3226,7 +3226,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         ];
 
         // 弹出层容器检测选择器
-        const POPUP_CONTAINER_SELECTORS = [
+        // 可信选择器：标准 ARIA role + 组件库精确 class，命中即视为弹层，无需二次验证。
+        const POPUP_TRUSTED_SELECTORS = [
           '[role="dialog"]', '[role="listbox"]', '[role="menu"]',
           '.jmtd-dropdown-panel', '.jmtd-dropdown-list',
           '.jmtd-popup', '.jmtd-modal',
@@ -3236,14 +3237,18 @@ document.addEventListener('DOMContentLoaded', async () => {
           '.ant-select-dropdown', '.ant-popover-inner',
           '.el-dialog', '.el-dropdown-menu',
           '.el-picker-panel', '.el-select-dropdown', '.el-popover',
+          '.modal[style*="display: block"]', '.modal.show'
+        ];
+        // 宽泛选择器：仅靠 class 子串匹配，容易误伤常驻侧栏/助手浮层（如"码小伴"）。
+        // 命中后必须再过 looksLikeFloatingLayer() 才算弹层，避免 active_popup 被常驻容器长期占用。
+        const POPUP_FUZZY_SELECTORS = [
           '[class*="popup"]:not([style*="display: none"])',
           '[class*="dropdown-list"]', '[class*="picker-panel"]',
           '[class*="search__dropdown"]', '[class*="autocomplete"]',
           '[class*="popover__content"]', '[class*="popper"]',
           '[class*="dropdownWrap"]', '[class*="dropdown__"]',
           '[class*="select-branch"]',
-          '[class*="select-list"]', '[class*="select-dropdown"]',
-          '.modal[style*="display: block"]', '.modal.show'
+          '[class*="select-list"]', '[class*="select-dropdown"]'
         ];
 
         const MAX_POPUP_ELEMENTS = 100;
@@ -3427,18 +3432,45 @@ document.addEventListener('DOMContentLoaded', async () => {
             }
             popups.push(el);
           };
-          for (const sel of POPUP_CONTAINER_SELECTORS) {
-            for (const el of document.querySelectorAll(sel)) {
-              if (!isVisible(el)) continue;
-              // 排除已经被另一个 popup 包含的
-              const dominated = popups.some(p => p.contains(el));
-              if (dominated) continue;
-              // 移除被当前 el 包含的
-              for (let i = popups.length - 1; i >= 0; i--) {
-                if (el.contains(popups[i])) popups.splice(i, 1);
-              }
-              popups.push(el);
+          // 判断一个（仅靠宽泛 class 命中的）容器是否真是"临时浮层"，而非常驻侧栏/助手面板。
+          // 弹层特征取其一即可：① 模态（有遮罩 / aria-modal / role=dialog）；② 定位脱离文档流
+          // （fixed/absolute）且未贴满整条视口边（常驻侧栏通常 fixed 且高度≈满屏、紧贴左右边）。
+          const looksLikeFloatingLayer = (el) => {
+            if (el.getAttribute('aria-modal') === 'true') return true;
+            const role = el.getAttribute('role');
+            if (role === 'dialog' || role === 'listbox' || role === 'menu') return true;
+            // 存在可见的遮罩层 → 模态
+            if (document.querySelector(
+              '.jmtd-modal-mask, .ant-modal-mask, .el-overlay, .el-dialog__wrapper, ' +
+              '[class*="modal-mask"], [class*="overlay"], [class*="mask"][style*="display"]'
+            )) return true;
+            const style = window.getComputedStyle(el);
+            if (style.position !== 'fixed' && style.position !== 'absolute') return false;
+            const rect = el.getBoundingClientRect();
+            const vw = window.innerWidth, vh = window.innerHeight;
+            // 贴边常驻栏：几乎满高(>=85%视口) 且 紧贴左或右边 → 判为常驻，不算弹层
+            const nearlyFullHeight = rect.height >= vh * 0.85;
+            const pinnedToSide = rect.left <= 2 || rect.right >= vw - 2;
+            if (nearlyFullHeight && pinnedToSide) return false;
+            // 几乎铺满整个视口的容器（页面级包裹层）也不算弹层
+            if (rect.width >= vw * 0.95 && rect.height >= vh * 0.95) return false;
+            return true;
+          };
+          const consider = (el, needsVerify) => {
+            if (!isVisible(el)) return;
+            if (needsVerify && !looksLikeFloatingLayer(el)) return;
+            const dominated = popups.some(p => p.contains(el));
+            if (dominated) return;
+            for (let i = popups.length - 1; i >= 0; i--) {
+              if (el.contains(popups[i])) popups.splice(i, 1);
             }
+            popups.push(el);
+          };
+          for (const sel of POPUP_TRUSTED_SELECTORS) {
+            for (const el of document.querySelectorAll(sel)) consider(el, false);
+          }
+          for (const sel of POPUP_FUZZY_SELECTORS) {
+            for (const el of document.querySelectorAll(sel)) consider(el, true);
           }
           // ARIA 兜底：只认 W3C 标准的「浮层型」信号（不碰厂商 class，也不认常驻的 group/tree，
           // 否则常驻容器会让 active_popup 永远非空，压制真正弹层的 popup_appeared 信号）
@@ -4433,7 +4465,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   //    它工作在【采集之后】，不是采集层。若某元素因 class 不匹配任何选择器而【采集阶段就漏了】，
   //    它既不在 prevEls 也不在 newEls，diff 永远发现不了它——这不是 bug，是设计边界。
   //    采集漏掉的元素只能靠"结构/cursor 通用抽取"（不依赖 class 的第2道防线）在采集层捞回，
-  //    不能指望这里兜。参见 POPUP_EXTRA_SELECTORS / POPUP_CONTAINER_SELECTORS 的 class 匹配。
+  //    不能指望这里兜。参见 POPUP_EXTRA_SELECTORS / POPUP_TRUSTED_SELECTORS / POPUP_FUZZY_SELECTORS 的 class 匹配。
   function detectInlineGroup(prevEls, newEls) {
     if (!Array.isArray(prevEls) || !Array.isArray(newEls) || !newEls.length) return null;
     const sig = (e) => `${e.tag}|${e.role}|${(e.text || '').slice(0, 20)}|${e.name}`;

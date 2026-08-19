@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "私人助手",
+  "name": "浏览器自动化助手",
   "version": "0.1.0",
-  "description": "侧边栏 LLM 助手，支持网页摘要、图片上传、框选截图和 Markdown 渲染",
+  "description": "侧边栏浏览器自动化 agent，支持自然语言驱动网页操作、联网搜索与截图/图片视觉输入",
   "icons": {
     "16": "icon-16.png",
     "32": "icon-32.png",
@@ -14,7 +14,6 @@
     "storage",
     "activeTab",
     "scripting",
-    "contextMenus",
     "permissions",
     "debugger"
   ],

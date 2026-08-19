@@ -153,14 +153,23 @@ def build_messages(session: "AgentSession", page_state: PageState) -> list[dict[
     parts.append(build_observation_message(page_state))
     user_text = "\n\n".join(parts)
 
-    # 多模态：当前观察带截图时，user 消息用 [文本 + image_url]（对齐 browser-use 截图 ground truth）
+    # 多模态：user 消息可带多张图——任务附带的视觉上下文（用户上传/框选，仅前几步注入）
+    # + 当前观察截图（对齐 browser-use 截图 ground truth）。
+    image_blocks = []
+    task_image = getattr(session, "task_image", "") or ""
+    if task_image and session.current_step <= 1:
+        image_blocks.append({"type": "text", "text": "（以下是用户为本任务提供的参考图）"})
+        image_blocks.append({"type": "image_url", "image_url": {"url": task_image}})
     screenshot = getattr(page_state, "screenshot", "") or ""
     if screenshot:
+        image_blocks.append({"type": "image_url", "image_url": {"url": screenshot}})
+
+    if image_blocks:
         return [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": [
                 {"type": "text", "text": user_text},
-                {"type": "image_url", "image_url": {"url": screenshot}},
+                *image_blocks,
             ]},
         ]
     return [

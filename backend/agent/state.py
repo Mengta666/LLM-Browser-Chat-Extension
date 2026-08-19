@@ -113,6 +113,8 @@ class AgentSession:
     last_memory: str = ""
     progress: str = ""                   # 供前端展示（= 最近 next_goal）
 
+    task_image: str = ""                 # 任务附带的视觉上下文（用户上传图/框选截图，data URL）；随首条 user 消息注入
+
     created_at: float = field(default_factory=time.time)
     last_activity: float = field(default_factory=time.time)  # 每次 /step 刷新；空闲 TTL 依据（活跃任务不被误清）
     in_flight: bool = False              # 忙标志：该会话有请求正在 run_step 处理中，拒绝同会话并发（防 current_step 竞态）

@@ -2514,234 +2514,25 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // 4. 发送与流式接收核心逻辑
   let _sendingLock = false;
+  // 侧边栏已收窄为 agent 为主体：发送即启动一次自动化任务，附带的图片作为视觉上下文。
   async function handleSend() {
     if (_sendingLock) return;
+    if (agentState.active) return;
+    const input = document.getElementById('chatInput');
+    const task = (input.value || '').trim();
+    if (!task) return;
+    if (task.length > MAX_PROMPT_LENGTH) {
+      alert(`单次任务描述不能超过 ${MAX_PROMPT_LENGTH} 字。`);
+      return;
+    }
     _sendingLock = true;
     const sendBtn = document.getElementById('sendBtn');
     if (sendBtn) sendBtn.disabled = true;
     try {
-    const input = document.getElementById('chatInput');
-    const queryText = input.value.trim();
-    const hasImage = Boolean(attachedImage);
-    const taskType = hasImage ? 'chat' : normalizeTaskType(taskState.taskType);
-    const focusText = hasImage ? '' : String(taskState.focusText || '').trim();
-    const defaultImagePrompt = '请帮我分析这张图片并给出关键信息。';
-    const chatText = queryText || (hasImage ? defaultImagePrompt : '');
-
-    if (hasImage && taskState.taskType !== 'chat') {
-      alert('当前翻译或解释任务暂不支持图片附件，请先清空选中文本或移除图片。');
-      return;
-    }
-    if (taskType === 'chat' && !chatText && !hasImage) return;
-    if ((taskType === 'explain' || taskType === 'translate') && !focusText) {
-      alert('当前任务需要先提供一段选中文本。');
-      return;
-    }
-    if (queryText.length > MAX_PROMPT_LENGTH) {
-      alert(`单次发送文本不能超过 ${MAX_PROMPT_LENGTH} 字。`);
-      return;
-    }
-    if (pageContextState.enabled && hasImage) {
-      alert('当前网页上下文只支持文本提问，请先移除图片附件。');
-      return;
-    }
-
-    let apiKey = '';
-    let modelName = '';
-    let safeApiUrl = '';
-    try {
-      ({ apiKey, modelName, safeApiUrl } = await resolveApiRequestConfig());
-    } catch (error) {
-      alert(error.message || 'API 配置无效');
-      return;
-    }
-    if (!(await ensurePrivacyNoticeAccepted())) return;
-
-    const pageContextResult = await resolvePageContextForSend();
-    if (!pageContextResult) return;
-    const currentPage = pageContextResult.currentPage;
-
-    const safeModelName = String(modelName || '').trim() || 'gpt-3.5-turbo';
-    input.value = '';
-
-    // 绘制用户消息
-    const userBubble = createMessageNode('user');
-    if (!hasImage && taskType !== 'chat') {
-      renderUserTaskSummary(userBubble, taskType, focusText, queryText);
-    } else if (chatText) {
-      const userTextNode = document.createElement('div');
-      userTextNode.textContent = chatText;
-      userBubble.appendChild(userTextNode);
-    }
-
-    if (hasImage) {
-      const previewImage = document.createElement('img');
-      previewImage.className = 'user-upload-preview';
-      previewImage.src = attachedImage.dataUrl;
-      previewImage.alt = attachedImage.name || '上传图片';
-      userBubble.appendChild(previewImage);
-    }
-    scrollToBottom();
-
-    // 推入上下文记忆
-    const userMessage = {
-      role: 'user',
-      content: hasImage
-        ? [
-            { type: 'text', text: chatText || defaultImagePrompt },
-            { type: 'image_url', image_url: { url: attachedImage.dataUrl } }
-          ]
-        : buildConversationUserContent(taskType, focusText, queryText)
-    };
-    conversationHistory.push(userMessage);
-
-    if (hasImage) {
-      clearAttachedImage();
-    }
-
-    // 创建 AI 等待气泡
-    const aiBubble = createMessageNode('ai');
-    bindSourceInteractions(aiBubble);
-    showTypingIndicator(aiBubble);
-    scrollToBottom();
-
-    // 构造带历史记录的请求数据
-    const messagesPayload = buildMessagesPayload(conversationHistory);
-    conversationHistory = compactConversationHistory(conversationHistory);
-
-    const msgId = createMessageId(); // 唯一请求ID
-    const chatId = await getOrCreateCurrentChatId();
-    let fullReply = ''; // 用于拼接流式文本
-    let citedSources = [];
-    let isStreamDone = false;
-    let finalizeTimer = null;
-    const requestBody = {
-      model: safeModelName,
-      messages: messagesPayload,
-      stream: true,
-      task_type: taskType,
-      focus_text: focusText,
-      query_text: queryText,
-      chat_id: chatId,
-      use_current_page: pageContextState.enabled,
-      force_refresh_page: Boolean(pageContextState.enabled && pageContextState.forceRefreshPage)
-    };
-    if (pageContextResult.pageContextId) {
-      requestBody.page_context_id = pageContextResult.pageContextId;
-    }
-    if (currentPage) {
-      requestBody.current_page = currentPage;
-    }
-    if (requestBody.force_refresh_page) {
-      pageContextState.forceRefreshPage = false;
-      updatePageContextUi();
-    }
-
-    const requestHeaders = {
-      'Content-Type': 'application/json'
-    };
-    if (String(apiKey || '').trim()) {
-      requestHeaders.Authorization = `Bearer ${String(apiKey).trim()}`;
-    }
-
-    // 向 background.js 发出流式请求指令
-    chrome.runtime.sendMessage({
-      type: 'CALL_LLM_STREAM',
-      msgId: msgId,
-      url: `${safeApiUrl}/chat/completions`,
-      options: {
-        method: 'POST',
-        headers: requestHeaders,
-        body: JSON.stringify(requestBody)
-      }
-    });
-
-    const finalizeAssistantResponse = () => {
-      if (finalizeTimer) {
-        clearTimeout(finalizeTimer);
-        finalizeTimer = null;
-      }
-      if (!fullReply) {
-        aiBubble.textContent = '响应为空。';
-      }
-      conversationHistory.push({ role: 'assistant', content: fullReply });
-      conversationHistory = compactConversationHistory(conversationHistory);
-      chrome.runtime.onMessage.removeListener(messageListener);
-    };
-
-    // 监听后台传回的字元块
-    let _renderTimer = null;
-    let _lastActivity = Date.now();
-    const _STALL_TIMEOUT = 30000;
-
-    const _stallChecker = setInterval(() => {
-      if (Date.now() - _lastActivity > _STALL_TIMEOUT) {
-        clearInterval(_stallChecker);
-        chrome.runtime.onMessage.removeListener(messageListener);
-        if (_renderTimer) { clearTimeout(_renderTimer); _renderTimer = null; }
-        aiBubble.textContent = '';
-        aiBubble.appendChild(Object.assign(document.createElement('span'), {
-          className: 'error-text',
-          textContent: '⚠️ 响应超时（30秒无数据）'
-        }));
-      }
-    }, 5000);
-
-    const messageListener = (msg) => {
-      if (msg.msgId !== msgId) return;
-      _lastActivity = Date.now();
-
-      if (msg.type === 'LLM_CHUNK') {
-        fullReply += msg.chunk;
-        if (!_renderTimer) {
-          _renderTimer = setTimeout(() => {
-            _renderTimer = null;
-            setRenderedMarkdown(aiBubble, fullReply);
-            enhanceCodeBlocks(aiBubble);
-            renderMathInContainer(aiBubble);
-            scrollToBottom();
-          }, 100);
-        }
-      }
-      else if (msg.type === 'LLM_SOURCES') {
-        citedSources = Array.isArray(msg.sources) ? msg.sources : [];
-        fullReply = normalizeSourceCitationText(fullReply, citedSources);
-        setRenderedMarkdown(aiBubble, fullReply);
-        enhanceCodeBlocks(aiBubble);
-        renderMathInContainer(aiBubble);
-        decorateSourceCitations(aiBubble);
-        renderCitedSources(aiBubble, citedSources);
-        scrollToBottom();
-      }
-      else if (msg.type === 'LLM_DONE') {
-        if (isStreamDone) return;
-        isStreamDone = true;
-        clearInterval(_stallChecker);
-        if (_renderTimer) { clearTimeout(_renderTimer); _renderTimer = null; }
-        setRenderedMarkdown(aiBubble, fullReply);
-        enhanceCodeBlocks(aiBubble);
-        renderMathInContainer(aiBubble);
-        decorateSourceCitations(aiBubble);
-        if (citedSources.length) renderCitedSources(aiBubble, citedSources);
-        scrollToBottom();
-        finalizeTimer = setTimeout(finalizeAssistantResponse, 150);
-      }
-      else if (msg.type === 'LLM_ERROR') {
-        clearInterval(_stallChecker);
-        if (_renderTimer) { clearTimeout(_renderTimer); _renderTimer = null; }
-        if (finalizeTimer) {
-          clearTimeout(finalizeTimer);
-          finalizeTimer = null;
-        }
-        aiBubble.textContent = '';
-        const errorSpan = document.createElement('span');
-        errorSpan.className = 'error-text';
-        errorSpan.textContent = `⚠️ 错误: ${msg.error}`;
-        aiBubble.appendChild(errorSpan);
-        chrome.runtime.onMessage.removeListener(messageListener);
-      }
-    };
-    chrome.runtime.onMessage.addListener(messageListener);
+      const image = attachedImage ? attachedImage.dataUrl : '';
+      input.value = '';
+      if (attachedImage) clearAttachedImage();
+      await runAgentTask(task, image);
     } finally {
       _sendingLock = false;
       if (sendBtn) sendBtn.disabled = false;
@@ -2749,99 +2540,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   // 5. 绑定各种交互事件
-  updateTaskUi();
-  updatePageContextUi();
   getOrCreateCurrentChatId().catch(console.error);
-
-  document.getElementById('useCurrentPageToggle')?.addEventListener('change', async (event) => {
-    pageContextState.enabled = Boolean(event.currentTarget?.checked);
-    if (!pageContextState.enabled) {
-      resetPageContextState();
-      return;
-    }
-
-    pageContextState.lastError = '';
-    updatePageContextUi();
-    await refreshPageContextSnapshot();
-  });
-
-  document.getElementById('lockCurrentPageToggle')?.addEventListener('change', async (event) => {
-    if (!pageContextState.enabled) {
-      updatePageContextUi();
-      return;
-    }
-
-    const shouldLock = Boolean(event.currentTarget?.checked);
-    if (!shouldLock) {
-      pageContextState.locked = false;
-      pageContextState.pageContextId = '';
-      updatePageContextUi();
-      return;
-    }
-
-    if (!pageContextState.snapshot) {
-      const snapshot = await refreshPageContextSnapshot();
-      if (!snapshot) {
-        pageContextState.locked = false;
-        updatePageContextUi();
-        return;
-      }
-    }
-
-    const validationError = getPageContextValidationError(pageContextState.snapshot);
-    if (validationError) {
-      alert(validationError);
-      pageContextState.locked = false;
-      updatePageContextUi();
-      return;
-    }
-
-    pageContextState.locked = true;
-    pageContextState.pageContextId = `pagectx_${createMessageId()}`;
-    updatePageContextUi();
-  });
-
-  document.getElementById('refreshPageContextBtn')?.addEventListener('click', async () => {
-    if (!pageContextState.enabled) return;
-
-    const snapshot = await refreshPageContextIndexNow();
-    if (!snapshot) return;
-
-    const validationError = getPageContextValidationError(snapshot);
-    if (validationError) {
-      alert(validationError);
-    }
-  });
-
-  document.getElementById('clearPageSnapshotBtn')?.addEventListener('click', () => {
-    clearPageContextSnapshot();
-  });
-
-  document.getElementById('toggleTaskDrawerBtn')?.addEventListener('click', () => {
-    drawerState.taskOpen = !drawerState.taskOpen;
-    updateTaskUi();
-  });
-
-  document.getElementById('togglePageContextDrawerBtn')?.addEventListener('click', () => {
-    drawerState.pageContextOpen = !drawerState.pageContextOpen;
-    updatePageContextUi();
-  });
-
-  document.getElementById('clearFocusTextBtn')?.addEventListener('click', () => {
-    resetTaskState();
-  });
-
-  document.querySelectorAll('.task-btn').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      const nextTaskType = normalizeTaskType(btn.dataset.taskType);
-      if (!taskState.focusText) {
-        alert('请先通过右键划词提供一段选中文本。');
-        return;
-      }
-      setTaskState(nextTaskType, taskState.focusText, taskState.source);
-      document.getElementById('chatInput')?.focus();
-    });
-  });
 
   document.getElementById('sendBtn').addEventListener('click', handleSend);
   document.getElementById('chatInput').addEventListener('keydown', (e) => {
@@ -2878,28 +2577,6 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   document.getElementById('clearImageBtn').addEventListener('click', clearAttachedImage);
 
-  document.getElementById('imageLoadBtn').addEventListener('click', loadImageToolFromUrl);
-  document.getElementById('imageCopyBtn').addEventListener('click', copyImageToolResult);
-  document.getElementById('imageClearBtn').addEventListener('click', clearImageTool);
-  document.getElementById('imageFileInput').addEventListener('change', async (event) => {
-    const file = event.target.files?.[0];
-    if (!file) return;
-
-    try {
-      await loadImageToolFromFile(file);
-    } catch (error) {
-      alert(error.message || '图片读取失败');
-      clearImageTool();
-    }
-  });
-
-  document.getElementById('imageSourceUrl').addEventListener('keydown', (event) => {
-    if (event.key === 'Enter') {
-      event.preventDefault();
-      loadImageToolFromUrl();
-    }
-  });
-
   document.getElementById('chatInput').addEventListener('paste', async (event) => {
     const pastedText = event.clipboardData?.getData('text/plain') || '';
     const normalizedDataUrl = pastedText.trim().replace(/\s+/g, '');
@@ -2918,20 +2595,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   });
 
-  // 清空对话只开启新 chat，保留当前网页快照和锁定状态。
+  // 清空只开启新执行记录。
   document.getElementById('clearChatBtn')?.addEventListener('click', async () => {
     document.getElementById('chatHistory').replaceChildren();
-    conversationHistory = []; // 清除记忆！
+    conversationHistory = [];
     document.getElementById('chatInput').value = '';
     clearAttachedImage();
     await resetCurrentChatId();
-  });
-
-  // 快捷指令填入
-  document.querySelectorAll('.prompt-btn').forEach(btn => {
-    btn.addEventListener('click', () => {
-      setChatInputText(btn.dataset.prompt || '');
-    });
   });
 
   function isReadablePageUrl(url) {
@@ -4496,7 +4166,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     };
   }
 
-  async function runAgentTask(task) {
+  async function runAgentTask(task, taskImage = '') {
     const sessionId = `agent_${createMessageId()}`;
     agentState.active = true;
     agentState.sessionId = sessionId;
@@ -4518,6 +4188,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     const userText = document.createElement('div');
     userText.textContent = `🤖 [自动化] ${task}`;
     userBubble.appendChild(userText);
+    if (taskImage) {
+      const previewImage = document.createElement('img');
+      previewImage.className = 'user-upload-preview';
+      previewImage.src = taskImage;
+      previewImage.alt = '任务参考图';
+      userBubble.appendChild(previewImage);
+    }
 
     const aiBubble = createMessageNode('ai');
     showTypingIndicator(aiBubble);
@@ -4551,7 +4228,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         page_state: pageState,
         session_id: sessionId,
         model: modelName || 'gpt-4o',
-        require_confirmation: []
+        require_confirmation: [],
+        task_image: taskImage || ''
       }, apiKey);
 
       const agentStartTime = Date.now();
@@ -4796,10 +4474,8 @@ document.addEventListener('DOMContentLoaded', async () => {
       return false;
     }
 
-    btnEl.addEventListener('click', (e) => tryAgentIntercept(e), true);
-    inputEl.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' && !e.shiftKey) tryAgentIntercept(e);
-    }, true);
+    // 侧边栏已收窄为 agent 为主体：发送统一由 handleSend → runAgentTask 处理，
+    // 不再需要旧的捕获阶段拦截（否则会与 handleSend 重复触发）。
   })();
 
   // ═══════════════════════════════════════════════════════════════════

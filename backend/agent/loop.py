@@ -125,7 +125,8 @@ def get_session(session_id: str) -> Optional[AgentSession]:
 
 
 def create_session(session_id: str, task: str, model: str,
-                   require_confirmation: Optional[list[str]] = None) -> AgentSession:
+                   require_confirmation: Optional[list[str]] = None,
+                   task_image: str = "") -> AgentSession:
     with _sessions_lock:
         _cleanup_expired_sessions()
         _evict_if_full()
@@ -136,10 +137,12 @@ def create_session(session_id: str, task: str, model: str,
         session = AgentSession(
             session_id=session_id, task=task, model=model,
             require_confirmation=require_confirmation or [],
+            task_image=task_image or "",
         )
         _sessions[session_id] = session
     _agent_log.info("session_create", session_id=session_id,
-                    data={"task": task, "model": model, "active_sessions": len(_sessions)})
+                    data={"task": task, "model": model, "has_image": bool(task_image),
+                          "active_sessions": len(_sessions)})
     return session
 
 

@@ -3,103 +3,34 @@
 <head>
   <meta charset="UTF-8">
   <meta name="color-scheme" content="light dark">
-  <link rel="stylesheet" href="vendor/katex/katex.min.css">
   <link rel="stylesheet" href="style.css">
 </head>
 
 <body>
   <!-- 顶部导航栏 -->
   <div class="tabs">
-    <button class="tab-btn active" data-target="chat">💬 聊天</button>
-    <button class="tab-btn" data-target="imageTool">🖼️图片工具</button>
-    <button class="tab-btn" data-target="settings">⚙️设置</button>
+    <button class="tab-btn active" data-target="chat">🤖 自动化</button>
+    <button class="tab-btn" data-target="settings">⚙️ 设置</button>
   </div>
 
-<!-- 聊天 Tab -->
+  <!-- 自动化 Tab：agent 执行 + 截图/图片视觉输入 -->
   <div id="chat" class="tab-content active">
-    <!-- 新增：聊天头部工具栏 -->
     <div class="chat-header">
-      <span class="chat-title">当前对话</span>
-      <button id="clearChatBtn" class="clear-btn" title="清空对话记录">🗑️ 清空</button>
+      <span class="chat-title">浏览器自动化</span>
+      <button id="clearChatBtn" class="clear-btn" title="清空执行记录">🗑️ 清空</button>
     </div>
-    
-    <!-- 在 sidepanel.html 中，替换掉原有的 <div class="input-area"> 前后的代码 -->
-  
+
     <div class="chat-history" id="chatHistory"></div>
-    
-    <!-- 新增：快捷功能指令栏 -->
-    <div class="quick-prompts">
-      <button class="pill-btn task-btn" data-task-type="translate">🌐 翻译</button>
-      <button class="pill-btn task-btn" data-task-type="explain">💻 解释</button>
-      <button class="pill-btn prompt-btn" data-prompt="请帮我提取图片中的公式，并把它转换为严格的 LaTeX 代码">✍️ 公式提取</button>
-    </div>
-
-    <div class="task-state-panel drawer-panel">
-      <div class="drawer-head">
-        <button id="toggleTaskDrawerBtn" class="drawer-toggle" type="button" aria-expanded="false">
-          <span class="drawer-toggle-text">
-            <span id="taskStateTitle" class="task-state-title">当前任务：普通问答</span>
-            <span id="taskStateSummary" class="drawer-summary">当前选中：未设置</span>
-          </span>
-          <span id="taskDrawerIndicator" class="drawer-indicator">展开</span>
-        </button>
-        <button id="clearFocusTextBtn" class="tool-btn secondary" type="button">清空选中</button>
-      </div>
-      <div id="taskDrawerBody" class="drawer-body" hidden>
-        <div id="taskStateFocusText" class="task-state-focus">当前选中：未设置</div>
-        <div id="taskStateMeta" class="task-state-meta">右键划词后可直接进入翻译或解释任务。</div>
-      </div>
-    </div>
-
-    <div class="page-context-panel drawer-panel">
-      <div class="drawer-head">
-        <button id="togglePageContextDrawerBtn" class="drawer-toggle" type="button" aria-expanded="false">
-          <span class="drawer-toggle-text">
-            <span class="task-state-title">网页快照</span>
-            <span id="pageContextSummary" class="drawer-summary">未启用</span>
-          </span>
-          <span id="pageContextDrawerIndicator" class="drawer-indicator">展开</span>
-        </button>
-        <div class="drawer-actions">
-          <button id="refreshPageContextBtn" class="tool-btn" type="button">刷新快照</button>
-          <button id="clearPageSnapshotBtn" class="tool-btn secondary" type="button">清空快照</button>
-        </div>
-      </div>
-      <div class="page-context-controls">
-        <div class="page-context-row">
-          <label class="page-context-toggle">
-            <input id="useCurrentPageToggle" type="checkbox">
-            <span>使用当前网页</span>
-          </label>
-          <label class="page-context-toggle">
-            <input id="lockCurrentPageToggle" type="checkbox">
-            <span>锁定当前页</span>
-          </label>
-        </div>
-        <div id="pageContextChatIdInline" class="page-context-debug">Chat ID：未创建</div>
-      </div>
-      <div id="pageContextDrawerBody" class="drawer-body" hidden>
-        <div class="page-context-status">
-          <div id="pageContextStatusTitle" class="page-context-status-title">网页上下文未启用</div>
-          <div id="pageContextStatusMeta" class="page-context-status-meta">发送时不会附带当前页面内容。</div>
-          <div id="pageContextChatId" class="page-context-status-value">Chat ID：未创建</div>
-          <div id="pageContextPageTitle" class="page-context-status-value">页面：未采集</div>
-          <div id="pageContextPageUrl" class="page-context-status-url">URL：未采集</div>
-        </div>
-      </div>
-    </div>
 
     <div class="input-area">
       <div class="composer">
-        <textarea id="chatInput" placeholder="输入问题 (Enter发送, Shift+Enter换行)..."></textarea>
+        <textarea id="chatInput" placeholder="描述要自动化执行的任务 (Enter发送, Shift+Enter换行)..."></textarea>
         <div class="attachment-toolbar">
           <div class="floating-tip-wrap">
-            <button id="uploadImageBtn" class="tool-btn" type="button" title="上传图片">🖼️ 图片</button>
-            <span class="floating-tip" role="tooltip">支持 PNG / JPG / WebP，截图会作为图片附件</span>
+            <button id="uploadImageBtn" class="tool-btn" type="button" title="上传参考图">🖼️ 图片</button>
+            <span class="floating-tip" role="tooltip">上传的图片会作为本次任务的视觉参考</span>
           </div>
           <button id="captureVisibleTabBtn" class="tool-btn" type="button" title="框选当前标签页区域截图">📸 框选截图</button>
-          <button id="agentModeBtn" class="tool-btn" type="button" title="开启/关闭浏览器自动化模式">🤖 自动化</button>
-          <input id="agentModeToggle" type="checkbox" hidden>
           <button id="clearImageBtn" class="tool-btn secondary" type="button" hidden>移除图片</button>
           <input type="file" id="imageInput" accept="image/png,image/jpeg,image/webp,image/gif,image/jpg" hidden>
         </div>
@@ -111,79 +42,29 @@
           </div>
         </div>
       </div>
-      <button id="sendBtn">发送</button>
+      <button id="sendBtn">执行</button>
     </div>
-  </div> <!-- 聊天 Tab 结束 -->
+  </div> <!-- 自动化 Tab 结束 -->
 
-  <!-- 图片工具 Tab -->
-  <div id="imageTool" class="tab-content image-tool-tab">
-    <div class="tool-stack">
-      <section class="tool-hero">
-        <div>
-          <p class="tool-eyebrow">Image Base64 Tool</p>
-          <h1>下载图片，转成 Base64</h1>
-          <p class="subtitle">支持 HTTP/HTTPS 图片 URL 和本地文件。远程、内网或本机图片会在加载前请求确认和站点授权。</p>
-        </div>
-        <div class="status-pill" id="imageToolStatus">等待输入</div>
-      </section>
-
-      <section class="tool-card">
-        <label for="imageSourceUrl">图片 URL</label>
-        <input id="imageSourceUrl" type="url" placeholder="https://example.com/image.png">
-
-        <label for="imagePageUrl">来源页面 URL（可选，不会作为 Referrer 发送）</label>
-        <input id="imagePageUrl" type="url" placeholder="https://example.com/page.html">
-
-        <label for="imageFileInput">本地图片文件</label>
-        <input id="imageFileInput" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/jpg">
-
-        <div class="tool-actions">
-          <button id="imageLoadBtn" class="primary-btn">下载并转 Base64</button>
-          <button id="imageCopyBtn" class="secondary-btn" disabled>复制 Base64</button>
-          <a id="imageDownloadLink" class="download-link is-disabled" href="#" download>下载图片</a>
-          <button id="imageClearBtn" class="ghost-btn" type="button">清空</button>
-        </div>
-
-        <p class="tool-hint">复制会把 base64 写入剪贴板，下载链接会直接保存转换后的 PNG。</p>
-      </section>
-
-      <section class="tool-card tool-preview-card">
-        <div class="tool-preview-head">
-          <div>
-            <h2>预览</h2>
-            <p id="imageMetaText" class="meta-text">尚未加载图片</p>
-          </div>
-        </div>
-        <div class="tool-preview-box">
-          <img id="imageToolPreviewImg" alt="">
-          <div id="imageToolEmptyState" class="empty-state">Base64 预览会显示在这里</div>
-        </div>
-      </section>
-    </div>
-  </div>
-
-  <!-- 设置 Tab (删除了 hidden) -->
+  <!-- 设置 Tab -->
   <div id="settings" class="tab-content">
     <label>API Base URL:</label>
     <input type="text" id="apiUrl" placeholder="https://api.openai.com/v1">
     <div class="settings-hint">默认使用 OpenAI。也可以填写可信的 HTTPS OpenAI-compatible API，例如 https://example.com/v1；首次保存会请求该域名权限。</div>
-    
+
     <label>API Key:</label>
     <input type="password" id="apiKey" placeholder="sk-...">
     <div id="apiKeyStatus" class="settings-hint"></div>
     <div class="settings-hint">切换 API 地址时需要重新输入该服务对应的 API Key，避免把旧 Key 发到错误服务。</div>
-    
+
     <label>模型 (Model):</label>
-    <input type="text" id="modelName" placeholder="gpt-3.5-turbo">
-    
+    <input type="text" id="modelName" placeholder="gpt-4o">
+
     <button id="saveSettingsBtn">保存配置</button>
     <button id="clearApiKeyBtn" type="button">清除 API Key</button>
     <div id="saveMsg"></div>
   </div>
 
-  <script src="vendor/katex/katex.min.js"></script>
-  <script src="vendor/katex/contrib/auto-render.min.js"></script>
-  <script src="vendor/marked.umd.js"></script>
   <script src="shared.js"></script>
   <script src="sidepanel.js"></script>
 </body>

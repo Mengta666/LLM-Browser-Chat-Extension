@@ -25,7 +25,8 @@ from agent.context_builder import (
     SYSTEM_PROMPT, build_messages, build_plan_block,
 )
 from agent.router import should_confirm_action
-from tools.tool_registry import ALLOWED_ACTION_TYPES
+from tools.tool_registry import ALLOWED_ACTION_TYPES, BACKEND_TOOL_TYPES
+from tools.web_search import search_web
 from observability.logger import get_logger
 
 _agent_log = get_logger("agent")
@@ -54,6 +55,8 @@ MAX_STALE_RETRIES = 3   # 连续编号失效重观察上限，防打转
 LLM_CALL_TIMEOUT = 90   # 单次 LLM 调用超时秒数（对齐 browser-use llm_timeout 75-90s，防单点卡死）
 COMPACT_TRIGGER_STEPS = 24   # history 超过此条数才触发 compaction（保守，短任务不触发）
 COMPACT_KEEP_RECENT = 8      # 摘要后保留的最近步数（首项 + <摘要> + 最近 N 项）
+MAX_CONSECUTIVE_SEARCHES = 3  # 单个 /step 内连续后端搜索上限，防 LLM 反复搜索打转
+WEB_SEARCH_TOP_K = 5          # 每次 web_search 返回的结果条数
 
 try:
     import tiktoken
@@ -176,6 +179,40 @@ def release_session(session: AgentSession) -> None:
 # 主循环：单步（观察 → 结构化 LLM → 一个动作）
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _run_web_search(session: AgentSession, action_obj: dict[str, Any]) -> HistoryItem:
+    """就地执行一次联网搜索（后端工具，不下发前端），把结果压成一条历史项。
+
+    web_search 与页面动作不同：它在后端直接完成、无需前端回执，因此 run_step 就地调用、
+    把结果注入历史后继续下一轮 LLM 决策。失败也返回一条 result，让 LLM 自行改策略。
+    """
+    query = str(action_obj.get("query") or action_obj.get("text") or "").strip()
+    session.current_step += 1
+    if not query:
+        return HistoryItem(step=session.current_step, next_goal=session.progress,
+                           action="web_search(空查询)", result="✗ 未提供查询词，已跳过")
+
+    try:
+        payload = search_web(query, top_k=WEB_SEARCH_TOP_K)
+        results = payload.get("results", [])
+        if results:
+            lines = [f"{i}. {r.get('title', '')} — {r.get('url', '')}\n   {r.get('snippet', '')[:200]}"
+                     for i, r in enumerate(results, start=1)]
+            result_text = "✓ 搜索结果:\n" + "\n".join(lines)
+        else:
+            result_text = "✓ 搜索完成但无结果，建议换关键词或改用页面操作"
+        _agent_log.info("web_search", session_id=session.session_id,
+                        data={"step": session.current_step, "query": query[:80],
+                              "result_count": len(results)})
+    except Exception as exc:
+        result_text = f"✗ 搜索失败: {str(exc)[:160]}"
+        _agent_log.error("web_search_failed", session_id=session.session_id,
+                         data={"step": session.current_step, "query": query[:80],
+                               "error": str(exc)[:200]})
+
+    return HistoryItem(step=session.current_step, next_goal=session.progress,
+                       action=f"web_search(\"{query[:60]}\")", result=result_text[:1200])
+
+
 def run_step(session: AgentSession, page_state: PageState,
              action_result: Optional[ActionResult] = None,
              force_done: bool = False) -> dict[str, Any]:
@@ -237,74 +274,108 @@ def run_step(session: AgentSession, page_state: PageState,
     #    最后一步（步数到上限前一步）或前端超时触发 → 强制只接受 task_complete。
     session.force_done = force_done or (session.current_step >= session.max_steps - 1)
 
-    # 3. compaction（对齐 browser-use maybe_compact_messages）：步数很多时把中间段 LLM 总结成一条摘要，
-    #    保留 首项 + <摘要> + 最近若干项。超长任务防止滑动窗口丢失中间进展。
-    _maybe_compact_history(session)
+    # 3~5 决策循环：正常一轮出一个动作即返回；若 LLM 选择 web_search（后端工具），
+    #    就地执行、把结果注入历史后再调一次 LLM，直到出页面动作/收尾，或达连续搜索上限。
+    search_count = 0
+    while True:
+        # 3. compaction（对齐 browser-use maybe_compact_messages）：步数很多时把中间段 LLM 总结成一条摘要，
+        #    保留 首项 + <摘要> + 最近若干项。超长任务防止滑动窗口丢失中间进展。
+        _maybe_compact_history(session)
 
-    # 4. 每步重建 messages（system + 任务 + 历史块 + 计划 + 当前观察）
-    session.messages = build_messages(session, page_state)
+        # 4. 每步重建 messages（system + 任务 + 历史块 + 计划 + 当前观察）
+        session.messages = build_messages(session, page_state)
 
-    # 5. 调 LLM（结构化 JSON）
-    _log_observation(session, page_state)
-    _log_exec_tokens(session)
-    parsed = _call_llm(session)
-    if parsed is None:
-        return _build_response(session)
+        # 5. 调 LLM（结构化 JSON）
+        _log_observation(session, page_state)
+        _log_exec_tokens(session)
+        parsed = _call_llm(session)
+        if parsed is None:
+            return _build_response(session)
 
-    # 5. 消化结构化输出：自评/记忆/意图/计划
-    session.last_evaluation = str(parsed.get("evaluation_previous_goal", ""))[:300]
-    session.last_memory = str(parsed.get("memory", ""))[:300]
-    session.progress = str(parsed.get("next_goal", ""))[:120] or session.progress
-    if isinstance(parsed.get("plan"), list) and parsed["plan"]:
-        session.plan_items = _sanitize_plan(parsed["plan"])
-    if parsed.get("current_plan_item") is not None:
-        try:
-            session.current_plan_item = int(parsed["current_plan_item"])
-        except (ValueError, TypeError):
-            pass
+        # 5. 消化结构化输出：自评/记忆/意图/计划
+        session.last_evaluation = str(parsed.get("evaluation_previous_goal", ""))[:300]
+        session.last_memory = str(parsed.get("memory", ""))[:300]
+        session.progress = str(parsed.get("next_goal", ""))[:120] or session.progress
+        if isinstance(parsed.get("plan"), list) and parsed["plan"]:
+            session.plan_items = _sanitize_plan(parsed["plan"])
+        if parsed.get("current_plan_item") is not None:
+            try:
+                session.current_plan_item = int(parsed["current_plan_item"])
+            except (ValueError, TypeError):
+                pass
 
-    action_obj = parsed.get("action") or {}
-    func_name = action_obj.get("type") or action_obj.get("action")
+        action_obj = parsed.get("action") or {}
+        func_name = action_obj.get("type") or action_obj.get("action")
 
-    _agent_log.info("llm_step", session_id=session.session_id,
-                    data={"step": session.current_step,
-                          "eval": session.last_evaluation[:100],
-                          "memory": session.last_memory[:100],
-                          "next_goal": session.progress[:80],
-                          "action": func_name,
-                          "plan_items": len(session.plan_items),
-                          "current_plan": session.current_plan_item})
+        _agent_log.info("llm_step", session_id=session.session_id,
+                        data={"step": session.current_step,
+                              "eval": session.last_evaluation[:100],
+                              "memory": session.last_memory[:100],
+                              "next_goal": session.progress[:80],
+                              "action": func_name,
+                              "plan_items": len(session.plan_items),
+                              "current_plan": session.current_plan_item})
 
-    if not func_name:
-        session.status = AgentStatus.ERROR
-        session.error = f"LLM 输出缺少 action。回复片段: {json.dumps(parsed, ensure_ascii=False)[:200]}"
-        return _build_response(session)
+        if not func_name:
+            session.status = AgentStatus.ERROR
+            session.error = f"LLM 输出缺少 action。回复片段: {json.dumps(parsed, ensure_ascii=False)[:200]}"
+            return _build_response(session)
 
-    if func_name == "task_complete":
-        session.status = AgentStatus.COMPLETED
-        session.summary = action_obj.get("summary", "任务完成")
-        session.success = bool(action_obj.get("success", True))
-        _agent_log.info("session_complete", session_id=session.session_id,
-                        data={"summary": session.summary, "success": session.success,
-                              "total_steps": session.current_step,
-                              "url": page_state.url, "title": (page_state.title or "")[:60]})
-        return _build_response(session)
+        if func_name == "task_complete":
+            session.status = AgentStatus.COMPLETED
+            session.summary = action_obj.get("summary", "任务完成")
+            session.success = bool(action_obj.get("success", True))
+            _agent_log.info("session_complete", session_id=session.session_id,
+                            data={"summary": session.summary, "success": session.success,
+                                  "total_steps": session.current_step,
+                                  "url": page_state.url, "title": (page_state.title or "")[:60]})
+            return _build_response(session)
 
-    # 强制收尾时 LLM 仍出页面动作（不听话）→ 代码用其记忆替它体面收尾（对齐 browser-use force-done）
-    if session.force_done:
-        session.status = AgentStatus.COMPLETED
-        session.success = False
-        session.summary = (f"已达步数/时间上限，未完全完成任务。最后进展：{session.last_memory[:180]}"
-                           if session.last_memory else "已达步数/时间上限，任务未完成。")
-        _agent_log.warn("forced_done_at_limit", session_id=session.session_id,
-                        data={"step": session.current_step, "wanted_action": func_name,
-                              "url": page_state.url})
-        return _build_response(session)
+        # 强制收尾时 LLM 仍出页面动作（不听话）→ 代码用其记忆替它体面收尾（对齐 browser-use force-done）
+        if session.force_done:
+            session.status = AgentStatus.COMPLETED
+            session.success = False
+            session.summary = (f"已达步数/时间上限，未完全完成任务。最后进展：{session.last_memory[:180]}"
+                               if session.last_memory else "已达步数/时间上限，任务未完成。")
+            _agent_log.warn("forced_done_at_limit", session_id=session.session_id,
+                            data={"step": session.current_step, "wanted_action": func_name,
+                                  "url": page_state.url})
+            return _build_response(session)
 
-    if func_name not in ALLOWED_ACTION_TYPES:
-        session.status = AgentStatus.ERROR
-        session.error = f"未知的操作类型: {func_name}"
-        return _build_response(session)
+        # 后端工具（web_search）：就地执行 → 注入历史 → 继续下一轮 LLM，不下发前端。
+        if func_name in BACKEND_TOOL_TYPES:
+            search_count += 1
+            history_item = _run_web_search(session, action_obj)
+            session.history_items.append(history_item)
+            if search_count >= MAX_CONSECUTIVE_SEARCHES:
+                # 连续搜索到上限：追加一条提示，逼 LLM 下一轮改用页面操作或收尾。
+                session.history_items.append(HistoryItem(
+                    step=session.current_step,
+                    result=f"⚠ 已连续搜索 {search_count} 次，请基于已有结果做页面操作或调用 task_complete"))
+                session.messages = build_messages(session, page_state)
+                parsed = _call_llm(session)
+                if parsed is None:
+                    return _build_response(session)
+                action_obj = parsed.get("action") or {}
+                func_name = action_obj.get("type") or action_obj.get("action")
+                if func_name == "task_complete":
+                    session.status = AgentStatus.COMPLETED
+                    session.summary = action_obj.get("summary", "任务完成")
+                    session.success = bool(action_obj.get("success", True))
+                    return _build_response(session)
+                if func_name in BACKEND_TOOL_TYPES or func_name not in ALLOWED_ACTION_TYPES:
+                    session.status = AgentStatus.ERROR
+                    session.error = "连续搜索超过上限且未给出有效页面动作"
+                    return _build_response(session)
+                break  # 拿到页面动作，跳出循环走下发流程
+            continue  # 未达上限，回到循环顶重新调 LLM
+
+        if func_name not in ALLOWED_ACTION_TYPES:
+            session.status = AgentStatus.ERROR
+            session.error = f"未知的操作类型: {func_name}"
+            return _build_response(session)
+
+        break  # 页面动作：跳出循环，走下发前端流程
 
     action = _parse_action(func_name, action_obj)
     session.pending_action = action

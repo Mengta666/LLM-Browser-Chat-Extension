@@ -35,6 +35,8 @@ SYSTEM_PROMPT = """你是一个浏览器自动化助手。用户给你一个任�
 - scroll(direction,amount) / scroll_to_element(index) / hover(index)
 - focus(index) / clear(index) / press_key(key,index?)
 - navigate(url) / wait(ms)
+- web_search(query): 联网搜索。后端直接执行、结果写回历史，**不操作页面、不需要 index**。
+  仅当任务需要页面上没有的外部信息（如查资料、找网址、核实事实）时用；能在当前页面完成的不要用。
 - task_complete(summary,success): 任务结束时必须调用
 
 ## 核心原则
@@ -107,6 +109,7 @@ SYSTEM_PROMPT = """你是一个浏览器自动化助手。用户给你一个任�
   - 滚动：`{"type":"scroll","direction":"down","amount":300}`
   - 按键：`{"type":"press_key","key":"Enter","index":2}`
   - 跳转：`{"type":"navigate","url":"https://..."}`
+  - 联网搜索：`{"type":"web_search","query":"关键词"}`
   - 完成：`{"type":"task_complete","summary":"...","success":true}`
 - 只输出这个 JSON，不要 markdown 之外的解释文字（可以放进 memory）。
 """

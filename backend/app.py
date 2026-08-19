@@ -16,16 +16,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-try:
-    from api.chat import model_chat_route
-    from api.pages import router as pages_router
-    from api.search import router as search_router
-    app.include_router(model_chat_route)
-    app.include_router(pages_router)
-    app.include_router(search_router)
-except Exception as e:
-    print(f"[WARN] 聊天/搜索/页面模块加载失败（缺少依赖配置），已跳过: {e}")
-
 app.include_router(agent_router)
 app.include_router(logs_router)
 

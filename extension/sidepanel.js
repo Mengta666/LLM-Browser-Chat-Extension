@@ -2628,36 +2628,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
-  // 接收右键划词传来的文本
-  chrome.runtime.onMessage.addListener((msg, sender) => {
-    if (sender?.id && sender.id !== chrome.runtime.id) return;
-
-    if (msg.type === 'AUTO_SEND_PROMPT' || msg.type === 'AUTO_IMAGE_TOOL') {
-      handlePendingAction(msg).finally(() => {
-        chrome.storage.session.remove('pendingSidePanelAction');
-      });
-    }
-  });
-
-  chrome.storage.onChanged.addListener((changes, areaName) => {
-    if (areaName !== 'session') return;
-
-    const pendingChange = changes.pendingSidePanelAction;
-    if (!pendingChange?.newValue) return;
-
-    handlePendingAction(pendingChange.newValue).finally(() => {
-      chrome.storage.session.remove('pendingSidePanelAction');
-    });
-  });
-
-  chrome.storage.session.get(['pendingSidePanelAction']).then(({ pendingSidePanelAction }) => {
-    if (!pendingSidePanelAction) return;
-
-    handlePendingAction(pendingSidePanelAction).finally(() => {
-      chrome.storage.session.remove('pendingSidePanelAction');
-    });
-  });
-
   // ═══════════════════════════════════════════════════════════════════
   // Agent 页面自动化模块
   // ═══════════════════════════════════════════════════════════════════

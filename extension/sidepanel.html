@@ -24,13 +24,15 @@
 
     <div class="input-area">
       <div class="composer">
-        <textarea id="chatInput" placeholder="描述要自动化执行的任务 (Enter发送, Shift+Enter换行)..."></textarea>
+        <textarea id="chatInput" placeholder="输入问题聊天，或点 🤖 自动化 让 agent 操作网页 (Enter发送, Shift+Enter换行)..."></textarea>
         <div class="attachment-toolbar">
           <div class="floating-tip-wrap">
             <button id="uploadImageBtn" class="tool-btn" type="button" title="上传参考图">🖼️ 图片</button>
-            <span class="floating-tip" role="tooltip">上传的图片会作为本次任务的视觉参考</span>
+            <span class="floating-tip" role="tooltip">上传的图片会作为提问或自动化任务的视觉参考</span>
           </div>
           <button id="captureVisibleTabBtn" class="tool-btn" type="button" title="框选当前标签页区域截图">📸 框选截图</button>
+          <button id="agentModeBtn" class="tool-btn" type="button" title="开启/关闭浏览器自动化模式">🤖 自动化</button>
+          <input id="agentModeToggle" type="checkbox" hidden>
           <button id="clearImageBtn" class="tool-btn secondary" type="button" hidden>移除图片</button>
           <input type="file" id="imageInput" accept="image/png,image/jpeg,image/webp,image/gif,image/jpg" hidden>
         </div>
@@ -42,7 +44,7 @@
           </div>
         </div>
       </div>
-      <button id="sendBtn">执行</button>
+      <button id="sendBtn">发送</button>
     </div>
   </div> <!-- 自动化 Tab 结束 -->
 

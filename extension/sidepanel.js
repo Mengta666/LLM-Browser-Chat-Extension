@@ -873,29 +873,127 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // 4. 发送与流式接收核心逻辑
   let _sendingLock = false;
-  // 侧边栏已收窄为 agent 为主体：发送即启动一次自动化任务，附带的图片作为视觉上下文。
+  // 发送分流：自动化开关开(或 /browser-operation 前缀)→ 启动 agent；否则走轻量直连聊天。
   async function handleSend() {
     if (_sendingLock) return;
     if (agentState.active) return;
     const input = document.getElementById('chatInput');
-    const task = (input.value || '').trim();
-    if (!task) return;
-    if (task.length > MAX_PROMPT_LENGTH) {
-      alert(`单次任务描述不能超过 ${MAX_PROMPT_LENGTH} 字。`);
+    const text = (input.value || '').trim();
+    if (!text) return;
+    if (text.length > MAX_PROMPT_LENGTH) {
+      alert(`单次发送不能超过 ${MAX_PROMPT_LENGTH} 字。`);
       return;
     }
+
     _sendingLock = true;
     const sendBtn = document.getElementById('sendBtn');
     if (sendBtn) sendBtn.disabled = true;
     try {
       const image = attachedImage ? attachedImage.dataUrl : '';
-      input.value = '';
-      if (attachedImage) clearAttachedImage();
-      await runAgentTask(task, image);
+      if (shouldUseAgent(text)) {
+        // 自动化模式：去掉命令前缀,启动 agent,图片作视觉输入
+        const task = text.startsWith(AGENT_COMMAND.trim())
+          ? text.slice(AGENT_COMMAND.trim().length).trim()
+          : text;
+        input.value = '';
+        if (attachedImage) clearAttachedImage();
+        await runAgentTask(task, image);
+      } else {
+        input.value = '';
+        if (attachedImage) clearAttachedImage();
+        await runPlainChat(text, image);
+      }
     } finally {
       _sendingLock = false;
       if (sendBtn) sendBtn.disabled = false;
     }
+  }
+
+  // 轻量直连聊天：不点自动化按钮时,消息直接发给用户配置的 OpenAI 兼容接口,流式返回。
+  async function runPlainChat(text, image) {
+    let apiKey, modelName, safeApiUrl;
+    try {
+      ({ apiKey, modelName, safeApiUrl } = await resolveApiRequestConfig());
+    } catch (error) {
+      alert(error.message || 'API 配置无效');
+      return;
+    }
+    if (!(await ensurePrivacyNoticeAccepted())) return;
+
+    const safeModelName = String(modelName || '').trim() || 'gpt-4o';
+
+    // 用户气泡
+    const userBubble = createMessageNode('user');
+    const userTextNode = document.createElement('div');
+    userTextNode.textContent = text;
+    userBubble.appendChild(userTextNode);
+    if (image) {
+      const previewImage = document.createElement('img');
+      previewImage.className = 'user-upload-preview';
+      previewImage.src = image;
+      previewImage.alt = '上传图片';
+      userBubble.appendChild(previewImage);
+    }
+    scrollToBottom();
+
+    // AI 气泡
+    const aiBubble = createMessageNode('ai');
+    showTypingIndicator(aiBubble);
+    scrollToBottom();
+
+    const userContent = image
+      ? [{ type: 'text', text: text || '请分析这张图片' }, { type: 'image_url', image_url: { url: image } }]
+      : text;
+    const requestBody = {
+      model: safeModelName,
+      messages: [{ role: 'user', content: userContent }],
+      stream: true
+    };
+    const requestHeaders = { 'Content-Type': 'application/json' };
+    if (String(apiKey || '').trim()) {
+      requestHeaders.Authorization = `Bearer ${String(apiKey).trim()}`;
+    }
+
+    const msgId = createMessageId();
+    let fullReply = '';
+    let done = false;
+
+    await new Promise((resolve) => {
+      const finalize = () => {
+        if (done) return;
+        done = true;
+        if (!fullReply) aiBubble.textContent = '响应为空。';
+        chrome.runtime.onMessage.removeListener(listener);
+        resolve();
+      };
+      const listener = (msg) => {
+        if (msg.msgId !== msgId) return;
+        if (msg.type === 'LLM_CHUNK') {
+          fullReply += msg.chunk;
+          aiBubble.textContent = fullReply;
+          scrollToBottom();
+        } else if (msg.type === 'LLM_DONE') {
+          finalize();
+        } else if (msg.type === 'LLM_ERROR') {
+          aiBubble.textContent = '';
+          const errorSpan = document.createElement('span');
+          errorSpan.className = 'error-text';
+          errorSpan.textContent = `⚠️ 错误: ${msg.error}`;
+          aiBubble.appendChild(errorSpan);
+          done = true;
+          chrome.runtime.onMessage.removeListener(listener);
+          resolve();
+        }
+      };
+      chrome.runtime.onMessage.addListener(listener);
+      chrome.runtime.sendMessage({
+        type: 'CALL_LLM_STREAM',
+        msgId,
+        url: `${safeApiUrl}/chat/completions`,
+        options: { method: 'POST', headers: requestHeaders, body: JSON.stringify(requestBody) }
+      });
+      setTimeout(finalize, 120000);
+    });
   }
 
   // 5. 绑定各种交互事件

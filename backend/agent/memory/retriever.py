@@ -1,17 +1,23 @@
 """记忆检索(注入 agent 前的读路径)。
 
-对齐 mem0 的检索:embed(query) → Qdrant 语义搜索 → threshold 过滤。
-不调 LLM(纯向量),按 domain + user 两个 scope 各取一批合并。
-组装成注入 agent prompt 的文本块。
+分层召回(对齐 MemGPT core-常驻 / archival-按需):
+- retrieve_resident_preferences:强用户偏好,**常驻**注入每步 prompt。不过相似度阈值
+  (偏好要全带,判断依据是"漏掉代价高"而非相关性),量小、按 top-K 截断。
+- recall_site_memories:站点经验 + 失败教训,**按需**由 recall 工具触发。过相似度阈值,
+  lesson 命中降权并标"待验证"。
+
+均不调 LLM(纯向量)。Qdrant 不可用/空库时返回空,不抛异常,保证 agent 主流程不受影响。
 """
 
-from typing import Any, Optional
+from typing import Any
 from urllib.parse import urlsplit
 
 from agent.memory import vector as V
 from agent.memory.config import (
-    RETRIEVE_TOP_K, RETRIEVE_THRESHOLD,
-    MEMORY_KIND_SEMANTIC, SCOPE_USER, SCOPE_DOMAIN, DEFAULT_USER_ID,
+    RETRIEVE_TOP_K, RETRIEVE_THRESHOLD, MEMORY_RECALL_TOP_K,
+    RESIDENT_PREFERENCE_TOP_K, LESSON_RECALL_WEIGHT,
+    MEMORY_TYPE_PREFERENCE, MEMORY_TYPE_SITE_EXPERIENCE, MEMORY_TYPE_LESSON,
+    SCOPE_GLOBAL, SCOPE_DOMAIN, DEFAULT_USER_ID,
 )
 from rag.embedder import embed_text
 
@@ -24,75 +30,91 @@ def extract_domain(url: str) -> str:
         return ""
 
 
-def retrieve_memories(query: str, *, domain: str = "",
-                      top_k: int = RETRIEVE_TOP_K,
-                      threshold: float = RETRIEVE_THRESHOLD,
-                      user_id: str = DEFAULT_USER_ID) -> list[dict[str, Any]]:
-    """按查询检索相关记忆(user 全局偏好 + 当前 domain 站点事实)。
+def retrieve_resident_preferences(user_id: str = DEFAULT_USER_ID,
+                                  top_k: int = RESIDENT_PREFERENCE_TOP_K) -> list[dict[str, Any]]:
+    """取常驻用户偏好(preference, scope=global),供每步 prompt 无条件注入。
 
-    Qdrant 不可用/空库时返回空列表(不抛异常,保证 agent 主流程不受影响)。
-    返回按 score 降序、去重后的记忆列表。
+    **不过相似度阈值**:偏好要全程约束,判断依据是漏掉代价,不是与当前任务相关性。
+    用零向量做一次无偏检索取回全部偏好(量小),按 created_at 稳定取前 top_k。
+    Qdrant 不可用/空库返回空。
+    """
+    try:
+        # 偏好量小,用任一非空向量拉回候选再本地排序即可;这里用固定探针向量避免额外语义偏向。
+        probe = embed_text("用户偏好")
+        prefs = V.search_memories(
+            probe, top_k=max(top_k * 3, 10), user_id=user_id,
+            memory_type=MEMORY_TYPE_PREFERENCE, scope=SCOPE_GLOBAL,
+        )
+    except Exception:
+        return []
+
+    # 稳定排序:created_at 升序(老偏好优先,行为稳定),截断 top_k
+    prefs.sort(key=lambda m: str(m.get("created_at", "")))
+    return prefs[:top_k]
+
+
+def recall_site_memories(query: str, *, domain: str = "",
+                         top_k: int = MEMORY_RECALL_TOP_K,
+                         threshold: float = RETRIEVE_THRESHOLD,
+                         user_id: str = DEFAULT_USER_ID) -> list[dict[str, Any]]:
+    """按需召回站点经验 + 失败教训(site_experience + lesson),供 recall 工具调用。
+
+    过相似度阈值过滤噪声;lesson 命中 score×LESSON_RECALL_WEIGHT 降权后与
+    site_experience 一同重排。Qdrant 不可用/空库返回空。
     """
     normalized_query = str(query or "").strip()
     if not normalized_query:
         return []
-
     try:
         query_vector = embed_text(normalized_query)
+        candidates = V.search_memories(
+            query_vector, top_k=top_k * 2, user_id=user_id,
+            memory_type=[MEMORY_TYPE_SITE_EXPERIENCE, MEMORY_TYPE_LESSON],
+            scope=SCOPE_DOMAIN, domain=(domain or None),
+        )
     except Exception:
         return []
 
-    candidates: list[dict[str, Any]] = []
-    try:
-        # user 域:全局偏好,不限 domain
-        candidates.extend(V.search_memories(
-            query_vector, top_k=top_k, user_id=user_id,
-            memory_kind=MEMORY_KIND_SEMANTIC, scope=SCOPE_USER,
-        ))
-        # domain 域:仅当前站点事实
-        if domain:
-            candidates.extend(V.search_memories(
-                query_vector, top_k=top_k, user_id=user_id,
-                memory_kind=MEMORY_KIND_SEMANTIC, scope=SCOPE_DOMAIN, domain=domain,
-            ))
-    except Exception:
-        # 向量库异常 → 降级为空,不拖垮 agent
-        return candidates
-
-    # threshold 过滤 + 去重 + 排序
-    seen_ids: set[str] = set()
-    filtered: list[dict[str, Any]] = []
+    ranked: list[dict[str, Any]] = []
     for item in candidates:
-        if float(item.get("score", 0.0)) < threshold:
+        raw_score = float(item.get("score", 0.0))
+        if raw_score < threshold:
             continue
-        memory_id = str(item.get("memory_id", ""))
-        if not memory_id or memory_id in seen_ids:
-            continue
-        seen_ids.add(memory_id)
-        filtered.append(item)
+        item = dict(item)
+        # lesson 降权(低权+待验证),用于排序,不改原始 score 语义
+        if item.get("memory_type") == MEMORY_TYPE_LESSON:
+            item["rank_score"] = raw_score * LESSON_RECALL_WEIGHT
+        else:
+            item["rank_score"] = raw_score
+        ranked.append(item)
 
-    filtered.sort(key=lambda m: float(m.get("score", 0.0)), reverse=True)
-    return filtered[:top_k]
+    ranked.sort(key=lambda m: m.get("rank_score", 0.0), reverse=True)
+    return ranked[:top_k]
 
 
-def build_memory_block(memories: list[dict[str, Any]]) -> str:
-    """把检索到的记忆组装成注入 prompt 的文本块。空则返回空串。"""
-    if not memories:
+def build_preference_block(preferences: list[dict[str, Any]]) -> str:
+    """把常驻偏好组装成注入每步 prompt 的文本块。空则返回空串。"""
+    if not preferences:
         return ""
+    lines = ["## 用户偏好(始终遵守)"]
+    for item in preferences:
+        content = str(item.get("content", "")).strip()
+        if content:
+            lines.append(f"- {content}")
+    return "\n".join(lines) if len(lines) > 1 else ""
 
-    lines = ["## 相关记忆(来自过往任务,供参考;与当前任务无关则忽略)"]
+
+def build_recall_block(memories: list[dict[str, Any]]) -> str:
+    """把 recall 到的站点经验/教训组装成注入历史的文本块。空则返回提示。"""
+    if not memories:
+        return "(未回忆到该站点的相关经验)"
+    lines = ["## 回忆到的站点经验(供参考,与当前任务无关则忽略)"]
     for item in memories:
         content = str(item.get("content", "")).strip()
         if not content:
             continue
-        scope = item.get("scope", "")
-        tag = f"[{item.get('domain', '')}] " if scope == SCOPE_DOMAIN and item.get("domain") else ""
-        lines.append(f"- {tag}{content}")
-
-    return "\n".join(lines) if len(lines) > 1 else ""
-
-
-def retrieve_for_task(task: str, *, url: str = "",
-                      user_id: str = DEFAULT_USER_ID) -> list[dict[str, Any]]:
-    """门面:按任务描述 + 当前页 URL 检索相关记忆。供 agent 任务开始时调用。"""
-    return retrieve_memories(task, domain=extract_domain(url), user_id=user_id)
+        if item.get("memory_type") == MEMORY_TYPE_LESSON:
+            lines.append(f"- ⚠待验证教训:{content}")
+        else:
+            lines.append(f"- {content}")
+    return "\n".join(lines) if len(lines) > 1 else "(未回忆到该站点的相关经验)"

@@ -37,6 +37,8 @@ SYSTEM_PROMPT = """你是一个浏览器自动化助手。用户给你一个任�
 - navigate(url) / wait(ms)
 - web_search(query): 联网搜索。后端直接执行、结果写回历史，**不操作页面、不需要 index**。
   仅当任务需要页面上没有的外部信息（如查资料、找网址、核实事实）时用；能在当前页面完成的不要用。
+- recall_memory(query): 回忆本站点过往的操作经验/失败教训。后端直接执行、结果写回历史，**不操作页面、不需要 index**。
+  当你在一个可能操作过的网站上、不确定某类任务的入口或步骤时用；query 写你想回忆的操作意图（如"提交请假的步骤"）。
 - task_complete(summary,success): 任务结束时必须调用
 
 ## 核心原则
@@ -139,14 +141,14 @@ def build_messages(session: "AgentSession", page_state: PageState) -> list[dict[
     """
     parts = [f"## 任务\n{session.task}"]
 
-    # 长期记忆:仅前两步注入(省 token,参考 task_image 的做法)。空则跳过,对 agent 零影响。
-    memory_context = getattr(session, "memory_context", None) or []
-    if memory_context and session.current_step <= 1:
+    # 常驻用户偏好:**每步**无条件注入(偏好要全程约束,非只前两步)。空则跳过,对 agent 零影响。
+    resident_preferences = getattr(session, "resident_preferences", None) or []
+    if resident_preferences:
         try:
-            from agent.memory.service import build_memory_block
-            memory_block = build_memory_block(memory_context)
-            if memory_block:
-                parts.append(memory_block)
+            from agent.memory.service import build_preference_block
+            pref_block = build_preference_block(resident_preferences)
+            if pref_block:
+                parts.append(pref_block)
         except Exception:
             pass
 

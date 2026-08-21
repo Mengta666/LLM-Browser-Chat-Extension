@@ -216,6 +216,41 @@ def _run_web_search(session: AgentSession, action_obj: dict[str, Any]) -> Histor
                        action=f"web_search(\"{query[:60]}\")", result=result_text[:1200])
 
 
+def _run_recall_memory(session: AgentSession, action_obj: dict[str, Any]) -> HistoryItem:
+    """就地执行一次记忆召回(后端工具,不下发前端),把站点经验/教训压成一条历史项。
+
+    与 web_search 同构:后端直接完成、结果注入历史、继续下一轮 LLM。
+    按 session.task_domain 过滤;失败/无命中也返回一条 result,让 LLM 自行决定。
+    """
+    query = str(action_obj.get("query") or action_obj.get("text") or "").strip()
+    session.current_step += 1
+    if not query:
+        query = session.task  # 空 query 退回用任务描述回忆
+
+    try:
+        from agent.memory import service as memory_service
+        memories = memory_service.recall_site_experience(
+            query, url=(session.task_domain and f"https://{session.task_domain}") or "")
+        result_text = memory_service.build_recall_block(memories)
+        _agent_log.info("recall_memory", session_id=session.session_id,
+                        data={"step": session.current_step, "query": query[:80],
+                              "domain": session.task_domain, "hit_count": len(memories)})
+    except Exception as exc:
+        result_text = "(回忆失败,忽略)"
+        _agent_log.warn("recall_memory_failed", session_id=session.session_id,
+                        data={"step": session.current_step, "error": str(exc)[:160]})
+
+    return HistoryItem(step=session.current_step, next_goal=session.progress,
+                       action=f"recall_memory(\"{query[:60]}\")", result=result_text[:1500])
+
+
+def _run_backend_tool(session: AgentSession, func_name: str, action_obj: dict[str, Any]) -> HistoryItem:
+    """后端工具分发:web_search / recall_memory。"""
+    if func_name == "recall_memory":
+        return _run_recall_memory(session, action_obj)
+    return _run_web_search(session, action_obj)
+
+
 def _build_trajectory(session: AgentSession) -> str:
     """把会话的结构化历史渲染成执行轨迹文本,供记忆抽取。"""
     lines: list[str] = []
@@ -229,8 +264,11 @@ def _build_trajectory(session: AgentSession) -> str:
     return "\n".join(lines)
 
 
-def _trigger_memory_write(session: AgentSession, url: str) -> None:
-    """任务成功后,后台线程抽取并写入长期记忆。绝不阻塞、绝不抛(记忆是尽力而为)。"""
+def _trigger_memory_write(session: AgentSession, url: str, success: bool = True) -> None:
+    """任务结束后,后台线程抽取并写入长期记忆。绝不阻塞、绝不抛(记忆是尽力而为)。
+
+    success=True → 成功任务(偏好/站点经验);False → 失败任务(教训)。
+    """
     task = session.task
     trajectory = _build_trajectory(session)
     session_id = session.session_id
@@ -238,9 +276,10 @@ def _trigger_memory_write(session: AgentSession, url: str) -> None:
     def _worker():
         try:
             from agent.memory import service as memory_service
-            result = memory_service.write_after_task(task, trajectory, url=url)
+            result = memory_service.write_after_task(task, trajectory, url=url, success=success)
             _agent_log.info("memory_written", session_id=session_id,
-                            data={"applied": result.get("applied", []),
+                            data={"success": success,
+                                  "applied": result.get("applied", []),
                                   "facts": len(result.get("facts", [])),
                                   "skipped_hash": result.get("skipped_hash", 0)})
         except Exception as exc:
@@ -262,20 +301,32 @@ def run_step(session: AgentSession, page_state: PageState,
     """
     session.last_activity = time.time()   # 刷新活动时间：活跃任务不会被空闲 TTL 误清
 
-    # 首步检索长期记忆(此时才拿得到 page_state.url→domain)。失败/无记忆都静默,agent 不受影响。
+    # 首步:检索常驻偏好 + 记录 task_domain + 启发式兜底召回(此时才拿得到 page_state.url→domain)。
+    # 任何失败/无记忆都静默,agent 不受影响。
     if not session.memory_retrieved:
         session.memory_retrieved = True
         try:
             from agent.memory import service as memory_service
-            session.memory_context = memory_service.retrieve_for_task(
-                session.task, url=page_state.url or "")
-            if session.memory_context:
-                _agent_log.info("memory_retrieved", session_id=session.session_id,
-                                data={"count": len(session.memory_context),
-                                      "url": page_state.url})
+            from agent.memory.retriever import extract_domain
+            session.task_domain = extract_domain(page_state.url or "")
+            # 常驻偏好:每步注入,不过阈值(偏好要全带)
+            session.resident_preferences = memory_service.get_resident_preferences()
+            if session.resident_preferences:
+                _agent_log.info("resident_preferences_loaded", session_id=session.session_id,
+                                data={"count": len(session.resident_preferences)})
+            # 启发式兜底:该 domain 若有站点经验,首步强制先召回一次(不等 LLM 自觉调 recall)
+            if session.task_domain and memory_service.count_site_memories(url=page_state.url or "") > 0:
+                recalled = memory_service.recall_site_experience(session.task, url=page_state.url or "")
+                if recalled:
+                    block = memory_service.build_recall_block(recalled)
+                    session.history_items.append(HistoryItem(
+                        step=session.current_step, next_goal=session.progress,
+                        action="recall_memory(自动)", result=block[:1500]))
+                    _agent_log.info("auto_recall", session_id=session.session_id,
+                                    data={"domain": session.task_domain, "hit_count": len(recalled)})
         except Exception as exc:
-            session.memory_context = []
-            _agent_log.warn("memory_retrieve_failed", session_id=session.session_id,
+            session.resident_preferences = []
+            _agent_log.warn("memory_first_step_failed", session_id=session.session_id,
                             data={"error": str(exc)[:120]})
 
     # 1. 记录上一步结果为一条结构化 HistoryItem（不累积 messages；messages 每步重建）
@@ -330,9 +381,9 @@ def run_step(session: AgentSession, page_state: PageState,
     #    最后一步（步数到上限前一步）或前端超时触发 → 强制只接受 task_complete。
     session.force_done = force_done or (session.current_step >= session.max_steps - 1)
 
-    # 3~5 决策循环：正常一轮出一个动作即返回；若 LLM 选择 web_search（后端工具），
-    #    就地执行、把结果注入历史后再调一次 LLM，直到出页面动作/收尾，或达连续搜索上限。
-    search_count = 0
+    # 3~5 决策循环：正常一轮出一个动作即返回；若 LLM 选择后端工具（web_search / recall_memory），
+    #    就地执行、把结果注入历史后再调一次 LLM，直到出页面动作/收尾，或达连续调用上限。
+    backend_tool_count = 0
     while True:
         # 3. compaction（对齐 browser-use maybe_compact_messages）：步数很多时把中间段 LLM 总结成一条摘要，
         #    保留 首项 + <摘要> + 最近若干项。超长任务防止滑动窗口丢失中间进展。
@@ -385,9 +436,8 @@ def run_step(session: AgentSession, page_state: PageState,
                             data={"summary": session.summary, "success": session.success,
                                   "total_steps": session.current_step,
                                   "url": page_state.url, "title": (page_state.title or "")[:60]})
-            # 任务成功 → 后台抽取记忆(失败任务不学,避免沉淀错误经验)
-            if session.success:
-                _trigger_memory_write(session, page_state.url or "")
+            # 成功→抽取偏好/站点经验;失败→抽取教训(lesson,低权待验证)。都后台异步。
+            _trigger_memory_write(session, page_state.url or "", success=session.success)
             return _build_response(session)
 
         # 强制收尾时 LLM 仍出页面动作（不听话）→ 代码用其记忆替它体面收尾（对齐 browser-use force-done）
@@ -401,16 +451,16 @@ def run_step(session: AgentSession, page_state: PageState,
                                   "url": page_state.url})
             return _build_response(session)
 
-        # 后端工具（web_search）：就地执行 → 注入历史 → 继续下一轮 LLM，不下发前端。
+        # 后端工具（web_search / recall_memory）：就地执行 → 注入历史 → 继续下一轮 LLM，不下发前端。
         if func_name in BACKEND_TOOL_TYPES:
-            search_count += 1
-            history_item = _run_web_search(session, action_obj)
+            backend_tool_count += 1
+            history_item = _run_backend_tool(session, func_name, action_obj)
             session.history_items.append(history_item)
-            if search_count >= MAX_CONSECUTIVE_SEARCHES:
-                # 连续搜索到上限：追加一条提示，逼 LLM 下一轮改用页面操作或收尾。
+            if backend_tool_count >= MAX_CONSECUTIVE_SEARCHES:
+                # 连续后端工具到上限：追加一条提示，逼 LLM 下一轮改用页面操作或收尾。
                 session.history_items.append(HistoryItem(
                     step=session.current_step,
-                    result=f"⚠ 已连续搜索 {search_count} 次，请基于已有结果做页面操作或调用 task_complete"))
+                    result=f"⚠ 已连续调用后端工具 {backend_tool_count} 次，请基于已有结果做页面操作或调用 task_complete"))
                 session.messages = build_messages(session, page_state)
                 parsed = _call_llm(session)
                 if parsed is None:
@@ -421,10 +471,11 @@ def run_step(session: AgentSession, page_state: PageState,
                     session.status = AgentStatus.COMPLETED
                     session.summary = action_obj.get("summary", "任务完成")
                     session.success = bool(action_obj.get("success", True))
+                    _trigger_memory_write(session, page_state.url or "", success=session.success)
                     return _build_response(session)
                 if func_name in BACKEND_TOOL_TYPES or func_name not in ALLOWED_ACTION_TYPES:
                     session.status = AgentStatus.ERROR
-                    session.error = "连续搜索超过上限且未给出有效页面动作"
+                    session.error = "连续调用后端工具超过上限且未给出有效页面动作"
                     return _build_response(session)
                 break  # 拿到页面动作，跳出循环走下发流程
             continue  # 未达上限，回到循环顶重新调 LLM
@@ -638,7 +689,9 @@ def _parse_structured(text: str) -> Optional[dict]:
                 data["action"] = aobj
             return data
         # 无 action 键但像动作（极端兜底）
-        if data.get("type") in ALLOWED_ACTION_TYPES or data.get("type") == "task_complete":
+        if (data.get("type") in ALLOWED_ACTION_TYPES
+                or data.get("type") in BACKEND_TOOL_TYPES
+                or data.get("type") == "task_complete"):
             return {"action": data}
     return None
 

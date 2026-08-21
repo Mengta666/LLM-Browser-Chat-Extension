@@ -115,10 +115,13 @@ class AgentSession:
 
     task_image: str = ""                 # 任务附带的视觉上下文（用户上传图/框选截图，data URL）；随首条 user 消息注入
 
-    # 长期记忆:任务开始时检索到的相关记忆(用户偏好/站点事实),注入前几步 prompt。
-    # 空列表 = 无相关记忆或记忆子系统不可用 → 对 agent 零影响。
-    memory_context: list = field(default_factory=list)
-    memory_retrieved: bool = False       # 是否已在首步检索过(避免每步重复检索)
+    # 长期记忆(分层):
+    # - resident_preferences: 常驻用户偏好,每步无条件注入 prompt(首步检索一次)。
+    # - task_domain: 当前任务站点域名,recall 工具/启发式兜底按它过滤。
+    # 空 = 无记忆或子系统不可用 → 对 agent 零影响。
+    resident_preferences: list = field(default_factory=list)
+    task_domain: str = ""
+    memory_retrieved: bool = False       # 是否已在首步检索过常驻偏好(避免每步重复)
 
     created_at: float = field(default_factory=time.time)
     last_activity: float = field(default_factory=time.time)  # 每次 /step 刷新；空闲 TTL 依据（活跃任务不被误清）

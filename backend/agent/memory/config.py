@@ -33,17 +33,29 @@ MEMORY_DB_PATH = Path(__file__).resolve().parents[1] / "data" / "agent_memory.sq
 # 取 0.6 干净隔开"查询确实关于这条记忆"与噪声。低于此易召回无关记忆污染 agent。
 RETRIEVE_TOP_K = int(os.getenv("MEMORY_RETRIEVE_TOP_K", "5"))
 RETRIEVE_THRESHOLD = float(os.getenv("MEMORY_RETRIEVE_THRESHOLD", "0.6"))
+MEMORY_RECALL_TOP_K = int(os.getenv("MEMORY_RECALL_TOP_K", "5"))  # recall 工具返回条数
 
 # 写入时检索相似旧记忆的数量(供 LLM 做 ADD/UPDATE/DELETE/NONE 决策)
 WRITE_SEARCH_TOP_K = int(os.getenv("MEMORY_WRITE_SEARCH_TOP_K", "10"))
 
-# 记忆种类(本期只 semantic;M6 workflow 第二期)
-MEMORY_KIND_SEMANTIC = "semantic"
-MEMORY_KIND_WORKFLOW = "workflow"
+# 三类记忆(分层的唯一依据)
+# - preference: 强用户偏好,成功任务抽取,常驻注入每步 prompt
+# - site_experience: 站点操作经验,成功任务抽取,按需 recall(存高层步骤,非底层路径)
+# - lesson: 失败教训,失败任务抽取,按需 recall,低权+待验证
+MEMORY_TYPE_PREFERENCE = "preference"
+MEMORY_TYPE_SITE_EXPERIENCE = "site_experience"
+MEMORY_TYPE_LESSON = "lesson"
 
 # 作用域
-SCOPE_USER = "user"      # 全局用户偏好
-SCOPE_DOMAIN = "domain"  # 站点相关事实
+SCOPE_GLOBAL = "global"  # 全局用户偏好(原 SCOPE_USER,语义更准)
+SCOPE_DOMAIN = "domain"  # 站点相关(site_experience/lesson)
+
+# 分层 / 门控参数
+RESIDENT_PREFERENCE_TOP_K = int(os.getenv("MEMORY_RESIDENT_PREF_TOP_K", "3"))  # 常驻偏好注入条数
+RESIDENT_PREFERENCE_CHAR_LIMIT = int(os.getenv("MEMORY_RESIDENT_PREF_CHARS", "800"))  # 常驻块字符上限,超限触发蒸馏(本期先监控)
+LESSON_RECALL_WEIGHT = float(os.getenv("MEMORY_LESSON_WEIGHT", "0.8"))  # lesson 检索排序降权系数
+LESSON_INIT_CONFIDENCE = float(os.getenv("MEMORY_LESSON_CONFIDENCE", "0.4"))  # lesson 初始置信度(低=待验证)
+MAX_CONSECUTIVE_BACKEND_TOOLS = int(os.getenv("MEMORY_MAX_BACKEND_TOOLS", "5"))  # web_search+recall 合并上限
 
 # 单用户固定 id
 DEFAULT_USER_ID = "local"

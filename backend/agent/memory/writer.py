@@ -19,10 +19,13 @@ from openai import OpenAI
 from agent.memory import vector as V
 from agent.memory import history as H
 from agent.memory.config import (
-    WRITE_SEARCH_TOP_K, MEMORY_KIND_SEMANTIC, SCOPE_USER, SCOPE_DOMAIN, DEFAULT_USER_ID,
+    WRITE_SEARCH_TOP_K, DEFAULT_USER_ID,
+    MEMORY_TYPE_PREFERENCE, MEMORY_TYPE_SITE_EXPERIENCE, MEMORY_TYPE_LESSON,
+    SCOPE_GLOBAL, SCOPE_DOMAIN, LESSON_INIT_CONFIDENCE,
 )
 from agent.memory.prompts import (
     EXTRACT_SYSTEM_PROMPT, build_extract_user_prompt,
+    FAILURE_EXTRACT_SYSTEM_PROMPT, build_failure_extract_user_prompt,
     DECISION_SYSTEM_PROMPT, build_decision_user_prompt,
 )
 from rag.embedder import embed_text
@@ -83,14 +86,25 @@ def _parse_json(raw: str) -> Optional[dict]:
 
 
 def extract_facts(task: str, trajectory: str, domain: str = "",
+                  success: bool = True,
                   llm: LlmFn = _default_llm) -> list[dict[str, Any]]:
-    """阶段一:抽取候选事实。返回 [{content, scope, domain}]。"""
-    result = llm(EXTRACT_SYSTEM_PROMPT, build_extract_user_prompt(task, trajectory, domain))
+    """阶段一:抽取候选事实。
+
+    success=True:成功任务 → preference / site_experience。
+    success=False:失败任务 → lesson(可推翻的教训)。
+    返回 [{content, memory_type, scope, domain, entry_url, intent_keywords, confidence}]。
+    """
+    if success:
+        result = llm(EXTRACT_SYSTEM_PROMPT, build_extract_user_prompt(task, trajectory, domain))
+    else:
+        result = llm(FAILURE_EXTRACT_SYSTEM_PROMPT,
+                     build_failure_extract_user_prompt(task, trajectory, domain))
     if not result:
         return []
     facts = result.get("facts", [])
     if not isinstance(facts, list):
         return []
+
     cleaned: list[dict[str, Any]] = []
     for f in facts:
         if not isinstance(f, dict):
@@ -98,14 +112,45 @@ def extract_facts(task: str, trajectory: str, domain: str = "",
         content = str(f.get("content", "")).strip()
         if not content:
             continue
-        scope = f.get("scope", SCOPE_USER)
-        if scope not in (SCOPE_USER, SCOPE_DOMAIN):
-            scope = SCOPE_USER
-        cleaned.append({
-            "content": content,
-            "scope": scope,
-            "domain": str(f.get("domain", "")).strip() if scope == SCOPE_DOMAIN else "",
-        })
+
+        if not success:
+            # 失败任务只产 lesson,domain 作用域,低置信度=待验证
+            cleaned.append({
+                "content": content,
+                "memory_type": MEMORY_TYPE_LESSON,
+                "scope": SCOPE_DOMAIN,
+                "domain": str(f.get("domain", "")).strip() or domain,
+                "entry_url": "",
+                "intent_keywords": [],
+                "confidence": LESSON_INIT_CONFIDENCE,
+            })
+            continue
+
+        # 成功任务:preference / site_experience
+        mtype = f.get("memory_type", MEMORY_TYPE_SITE_EXPERIENCE)
+        if mtype not in (MEMORY_TYPE_PREFERENCE, MEMORY_TYPE_SITE_EXPERIENCE):
+            mtype = MEMORY_TYPE_SITE_EXPERIENCE  # 拿不准归按需层
+        if mtype == MEMORY_TYPE_PREFERENCE:
+            cleaned.append({
+                "content": content,
+                "memory_type": MEMORY_TYPE_PREFERENCE,
+                "scope": SCOPE_GLOBAL,
+                "domain": "",
+                "entry_url": "",
+                "intent_keywords": [],
+                "confidence": 1.0,
+            })
+        else:
+            kws = f.get("intent_keywords", [])
+            cleaned.append({
+                "content": content,
+                "memory_type": MEMORY_TYPE_SITE_EXPERIENCE,
+                "scope": SCOPE_DOMAIN,
+                "domain": str(f.get("domain", "")).strip() or domain,
+                "entry_url": str(f.get("entry_url", "")).strip(),
+                "intent_keywords": [str(k).strip() for k in kws if str(k).strip()] if isinstance(kws, list) else [],
+                "confidence": 1.0,
+            })
     return cleaned
 
 
@@ -125,10 +170,14 @@ def _apply_decision(event: str, temp_id: str, text: str,
             return None
         payload = V.insert_memory(
             text, vector=embed_text(text),
-            memory_kind=MEMORY_KIND_SEMANTIC,
-            scope=fact_meta.get("scope", SCOPE_USER),
+            memory_type=fact_meta.get("memory_type", MEMORY_TYPE_SITE_EXPERIENCE),
+            scope=fact_meta.get("scope", SCOPE_GLOBAL),
             domain=fact_meta.get("domain", ""),
             user_id=user_id,
+            confidence=fact_meta.get("confidence", 1.0),
+            verified=False,
+            entry_url=fact_meta.get("entry_url", ""),
+            intent_keywords=fact_meta.get("intent_keywords", []),
         )
         H.add_history(payload["memory_id"], "ADD", "", text)
         return f"ADD {payload['memory_id']}"
@@ -157,47 +206,42 @@ def _apply_decision(event: str, temp_id: str, text: str,
 
 
 def write_memory(task: str, trajectory: str, domain: str = "",
+                 success: bool = True,
                  user_id: str = DEFAULT_USER_ID, llm: LlmFn = _default_llm) -> dict[str, Any]:
     """完整两阶段写入。返回 {facts, applied:[...], skipped_hash:int}。
 
+    success=True:成功任务 → preference/site_experience;False:失败任务 → lesson。
     整个流程对异常宽容:任一环节失败都不抛,返回已完成的部分(记忆写入是尽力而为)。
     """
     result: dict[str, Any] = {"facts": [], "applied": [], "skipped_hash": 0}
 
-    # 阶段一:抽取
+    # 阶段一:抽取(按 success 分流成功/失败 prompt)
     try:
-        facts = extract_facts(task, trajectory, domain, llm=llm)
+        facts = extract_facts(task, trajectory, domain, success=success, llm=llm)
     except Exception:
         return result
     result["facts"] = facts
     if not facts:
         return result
 
-    # hash 去重:对每条事实,先看是否已有完全相同正文(命中直接跳过,连决策 LLM 都不调)
-    fact_texts = [f["content"] for f in facts]
-    fresh_facts: list[dict[str, Any]] = []
-    for f in facts:
-        h = V.content_hash(f["content"])
-        # 用 domain/scope 过滤后搜同 hash 的代价高;这里简单用检索候选里的 hash 判重(下方统一处理)
-        fresh_facts.append(f)
-
     # 阶段二:对每条事实检索相似旧记忆 → 决策
-    # 为了让 uuid_mapping 干净,逐条事实处理(每条独立的临时 id 空间)
-    for fact in fresh_facts:
+    # 逐条事实处理,每条独立的临时 id 空间(反幻觉)
+    for fact in facts:
         content = fact["content"]
-        scope = fact.get("scope", SCOPE_USER)
+        memory_type = fact.get("memory_type", MEMORY_TYPE_SITE_EXPERIENCE)
+        scope = fact.get("scope", SCOPE_GLOBAL)
         domain_f = fact.get("domain", "")
         try:
             query_vec = embed_text(content)
             similar = V.search_memories(
                 query_vec, top_k=WRITE_SEARCH_TOP_K, user_id=user_id,
-                memory_kind=MEMORY_KIND_SEMANTIC,
+                memory_type=memory_type,
                 scope=scope, domain=(domain_f or None) if scope == SCOPE_DOMAIN else None,
             )
         except Exception:
             similar = []
 
-        # hash 去重:与已有完全相同 → 跳过
+        # hash 去重:与已有完全相同 → 跳过(连决策 LLM 都不调)
         new_hash = V.content_hash(content)
         if any(m.get("hash") == new_hash for m in similar):
             result["skipped_hash"] += 1
@@ -214,7 +258,7 @@ def write_memory(task: str, trajectory: str, domain: str = "",
                        build_decision_user_prompt(existing_for_llm, [content]))
         if not decision:
             # 决策失败 → 保守:直接 ADD 这条新事实(它不在库里)
-            action = _apply_decision("ADD", "", content, {}, fact, user_id)
+            action = _apply_decision("ADD", "", content, uuid_mapping, fact, user_id)
             if action:
                 result["applied"].append(action)
             continue

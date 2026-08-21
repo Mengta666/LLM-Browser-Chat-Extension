@@ -19,7 +19,7 @@ from qdrant_client.http.exceptions import UnexpectedResponse
 from agent.memory.config import (
     QDRANT_URL, QDRANT_API_KEY, QDRANT_DISTANCE,
     MEMORY_COLLECTION, MEMORY_VECTOR_SIZE,
-    MEMORY_KIND_SEMANTIC, SCOPE_USER, DEFAULT_USER_ID,
+    MEMORY_TYPE_PREFERENCE, SCOPE_GLOBAL, DEFAULT_USER_ID,
 )
 
 
@@ -96,33 +96,48 @@ def ensure_collection() -> None:
 
 
 def _build_payload(memory_id: str, content: str, *,
-                   memory_kind: str, scope: str, domain: str,
-                   user_id: str, created_at: str, updated_at: str) -> dict[str, Any]:
-    """组装 point payload(事实源)。"""
+                   memory_type: str, scope: str, domain: str,
+                   user_id: str, created_at: str, updated_at: str,
+                   confidence: float = 1.0, verified: bool = False,
+                   entry_url: str = "", intent_keywords: Optional[list[str]] = None) -> dict[str, Any]:
+    """组装 point payload(事实源)。
+
+    confidence/verified 仅 lesson 消费(失败通道门控);
+    entry_url/intent_keywords 仅 site_experience 消费(轻结构头,提检索命中+给起点)。
+    其他 memory_type 用默认值。
+    """
     return {
         "memory_id": memory_id,
         "content": content,
         "hash": content_hash(content),
-        "memory_kind": memory_kind,
+        "memory_type": memory_type,
         "scope": scope,
         "domain": domain or "",
         "user_id": user_id,
         "created_at": created_at,
         "updated_at": updated_at,
+        "confidence": float(confidence),
+        "verified": bool(verified),
+        "entry_url": entry_url or "",
+        "intent_keywords": intent_keywords or [],
     }
 
 
 def insert_memory(content: str, *, vector: list[float],
-                  memory_kind: str = MEMORY_KIND_SEMANTIC,
-                  scope: str = SCOPE_USER, domain: str = "",
-                  user_id: str = DEFAULT_USER_ID) -> dict[str, Any]:
+                  memory_type: str = MEMORY_TYPE_PREFERENCE,
+                  scope: str = SCOPE_GLOBAL, domain: str = "",
+                  user_id: str = DEFAULT_USER_ID,
+                  confidence: float = 1.0, verified: bool = False,
+                  entry_url: str = "", intent_keywords: Optional[list[str]] = None) -> dict[str, Any]:
     """写入一条新记忆,返回落库的 payload(含生成的 memory_id)。"""
     ensure_collection()
     memory_id = make_memory_id()
     now = _now_iso()
     payload = _build_payload(
-        memory_id, content, memory_kind=memory_kind, scope=scope,
+        memory_id, content, memory_type=memory_type, scope=scope,
         domain=domain, user_id=user_id, created_at=now, updated_at=now,
+        confidence=confidence, verified=verified,
+        entry_url=entry_url, intent_keywords=intent_keywords,
     )
     get_client().upsert(
         collection_name=MEMORY_COLLECTION,
@@ -133,7 +148,7 @@ def insert_memory(content: str, *, vector: list[float],
 
 
 def update_memory(memory_id: str, content: str, *, vector: list[float]) -> Optional[dict[str, Any]]:
-    """更新已存记忆的正文与向量,保留 created_at、刷新 updated_at。
+    """更新已存记忆的正文与向量,保留其余字段、刷新 updated_at。
 
     memory_id 不存在返回 None(调用方据此避免误判)。
     """
@@ -144,12 +159,16 @@ def update_memory(memory_id: str, content: str, *, vector: list[float]) -> Optio
     now = _now_iso()
     payload = _build_payload(
         memory_id, content,
-        memory_kind=existing.get("memory_kind", MEMORY_KIND_SEMANTIC),
-        scope=existing.get("scope", SCOPE_USER),
+        memory_type=existing.get("memory_type", MEMORY_TYPE_PREFERENCE),
+        scope=existing.get("scope", SCOPE_GLOBAL),
         domain=existing.get("domain", ""),
         user_id=existing.get("user_id", DEFAULT_USER_ID),
         created_at=existing.get("created_at", now),
         updated_at=now,
+        confidence=existing.get("confidence", 1.0),
+        verified=existing.get("verified", False),
+        entry_url=existing.get("entry_url", ""),
+        intent_keywords=existing.get("intent_keywords", []),
     )
     get_client().upsert(
         collection_name=MEMORY_COLLECTION,
@@ -187,14 +206,23 @@ def get_memory(memory_id: str) -> Optional[dict[str, Any]]:
     return points[0].payload or None
 
 
-def _build_filter(*, user_id: str, memory_kind: Optional[str],
+def _build_filter(*, user_id: str, memory_type: Optional[Any],
                   scope: Optional[str], domain: Optional[str]) -> models.Filter:
-    """组装 Qdrant payload 过滤条件。"""
+    """组装 Qdrant payload 过滤条件。
+
+    memory_type 可传 str(单类)或 list(多类,用 MatchAny)——
+    recall 要同时查 site_experience+lesson 两类。
+    """
     must: list[models.FieldCondition] = [
         models.FieldCondition(key="user_id", match=models.MatchValue(value=user_id)),
     ]
-    if memory_kind:
-        must.append(models.FieldCondition(key="memory_kind", match=models.MatchValue(value=memory_kind)))
+    if memory_type:
+        if isinstance(memory_type, (list, tuple, set)):
+            must.append(models.FieldCondition(
+                key="memory_type", match=models.MatchAny(any=list(memory_type))))
+        else:
+            must.append(models.FieldCondition(
+                key="memory_type", match=models.MatchValue(value=memory_type)))
     if scope:
         must.append(models.FieldCondition(key="scope", match=models.MatchValue(value=scope)))
     if domain:
@@ -204,11 +232,12 @@ def _build_filter(*, user_id: str, memory_kind: Optional[str],
 
 def search_memories(query_vector: list[float], *, top_k: int,
                     user_id: str = DEFAULT_USER_ID,
-                    memory_kind: Optional[str] = None,
+                    memory_type: Optional[Any] = None,
                     scope: Optional[str] = None,
                     domain: Optional[str] = None) -> list[dict[str, Any]]:
     """按语义相似度检索记忆,collection 不存在时返回空。
 
+    memory_type 可传 str 或 list(多类)。
     返回 [{memory_id, content, score, ...payload}]，按相似度降序。
     """
     ensure_collection()
@@ -217,7 +246,7 @@ def search_memories(query_vector: list[float], *, top_k: int,
             collection_name=MEMORY_COLLECTION,
             query=query_vector,
             query_filter=_build_filter(
-                user_id=user_id, memory_kind=memory_kind, scope=scope, domain=domain
+                user_id=user_id, memory_type=memory_type, scope=scope, domain=domain
             ),
             limit=max(1, int(top_k)),
             with_payload=True,
@@ -236,12 +265,18 @@ def search_memories(query_vector: list[float], *, top_k: int,
     return out
 
 
-def count_memories(user_id: str = DEFAULT_USER_ID) -> int:
-    """统计某用户的记忆条数(测试/一致性校验用)。"""
+def count_memories(user_id: str = DEFAULT_USER_ID, *,
+                   memory_type: Optional[Any] = None,
+                   domain: Optional[str] = None) -> int:
+    """统计记忆条数(测试/一致性校验 + 启发式兜底用)。
+
+    可按 memory_type、domain 过滤——启发式兜底要数"某站点有几条 site_experience"。
+    """
     ensure_collection()
     result = get_client().count(
         collection_name=MEMORY_COLLECTION,
-        count_filter=_build_filter(user_id=user_id, memory_kind=None, scope=None, domain=None),
+        count_filter=_build_filter(
+            user_id=user_id, memory_type=memory_type, scope=None, domain=domain),
         exact=True,
     )
     return int(result.count)

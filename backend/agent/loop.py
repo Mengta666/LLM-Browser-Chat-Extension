@@ -216,6 +216,43 @@ def _run_web_search(session: AgentSession, action_obj: dict[str, Any]) -> Histor
                        action=f"web_search(\"{query[:60]}\")", result=result_text[:1200])
 
 
+def _build_trajectory(session: AgentSession) -> str:
+    """把会话的结构化历史渲染成执行轨迹文本,供记忆抽取。"""
+    lines: list[str] = []
+    for item in session.history_items:
+        try:
+            lines.append(item.to_string())
+        except Exception:
+            continue
+    if session.summary:
+        lines.append(f"[总结] {session.summary}")
+    return "\n".join(lines)
+
+
+def _trigger_memory_write(session: AgentSession, url: str) -> None:
+    """任务成功后,后台线程抽取并写入长期记忆。绝不阻塞、绝不抛(记忆是尽力而为)。"""
+    task = session.task
+    trajectory = _build_trajectory(session)
+    session_id = session.session_id
+
+    def _worker():
+        try:
+            from agent.memory import service as memory_service
+            result = memory_service.write_after_task(task, trajectory, url=url)
+            _agent_log.info("memory_written", session_id=session_id,
+                            data={"applied": result.get("applied", []),
+                                  "facts": len(result.get("facts", [])),
+                                  "skipped_hash": result.get("skipped_hash", 0)})
+        except Exception as exc:
+            _agent_log.warn("memory_write_failed", session_id=session_id,
+                            data={"error": str(exc)[:160]})
+
+    try:
+        threading.Thread(target=_worker, daemon=True, name=f"mem-write-{session_id}").start()
+    except Exception:
+        pass  # 连线程都起不了也不影响 agent 收尾
+
+
 def run_step(session: AgentSession, page_state: PageState,
              action_result: Optional[ActionResult] = None,
              force_done: bool = False) -> dict[str, Any]:
@@ -224,6 +261,22 @@ def run_step(session: AgentSession, page_state: PageState,
     force_done=True（前端整轮超时触发）：强制本步只接受 task_complete，给用户一个交代。
     """
     session.last_activity = time.time()   # 刷新活动时间：活跃任务不会被空闲 TTL 误清
+
+    # 首步检索长期记忆(此时才拿得到 page_state.url→domain)。失败/无记忆都静默,agent 不受影响。
+    if not session.memory_retrieved:
+        session.memory_retrieved = True
+        try:
+            from agent.memory import service as memory_service
+            session.memory_context = memory_service.retrieve_for_task(
+                session.task, url=page_state.url or "")
+            if session.memory_context:
+                _agent_log.info("memory_retrieved", session_id=session.session_id,
+                                data={"count": len(session.memory_context),
+                                      "url": page_state.url})
+        except Exception as exc:
+            session.memory_context = []
+            _agent_log.warn("memory_retrieve_failed", session_id=session.session_id,
+                            data={"error": str(exc)[:120]})
 
     # 1. 记录上一步结果为一条结构化 HistoryItem（不累积 messages；messages 每步重建）
     if action_result and session.pending_action:
@@ -332,6 +385,9 @@ def run_step(session: AgentSession, page_state: PageState,
                             data={"summary": session.summary, "success": session.success,
                                   "total_steps": session.current_step,
                                   "url": page_state.url, "title": (page_state.title or "")[:60]})
+            # 任务成功 → 后台抽取记忆(失败任务不学,避免沉淀错误经验)
+            if session.success:
+                _trigger_memory_write(session, page_state.url or "")
             return _build_response(session)
 
         # 强制收尾时 LLM 仍出页面动作（不听话）→ 代码用其记忆替它体面收尾（对齐 browser-use force-done）

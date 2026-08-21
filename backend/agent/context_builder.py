@@ -139,6 +139,17 @@ def build_messages(session: "AgentSession", page_state: PageState) -> list[dict[
     """
     parts = [f"## 任务\n{session.task}"]
 
+    # 长期记忆:仅前两步注入(省 token,参考 task_image 的做法)。空则跳过,对 agent 零影响。
+    memory_context = getattr(session, "memory_context", None) or []
+    if memory_context and session.current_step <= 1:
+        try:
+            from agent.memory.service import build_memory_block
+            memory_block = build_memory_block(memory_context)
+            if memory_block:
+                parts.append(memory_block)
+        except Exception:
+            pass
+
     hist = render_history_block(session)
     if hist:
         parts.append(hist)

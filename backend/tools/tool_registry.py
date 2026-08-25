@@ -11,9 +11,3 @@ ALLOWED_ACTION_TYPES: set[str] = {
     "focus", "clear", "press_key", "wait", "navigate",
 }
 
-# 后端直接执行的工具动作（不下发前端）。loop 就地调用、把结果注入历史后继续下一轮 LLM。
-BACKEND_TOOL_TYPES: set[str] = {
-    "web_search",
-    "recall_memory",   # 按需召回当前站点的操作经验/失败教训
-}
-

@@ -122,6 +122,7 @@ class AgentSession:
     resident_preferences: list = field(default_factory=list)
     task_domain: str = ""
     memory_retrieved: bool = False       # 是否已在首步检索过常驻偏好(避免每步重复)
+    recalled_memory_ids: list = field(default_factory=list)  # 本轮 recall 用过的记忆(收尾时升权/负强化)
 
     created_at: float = field(default_factory=time.time)
     last_activity: float = field(default_factory=time.time)  # 每次 /step 刷新；空闲 TTL 依据（活跃任务不被误清）

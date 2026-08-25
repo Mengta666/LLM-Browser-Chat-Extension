@@ -1,6 +1,10 @@
 document.addEventListener('DOMContentLoaded', async () => {
   let attachedImage = null;
   let currentChatId = '';
+  // 轻量聊天的多轮历史(user/assistant 交替);带给后端做上下文 + 记忆抽取。
+  // 只保留最近若干轮,防无限增长(图片消息不入历史,避免 base64 累积撑爆请求)。
+  let chatMessages = [];
+  const MAX_CHAT_HISTORY_MESSAGES = 20;
   const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
   const MAX_IMAGE_PIXELS = 20_000_000;
   const MAX_URL_LENGTH = 2048;
@@ -944,10 +948,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     const userContent = image
       ? [{ type: 'text', text: text || '请分析这张图片' }, { type: 'image_url', image_url: { url: image } }]
       : text;
+    // 带上多轮历史 + chat_id:后端据此做上下文续写与记忆抽取(chat_id 让"攒 N 轮"去抖生效)。
+    const chatId = await getOrCreateCurrentChatId();
     const requestBody = {
       model: safeModelName,
-      messages: [{ role: 'user', content: userContent }],
-      stream: true
+      messages: [...chatMessages, { role: 'user', content: userContent }],
+      stream: true,
+      chat_id: chatId
     };
     const requestHeaders = { 'Content-Type': 'application/json' };
     if (String(apiKey || '').trim()) {
@@ -963,6 +970,14 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (done) return;
         done = true;
         if (!fullReply) aiBubble.textContent = '响应为空。';
+        else {
+          // 存这轮到多轮历史(仅文本;图片轮用占位符,不把 base64 塞进历史)。
+          chatMessages.push({ role: 'user', content: image ? (text || '[图片]') : text });
+          chatMessages.push({ role: 'assistant', content: fullReply });
+          if (chatMessages.length > MAX_CHAT_HISTORY_MESSAGES) {
+            chatMessages = chatMessages.slice(-MAX_CHAT_HISTORY_MESSAGES);
+          }
+        }
         chrome.runtime.onMessage.removeListener(listener);
         resolve();
       };
@@ -1057,6 +1072,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     document.getElementById('chatHistory').replaceChildren();
     document.getElementById('chatInput').value = '';
     clearAttachedImage();
+    chatMessages = [];   // 清空多轮历史,新会话从零开始
     await resetCurrentChatId();
   });
 

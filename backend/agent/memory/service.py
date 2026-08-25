@@ -74,6 +74,83 @@ def write_after_task(task: str, trajectory: str, url: str = "",
     """
     try:
         domain = extract_domain(url)
-        return W.write_memory(task, trajectory, domain=domain, success=success, user_id=user_id)
+        result = W.write_memory(task, trajectory, domain=domain, success=success, user_id=user_id)
+        # 写入后触发遗忘剪枝(容量护栏)
+        try:
+            if domain:
+                V.prune_domain(domain, user_id=user_id)   # domain 记忆(站点经验/教训)
+            # 成功任务可能写入 preference(global,domain 为空)→ 单独剪枝防堆积
+            if success:
+                V.prune_global_preferences(user_id=user_id)
+        except Exception:
+            pass
+        return result
     except Exception:
         return {"facts": [], "applied": [], "skipped_hash": 0}
+
+
+def reinforce_used_memories(memory_ids: list[str], *, success: bool,
+                            user_id: str = DEFAULT_USER_ID) -> None:
+    """任务收尾:对本轮 recall 用过的记忆按成败结算(升权/负强化)。异常吞掉。"""
+    for mid in memory_ids or []:
+        try:
+            V.reinforce_memory(str(mid), success=success)
+        except Exception:
+            continue
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# chat 门面(分层:core 常驻 + episodic 按需;全部异常降级为空/无操作)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def get_core_memories(user_id: str = None) -> list[dict[str, Any]]:
+    """取 chat 常驻记忆(persona + preference),供每轮注入。异常降级为空。"""
+    from agent.memory.config import CHAT_USER_ID
+    try:
+        return R.retrieve_core_memories(user_id=user_id or CHAT_USER_ID)
+    except Exception:
+        return []
+
+
+def build_core_block(memories: list[dict[str, Any]]) -> str:
+    """chat 常驻记忆 → 注入块文本。"""
+    try:
+        return R.build_core_block(memories)
+    except Exception:
+        return ""
+
+
+def recall_episodic(query: str, user_id: str = None) -> list[dict[str, Any]]:
+    """chat 事件记忆按需召回(过双相关性闸门)。异常降级为空。"""
+    from agent.memory.config import CHAT_USER_ID
+    try:
+        return R.recall_episodic_memories(query, user_id=user_id or CHAT_USER_ID)
+    except Exception:
+        return []
+
+
+def build_episodic_block(memories: list[dict[str, Any]]) -> str:
+    """chat 事件召回 → 注入块文本(空则空串,不注入)。"""
+    try:
+        return R.build_episodic_block(memories)
+    except Exception:
+        return ""
+
+
+def write_chat_memory(user_msg: str, assistant_msg: str,
+                      history_summary: str = "", user_id: str = None) -> dict[str, Any]:
+    """chat 对话抽取并写入记忆(persona/preference/episodic)。任何异常都吞掉。"""
+    from agent.memory.config import CHAT_USER_ID
+    try:
+        result = W.write_chat_memory(
+            user_msg, assistant_msg, history_summary=history_summary,
+            user_id=user_id or CHAT_USER_ID)
+        # 写后剪枝 core 层(persona/preference 属 global,防无限堆积)
+        try:
+            V.prune_global_preferences(user_id=user_id or CHAT_USER_ID)
+        except Exception:
+            pass
+        return result
+    except Exception:
+        return {"facts": [], "applied": [], "skipped_hash": 0}
+

@@ -70,6 +70,16 @@ def embed_texts(texts: list[str], model: str | None = None) -> list[list[float]]
     return embeddings
 
 
+def embed_query(text: str, task_instruct: str, model: str | None = None) -> list[float]:
+    """查询侧 embedding:加 Qwen3 非对称 instruct 前缀(写入侧 doc 不加)。
+
+    格式对齐 Qwen3 官方:`Instruct: {task}\\nQuery:{text}`(Query: 后无空格)。
+    task_instruct 用英文写(官方要求,与中文 query 可不同语言),典型提升 1-5% 召回。
+    """
+    prefixed = f"Instruct: {task_instruct}\nQuery:{text}"
+    return embed_text(prefixed, model=model)
+
+
 if __name__ == "__main__":
     print(len(embed_text("This is a sample text.")))
     print(len(embed_texts(["I love you", "I love coding"])))

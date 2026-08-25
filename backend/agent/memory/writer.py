@@ -19,14 +19,16 @@ from openai import OpenAI
 from agent.memory import vector as V
 from agent.memory import history as H
 from agent.memory.config import (
-    WRITE_SEARCH_TOP_K, DEFAULT_USER_ID,
+    WRITE_SEARCH_TOP_K, DEFAULT_USER_ID, CHAT_USER_ID,
     MEMORY_TYPE_PREFERENCE, MEMORY_TYPE_SITE_EXPERIENCE, MEMORY_TYPE_LESSON,
+    MEMORY_TYPE_PERSONA, MEMORY_TYPE_EPISODIC,
     SCOPE_GLOBAL, SCOPE_DOMAIN, LESSON_INIT_CONFIDENCE,
 )
 from agent.memory.prompts import (
     EXTRACT_SYSTEM_PROMPT, build_extract_user_prompt,
     FAILURE_EXTRACT_SYSTEM_PROMPT, build_failure_extract_user_prompt,
     DECISION_SYSTEM_PROMPT, build_decision_user_prompt,
+    CHAT_EXTRACT_SYSTEM_PROMPT, build_chat_extract_user_prompt,
 )
 from rag.embedder import embed_text
 
@@ -85,6 +87,29 @@ def _parse_json(raw: str) -> Optional[dict]:
         return None
 
 
+def _redact_secrets(text: str) -> str:
+    """脱敏:把疑似密钥/token/密码替换为 [REDACTED_SECRET],防写入长期记忆。"""
+    import re
+    s = str(text or "")
+    s = re.sub(r"\b(sk|pk|ghp|xox[bap])[-_][A-Za-z0-9]{8,}", "[REDACTED_SECRET]", s)
+    s = re.sub(r"(?i)\b(token|password|passwd|pwd|secret|api[_-]?key|access[_-]?key)\s*[=:]\s*\S+",
+               r"\1=[REDACTED_SECRET]", s)
+    s = re.sub(r"\b[A-Za-z0-9_-]{32,}\b", "[REDACTED_SECRET]", s)  # 长 hex/base64 串
+    return s
+
+
+def _clean_keywords(raw: Any) -> list[str]:
+    """规整 keywords 字段为去重字符串列表(≤8 个)。"""
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    for k in raw:
+        k = str(k).strip()
+        if k and k not in out:
+            out.append(k)
+    return out[:8]
+
+
 def extract_facts(task: str, trajectory: str, domain: str = "",
                   success: bool = True,
                   llm: LlmFn = _default_llm) -> list[dict[str, Any]]:
@@ -92,7 +117,8 @@ def extract_facts(task: str, trajectory: str, domain: str = "",
 
     success=True:成功任务 → preference / site_experience。
     success=False:失败任务 → lesson(可推翻的教训)。
-    返回 [{content, memory_type, scope, domain, entry_url, intent_keywords, confidence}]。
+    返回 [{content, memory_type, scope, domain, entry_url, intent_keywords, keywords, confidence}]。
+    content 与 keywords 均过脱敏。
     """
     if success:
         result = llm(EXTRACT_SYSTEM_PROMPT, build_extract_user_prompt(task, trajectory, domain))
@@ -109,9 +135,10 @@ def extract_facts(task: str, trajectory: str, domain: str = "",
     for f in facts:
         if not isinstance(f, dict):
             continue
-        content = str(f.get("content", "")).strip()
+        content = _redact_secrets(str(f.get("content", "")).strip())
         if not content:
             continue
+        keywords = _clean_keywords(f.get("keywords", []))
 
         if not success:
             # 失败任务只产 lesson,domain 作用域,低置信度=待验证
@@ -122,6 +149,7 @@ def extract_facts(task: str, trajectory: str, domain: str = "",
                 "domain": str(f.get("domain", "")).strip() or domain,
                 "entry_url": "",
                 "intent_keywords": [],
+                "keywords": keywords,
                 "confidence": LESSON_INIT_CONFIDENCE,
             })
             continue
@@ -138,6 +166,7 @@ def extract_facts(task: str, trajectory: str, domain: str = "",
                 "domain": "",
                 "entry_url": "",
                 "intent_keywords": [],
+                "keywords": keywords,
                 "confidence": 1.0,
             })
         else:
@@ -149,6 +178,7 @@ def extract_facts(task: str, trajectory: str, domain: str = "",
                 "domain": str(f.get("domain", "")).strip() or domain,
                 "entry_url": str(f.get("entry_url", "")).strip(),
                 "intent_keywords": [str(k).strip() for k in kws if str(k).strip()] if isinstance(kws, list) else [],
+                "keywords": keywords,
                 "confidence": 1.0,
             })
     return cleaned
@@ -178,6 +208,7 @@ def _apply_decision(event: str, temp_id: str, text: str,
             verified=False,
             entry_url=fact_meta.get("entry_url", ""),
             intent_keywords=fact_meta.get("intent_keywords", []),
+            keywords=fact_meta.get("keywords", []),
         )
         H.add_history(payload["memory_id"], "ADD", "", text)
         return f"ADD {payload['memory_id']}"
@@ -198,9 +229,10 @@ def _apply_decision(event: str, temp_id: str, text: str,
         prev = V.get_memory(real_id)
         if prev is None:
             return None
-        V.delete_memory(real_id)
-        H.add_history(real_id, "DELETE", prev.get("content", ""), "")
-        return f"DELETE {real_id}"
+        # 矛盾时标记失效而非物理删除(可回溯,对齐 Zep 双时间;chat+agent 统一)
+        V.invalidate_memory(real_id)
+        H.add_history(real_id, "INVALIDATE", prev.get("content", ""), "")
+        return f"INVALIDATE {real_id}"
 
     return None  # NONE 或未知
 
@@ -224,8 +256,18 @@ def write_memory(task: str, trajectory: str, domain: str = "",
     if not facts:
         return result
 
-    # 阶段二:对每条事实检索相似旧记忆 → 决策
-    # 逐条事实处理,每条独立的临时 id 空间(反幻觉)
+    # 阶段二:消化(检索相似→去重→决策→落库)
+    _consolidate_facts(facts, user_id=user_id, llm=llm, result=result)
+    return result
+
+
+def _consolidate_facts(facts: list[dict[str, Any]], *, user_id: str,
+                       llm: LlmFn, result: dict[str, Any]) -> None:
+    """阶段二:对每条事实检索相似旧记忆 → hash 去重 → LLM 决策 → 落库。
+
+    逐条事实处理,每条独立的临时 id 空间(反幻觉)。就地累加到 result["applied"]/["skipped_hash"]。
+    agent 写入(write_memory)与 chat 写入(write_chat_memory)共用此主体。
+    """
     for fact in facts:
         content = fact["content"]
         memory_type = fact.get("memory_type", MEMORY_TYPE_SITE_EXPERIENCE)
@@ -234,7 +276,7 @@ def write_memory(task: str, trajectory: str, domain: str = "",
         try:
             query_vec = embed_text(content)
             similar = V.search_memories(
-                query_vec, top_k=WRITE_SEARCH_TOP_K, user_id=user_id,
+                query_vec, query_text=content, top_k=WRITE_SEARCH_TOP_K, user_id=user_id,
                 memory_type=memory_type,
                 scope=scope, domain=(domain_f or None) if scope == SCOPE_DOMAIN else None,
             )
@@ -276,4 +318,65 @@ def write_memory(task: str, trajectory: str, domain: str = "",
             if action:
                 result["applied"].append(action)
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# chat 写入:从对话抽 persona/preference/episodic(单 prompt,无成败分流)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def extract_chat_facts(user_msg: str, assistant_msg: str,
+                       history_summary: str = "",
+                       llm: LlmFn = _default_llm) -> list[dict[str, Any]]:
+    """chat 抽取阶段:从一轮(或多轮摘要+最近一轮)对话抽 persona/preference/episodic。
+
+    返回 [{content, memory_type, scope, domain, keywords, confidence}]。content/keywords 过脱敏。
+    persona/preference→scope=global 常驻;episodic→scope=global 按需检索。domain 一律空(chat 无站点)。
+    """
+    result = llm(CHAT_EXTRACT_SYSTEM_PROMPT,
+                 build_chat_extract_user_prompt(user_msg, assistant_msg, history_summary))
+    if not result:
+        return []
+    facts = result.get("facts", [])
+    if not isinstance(facts, list):
+        return []
+
+    cleaned: list[dict[str, Any]] = []
+    for f in facts:
+        if not isinstance(f, dict):
+            continue
+        content = _redact_secrets(str(f.get("content", "")).strip())
+        if not content:
+            continue
+        mtype = f.get("memory_type", MEMORY_TYPE_EPISODIC)
+        if mtype not in (MEMORY_TYPE_PERSONA, MEMORY_TYPE_PREFERENCE, MEMORY_TYPE_EPISODIC):
+            mtype = MEMORY_TYPE_EPISODIC  # 拿不准归按需层(不轻进常驻 core)
+        cleaned.append({
+            "content": content,
+            "memory_type": mtype,
+            "scope": SCOPE_GLOBAL,
+            "domain": "",
+            "entry_url": "",
+            "intent_keywords": [],
+            "keywords": _clean_keywords(f.get("keywords", [])),
+            "confidence": 1.0,
+        })
+    return cleaned
+
+
+def write_chat_memory(user_msg: str, assistant_msg: str,
+                      history_summary: str = "",
+                      user_id: str = CHAT_USER_ID, llm: LlmFn = _default_llm) -> dict[str, Any]:
+    """chat 完整两阶段写入。返回 {facts, applied:[...], skipped_hash:int}。
+
+    阶段一:extract_chat_facts;阶段二:复用 _consolidate_facts(检索相似→去重→决策→落库,
+    矛盾走失效)。对异常宽容,记忆写入是尽力而为。
+    """
+    result: dict[str, Any] = {"facts": [], "applied": [], "skipped_hash": 0}
+    try:
+        facts = extract_chat_facts(user_msg, assistant_msg, history_summary, llm=llm)
+    except Exception:
+        return result
+    result["facts"] = facts
+    if not facts:
+        return result
+    _consolidate_facts(facts, user_id=user_id, llm=llm, result=result)
     return result

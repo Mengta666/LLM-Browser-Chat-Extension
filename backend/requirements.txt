@@ -11,6 +11,11 @@ python-dotenv==1.2.2
 requests==2.32.5
 tiktoken==0.13.0          # 执行/规划调用的 token 埋点（缺失时回退字符估算，但精度下降）
 
+# ── Agent 长期记忆（hybrid 检索）──
+# 缺失时记忆子系统整体优雅降级（不影响 agent 主流程），但建议安装以启用记忆。
+jieba==0.42.1             # 中文分词，供 BM25 稀疏向量（sparse.py）
+mmh3==5.2.1               # term id 哈希，对齐 FastEmbed（sparse.py）
+
 # ── 可选：RAG 网页问答 / 向量检索 / 搜索 ──
 # app.py 以 try/except 懒加载这些模块，未安装时仅跳过网页问答与搜索，
 # 不影响 Agent 自动化和知识库召回。需要这些功能时再装。

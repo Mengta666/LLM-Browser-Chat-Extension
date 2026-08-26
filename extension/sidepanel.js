@@ -17,6 +17,121 @@ document.addEventListener('DOMContentLoaded', async () => {
   ]);
   const DEFAULT_API_URL = 'https://api.openai.com/v1';
 
+  // ── Markdown 渲染管线 ──────────────────────────────────────────────
+  // marked(解析) → 补全未闭合行内标记(仅流式期) → DOMPurify(消毒) → innerHTML
+  //   → KaTeX(仅流末) → 代码块复制钮。依赖为 vendor 全局,缺失时降级为纯文本。
+  if (window.marked && typeof window.marked.setOptions === 'function') {
+    window.marked.setOptions({ gfm: true, breaks: true });
+  }
+
+  // DOMPurify:允许链接开新标签,并给外链补 rel。class 属性默认在白名单内,
+  // KaTeX / 代码高亮的 class 得以保留(未自定义 ALLOWED_ATTR,不会被剥)。
+  if (window.DOMPurify && typeof window.DOMPurify.addHook === 'function') {
+    window.DOMPurify.addHook('afterSanitizeAttributes', (node) => {
+      if (node.tagName === 'A' && node.hasAttribute('href')) {
+        node.setAttribute('target', '_blank');
+        node.setAttribute('rel', 'noopener noreferrer');
+      }
+    });
+  }
+
+  // 流式期间补全尾部悬空的行内标记,避免 `**bold` 在闭合符到达前以字面 `**` 闪现。
+  // 只处理最后一个未闭合标记的常见场景;代码块 fence 由 marked 自动闭合,无需干预。
+  function closeOpenMarks(buffer) {
+    let text = buffer || '';
+    // fence 代码块内部不补(奇数个 ``` 说明正处于未闭合代码块,marked 会自渲)。
+    const fenceCount = (text.match(/```/g) || []).length;
+    if (fenceCount % 2 === 1) return text;
+    // 行内 code:奇数个反引号 → 末尾补一个。
+    const backticks = (text.match(/`/g) || []).length;
+    if (backticks % 2 === 1) text += '`';
+    // 未完成链接 `[text](` 或 `[text` → 降级为纯文本,避免半截链接语法。
+    if (/\[[^\]]*\]\([^)]*$/.test(text) || /\[[^\]]*$/.test(text)) {
+      text = text.replace(/\[([^\]]*)\]\([^)]*$/, '$1').replace(/\[([^\]]*)$/, '$1');
+    }
+    // 加粗 **:成对补全(不误伤 `- ` 列表项后的裸 **,故要求 ** 后紧跟非空白)。
+    const boldCount = (text.match(/\*\*/g) || []).length;
+    if (boldCount % 2 === 1 && /\*\*\S[^*]*$/.test(text)) text += '**';
+    return text;
+  }
+
+  // 给渲染后的每个 <pre> 包一层 .code-block 并加复制按钮(复用已有 CSS)。
+  function addCodeCopyButtons(el) {
+    el.querySelectorAll('pre').forEach((pre) => {
+      if (pre.parentElement && pre.parentElement.classList.contains('code-block')) return;
+      const wrap = document.createElement('div');
+      wrap.className = 'code-block';
+      pre.parentNode.insertBefore(wrap, pre);
+      wrap.appendChild(pre);
+      const btn = document.createElement('button');
+      btn.className = 'code-copy-btn';
+      btn.type = 'button';
+      btn.textContent = '复制';
+      btn.addEventListener('click', () => {
+        const code = pre.innerText;
+        navigator.clipboard.writeText(code).then(() => {
+          btn.textContent = '已复制';
+          setTimeout(() => { btn.textContent = '复制'; }, 1500);
+        }).catch(() => { btn.textContent = '复制失败'; });
+      });
+      wrap.appendChild(btn);
+    });
+  }
+
+  // 把 markdown 文本渲染进目标节点。opts.streaming=true 时补全未闭合标记且跳过 KaTeX;
+  // 流末(streaming=false)用原始文本渲染并跑一次 KaTeX。marked 缺失时降级纯文本。
+  function renderMarkdownInto(el, text, opts) {
+    const streaming = opts && opts.streaming;
+    const src = streaming ? closeOpenMarks(text) : (text || '');
+    let html;
+    if (window.marked && typeof window.marked.parse === 'function') {
+      html = window.marked.parse(src);
+      if (window.DOMPurify && typeof window.DOMPurify.sanitize === 'function') {
+        html = window.DOMPurify.sanitize(html);
+      }
+      el.innerHTML = html;
+      addCodeCopyButtons(el);
+      if (!streaming && typeof window.renderMathInElement === 'function') {
+        try {
+          window.renderMathInElement(el, {
+            delimiters: [
+              { left: '$$', right: '$$', display: true },
+              { left: '\\[', right: '\\]', display: true },
+              { left: '\\(', right: '\\)', display: false },
+              { left: '$', right: '$', display: false }
+            ],
+            throwOnError: false
+          });
+        } catch (_) { /* KaTeX 失败不影响已渲染的文本 */ }
+      }
+    } else {
+      el.textContent = src;
+    }
+  }
+
+  // rAF 节流:流式期间把重渲染对齐到显示器刷新率,避免每个 token 都重解析。
+  function createMarkdownStreamer(el) {
+    let pending = '';
+    let frame = 0;
+    const flush = () => {
+      frame = 0;
+      renderMarkdownInto(el, pending, { streaming: true });
+    };
+    return {
+      update(text) {
+        pending = text;
+        if (!frame) frame = requestAnimationFrame(flush);
+      },
+      finalize(text) {
+        if (frame) { cancelAnimationFrame(frame); frame = 0; }
+        renderMarkdownInto(el, text, { streaming: false });
+      },
+      cancel() {
+        if (frame) { cancelAnimationFrame(frame); frame = 0; }
+      }
+    };
+  }
+
   function loadImageElement(src) {
     return new Promise((resolve, reject) => {
       const image = new Image();
@@ -964,6 +1079,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const msgId = createMessageId();
     let fullReply = '';
     let done = false;
+    const streamer = createMarkdownStreamer(aiBubble);
 
     await new Promise((resolve) => {
       const finalize = () => {
@@ -971,6 +1087,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         done = true;
         if (!fullReply) aiBubble.textContent = '响应为空。';
         else {
+          streamer.finalize(fullReply);
           // 存这轮到多轮历史(仅文本;图片轮用占位符,不把 base64 塞进历史)。
           chatMessages.push({ role: 'user', content: image ? (text || '[图片]') : text });
           chatMessages.push({ role: 'assistant', content: fullReply });
@@ -985,11 +1102,12 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (msg.msgId !== msgId) return;
         if (msg.type === 'LLM_CHUNK') {
           fullReply += msg.chunk;
-          aiBubble.textContent = fullReply;
+          streamer.update(fullReply);
           scrollToBottom();
         } else if (msg.type === 'LLM_DONE') {
           finalize();
         } else if (msg.type === 'LLM_ERROR') {
+          streamer.cancel();
           aiBubble.textContent = '';
           const errorSpan = document.createElement('span');
           errorSpan.className = 'error-text';
@@ -2521,9 +2639,15 @@ document.addEventListener('DOMContentLoaded', async () => {
   function renderAgentComplete(bubble, summary, success) {
     const completeEl = document.createElement('div');
     completeEl.className = success !== false ? 'agent-complete' : 'agent-error';
-    completeEl.textContent = success !== false
-      ? `✅ 任务完成: ${summary || '已完成所有操作'}`
-      : `⚠️ 任务未能完成: ${summary || ''}`;
+    const label = document.createElement('span');
+    label.textContent = success !== false ? '✅ 任务完成: ' : '⚠️ 任务未能完成: ';
+    completeEl.appendChild(label);
+    const body = document.createElement('div');
+    const summaryText = success !== false
+      ? (summary || '已完成所有操作')
+      : (summary || '');
+    renderMarkdownInto(body, summaryText, { streaming: false });
+    completeEl.appendChild(body);
     bubble.appendChild(completeEl);
     scrollToBottom();
   }

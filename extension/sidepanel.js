@@ -389,6 +389,23 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
 
+  // 会话历史 + 记忆管理 CRUD:走 background 的 CALL_BACKEND_API 通道(支持 GET/POST/PATCH/DELETE)。
+  function callBackendApi(url, method = 'GET', body = null) {
+    const options = { method, headers: { 'Content-Type': 'application/json' } };
+    if (body != null) options.body = JSON.stringify(body);
+    return new Promise((resolve, reject) => {
+      chrome.runtime.sendMessage(
+        { type: 'CALL_BACKEND_API', url, options },
+        (response) => {
+          const runtimeError = chrome.runtime.lastError;
+          if (runtimeError) { reject(new Error(runtimeError.message || '后台请求失败')); return; }
+          if (!response?.ok) { reject(new Error(response?.error || '后台请求失败')); return; }
+          resolve(response.body);
+        }
+      );
+    });
+  }
+
   function isAllowedDataImageUrl(value) {
     const text = String(value || '').trim();
     const match = text.match(/^data:(image\/(?:png|jpe?g|webp|gif));base64,([A-Za-z0-9+/=]+)$/i);
@@ -870,7 +887,9 @@ document.addEventListener('DOMContentLoaded', async () => {
   // 1. Tab 切换逻辑
   document.querySelectorAll('.tab-btn').forEach(btn => {
     btn.addEventListener('click', (e) => {
-      activateTab(e.currentTarget.dataset.target);
+      const target = e.currentTarget.dataset.target;
+      activateTab(target);
+      if (target === 'settings') loadMemoryPanel().catch((err) => console.warn('加载记忆面板失败', err));
     });
   });
 
@@ -1129,12 +1148,260 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
 
+  // ── 会话历史(抽屉:列表 / 续谈 / 重命名 / 删除)──
+
+  async function backendBase() {
+    // 取当前后端 base url(localhost:8000/v1 之类);失败抛错由调用方降级
+    const { safeApiUrl } = await resolveApiRequestConfig();
+    return safeApiUrl;
+  }
+
+  function openDrawer() {
+    document.getElementById('sessionDrawer')?.classList.add('open');
+    document.getElementById('drawerMask')?.classList.remove('hidden');
+    loadSessionList().catch((e) => console.warn('加载会话列表失败', e));
+  }
+
+  function closeDrawer() {
+    document.getElementById('sessionDrawer')?.classList.remove('open');
+    document.getElementById('drawerMask')?.classList.add('hidden');
+  }
+
+  async function loadSessionList() {
+    const listEl = document.getElementById('sessionList');
+    if (!listEl) return;
+    listEl.replaceChildren();
+    let base;
+    try { base = await backendBase(); } catch { listEl.innerHTML = '<div class="session-empty">需先在设置里配置后端地址</div>'; return; }
+    let data;
+    try {
+      data = await callBackendApi(buildBackendEndpointUrl(base, '/v1/sessions/list'), 'GET');
+    } catch (e) {
+      listEl.innerHTML = '<div class="session-empty">会话历史不可用</div>';
+      return;
+    }
+    const sessions = data?.sessions || [];
+    if (!sessions.length) {
+      listEl.innerHTML = '<div class="session-empty">还没有历史会话</div>';
+      return;
+    }
+    for (const s of sessions) {
+      const item = document.createElement('div');
+      item.className = 'session-item';
+      if (s.chat_id === currentChatId) item.classList.add('active');
+
+      const titleEl = document.createElement('div');
+      titleEl.className = 'session-item-title';
+      titleEl.textContent = s.title || '(未命名会话)';
+      titleEl.addEventListener('click', () => resumeSession(s.chat_id));
+      item.appendChild(titleEl);
+
+      const actions = document.createElement('div');
+      actions.className = 'session-item-actions';
+      const renameBtn = document.createElement('button');
+      renameBtn.textContent = '✏️';
+      renameBtn.title = '重命名';
+      renameBtn.addEventListener('click', (ev) => { ev.stopPropagation(); renameSession(s.chat_id, s.title); });
+      const delBtn = document.createElement('button');
+      delBtn.textContent = '🗑️';
+      delBtn.title = '删除';
+      delBtn.addEventListener('click', (ev) => { ev.stopPropagation(); deleteSession(s.chat_id, s.title); });
+      actions.appendChild(renameBtn);
+      actions.appendChild(delBtn);
+      item.appendChild(actions);
+
+      listEl.appendChild(item);
+    }
+  }
+
+  async function resumeSession(chatId) {
+    let base;
+    try { base = await backendBase(); } catch { return; }
+    let data;
+    try {
+      data = await callBackendApi(buildBackendEndpointUrl(base, `/v1/sessions/${encodeURIComponent(chatId)}/messages`), 'GET');
+    } catch (e) {
+      alert('载入会话失败: ' + (e?.message || ''));
+      return;
+    }
+    const messages = data?.messages || [];
+    // 切到该会话:重建内存历史 + DOM 气泡
+    currentChatId = chatId;
+    await chrome.storage.session.set({ [CURRENT_CHAT_ID_KEY]: chatId });
+    chatMessages = [];
+    const historyEl = document.getElementById('chatHistory');
+    historyEl.replaceChildren();
+    for (const m of messages) {
+      chatMessages.push({ role: m.role, content: m.content });
+      const bubble = createMessageNode(m.role === 'user' ? 'user' : 'ai');
+      if (m.role === 'user') {
+        const node = document.createElement('div');
+        node.textContent = m.content;
+        bubble.appendChild(node);
+      } else {
+        renderMarkdownInto(bubble, m.content, { streaming: false });
+      }
+    }
+    // 超长截断:只保留最近 N 条进上下文(DOM 全显示,发送时用 chatMessages 尾部)
+    if (chatMessages.length > MAX_CHAT_HISTORY_MESSAGES) {
+      chatMessages = chatMessages.slice(-MAX_CHAT_HISTORY_MESSAGES);
+    }
+    scrollToBottom();
+    closeDrawer();
+  }
+
+  async function renameSession(chatId, oldTitle) {
+    const title = prompt('重命名会话:', oldTitle || '');
+    if (title == null) return;
+    try {
+      const base = await backendBase();
+      await callBackendApi(buildBackendEndpointUrl(base, `/v1/sessions/${encodeURIComponent(chatId)}`), 'PATCH', { title: title.trim() });
+      await loadSessionList();
+    } catch (e) {
+      alert('重命名失败: ' + (e?.message || ''));
+    }
+  }
+
+  async function deleteSession(chatId, title) {
+    if (!confirm(`删除会话「${title || '未命名'}」?`)) return;
+    try {
+      const base = await backendBase();
+      await callBackendApi(buildBackendEndpointUrl(base, `/v1/sessions/${encodeURIComponent(chatId)}`), 'DELETE');
+      // 若删的是当前会话,顺带清空并开新会话
+      if (chatId === currentChatId) {
+        document.getElementById('chatHistory').replaceChildren();
+        chatMessages = [];
+        await resetCurrentChatId();
+      }
+      await loadSessionList();
+    } catch (e) {
+      alert('删除失败: ' + (e?.message || ''));
+    }
+  }
+
+  // ── 长期记忆管理(设置内:列出 / 删 / 改 / 加)──
+
+  const MEMORY_TYPE_LABELS = { persona: '身份', preference: '偏好', episodic: '事件' };
+
+  async function loadMemoryPanel() {
+    const listEl = document.getElementById('memoryList');
+    if (!listEl) return;
+    listEl.replaceChildren();
+    let base;
+    try { base = await backendBase(); } catch { listEl.innerHTML = '<div class="memory-empty">需先在设置里配置后端地址</div>'; return; }
+    let data;
+    try {
+      data = await callBackendApi(buildBackendEndpointUrl(base, '/v1/memory/list'), 'GET');
+    } catch (e) {
+      listEl.innerHTML = '<div class="memory-empty">记忆库不可用</div>';
+      return;
+    }
+    const memories = data?.memories || [];
+    if (!memories.length) {
+      listEl.innerHTML = '<div class="memory-empty">还没有长期记忆</div>';
+      return;
+    }
+    // 按类型分组:persona → preference → episodic
+    const order = ['persona', 'preference', 'episodic'];
+    const grouped = {};
+    for (const m of memories) (grouped[m.memory_type] = grouped[m.memory_type] || []).push(m);
+    for (const type of order) {
+      const items = grouped[type];
+      if (!items || !items.length) continue;
+      const label = document.createElement('div');
+      label.className = 'memory-group-label';
+      label.textContent = MEMORY_TYPE_LABELS[type] || type;
+      listEl.appendChild(label);
+      for (const m of items) listEl.appendChild(buildMemoryItem(m));
+    }
+  }
+
+  function buildMemoryItem(m) {
+    const item = document.createElement('div');
+    item.className = 'memory-item';
+    const content = document.createElement('div');
+    content.className = 'memory-item-content';
+    content.textContent = m.content;
+    item.appendChild(content);
+
+    const actions = document.createElement('div');
+    actions.className = 'memory-item-actions';
+    const editBtn = document.createElement('button');
+    editBtn.textContent = '✏️';
+    editBtn.title = '编辑';
+    editBtn.addEventListener('click', () => editMemory(m.memory_id, m.content));
+    const delBtn = document.createElement('button');
+    delBtn.textContent = '🗑️';
+    delBtn.title = '删除';
+    delBtn.addEventListener('click', () => deleteMemory(m.memory_id, m.content));
+    actions.appendChild(editBtn);
+    actions.appendChild(delBtn);
+    item.appendChild(actions);
+    return item;
+  }
+
+  async function editMemory(memoryId, oldContent) {
+    const content = prompt('编辑记忆:', oldContent || '');
+    if (content == null || !content.trim()) return;
+    try {
+      const base = await backendBase();
+      await callBackendApi(buildBackendEndpointUrl(base, `/v1/memory/${encodeURIComponent(memoryId)}`), 'PATCH', { content: content.trim() });
+      await loadMemoryPanel();
+    } catch (e) {
+      alert('编辑失败: ' + (e?.message || ''));
+    }
+  }
+
+  async function deleteMemory(memoryId, content) {
+    if (!confirm(`删除这条记忆?\n\n${content}`)) return;
+    try {
+      const base = await backendBase();
+      await callBackendApi(buildBackendEndpointUrl(base, `/v1/memory/${encodeURIComponent(memoryId)}`), 'DELETE');
+      await loadMemoryPanel();
+    } catch (e) {
+      alert('删除失败: ' + (e?.message || ''));
+    }
+  }
+
+  async function addMemory() {
+    const input = document.getElementById('memoryAddInput');
+    const typeSel = document.getElementById('memoryAddType');
+    const content = String(input?.value || '').trim();
+    if (!content) return;
+    try {
+      const base = await backendBase();
+      await callBackendApi(buildBackendEndpointUrl(base, '/v1/memory'), 'POST', { content, memory_type: typeSel?.value || 'episodic' });
+      input.value = '';
+      await loadMemoryPanel();
+    } catch (e) {
+      alert('添加失败: ' + (e?.message || ''));
+    }
+  }
+
   // 5. 绑定各种交互事件
   getOrCreateCurrentChatId().catch(console.error);
 
   document.getElementById('sendBtn').addEventListener('click', handleSend);
   document.getElementById('chatInput').addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); }
+  });
+
+  // 会话抽屉:开/关/遮罩/新建
+  document.getElementById('openSessionsBtn')?.addEventListener('click', openDrawer);
+  document.getElementById('closeSessionsBtn')?.addEventListener('click', closeDrawer);
+  document.getElementById('drawerMask')?.addEventListener('click', closeDrawer);
+  document.getElementById('newSessionBtn')?.addEventListener('click', async () => {
+    document.getElementById('chatHistory').replaceChildren();
+    chatMessages = [];
+    await resetCurrentChatId();
+    closeDrawer();
+  });
+
+  // 记忆面板:刷新 / 添加(添加支持 Enter)
+  document.getElementById('refreshMemoryBtn')?.addEventListener('click', () => loadMemoryPanel());
+  document.getElementById('memoryAddBtn')?.addEventListener('click', addMemory);
+  document.getElementById('memoryAddInput')?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); addMemory(); }
   });
 
   document.getElementById('uploadImageBtn').addEventListener('click', () => {

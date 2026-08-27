@@ -663,3 +663,61 @@ input { width: 100%; padding: 8px; margin-top: 5px; box-sizing: border-box; bord
 .task-summary { display: flex; flex-direction: column; gap: 6px; }
 .task-summary-title { font-size: 12px; font-weight: 700; opacity: 0.9; }
 .task-summary-line { white-space: pre-wrap; word-break: break-word; }
+
+/* ── 会话历史侧滑抽屉 ── */
+.drawer-mask {
+  position: fixed; inset: 0; background: rgba(0,0,0,0.35); z-index: 40;
+}
+.drawer-mask.hidden { display: none; }
+.side-drawer {
+  position: fixed; top: 0; left: 0; bottom: 0; width: 78%; max-width: 300px;
+  background: var(--app-bg); border-right: 1px solid var(--app-border);
+  z-index: 50; transform: translateX(-100%); transition: transform 0.22s ease;
+  display: flex; flex-direction: column; box-shadow: 2px 0 12px rgba(0,0,0,0.12);
+}
+.side-drawer.open { transform: translateX(0); }
+.side-drawer-head {
+  display: flex; align-items: center; gap: 6px; padding: 10px 12px;
+  border-bottom: 1px solid var(--app-border);
+}
+.side-drawer-title { flex: 1; font-weight: 600; color: var(--app-text); font-size: 14px; }
+.session-list { flex: 1; overflow-y: auto; padding: 6px; }
+.session-item {
+  display: flex; align-items: center; gap: 6px; padding: 8px 10px; margin-bottom: 4px;
+  border-radius: 8px; cursor: pointer; color: var(--app-text);
+}
+.session-item:hover { background: var(--app-surface); }
+.session-item.active { background: var(--app-accent-soft); }
+.session-item-title {
+  flex: 1; min-width: 0; font-size: 13px; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
+}
+.session-item-actions { display: none; gap: 4px; flex-shrink: 0; }
+.session-item:hover .session-item-actions { display: inline-flex; }
+.session-item-actions button {
+  padding: 2px 6px; font-size: 12px; border: none; background: transparent;
+  cursor: pointer; border-radius: 4px; color: var(--app-muted);
+}
+.session-item-actions button:hover { background: var(--app-accent-soft-hover); color: var(--app-text); }
+.session-empty { padding: 20px 12px; text-align: center; color: var(--app-muted); font-size: 13px; }
+
+/* ── 长期记忆管理面板(设置内)── */
+.memory-section { margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--app-border); }
+.memory-head { display: flex; align-items: center; justify-content: space-between; }
+.memory-add { display: flex; gap: 6px; margin: 8px 0; }
+.memory-add input { flex: 1; min-width: 0; }
+.memory-add select { flex-shrink: 0; }
+.memory-list { display: flex; flex-direction: column; gap: 6px; }
+.memory-group-label { font-size: 12px; color: var(--app-muted); margin-top: 8px; font-weight: 600; }
+.memory-item {
+  display: flex; align-items: flex-start; gap: 6px; padding: 8px 10px;
+  border: 1px solid var(--app-border); border-radius: 8px; background: var(--app-surface);
+}
+.memory-item-content { flex: 1; min-width: 0; font-size: 13px; color: var(--app-text); word-break: break-word; }
+.memory-item-actions { display: inline-flex; gap: 4px; flex-shrink: 0; }
+.memory-item-actions button {
+  padding: 2px 6px; font-size: 12px; border: none; background: transparent;
+  cursor: pointer; border-radius: 4px; color: var(--app-muted);
+}
+.memory-item-actions button:hover { background: var(--app-accent-soft-hover); color: var(--app-text); }
+.memory-empty { padding: 12px; text-align: center; color: var(--app-muted); font-size: 13px; }

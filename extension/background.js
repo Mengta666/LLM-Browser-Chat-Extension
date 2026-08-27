@@ -6,6 +6,9 @@ const MAX_LLM_BODY_BYTES = 25 * 1024 * 1024;
 const PAGE_REFRESH_ENDPOINT_PATH = '/api/pages/refresh_snapshot';
 const AGENT_ENDPOINT_PATHS = ['/v1/agent/execute', '/v1/agent/step', '/v1/agent/cancel'];
 
+// 会话历史 + 记忆管理 CRUD 的路径前缀(支持 GET/POST/PATCH/DELETE，仅本地/自定义后端）
+const BACKEND_API_PREFIXES = ['/v1/sessions', '/v1/memory'];
+
 function normalizeChatUrl(value) {
   const url = new URL(String(value || ''));
   return `${url.origin}${url.pathname.replace(/\/$/, '')}`;
@@ -58,6 +61,26 @@ async function isAllowedAgentUrl(value) {
         const root = buildBackendRootFromApiBase(baseUrl);
         for (const path of AGENT_ENDPOINT_PATHS) {
           if (normalized === `${root}${path}`) return true;
+        }
+      } catch { /* skip invalid */ }
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+// 会话/记忆 CRUD：路径以白名单前缀开头即放行（覆盖 /v1/sessions/{id}、/v1/memory/{id} 等动态段）
+async function isAllowedBackendApiUrl(value) {
+  try {
+    const url = new URL(String(value || ''));
+    const { [CUSTOM_API_BASE_URLS_KEY]: customUrls = [] } = await chrome.storage.local.get([CUSTOM_API_BASE_URLS_KEY]);
+    const normalized = normalizeChatUrl(url.href);
+    for (const baseUrl of customUrls) {
+      try {
+        const root = buildBackendRootFromApiBase(baseUrl);
+        for (const prefix of BACKEND_API_PREFIXES) {
+          if (normalized === `${root}${prefix}` || normalized.startsWith(`${root}${prefix}/`)) return true;
         }
       } catch { /* skip invalid */ }
     }
@@ -282,6 +305,62 @@ async function handleCallApiJson(request) {
   return response.json();
 }
 
+// 会话历史 + 记忆管理 CRUD 代理:支持 GET/POST/PATCH/DELETE，路径前缀白名单，仅本地/自定义后端。
+// 与 handleCallApiJson(仅 POST、agent 专用)分开，避免放宽后者的安全约束。
+async function handleCallBackendApi(request) {
+  const { url, options } = request;
+
+  if (!(await isAllowedBackendApiUrl(url))) {
+    throw new Error('API 地址不被允许');
+  }
+
+  const method = String(options?.method || 'GET').toUpperCase();
+  const ALLOWED_METHODS = new Set(['GET', 'POST', 'PATCH', 'DELETE']);
+  if (!ALLOWED_METHODS.has(method)) {
+    throw new Error('不支持的请求方法');
+  }
+
+  const apiHost = new URL(url).hostname;
+  const allowMissingAuth = isPrivateOrLocalHost(apiHost);
+  const authHeader = options?.headers?.Authorization || options?.headers?.authorization || '';
+  const authToken = String(authHeader).replace(/^Bearer\s+/i, '').trim();
+  const hasBearerAuth = String(authHeader).startsWith('Bearer ') && !!authToken;
+  if (!hasBearerAuth && !allowMissingAuth) {
+    throw new Error('API 请求配置无效');
+  }
+
+  const requestHeaders = { 'Content-Type': 'application/json' };
+  if (hasBearerAuth) requestHeaders.Authorization = authHeader;
+
+  const fetchOptions = {
+    method,
+    credentials: 'omit',
+    redirect: 'error',
+    headers: requestHeaders,
+    signal: AbortSignal.timeout(30000)
+  };
+  // GET/DELETE 通常无 body;POST/PATCH 带 body(校验为合法 JSON 且不过大)
+  if (method === 'POST' || method === 'PATCH') {
+    const body = String(options?.body || '');
+    if (!body || body.length > MAX_LLM_BODY_BYTES) {
+      throw new Error('API 请求体为空或过大');
+    }
+    try {
+      JSON.parse(body);
+    } catch {
+      throw new Error('API 请求体不是有效 JSON');
+    }
+    fetchOptions.body = body;
+  }
+
+  const response = await fetch(url, fetchOptions);
+  if (!response.ok) {
+    const errorMessage = await getResponseErrorMessage(response);
+    throw new Error(`请求失败 (${response.status})：${errorMessage}`);
+  }
+  return response.json();
+}
+
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === 'CALL_LLM_STREAM') {
     handleCallLlmStream(request).catch((error) => {
@@ -292,6 +371,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   if (request.type === 'CALL_API_JSON') {
     handleCallApiJson(request)
+      .then((body) => sendResponse({ ok: true, body }))
+      .catch((error) => sendResponse({ ok: false, error: error?.message || '未知错误' }));
+    return true;
+  }
+
+  if (request.type === 'CALL_BACKEND_API') {
+    handleCallBackendApi(request)
       .then((body) => sendResponse({ ok: true, body }))
       .catch((error) => sendResponse({ ok: false, error: error?.message || '未知错误' }));
     return true;

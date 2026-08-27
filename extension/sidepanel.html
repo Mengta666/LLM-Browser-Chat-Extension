@@ -17,8 +17,9 @@
   <!-- 自动化 Tab：agent 执行 + 截图/图片视觉输入 -->
   <div id="chat" class="tab-content active">
     <div class="chat-header">
+      <button id="openSessionsBtn" class="clear-btn" title="会话历史">☰ 会话</button>
       <span class="chat-title">浏览器自动化</span>
-      <button id="clearChatBtn" class="clear-btn" title="清空执行记录">🗑️ 清空</button>
+      <button id="clearChatBtn" class="clear-btn" title="新建会话/清空">🗑️ 清空</button>
     </div>
 
     <div class="chat-history" id="chatHistory"></div>
@@ -66,7 +67,37 @@
     <button id="saveSettingsBtn">保存配置</button>
     <button id="clearApiKeyBtn" type="button">清除 API Key</button>
     <div id="saveMsg"></div>
+
+    <!-- 长期记忆管理 -->
+    <div class="memory-section">
+      <div class="memory-head">
+        <label>🧠 长期记忆</label>
+        <button id="refreshMemoryBtn" class="tool-btn secondary" type="button" title="刷新">↻ 刷新</button>
+      </div>
+      <div class="settings-hint">Claude 从对话中学到的关于你的长期事实。可删除、编辑或手动添加,下次对话会参考。</div>
+      <div class="memory-add">
+        <input type="text" id="memoryAddInput" placeholder="手动添加一条记忆,如「我偏好用 TypeScript」">
+        <select id="memoryAddType">
+          <option value="persona">身份</option>
+          <option value="preference">偏好</option>
+          <option value="episodic">事件</option>
+        </select>
+        <button id="memoryAddBtn" class="tool-btn" type="button">添加</button>
+      </div>
+      <div id="memoryList" class="memory-list"></div>
+    </div>
   </div>
+
+  <!-- 会话历史侧滑抽屉 + 遮罩 -->
+  <div id="drawerMask" class="drawer-mask hidden"></div>
+  <aside id="sessionDrawer" class="side-drawer">
+    <div class="side-drawer-head">
+      <span class="side-drawer-title">会话历史</span>
+      <button id="newSessionBtn" class="tool-btn" type="button" title="新建会话">＋ 新建</button>
+      <button id="closeSessionsBtn" class="tool-btn secondary" type="button" title="关闭">✕</button>
+    </div>
+    <div id="sessionList" class="session-list"></div>
+  </aside>
 
   <script src="vendor/marked.umd.js"></script>
   <script src="vendor/purify.min.js"></script>

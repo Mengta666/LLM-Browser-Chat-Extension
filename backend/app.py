@@ -28,6 +28,13 @@ try:
 except Exception:
     pass
 
+# 会话历史路由(会话列表 + 续谈):仅依赖标准库 sqlite3,正常都会挂载
+try:
+    from api.sessions import router as sessions_router
+    app.include_router(sessions_router)
+except Exception:
+    pass
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -19,14 +19,11 @@ from openai import OpenAI
 from agent.memory import vector as V
 from agent.memory import history as H
 from agent.memory.config import (
-    WRITE_SEARCH_TOP_K, DEFAULT_USER_ID, CHAT_USER_ID,
-    MEMORY_TYPE_PREFERENCE, MEMORY_TYPE_SITE_EXPERIENCE, MEMORY_TYPE_LESSON,
-    MEMORY_TYPE_PERSONA, MEMORY_TYPE_EPISODIC,
-    SCOPE_GLOBAL, SCOPE_DOMAIN, LESSON_INIT_CONFIDENCE,
+    WRITE_SEARCH_TOP_K, CHAT_USER_ID,
+    MEMORY_TYPE_PERSONA, MEMORY_TYPE_PREFERENCE, MEMORY_TYPE_EPISODIC,
+    SCOPE_GLOBAL,
 )
 from agent.memory.prompts import (
-    EXTRACT_SYSTEM_PROMPT, build_extract_user_prompt,
-    FAILURE_EXTRACT_SYSTEM_PROMPT, build_failure_extract_user_prompt,
     DECISION_SYSTEM_PROMPT, build_decision_user_prompt,
     CHAT_EXTRACT_SYSTEM_PROMPT, build_chat_extract_user_prompt,
 )
@@ -110,87 +107,27 @@ def _clean_keywords(raw: Any) -> list[str]:
     return out[:8]
 
 
-def extract_facts(task: str, trajectory: str, domain: str = "",
-                  success: bool = True,
-                  llm: LlmFn = _default_llm) -> list[dict[str, Any]]:
-    """阶段一:抽取候选事实。
+def _importance_to_confidence(raw: Any) -> float:
+    """LLM importance(1-10)→ confidence 存储位(0.1-1.0)。缺省/异常回退 0.5(中性)。
 
-    success=True:成功任务 → preference / site_experience。
-    success=False:失败任务 → lesson(可推翻的教训)。
-    返回 [{content, memory_type, scope, domain, entry_url, intent_keywords, keywords, confidence}]。
-    content 与 keywords 均过脱敏。
+    confidence 字段兼作 importance:供检索三因子重排与 episodic GC 排序共用。
     """
-    if success:
-        result = llm(EXTRACT_SYSTEM_PROMPT, build_extract_user_prompt(task, trajectory, domain))
-    else:
-        result = llm(FAILURE_EXTRACT_SYSTEM_PROMPT,
-                     build_failure_extract_user_prompt(task, trajectory, domain))
-    if not result:
-        return []
-    facts = result.get("facts", [])
-    if not isinstance(facts, list):
-        return []
-
-    cleaned: list[dict[str, Any]] = []
-    for f in facts:
-        if not isinstance(f, dict):
-            continue
-        content = _redact_secrets(str(f.get("content", "")).strip())
-        if not content:
-            continue
-        keywords = _clean_keywords(f.get("keywords", []))
-
-        if not success:
-            # 失败任务只产 lesson,domain 作用域,低置信度=待验证
-            cleaned.append({
-                "content": content,
-                "memory_type": MEMORY_TYPE_LESSON,
-                "scope": SCOPE_DOMAIN,
-                "domain": str(f.get("domain", "")).strip() or domain,
-                "entry_url": "",
-                "intent_keywords": [],
-                "keywords": keywords,
-                "confidence": LESSON_INIT_CONFIDENCE,
-            })
-            continue
-
-        # 成功任务:preference / site_experience
-        mtype = f.get("memory_type", MEMORY_TYPE_SITE_EXPERIENCE)
-        if mtype not in (MEMORY_TYPE_PREFERENCE, MEMORY_TYPE_SITE_EXPERIENCE):
-            mtype = MEMORY_TYPE_SITE_EXPERIENCE  # 拿不准归按需层
-        if mtype == MEMORY_TYPE_PREFERENCE:
-            cleaned.append({
-                "content": content,
-                "memory_type": MEMORY_TYPE_PREFERENCE,
-                "scope": SCOPE_GLOBAL,
-                "domain": "",
-                "entry_url": "",
-                "intent_keywords": [],
-                "keywords": keywords,
-                "confidence": 1.0,
-            })
-        else:
-            kws = f.get("intent_keywords", [])
-            cleaned.append({
-                "content": content,
-                "memory_type": MEMORY_TYPE_SITE_EXPERIENCE,
-                "scope": SCOPE_DOMAIN,
-                "domain": str(f.get("domain", "")).strip() or domain,
-                "entry_url": str(f.get("entry_url", "")).strip(),
-                "intent_keywords": [str(k).strip() for k in kws if str(k).strip()] if isinstance(kws, list) else [],
-                "keywords": keywords,
-                "confidence": 1.0,
-            })
-    return cleaned
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return 0.5
+    v = max(1.0, min(10.0, v))
+    return round(v / 10.0, 3)
 
 
 def _apply_decision(event: str, temp_id: str, text: str,
                     uuid_mapping: dict[str, str], fact_meta: dict[str, Any],
-                    user_id: str) -> Optional[str]:
+                    user_id: str, chat_id: str = "") -> Optional[str]:
     """把单条决策落库。返回落库动作的简短描述,NONE/无效返回 None。
 
     反幻觉:UPDATE/DELETE 的 temp_id 必须在 uuid_mapping 里(即来自本次检索的真实旧记忆)。
     不在 mapping 里的 UPDATE/DELETE 一律忽略(LLM 若编造 id 也无从生效)。
+    chat_id:episodic 落所属会话 id(会话隔离),persona/preference 落 ""(全局)。
     """
     event = str(event or "").upper()
     real_id = uuid_mapping.get(str(temp_id))
@@ -200,15 +137,13 @@ def _apply_decision(event: str, temp_id: str, text: str,
             return None
         payload = V.insert_memory(
             text, vector=embed_text(text),
-            memory_type=fact_meta.get("memory_type", MEMORY_TYPE_SITE_EXPERIENCE),
+            memory_type=fact_meta.get("memory_type", MEMORY_TYPE_EPISODIC),
             scope=fact_meta.get("scope", SCOPE_GLOBAL),
-            domain=fact_meta.get("domain", ""),
             user_id=user_id,
             confidence=fact_meta.get("confidence", 1.0),
             verified=False,
-            entry_url=fact_meta.get("entry_url", ""),
-            intent_keywords=fact_meta.get("intent_keywords", []),
             keywords=fact_meta.get("keywords", []),
+            chat_id=chat_id,
         )
         H.add_history(payload["memory_id"], "ADD", "", text)
         return f"ADD {payload['memory_id']}"
@@ -237,48 +172,25 @@ def _apply_decision(event: str, temp_id: str, text: str,
     return None  # NONE 或未知
 
 
-def write_memory(task: str, trajectory: str, domain: str = "",
-                 success: bool = True,
-                 user_id: str = DEFAULT_USER_ID, llm: LlmFn = _default_llm) -> dict[str, Any]:
-    """完整两阶段写入。返回 {facts, applied:[...], skipped_hash:int}。
-
-    success=True:成功任务 → preference/site_experience;False:失败任务 → lesson。
-    整个流程对异常宽容:任一环节失败都不抛,返回已完成的部分(记忆写入是尽力而为)。
-    """
-    result: dict[str, Any] = {"facts": [], "applied": [], "skipped_hash": 0}
-
-    # 阶段一:抽取(按 success 分流成功/失败 prompt)
-    try:
-        facts = extract_facts(task, trajectory, domain, success=success, llm=llm)
-    except Exception:
-        return result
-    result["facts"] = facts
-    if not facts:
-        return result
-
-    # 阶段二:消化(检索相似→去重→决策→落库)
-    _consolidate_facts(facts, user_id=user_id, llm=llm, result=result)
-    return result
-
-
-def _consolidate_facts(facts: list[dict[str, Any]], *, user_id: str,
+def _consolidate_facts(facts: list[dict[str, Any]], *, user_id: str, chat_id: str,
                        llm: LlmFn, result: dict[str, Any]) -> None:
     """阶段二:对每条事实检索相似旧记忆 → hash 去重 → LLM 决策 → 落库。
 
     逐条事实处理,每条独立的临时 id 空间(反幻觉)。就地累加到 result["applied"]/["skipped_hash"]。
-    agent 写入(write_memory)与 chat 写入(write_chat_memory)共用此主体。
+    去重作用域按类型分流:episodic 仅在本会话(chat_id)内比对,persona/preference 在全局
+    (chat_id="")内比对——避免跨会话误去重,也让 persona/preference 的矛盾/更新作用于全局。
     """
     for fact in facts:
         content = fact["content"]
-        memory_type = fact.get("memory_type", MEMORY_TYPE_SITE_EXPERIENCE)
+        memory_type = fact.get("memory_type", MEMORY_TYPE_EPISODIC)
         scope = fact.get("scope", SCOPE_GLOBAL)
-        domain_f = fact.get("domain", "")
+        # 作用域分流:episodic→本会话;persona/preference→全局("")
+        fact_chat_id = chat_id if memory_type == MEMORY_TYPE_EPISODIC else ""
         try:
             query_vec = embed_text(content)
             similar = V.search_memories(
                 query_vec, query_text=content, top_k=WRITE_SEARCH_TOP_K, user_id=user_id,
-                memory_type=memory_type,
-                scope=scope, domain=(domain_f or None) if scope == SCOPE_DOMAIN else None,
+                memory_type=memory_type, scope=scope, chat_id=fact_chat_id,
             )
         except Exception:
             similar = []
@@ -300,7 +212,7 @@ def _consolidate_facts(facts: list[dict[str, Any]], *, user_id: str,
                        build_decision_user_prompt(existing_for_llm, [content]))
         if not decision:
             # 决策失败 → 保守:直接 ADD 这条新事实(它不在库里)
-            action = _apply_decision("ADD", "", content, uuid_mapping, fact, user_id)
+            action = _apply_decision("ADD", "", content, uuid_mapping, fact, user_id, fact_chat_id)
             if action:
                 result["applied"].append(action)
             continue
@@ -313,7 +225,7 @@ def _consolidate_facts(facts: list[dict[str, Any]], *, user_id: str,
                 continue
             action = _apply_decision(
                 op.get("event", ""), op.get("id", ""), str(op.get("text", "")).strip(),
-                uuid_mapping, fact, user_id,
+                uuid_mapping, fact, user_id, fact_chat_id,
             )
             if action:
                 result["applied"].append(action)
@@ -357,18 +269,20 @@ def extract_chat_facts(user_msg: str, assistant_msg: str,
             "entry_url": "",
             "intent_keywords": [],
             "keywords": _clean_keywords(f.get("keywords", [])),
-            "confidence": 1.0,
+            "confidence": _importance_to_confidence(f.get("importance")),
         })
     return cleaned
 
 
 def write_chat_memory(user_msg: str, assistant_msg: str,
                       history_summary: str = "",
-                      user_id: str = CHAT_USER_ID, llm: LlmFn = _default_llm) -> dict[str, Any]:
+                      user_id: str = CHAT_USER_ID, chat_id: str = "",
+                      llm: LlmFn = _default_llm) -> dict[str, Any]:
     """chat 完整两阶段写入。返回 {facts, applied:[...], skipped_hash:int}。
 
     阶段一:extract_chat_facts;阶段二:复用 _consolidate_facts(检索相似→去重→决策→落库,
-    矛盾走失效)。对异常宽容,记忆写入是尽力而为。
+    矛盾走失效)。chat_id 用于 episodic 会话隔离(persona/preference 仍落全局)。
+    对异常宽容,记忆写入是尽力而为。
     """
     result: dict[str, Any] = {"facts": [], "applied": [], "skipped_hash": 0}
     try:
@@ -378,5 +292,5 @@ def write_chat_memory(user_msg: str, assistant_msg: str,
     result["facts"] = facts
     if not facts:
         return result
-    _consolidate_facts(facts, user_id=user_id, llm=llm, result=result)
+    _consolidate_facts(facts, user_id=user_id, chat_id=chat_id, llm=llm, result=result)
     return result

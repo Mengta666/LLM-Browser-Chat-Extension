@@ -20,7 +20,9 @@ from agent.memory.config import (
     QDRANT_URL, QDRANT_API_KEY, QDRANT_DISTANCE,
     MEMORY_COLLECTION, MEMORY_VECTOR_SIZE,
     DENSE_VECTOR_NAME, SPARSE_VECTOR_NAME,
-    MEMORY_TYPE_PREFERENCE, SCOPE_GLOBAL, DEFAULT_USER_ID,
+    MEMORY_TYPE_PREFERENCE, MEMORY_TYPE_EPISODIC,
+    SCOPE_GLOBAL, DEFAULT_USER_ID, CHAT_USER_ID, CHAT_CORE_TYPES,
+    EPISODIC_CAP, EPISODIC_KEEP_RATIO, EPISODIC_PRUNE_GRACE_HOURS,
 )
 from agent.memory.sparse import to_sparse_vector
 
@@ -63,10 +65,35 @@ def get_client() -> QdrantClient:
     return _client
 
 
+def _ensure_payload_indexes() -> None:
+    """为高频过滤字段建 payload 索引(幂等):user_id/memory_type/chat_id/valid。
+
+    _build_filter 的每个 must 条件都需要索引,否则 Qdrant 走线性全表扫描
+    (无索引时几十个点的 scroll 就要十几秒)。keyword 型精确匹配,bool 用 bool 型。
+    重复建同名同型索引是 no-op;异常静默(索引缺失只影响性能不影响正确性)。
+    """
+    client = get_client()
+    keyword_fields = ["user_id", "memory_type", "chat_id", "scope"]
+    for field in keyword_fields:
+        try:
+            client.create_payload_index(
+                collection_name=MEMORY_COLLECTION, field_name=field,
+                field_schema=models.PayloadSchemaType.KEYWORD, wait=True)
+        except Exception:
+            pass
+    try:
+        client.create_payload_index(
+            collection_name=MEMORY_COLLECTION, field_name="valid",
+            field_schema=models.PayloadSchemaType.BOOL, wait=True)
+    except Exception:
+        pass
+
+
 def ensure_collection() -> None:
     """确保记忆 collection 存在:dense(4096/Cosine 具名)+ sparse(IDF)双向量。
 
     hybrid 检索需具名双向量。维度硬校验 dense==4096(拒绝维度炸弹)。
+    并建 payload 索引(过滤字段,防线性扫描)。
     """
     global _collection_ready
     if _collection_ready:
@@ -89,6 +116,7 @@ def ensure_collection() -> None:
                 ),
             },
         )
+        _ensure_payload_indexes()
         _collection_ready = True
         return
 
@@ -104,6 +132,7 @@ def ensure_collection() -> None:
             f"collection {MEMORY_COLLECTION} dense 维度不符:"
             f"期望 {MEMORY_VECTOR_SIZE},实际 {vectors_config[DENSE_VECTOR_NAME].size}"
         )
+    _ensure_payload_indexes()  # 已存在的老 collection 也补建(幂等)
     _collection_ready = True
 
 
@@ -114,13 +143,16 @@ def _build_payload(memory_id: str, content: str, *,
                    entry_url: str = "", intent_keywords: Optional[list[str]] = None,
                    keywords: Optional[list[str]] = None,
                    reinforce_count: int = 0, last_accessed_at: str = "",
-                   valid: bool = True, invalid_at: str = "") -> dict[str, Any]:
+                   valid: bool = True, invalid_at: str = "",
+                   chat_id: str = "") -> dict[str, Any]:
     """组装 point payload(事实源)。
 
-    confidence/verified/reinforce_count 是生命周期门控(H6:复用升权/负强化);
-    entry_url/intent_keywords 仅 site_experience 消费;
-    keywords 供 BM25 稀疏向量(H1)与检索;
+    confidence/verified/reinforce_count 是生命周期门控;
+    keywords 供 BM25 稀疏向量与检索;
     valid/invalid_at 是时间失效(矛盾时标记失效而非物理删除,可回溯,对齐 Zep)。
+    chat_id 是第二级隔离键:episodic 带所属会话 id(仅本会话检索),
+    persona/preference 留空表全局(跨所有会话)。
+    confidence 兼作 importance 存储位(1-10 归一到 0.1-1.0,供检索三因子重排与 GC 排序)。
     其他 memory_type 用默认值。
     """
     return {
@@ -131,6 +163,7 @@ def _build_payload(memory_id: str, content: str, *,
         "scope": scope,
         "domain": domain or "",
         "user_id": user_id,
+        "chat_id": chat_id or "",
         "created_at": created_at,
         "updated_at": updated_at,
         "confidence": float(confidence),
@@ -163,7 +196,7 @@ def insert_memory(content: str, *, vector: list[float],
                   confidence: float = 1.0, verified: bool = False,
                   entry_url: str = "", intent_keywords: Optional[list[str]] = None,
                   keywords: Optional[list[str]] = None,
-                  reinforce_count: int = 0) -> dict[str, Any]:
+                  reinforce_count: int = 0, chat_id: str = "") -> dict[str, Any]:
     """写入一条新记忆(dense+sparse 双向量),返回落库的 payload(含生成的 memory_id)。"""
     ensure_collection()
     memory_id = make_memory_id()
@@ -173,7 +206,7 @@ def insert_memory(content: str, *, vector: list[float],
         domain=domain, user_id=user_id, created_at=now, updated_at=now,
         confidence=confidence, verified=verified,
         entry_url=entry_url, intent_keywords=intent_keywords,
-        keywords=keywords, reinforce_count=reinforce_count,
+        keywords=keywords, reinforce_count=reinforce_count, chat_id=chat_id,
     )
     get_client().upsert(
         collection_name=MEMORY_COLLECTION,
@@ -215,6 +248,7 @@ def update_memory(memory_id: str, content: str, *, vector: list[float]) -> Optio
         last_accessed_at=existing.get("last_accessed_at", ""),
         valid=existing.get("valid", True),
         invalid_at=existing.get("invalid_at", ""),
+        chat_id=existing.get("chat_id", ""),
     )
     get_client().upsert(
         collection_name=MEMORY_COLLECTION,
@@ -226,39 +260,6 @@ def update_memory(memory_id: str, content: str, *, vector: list[float]) -> Optio
         wait=True,
     )
     return payload
-
-
-def reinforce_memory(memory_id: str, *, success: bool) -> Optional[dict[str, Any]]:
-    """复用结算(H6):recall 命中的记忆在任务收尾时按成败升/降权。只改 payload,不动向量。
-
-    - 成功:未验证记忆 +2(快速转正)、已验证 +1;置 verified=true;刷新 last_accessed_at。
-    - 失败:reinforce_count-1(负强化);≤0 直接删(防失败经验固化)。
-    返回更新后的 payload;记忆不存在返回 None;删除返回 {"deleted": True}。
-    """
-    ensure_collection()
-    existing = get_memory(memory_id)
-    if existing is None:
-        return None
-    count = int(existing.get("reinforce_count", 0))
-    verified = bool(existing.get("verified", False))
-
-    if success:
-        count += 2 if not verified else 1
-        patch = {"reinforce_count": count, "verified": True, "last_accessed_at": _now_iso()}
-        get_client().set_payload(
-            collection_name=MEMORY_COLLECTION, payload=patch,
-            points=[_point_id(memory_id)], wait=True)
-        return {**existing, **patch}
-
-    count -= 1
-    if count <= 0:
-        delete_memory(memory_id)
-        return {"deleted": True, "memory_id": memory_id}
-    patch = {"reinforce_count": count, "last_accessed_at": _now_iso()}
-    get_client().set_payload(
-        collection_name=MEMORY_COLLECTION, payload=patch,
-        points=[_point_id(memory_id)], wait=True)
-    return {**existing, **patch}
 
 
 def invalidate_memory(memory_id: str) -> Optional[dict[str, Any]]:
@@ -278,6 +279,33 @@ def invalidate_memory(memory_id: str) -> Optional[dict[str, Any]]:
     return {**existing, **patch}
 
 
+def touch_memories(memory_ids: list[str]) -> None:
+    """召回命中后回写访问信号:reinforce_count+1、last_accessed_at=now(激活死字段)。
+
+    只改 payload、不动 4096 向量(轻),供检索 recency×frequency 与 GC 排序用。
+    best-effort:任何异常静默吞掉(访问回写失败不该拖垮 chat 读路径)。
+    逐条 get→set(条数少,每轮 ≤top_k),避免读改写竞态用 set_payload 增量。
+    """
+    if not memory_ids:
+        return
+    now = _now_iso()
+    client = get_client()
+    for mid in memory_ids:
+        try:
+            existing = get_memory(str(mid))
+            if existing is None:
+                continue
+            patch = {
+                "reinforce_count": int(existing.get("reinforce_count", 0)) + 1,
+                "last_accessed_at": now,
+            }
+            client.set_payload(
+                collection_name=MEMORY_COLLECTION, payload=patch,
+                points=[_point_id(str(mid))], wait=False)
+        except Exception:
+            continue
+
+
 def _prune_items(items: list[dict[str, Any]], cap: int, keep_ratio: float) -> int:
     """按 (reinforce_count 降序, last_accessed_at 降序) 保留高价值,删尾部。返回删除数。"""
     if len(items) <= cap:
@@ -293,29 +321,68 @@ def _prune_items(items: list[dict[str, Any]], cap: int, keep_ratio: float) -> in
     return len(to_delete)
 
 
-def prune_domain(domain: str, *, user_id: str = DEFAULT_USER_ID,
-                 cap: int = 50, keep_ratio: float = 0.8) -> int:
-    """遗忘剪枝(H6):某 domain 记忆(站点经验/教训)数超 cap → 删到 cap*keep_ratio。
-
-    保留高价值:按 (reinforce_count 降序, last_accessed_at 降序) 排,删尾部低分/最久未用的。
-    仅作用于该 domain 下的记忆(global 偏好 domain 为空,不在此列,另见 prune_global_preferences)。
-    """
-    ensure_collection()
-    items = scroll_memories(user_id=user_id, scope=SCOPE_DOMAIN, domain=domain, limit=1000)
-    return _prune_items(items, cap, keep_ratio)
-
-
-def prune_global_preferences(*, user_id: str = DEFAULT_USER_ID,
+def prune_global_preferences(*, user_id: str = CHAT_USER_ID,
                              cap: int = 50, keep_ratio: float = 0.8) -> int:
-    """遗忘剪枝(H6):global 偏好(domain 为空)超 cap → 删到 cap*keep_ratio。
+    """遗忘剪枝:core 记忆(persona/preference,scope=global)超 cap → 删到 cap*keep_ratio。
 
-    偏好 domain 为空,prune_domain 覆盖不到,需单独剪枝防无限堆积。
-    保留高 reinforce_count 的偏好。
+    防无限堆积。保留高 reinforce_count 的。chat_id="" 只剪全局,别误剪会话候选。
     """
     ensure_collection()
-    items = scroll_memories(user_id=user_id, memory_type=MEMORY_TYPE_PREFERENCE,
-                            scope=SCOPE_GLOBAL, limit=1000)
+    items = scroll_memories(user_id=user_id, memory_type=CHAT_CORE_TYPES,
+                            scope=SCOPE_GLOBAL, chat_id="", limit=1000)
     return _prune_items(items, cap, keep_ratio)
+
+
+def prune_episodic(chat_id: str, *, user_id: str = CHAT_USER_ID,
+                   cap: int = EPISODIC_CAP,
+                   keep_ratio: float = EPISODIC_KEEP_RATIO) -> int:
+    """会话级 episodic 遗忘剪枝:某会话的 episodic 超 cap → 软失效尾部到 cap*keep_ratio。
+
+    与 _prune_items 不同:①按 (verified 保留, importance/confidence 降序, reinforce_count 降序,
+    last_accessed_at 降序) 排序,把 importance 纳入淘汰键;②用 invalidate_memory 软失效
+    (可回溯)而非物理删;③跳过 verified=True 与 created_at 在宽限窗内的新记忆(防误删)。
+    只扫单个会话(几十条),在写入后同步调用,非后台全量扫描。返回失效条数。
+    """
+    if not chat_id:
+        return 0
+    ensure_collection()
+    items = scroll_memories(user_id=user_id, memory_type=MEMORY_TYPE_EPISODIC,
+                            scope=SCOPE_GLOBAL, chat_id=chat_id, limit=1000)
+    if len(items) <= cap:
+        return 0
+
+    now = datetime.now(timezone.utc)
+    grace_cutoff = now.timestamp() - EPISODIC_PRUNE_GRACE_HOURS * 3600
+
+    def _in_grace(m: dict[str, Any]) -> bool:
+        raw = str(m.get("created_at", ""))
+        if not raw:
+            return False
+        try:
+            ts = datetime.fromisoformat(raw).timestamp()
+        except ValueError:
+            return False
+        return ts >= grace_cutoff
+
+    # 高价值在前:verified > 高 importance > 高 reinforce > 近期访问
+    items.sort(key=lambda m: (
+        1 if m.get("verified") else 0,
+        float(m.get("confidence", 1.0)),
+        int(m.get("reinforce_count", 0)),
+        str(m.get("last_accessed_at", "")),
+    ), reverse=True)
+
+    keep_n = int(cap * keep_ratio)
+    invalidated = 0
+    for m in items[keep_n:]:
+        # 保护:verified 或 宽限窗内新记忆 不失效
+        if m.get("verified") or _in_grace(m):
+            continue
+        mid = str(m.get("memory_id", ""))
+        if mid:
+            invalidate_memory(mid)
+            invalidated += 1
+    return invalidated
 
 
 def delete_memory(memory_id: str) -> None:
@@ -348,13 +415,16 @@ def get_memory(memory_id: str) -> Optional[dict[str, Any]]:
 
 def _build_filter(*, user_id: str, memory_type: Optional[Any],
                   scope: Optional[str], domain: Optional[str],
-                  include_invalid: bool = False) -> models.Filter:
+                  include_invalid: bool = False,
+                  chat_id: Optional[str] = None) -> models.Filter:
     """组装 Qdrant payload 过滤条件。
 
     memory_type 可传 str(单类)或 list(多类,用 MatchAny)——
-    recall 要同时查 site_experience+lesson 两类。
+    core 检索要同时查 persona+preference 两类。
     include_invalid=False(默认)时追加 valid==True,过滤掉已失效记忆
     (时间失效:矛盾记忆标记失效而非删除,检索默认不返回,但可回溯)。
+    chat_id 是第二级隔离:None(默认)不加条件(向后兼容全局行为);
+    ""(空串)显式匹配全局记忆(persona/preference);"X" 仅匹配该会话(episodic)。
     """
     must: list[models.FieldCondition] = [
         models.FieldCondition(key="user_id", match=models.MatchValue(value=user_id)),
@@ -370,6 +440,8 @@ def _build_filter(*, user_id: str, memory_type: Optional[Any],
         must.append(models.FieldCondition(key="scope", match=models.MatchValue(value=scope)))
     if domain:
         must.append(models.FieldCondition(key="domain", match=models.MatchValue(value=domain)))
+    if chat_id is not None:
+        must.append(models.FieldCondition(key="chat_id", match=models.MatchValue(value=chat_id)))
     if not include_invalid:
         must.append(models.FieldCondition(key="valid", match=models.MatchValue(value=True)))
     return models.Filter(must=must)
@@ -381,17 +453,18 @@ def search_memories(query_vector: list[float], *, top_k: int,
                     memory_type: Optional[Any] = None,
                     scope: Optional[str] = None,
                     domain: Optional[str] = None,
-                    include_invalid: bool = False) -> list[dict[str, Any]]:
+                    include_invalid: bool = False,
+                    chat_id: Optional[str] = None) -> list[dict[str, Any]]:
     """hybrid 检索:dense(语义)+ sparse(BM25)双路 prefetch → RRF 融合。
 
     query_text 用于算 sparse 向量;为空或稀疏不可用时,sparse 路命中为空,
     RRF 自动退化为纯 dense。memory_type 可传 str 或 list(多类)。
-    include_invalid=False 默认过滤已失效记忆。
+    include_invalid=False 默认过滤已失效记忆。chat_id 见 _build_filter(会话隔离)。
     collection 不存在时返回空。返回 [{memory_id, content, score, ...payload}]，融合分降序。
     """
     ensure_collection()
     flt = _build_filter(user_id=user_id, memory_type=memory_type, scope=scope,
-                        domain=domain, include_invalid=include_invalid)
+                        domain=domain, include_invalid=include_invalid, chat_id=chat_id)
     limit = max(1, int(top_k))
     prefetch = [
         models.Prefetch(query=query_vector, using=DENSE_VECTOR_NAME, filter=flt, limit=limit * 2),
@@ -427,15 +500,16 @@ def dense_scores(query_vector: list[float], *, top_k: int,
                  memory_type: Optional[Any] = None,
                  scope: Optional[str] = None,
                  domain: Optional[str] = None,
-                 include_invalid: bool = False) -> dict[str, float]:
+                 include_invalid: bool = False,
+                 chat_id: Optional[str] = None) -> dict[str, float]:
     """纯 dense 检索,返回 {memory_id: cosine}(Cosine 距离下 query_points 的 score 即余弦)。
 
     供相关性闸门用:hybrid RRF 分数量级极小、绝对阈值不可用,故单独取 dense 余弦判绝对相关性。
-    collection 不存在返回空 dict。
+    chat_id 见 _build_filter(会话隔离)。collection 不存在返回空 dict。
     """
     ensure_collection()
     flt = _build_filter(user_id=user_id, memory_type=memory_type, scope=scope,
-                        domain=domain, include_invalid=include_invalid)
+                        domain=domain, include_invalid=include_invalid, chat_id=chat_id)
     try:
         result = get_client().query_points(
             collection_name=MEMORY_COLLECTION,
@@ -460,11 +534,12 @@ def scroll_memories(*, user_id: str = DEFAULT_USER_ID,
                     scope: Optional[str] = None,
                     domain: Optional[str] = None,
                     limit: int = 200,
-                    include_invalid: bool = False) -> list[dict[str, Any]]:
+                    include_invalid: bool = False,
+                    chat_id: Optional[str] = None) -> list[dict[str, Any]]:
     """filter-only 拉取记忆(不做相似度检索),供常驻偏好全量取回 / 遗忘剪枝 / CRUD 列表用。
 
     与向量无关,按 payload 过滤条件 scroll。include_invalid=True 时含已失效记忆
-    (CRUD 回溯用)。collection 不存在返回空。
+    (CRUD 回溯用)。chat_id 见 _build_filter(会话隔离)。collection 不存在返回空。
     """
     ensure_collection()
     try:
@@ -472,7 +547,7 @@ def scroll_memories(*, user_id: str = DEFAULT_USER_ID,
             collection_name=MEMORY_COLLECTION,
             scroll_filter=_build_filter(
                 user_id=user_id, memory_type=memory_type, scope=scope,
-                domain=domain, include_invalid=include_invalid),
+                domain=domain, include_invalid=include_invalid, chat_id=chat_id),
             limit=max(1, int(limit)),
             with_payload=True,
         )
@@ -486,18 +561,18 @@ def scroll_memories(*, user_id: str = DEFAULT_USER_ID,
 def count_memories(user_id: str = DEFAULT_USER_ID, *,
                    memory_type: Optional[Any] = None,
                    domain: Optional[str] = None,
-                   include_invalid: bool = False) -> int:
-    """统计记忆条数(测试/一致性校验 + 启发式兜底用)。
+                   include_invalid: bool = False,
+                   chat_id: Optional[str] = None) -> int:
+    """统计记忆条数(测试/一致性校验用)。
 
-    可按 memory_type、domain 过滤——启发式兜底要数"某站点有几条 site_experience"。
-    include_invalid=False 默认只数有效记忆。
+    可按 memory_type、domain、chat_id 过滤。include_invalid=False 默认只数有效记忆。
     """
     ensure_collection()
     result = get_client().count(
         collection_name=MEMORY_COLLECTION,
         count_filter=_build_filter(
             user_id=user_id, memory_type=memory_type, scope=None,
-            domain=domain, include_invalid=include_invalid),
+            domain=domain, include_invalid=include_invalid, chat_id=chat_id),
         exact=True,
     )
     return int(result.count)

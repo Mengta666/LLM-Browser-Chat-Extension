@@ -1,128 +1,24 @@
-"""记忆检索(注入 agent 前的读路径)。
+"""记忆检索(注入 chat 前的读路径)。
 
 分层召回(对齐 MemGPT core-常驻 / archival-按需):
-- retrieve_resident_preferences:强用户偏好,**常驻**注入每步 prompt。不过相似度阈值
-  (偏好要全带,判断依据是"漏掉代价高"而非相关性),量小、按 top-K 截断。
-- recall_site_memories:站点经验 + 失败教训,**按需**由 recall 工具触发。过相似度阈值,
-  lesson 命中降权并标"待验证"。
+- retrieve_core_memories:persona + preference,**常驻**注入每轮对话(scroll 全量,不过阈值)。
+- recall_episodic_memories:episodic 事件记忆,**按需**召回,过双相关性闸门。
 
-均不调 LLM(纯向量)。Qdrant 不可用/空库时返回空,不抛异常,保证 agent 主流程不受影响。
+均不调 LLM(纯向量)。Qdrant 不可用/空库时返回空,不抛异常,保证 chat 主流程不受影响。
 """
 
+from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import urlsplit
 
 from agent.memory import vector as V
 from agent.memory.config import (
-    MEMORY_RECALL_TOP_K,
-    RESIDENT_PREFERENCE_TOP_K, RESIDENT_PREFERENCE_CHAR_LIMIT, LESSON_RECALL_WEIGHT,
-    MEMORY_TYPE_PREFERENCE, MEMORY_TYPE_SITE_EXPERIENCE, MEMORY_TYPE_LESSON,
+    MEMORY_RECALL_TOP_K, RESIDENT_PREFERENCE_CHAR_LIMIT,
     MEMORY_TYPE_PERSONA, MEMORY_TYPE_EPISODIC,
-    SCOPE_GLOBAL, SCOPE_DOMAIN, DEFAULT_USER_ID, CHAT_USER_ID, INSTRUCT_SITE, INSTRUCT_CHAT,
+    SCOPE_GLOBAL, CHAT_USER_ID, INSTRUCT_CHAT,
     CHAT_CORE_TYPES, CHAT_CORE_TOP_K, RECALL_MIN_COSINE, RECALL_REL_RATIO,
+    RECALL_W_RECENCY, RECALL_W_IMPORTANCE, RECALL_GAP_REF, RECALL_HALFLIFE_HOURS,
 )
 from rag.embedder import embed_query
-
-
-def extract_domain(url: str) -> str:
-    """从 URL 提取小写域名,失败返回空字符串。"""
-    try:
-        return (urlsplit(str(url or "")).hostname or "").lower()
-    except ValueError:
-        return ""
-
-
-def retrieve_resident_preferences(user_id: str = DEFAULT_USER_ID,
-                                  top_k: int = RESIDENT_PREFERENCE_TOP_K) -> list[dict[str, Any]]:
-    """取常驻用户偏好(preference, scope=global),供每步 prompt 无条件注入。
-
-    用 scroll(filter-only,与相似度无关)全量取回——偏好要全程约束,不是按当前任务相关性检索。
-    排序:reinforce_count 降序(高频/高置信优先常驻)+ created_at 升序(稳定),截断 top_k。
-    Qdrant 不可用/空库返回空。
-    """
-    try:
-        prefs = V.scroll_memories(
-            user_id=user_id, memory_type=MEMORY_TYPE_PREFERENCE, scope=SCOPE_GLOBAL, limit=200)
-    except Exception:
-        return []
-
-    # 高 reinforce 优先(高频/高置信偏好先常驻),同分按 created_at 稳定
-    prefs.sort(key=lambda m: (-int(m.get("reinforce_count", 0)), str(m.get("created_at", ""))))
-    return prefs[:top_k]
-
-
-def recall_site_memories(query: str, *, domain: str = "",
-                         top_k: int = MEMORY_RECALL_TOP_K,
-                         user_id: str = DEFAULT_USER_ID) -> list[dict[str, Any]]:
-    """按需召回站点经验 + 失败教训(site_experience + lesson),供 recall 工具调用。
-
-    hybrid(dense+BM25)召回,RRF 融合。截断:主用 top_k 硬截断(RRF 分数量级极小,
-    绝对阈值不适用);lesson 命中 rank_score×LESSON_RECALL_WEIGHT 降权后与
-    site_experience 一同重排。Qdrant 不可用/空库返回空。
-    """
-    normalized_query = str(query or "").strip()
-    if not normalized_query:
-        return []
-    try:
-        query_vector = embed_query(normalized_query, INSTRUCT_SITE)
-        candidates = V.search_memories(
-            query_vector, query_text=normalized_query, top_k=top_k * 2, user_id=user_id,
-            memory_type=[MEMORY_TYPE_SITE_EXPERIENCE, MEMORY_TYPE_LESSON],
-            scope=SCOPE_DOMAIN, domain=(domain or None),
-        )
-    except Exception:
-        return []
-
-    ranked: list[dict[str, Any]] = []
-    for item in candidates:
-        raw_score = float(item.get("score", 0.0))
-        item = dict(item)
-        # lesson 降权(低权+待验证),用于排序,不改原始 score 语义
-        if item.get("memory_type") == MEMORY_TYPE_LESSON:
-            item["rank_score"] = raw_score * LESSON_RECALL_WEIGHT
-        else:
-            item["rank_score"] = raw_score
-        ranked.append(item)
-
-    ranked.sort(key=lambda m: m.get("rank_score", 0.0), reverse=True)
-    return ranked[:top_k]
-
-
-def build_preference_block(preferences: list[dict[str, Any]]) -> str:
-    """把常驻偏好组装成注入每步 prompt 的文本块。空则返回空串。
-
-    容量护栏(仿 Letta core block 字符上限):累计超 RESIDENT_PREFERENCE_CHAR_LIMIT 即停,
-    偏好已按 reinforce_count 降序,高频/高置信优先常驻,低频自然被挡在外(下沉召回层)。
-    """
-    if not preferences:
-        return ""
-    lines = ["## 用户偏好(始终遵守)"]
-    used = 0
-    for item in preferences:
-        content = str(item.get("content", "")).strip()
-        if not content:
-            continue
-        if used + len(content) > RESIDENT_PREFERENCE_CHAR_LIMIT:
-            break
-        lines.append(f"- {content}")
-        used += len(content)
-    return "\n".join(lines) if len(lines) > 1 else ""
-
-
-def build_recall_block(memories: list[dict[str, Any]]) -> str:
-    """把 recall 到的站点经验/教训组装成注入历史的文本块。空则返回提示。"""
-    if not memories:
-        return "(未回忆到该站点的相关经验)"
-    lines = ["## 回忆到的站点经验(供参考,与当前任务无关则忽略)"]
-    for item in memories:
-        content = str(item.get("content", "")).strip()
-        if not content:
-            continue
-        if item.get("memory_type") == MEMORY_TYPE_LESSON:
-            lines.append(f"- ⚠待验证教训:{content}")
-        else:
-            lines.append(f"- {content}")
-    return "\n".join(lines) if len(lines) > 1 else "(未回忆到该站点的相关经验)"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -186,16 +82,31 @@ def build_core_block(memories: list[dict[str, Any]]) -> str:
     return "\n".join(lines) if len(lines) > 1 else ""
 
 
+def _recency_score(created_at: str, *, now_ts: float) -> float:
+    """指数衰减:0.5**(age_hours/half_life)。用 created_at(事件新鲜度)。解析失败返回 0.5。"""
+    raw = str(created_at or "")
+    if not raw:
+        return 0.5
+    try:
+        ts = datetime.fromisoformat(raw).timestamp()
+    except ValueError:
+        return 0.5
+    age_hours = max(0.0, (now_ts - ts) / 3600.0)
+    return 0.5 ** (age_hours / max(1e-6, RECALL_HALFLIFE_HOURS))
+
+
 def recall_episodic_memories(query: str, *,
                              top_k: int = MEMORY_RECALL_TOP_K,
-                             user_id: str = CHAT_USER_ID) -> list[dict[str, Any]]:
-    """按需召回 chat 事件记忆(episodic),过双相关性闸门(防 Lost-in-the-Middle 噪声)。
+                             user_id: str = CHAT_USER_ID,
+                             chat_id: str = "") -> list[dict[str, Any]]:
+    """按需召回 chat 事件记忆(episodic),仅本会话(chat_id 隔离),过双闸门 + 三因子重排。
 
-    双闸门:
+    双闸门(防 Lost-in-the-Middle 噪声):
     ① 绝对余弦门(主):额外发一次纯 dense 检索取余弦,过滤 cosine < RECALL_MIN_COSINE。
     ② 相对比门(兜底):过滤 rrf_score < top1_rrf * RECALL_REL_RATIO。
-    两门取交集后 top_k。全被挡则返回空(宁可不注入,不注入噪声)。
-    Qdrant 不可用/空库/query 空返回空。
+    过闸门后按三因子(relevance 余弦 + recency 时间衰减 + importance/confidence)gap-gated
+    稀释重排(对齐 Generative Agents;相关度扎堆时才放大次要因子),取 top_k。命中项 touch 回写访问信号。
+    全被挡则返回空(宁可不注入,不注入噪声)。Qdrant 不可用/空库/query 空返回空。
     """
     normalized_query = str(query or "").strip()
     if not normalized_query:
@@ -204,12 +115,12 @@ def recall_episodic_memories(query: str, *,
         query_vector = embed_query(normalized_query, INSTRUCT_CHAT)
         candidates = V.search_memories(
             query_vector, query_text=normalized_query, top_k=top_k * 2, user_id=user_id,
-            memory_type=MEMORY_TYPE_EPISODIC, scope=SCOPE_GLOBAL,
+            memory_type=MEMORY_TYPE_EPISODIC, scope=SCOPE_GLOBAL, chat_id=chat_id,
         )
         # 闸门①数据:纯 dense 余弦(hybrid RRF 分丢了绝对相关性,单独取)
         cos_map = V.dense_scores(
             query_vector, top_k=top_k * 2, user_id=user_id,
-            memory_type=MEMORY_TYPE_EPISODIC, scope=SCOPE_GLOBAL)
+            memory_type=MEMORY_TYPE_EPISODIC, scope=SCOPE_GLOBAL, chat_id=chat_id)
     except Exception:
         return []
 
@@ -230,8 +141,32 @@ def recall_episodic_memories(query: str, *,
             c["cosine"] = cosine
             passed.append(c)
 
-    passed.sort(key=lambda m: m.get("score", 0.0), reverse=True)
-    return passed[:top_k]
+    if not passed:
+        return []
+
+    # 三因子重排(gap-gated 稀释):relevance 用原始 cosine,recency/importance 受稀释门控。
+    # spread=候选 cosine 极差;dilution=1-min(1,spread/GAP_REF)。
+    # 相关度拉得开→dilution→0→relevance 主导;扎堆→dilution→1→放手让次要因子打破 tie。
+    now_ts = datetime.now(timezone.utc).timestamp()
+    rel_raw = [float(m.get("cosine", 0.0)) for m in passed]
+    spread = (max(rel_raw) - min(rel_raw)) if rel_raw else 0.0
+    dilution = 1.0 - min(1.0, spread / max(1e-9, RECALL_GAP_REF))
+    for i, m in enumerate(passed):
+        rec = _recency_score(m.get("created_at", ""), now_ts=now_ts)
+        imp = float(m.get("confidence", 1.0))
+        m["_recency"] = rec
+        m["_dilution"] = dilution
+        m["_score3"] = rel_raw[i] + dilution * (RECALL_W_RECENCY * rec + RECALL_W_IMPORTANCE * imp)
+
+    passed.sort(key=lambda m: m.get("_score3", 0.0), reverse=True)
+    result = passed[:top_k]
+
+    # 命中回写访问信号(best-effort,激活 reinforce_count/last_accessed_at 死字段)
+    try:
+        V.touch_memories([str(m.get("memory_id", "")) for m in result if m.get("memory_id")])
+    except Exception:
+        pass
+    return result
 
 
 def build_episodic_block(memories: list[dict[str, Any]]) -> str:

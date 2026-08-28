@@ -15,7 +15,8 @@
     "activeTab",
     "scripting",
     "permissions",
-    "debugger"
+    "debugger",
+    "alarms"
   ],
   "host_permissions": [
     "https://api.openai.com/*",

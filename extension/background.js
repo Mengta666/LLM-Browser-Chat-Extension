@@ -901,12 +901,28 @@ async function detectClickListeners(target) {
 // bounding-box 传播过滤（serializer.py _apply_bounding_box_filtering）：
 // 传播容器（a/button/summary/label/role=button|combobox）把自己的 box 传给后代，
 // 后代若被父 box ≥99% 包含则标 excludedByParent（不给编号）——避免一个可点按钮连同它内部的
-// 图标/文字 span 各拿一个编号（冗余编号 + 视觉密集的主因）。例外：后代是真表单控件
-// (input/select/textarea) 或自身是独立传播容器时保留。
+// 图标/文字 span 各拿一个编号（冗余编号 + 视觉密集的主因）。5 条豁免（见 bboxExempt）保证
+// 真正独立可点的后代（onclick/aria-label/交互 role/表单控件/传播容器）仍保留编号，不被误伤。
 const PROPAGATING_TAGS = new Set(['a', 'button', 'summary', 'label']);
 const PROPAGATING_ROLES = new Set(['button', 'combobox']);
 const CONTAINMENT_THRESHOLD = 0.99;
-const KEEP_TAGS = new Set(['input', 'select', 'textarea']);
+const KEEP_TAGS = new Set(['input', 'select', 'textarea', 'label']);
+// 被父包含但仍保留独立编号的 role（对齐 browser-use _should_exclude_child 豁免第 5 条）。
+const KEEP_ROLES = new Set(['button', 'link', 'checkbox', 'radio', 'tab', 'menuitem', 'option']);
+
+// 后代是否应豁免（保留独立编号）：对齐 browser-use 5 条豁免——真表单控件/label、自身传播容器、
+// 有 onclick、有非空 aria-label、交互 role。漏这几条会过度排除、误伤真正独立的可点子元素。
+function bboxExempt(node) {
+  const tag = (node.nodeName || '').toLowerCase();
+  if (KEEP_TAGS.has(tag)) return true;
+  if (isPropagating(node)) return true;
+  const attrs = node.attributes || {};
+  if (attrs.onclick !== undefined) return true;
+  if (attrs['aria-label'] && attrs['aria-label'].trim()) return true;
+  const role = attrs.role || (node.ax && node.ax.role) || '';
+  if (KEEP_ROLES.has(role)) return true;
+  return false;
+}
 
 function isPropagating(node) {
   const tag = (node.nodeName || '').toLowerCase();
@@ -938,9 +954,7 @@ function applyBoundingBoxFilter(allNodes) {
       if (!d) continue;
       for (const c of d.children) stack.push(c);
       if (d === node || !d.isInteractive || !d.isVisible || d.excludedByParent) continue;
-      const dtag = (d.nodeName || '').toLowerCase();
-      if (KEEP_TAGS.has(dtag)) continue;         // 真表单控件保留
-      if (isPropagating(d)) continue;            // 自身是独立可点容器保留
+      if (bboxExempt(d)) continue;               // 5 条豁免:表单控件/传播容器/onclick/aria-label/交互role
       if (d.absolutePosition && containmentRatio(d.absolutePosition, pbox) >= CONTAINMENT_THRESHOLD) {
         d.excludedByParent = true;               // 被父按钮几乎完全包含 → 不单独编号
       }

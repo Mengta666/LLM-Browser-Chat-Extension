@@ -805,6 +805,7 @@ function constructEnhancedTree(domRoot, snapshotLookup, opts) {
       isInteractive: false,
       hasJsClickListener: jsClickIds.has(cdpNode.backendNodeId),
       ignoredByPaintOrder: false,          // Phase 2 接 paint order
+      excludedByParent: false,             // bounding-box 传播过滤:被父按钮≥99%包含→不单独编号
       parent: null,
       children: [],
       selectorIndex: null,
@@ -895,6 +896,56 @@ async function detectClickListeners(target) {
     await cdpSend(target, 'Runtime.releaseObject', { objectId }).catch(() => {});
   } catch { /* getEventListeners 不可用/异常：降级为空集 */ }
   return ids;
+}
+
+// bounding-box 传播过滤（serializer.py _apply_bounding_box_filtering）：
+// 传播容器（a/button/summary/label/role=button|combobox）把自己的 box 传给后代，
+// 后代若被父 box ≥99% 包含则标 excludedByParent（不给编号）——避免一个可点按钮连同它内部的
+// 图标/文字 span 各拿一个编号（冗余编号 + 视觉密集的主因）。例外：后代是真表单控件
+// (input/select/textarea) 或自身是独立传播容器时保留。
+const PROPAGATING_TAGS = new Set(['a', 'button', 'summary', 'label']);
+const PROPAGATING_ROLES = new Set(['button', 'combobox']);
+const CONTAINMENT_THRESHOLD = 0.99;
+const KEEP_TAGS = new Set(['input', 'select', 'textarea']);
+
+function isPropagating(node) {
+  const tag = (node.nodeName || '').toLowerCase();
+  if (PROPAGATING_TAGS.has(tag)) return true;
+  const role = (node.attributes && node.attributes.role) || (node.ax && node.ax.role) || '';
+  return PROPAGATING_ROLES.has(role);
+}
+
+// 后代 box 被祖先 box 覆盖的面积占比（后代面积为分母）。
+function containmentRatio(childBox, parentBox) {
+  if (!childBox || !parentBox) return 0;
+  const cw = childBox.width, ch = childBox.height;
+  if (cw <= 0 || ch <= 0) return 0;
+  const ix = Math.max(0, Math.min(childBox.x + cw, parentBox.x + parentBox.width) - Math.max(childBox.x, parentBox.x));
+  const iy = Math.max(0, Math.min(childBox.y + ch, parentBox.y + parentBox.height) - Math.max(childBox.y, parentBox.y));
+  return (ix * iy) / (cw * ch);
+}
+
+function applyBoundingBoxFilter(allNodes) {
+  for (const node of allNodes) {
+    if (!node.isInteractive || !node.isVisible || node.ignoredByPaintOrder) continue;
+    if (!isPropagating(node)) continue;
+    const pbox = node.absolutePosition;
+    if (!pbox) continue;
+    // 向下遍历该节点子树，标记被 ≥99% 包含的可交互后代。
+    const stack = [...node.children];
+    while (stack.length) {
+      const d = stack.pop();
+      if (!d) continue;
+      for (const c of d.children) stack.push(c);
+      if (d === node || !d.isInteractive || !d.isVisible || d.excludedByParent) continue;
+      const dtag = (d.nodeName || '').toLowerCase();
+      if (KEEP_TAGS.has(dtag)) continue;         // 真表单控件保留
+      if (isPropagating(d)) continue;            // 自身是独立可点容器保留
+      if (d.absolutePosition && containmentRatio(d.absolutePosition, pbox) >= CONTAINMENT_THRESHOLD) {
+        d.excludedByParent = true;               // 被父按钮几乎完全包含 → 不单独编号
+      }
+    }
+  }
 }
 
 // paint order 遮挡过滤（paint_order.py:165）：按 paint_order 降序分组，同一区域下层被上层遮挡则标 ignored。
@@ -1079,6 +1130,7 @@ function serializeInteractive(allNodes, ctx) {
   for (const node of allNodes) {
     if (!node.isInteractive || !node.isVisible) continue;
     if (node.ignoredByPaintOrder) continue;
+    if (node.excludedByParent) continue;       // 被父按钮包含的冗余后代:不单独编号
     const attrs = node.attributes || {};
     const tag = (node.nodeName || '').toLowerCase();
     const text = extractText(node);
@@ -1253,6 +1305,7 @@ async function handleAgentObserve(tabId) {
     pending = nextPending;
   }
 
+  applyBoundingBoxFilter(allNodes);   // 先剔除被父按钮包含的冗余后代
   applyPaintOrderFilter(allNodes);
   const { elements, indexMap } = serializeInteractive(allNodes, { sessionId: null, targetId: null });
   const extras = await pageExtrasProbe(target);

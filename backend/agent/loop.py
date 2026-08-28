@@ -36,6 +36,11 @@ load_dotenv(dotenv_path=__env_path)
 MODEL_BASE_URL = os.getenv("MODEL_BASE_URL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
+# 调试：置 AGENT_DEBUG_SCREENSHOT=1 时，把每步观察的截图（含 SoM 编号框）落盘到
+# backend/logs/screenshots/ 供人工查看。默认关，零开销（不落盘不解码）。logs/ 已 gitignore。
+_DEBUG_SCREENSHOT = os.getenv("AGENT_DEBUG_SCREENSHOT", "").strip() in ("1", "true", "True", "yes")
+_SHOT_DIR = Path(__file__).resolve().parents[1] / "logs" / "screenshots"
+
 _llm_client = OpenAI(base_url=MODEL_BASE_URL, api_key=OPENAI_API_KEY)
 
 _sessions: dict[str, AgentSession] = {}
@@ -251,6 +256,7 @@ def run_step(session: AgentSession, page_state: PageState,
 
         # 5. 调 LLM（结构化 JSON）
         _log_observation(session, page_state)
+        _dump_screenshot(session, page_state)   # 调试通道：AGENT_DEBUG_SCREENSHOT=1 时落盘截图
         _log_exec_tokens(session)
         parsed = _call_llm(session)
         if parsed is None:
@@ -681,6 +687,32 @@ def _log_observation(session: AgentSession, page_state: PageState) -> None:
                           "popup": popup.get("type", "") if popup else "",
                           "text_len": len(txt), "text_head": txt[:160],
                           "text_tail": txt[-160:] if len(txt) > 320 else ""})
+
+
+def _dump_screenshot(session: AgentSession, page_state: PageState) -> None:
+    """调试通道：把当前观察截图（data URL）落盘到 logs/screenshots/。仅 _DEBUG_SCREENSHOT 开启时执行。
+
+    文件名：{session_id}_s{step}.{ext}，便于按会话/步数对照 JSONL 日志排查。失败静默（调试功能不阻断主流程）。
+    """
+    if not _DEBUG_SCREENSHOT:
+        return
+    shot = getattr(page_state, "screenshot", "") or ""
+    if not shot.startswith("data:"):
+        return
+    try:
+        import base64
+        header, _, b64 = shot.partition(",")
+        if not b64:
+            return
+        ext = "png" if "image/png" in header else "jpg"
+        _SHOT_DIR.mkdir(parents=True, exist_ok=True)
+        fname = f"{session.session_id}_s{session.current_step}.{ext}"
+        (_SHOT_DIR / fname).write_bytes(base64.b64decode(b64))
+        _agent_log.info("screenshot_dumped", session_id=session.session_id,
+                        data={"step": session.current_step, "path": str(_SHOT_DIR / fname)})
+    except Exception as e:
+        _agent_log.warn("screenshot_dump_failed", session_id=session.session_id,
+                        data={"step": session.current_step, "error": str(e)[:120]})
 
 
 def _log_exec_tokens(session: AgentSession) -> None:

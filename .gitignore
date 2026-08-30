@@ -20,9 +20,10 @@ backend/config/.env
 *.sqlite3-wal
 *.sqlite3-shm
 
-# 运行产物（日志、Agent 运行数据），本地保留、不进仓库
+# 运行产物(日志、Agent 运行数据),本地保留、不进仓库
 backend/logs/
 *.jsonl
+!backend/test/eval/cases/*.jsonl
 backend/backend_run.log
 backend/backend_err.log
 backend/knowledge/records/operations.json

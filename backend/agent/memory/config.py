@@ -5,6 +5,7 @@
 避免老系统 QDRANT_VECTOR_SIZE 默认 1024 的维度炸弹。
 """
 
+import json
 import os
 from pathlib import Path
 
@@ -12,6 +13,28 @@ from dotenv import load_dotenv
 
 __env_path = Path(__file__).resolve().parents[2] / "config" / ".env"
 load_dotenv(dotenv_path=__env_path)
+
+
+def _load_calibrated_thresholds() -> dict:
+    """B6:按 embedding 模型名加载 config/thresholds_<model>.json,替代硬编码魔数。
+
+    找不到文件或字段缺失时不影响启动,退回 env/默认值。cosine 分布不可跨模型迁移
+    (arXiv:2310.13994),换 embedding 需重跑 test/eval/calibrate_thresholds.py。
+    """
+    embed_model = os.environ.get("EMBEDDING_MODEL", "")
+    if not embed_model:
+        return {}
+    safe_name = embed_model.replace("/", "_").replace(":", "_")
+    path = Path(__file__).resolve().parents[2] / "config" / f"thresholds_{safe_name}.json"
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+_CAL = _load_calibrated_thresholds()
 
 # Qdrant 连接(复用页面 RAG 的同一实例)
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
@@ -37,12 +60,12 @@ MEMORY_RECALL_TOP_K = int(os.getenv("MEMORY_RECALL_TOP_K", "5"))  # recall 工�
 # 写入时检索相似旧记忆的数量(供 LLM 做 ADD/UPDATE/DELETE/NONE 决策)
 WRITE_SEARCH_TOP_K = int(os.getenv("MEMORY_WRITE_SEARCH_TOP_K", "10"))
 
-# 记忆类型(chat 长期记忆):
-# - persona: 用户是谁(稳定身份/职业/技术栈),常驻注入
-# - preference: 用户想怎样(语言/风格/格式偏好),常驻注入
-# - episodic: 发生过什么(项目/事件/上下文),按需检索注入
-MEMORY_TYPE_PERSONA = "persona"
-MEMORY_TYPE_PREFERENCE = "preference"
+# 记忆类型(chat 长期记忆),两类:
+# - core: 关于用户的稳定事实(身份/职业/技术栈 + 语言/风格/格式偏好),常驻注入。
+#         由原 persona + preference 合并而来(二者作用域/注入/GC 行为完全同构,
+#         区分只在显示,合并抹掉这层无谓边界;抽取只需判 core-vs-episodic 真边界)。
+# - episodic: 发生过什么(项目/事件/上下文),按会话隔离、按需检索注入。
+MEMORY_TYPE_CORE = "core"
 MEMORY_TYPE_EPISODIC = "episodic"
 
 # 作用域:chat 三类全用 global(跨会话通用);保留常量供 payload/过滤统一使用
@@ -56,12 +79,15 @@ DEFAULT_USER_ID = "local"
 CHAT_USER_ID = os.getenv("CHAT_MEMORY_USER_ID", "chat:local")
 
 # ── chat 分层记忆参数 ──
-# core 层(persona + preference):常驻注入每轮对话,量小、都重要,不过相关性闸门。
-CHAT_CORE_TYPES = [MEMORY_TYPE_PERSONA, MEMORY_TYPE_PREFERENCE]
-CHAT_CORE_TOP_K = int(os.getenv("CHAT_CORE_TOP_K", "6"))              # 常驻 core 注入条数上限
-RESIDENT_PREFERENCE_CHAR_LIMIT = int(os.getenv("MEMORY_CORE_CHARS", "800"))  # core 注入块字符上限
+# core 层(合并后单一类型):常驻注入每轮对话,量小、都重要,不过相关性闸门。
+CHAT_CORE_TYPES = [MEMORY_TYPE_CORE]                                 # 单元素,检索/剪枝/过滤统一用
+CHAT_CORE_TOP_K = int(os.getenv("CHAT_CORE_TOP_K", "6"))              # 常驻 core 注入条数上限(兜底,真正限制器是字符预算)
+RESIDENT_PREFERENCE_CHAR_LIMIT = int(os.getenv("MEMORY_CORE_CHARS", "800"))  # core 注入块字符上限(兼容旧名)
+# P0 注入选取:core 无条数上限后,字符预算才是绑定约束(弃固定 top_k=6 的最老窗口)。
+CORE_CHAR_BUDGET = int(os.getenv("MEMORY_CORE_CHAR_BUDGET", "1500")) # core 注入总字符预算,按 importance 优先填到满
 # episodic 层:按需 hybrid 检索,过相关性闸门(防 Lost-in-the-Middle 噪声污染)。
-RECALL_MIN_COSINE = float(os.getenv("CHAT_RECALL_MIN_COSINE", "0.5"))  # 绝对余弦门(主闸门)
+RECALL_MIN_COSINE = float(_CAL.get("RECALL_MIN_COSINE",
+    os.getenv("CHAT_RECALL_MIN_COSINE", "0.5")))  # 绝对余弦门(主闸门,标定优先)
 RECALL_REL_RATIO = float(os.getenv("CHAT_RECALL_REL_RATIO", "0.6"))    # 相对比门(兜底,占 top1 比例)
 # 写入去抖:攒 N 轮对话才抽取一次(对齐 mem0 滚动窗口,降 token 成本)。
 CHAT_WRITE_EVERY_N_TURNS = int(os.getenv("CHAT_WRITE_EVERY_N_TURNS", "3"))
@@ -72,12 +98,12 @@ INSTRUCT_CHAT = "Retrieve facts about the user relevant to the current message"
 
 # ── 会话隔离(路线乙)──
 # episodic 记忆按会话隔离:payload.chat_id 存所属会话 id、仅本会话检索;
-# persona/preference 是全局记忆,chat_id 留空(跨所有会话常驻)。
+# core 是全局记忆,chat_id 留空(跨所有会话常驻)。
 # confidence 字段兼作 importance 存储位:抽取时 LLM 打 1-10 分,归一到 0.1-1.0,
 # 供检索三因子重排与 episodic GC 排序共用(一次打分两用)。
 
 # ── episodic 检索三因子重排(对齐 Generative Agents:relevance+recency+importance)──
-# 仅用于 episodic 召回排序;core(persona/preference)是常驻全量注入,不套三因子。
+# 仅用于 episodic 召回排序;core 是常驻全量注入,不套三因子。
 # gap-gated 稀释(调研 IR:候选相关度扎堆时 relevance 区分度差,应看相对间隔而非绝对归一):
 # relevance 直接用原始 cosine(不归一);次要因子(recency+importance)乘一个动态稀释系数
 # dilution = 1 - min(1, spread/GAP_REF),spread=候选 cosine 极差。
@@ -85,7 +111,8 @@ INSTRUCT_CHAT = "Retrieve facts about the user relevant to the current message"
 #   - 相关度扎堆(spread 小)→ dilution→1 → 放手让 recency/importance 决定(打破 tie)。
 RECALL_W_RECENCY = float(os.getenv("CHAT_RECALL_W_RECENCY", "0.25"))       # 时间新近(次要,受稀释门控)
 RECALL_W_IMPORTANCE = float(os.getenv("CHAT_RECALL_W_IMPORTANCE", "0.20")) # 重要性(次要,受稀释门控)
-RECALL_GAP_REF = float(os.getenv("CHAT_RECALL_GAP_REF", "0.15"))           # 多大 cosine 极差算"拉开了"
+RECALL_GAP_REF = float(_CAL.get("RECALL_GAP_REF",
+    os.getenv("CHAT_RECALL_GAP_REF", "0.15")))           # 多大 cosine 极差算"拉开了"(标定优先)
 # recency 指数衰减半衰期(小时);用 created_at(事件新鲜度),非 last_accessed_at。
 RECALL_HALFLIFE_HOURS = float(os.getenv("CHAT_RECALL_HALFLIFE_HOURS", "240"))  # 10 天
 
@@ -95,3 +122,19 @@ RECALL_HALFLIFE_HOURS = float(os.getenv("CHAT_RECALL_HALFLIFE_HOURS", "240"))  #
 EPISODIC_CAP = int(os.getenv("CHAT_EPISODIC_CAP", "50"))                  # 每会话 episodic 上限
 EPISODIC_KEEP_RATIO = float(os.getenv("CHAT_EPISODIC_KEEP_RATIO", "0.8")) # 超限剪到 cap*ratio
 EPISODIC_PRUNE_GRACE_HOURS = float(os.getenv("CHAT_EPISODIC_GRACE_HOURS", "24"))  # 新记忆宽限窗,不剪
+
+# ── 跨会话晋升(批次 B)──
+# episodic 在 N 个不同 chat_id 复现(LLM 判"同一稳定事实" 而非"同一主题不同进展")→ 升 core 全局常驻。
+PROMOTE_THRESHOLD = int(os.getenv("MEMORY_PROMOTE_THRESHOLD", "3"))       # 兄弟集至少覆盖 N 个 distinct chat_id
+PROMOTE_SIM_COSINE = float(_CAL.get("PROMOTE_SIM_COSINE",
+    os.getenv("MEMORY_PROMOTE_SIM_COSINE", "0.85"))) # 复现检测余弦门(比读路径严;标定优先)
+PROMOTE_CONFIDENCE = float(os.getenv("MEMORY_PROMOTE_CONFIDENCE", "0.9"))  # 晋升 canonical 的 confidence,保 -confidence 主导排序靠前
+
+# ── core 摘要/合并(批次 B5)──
+# P0 后 core 无条数上限,只增不减(除非 UPDATE/矛盾软失效);晋升每次成功再 +1。
+# 存量最终会超预算 → 靠 LLM 分组摘要压缩(对齐 MemGPT rethink)。
+# 触发点:service.write_chat_memory 里 prune_global_preferences 之后异步调。
+CORE_COMPACT_TRIGGER_RATIO = float(os.getenv("MEMORY_CORE_COMPACT_RATIO", "3.0"))
+# 超预算多少倍触发(默认 3.0 → 4500 字符,约 150 条身份类 core)
+CORE_COMPACT_MIN_GROUP = int(os.getenv("MEMORY_CORE_COMPACT_MIN_GROUP", "2"))
+# 至少 N 条同主题才合并(1 条不需要"合并")

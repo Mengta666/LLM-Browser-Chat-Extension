@@ -1,7 +1,7 @@
 """记忆检索(注入 chat 前的读路径)。
 
 分层召回(对齐 MemGPT core-常驻 / archival-按需):
-- retrieve_core_memories:persona + preference,**常驻**注入每轮对话(scroll 全量,不过阈值)。
+- retrieve_core_memories:core(合并后单一类型),**常驻**注入每轮对话(scroll 全量,不过阈值)。
 - recall_episodic_memories:episodic 事件记忆,**按需**召回,过双相关性闸门。
 
 均不调 LLM(纯向量)。Qdrant 不可用/空库时返回空,不抛异常,保证 chat 主流程不受影响。
@@ -12,10 +12,11 @@ from typing import Any
 
 from agent.memory import vector as V
 from agent.memory.config import (
-    MEMORY_RECALL_TOP_K, RESIDENT_PREFERENCE_CHAR_LIMIT,
-    MEMORY_TYPE_PERSONA, MEMORY_TYPE_EPISODIC,
+    MEMORY_RECALL_TOP_K,
+    MEMORY_TYPE_EPISODIC,
     SCOPE_GLOBAL, CHAT_USER_ID, INSTRUCT_CHAT,
-    CHAT_CORE_TYPES, CHAT_CORE_TOP_K, RECALL_MIN_COSINE, RECALL_REL_RATIO,
+    CHAT_CORE_TYPES, CORE_CHAR_BUDGET,
+    RECALL_MIN_COSINE, RECALL_REL_RATIO,
     RECALL_W_RECENCY, RECALL_W_IMPORTANCE, RECALL_GAP_REF, RECALL_HALFLIFE_HOURS,
 )
 from rag.embedder import embed_query
@@ -26,59 +27,54 @@ from rag.embedder import embed_query
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def retrieve_core_memories(user_id: str = CHAT_USER_ID,
-                           top_k: int = CHAT_CORE_TOP_K) -> list[dict[str, Any]]:
-    """取 chat 常驻记忆(persona + preference,scope=global),每轮无条件注入。
+                           top_k: int = 200) -> list[dict[str, Any]]:
+    """取 chat 常驻记忆(core,scope=global),每轮无条件注入。
 
-    scroll 全量取回(与相似度无关——core 是"永远该记着"的),排序:
-    persona 优先(用户是谁比偏好更根本)→ reinforce_count 降序 → created_at 升序(稳定)。
+    scroll 全量取回(与相似度无关——core 是"永远该记着"的),按 importance 优先排序:
+    confidence(importance)降序 → reinforce_count 降序 → created_at 降序(新在前)。
+    P0:排序主键是 importance 而非"最老优先",trivia 先被挤出、身份类稳在窗内。
+    verified(手动条)不作为主键——否则手动条默认 confidence=1.0 会永久霸占注入窗;
+    真正的注入限制器是 build_core_block 的字符预算,这里默认 top_k=200 只是防单次
+    scroll 拉太多(远高于任何合理 core 规模,不再作为绑定约束——原 CHAT_CORE_TOP_K=6
+    的硬截断已废弃,字符预算才是真限制器)。
     Qdrant 不可用/空库返回空。
     """
     try:
         items = V.scroll_memories(
-            user_id=user_id, memory_type=CHAT_CORE_TYPES, scope=SCOPE_GLOBAL, limit=200)
+            user_id=user_id, memory_type=CHAT_CORE_TYPES, scope=SCOPE_GLOBAL, limit=1000)
     except Exception:
         return []
 
-    def _sort_key(m: dict[str, Any]):
-        persona_first = 0 if m.get("memory_type") == MEMORY_TYPE_PERSONA else 1
-        return (persona_first, -int(m.get("reinforce_count", 0)), str(m.get("created_at", "")))
-
-    items.sort(key=_sort_key)
+    # 稳定排序两步(避免在一个 tuple 里混升/降序):先按 created_at 降序(次要 tiebreaker),
+    # 再按 (confidence, reinforce_count) 降序(主键)。Python sort 稳定,主键相同者保持"新在前"。
+    items.sort(key=lambda m: str(m.get("created_at", "")), reverse=True)
+    items.sort(key=lambda m: (float(m.get("confidence", 0.0)),
+                              int(m.get("reinforce_count", 0))), reverse=True)
     return items[:top_k]
 
 
 def build_core_block(memories: list[dict[str, Any]]) -> str:
     """把 core 记忆组装成注入每轮对话的文本块。空则返回空串。
 
-    persona / preference 分组呈现;累计超 RESIDENT_PREFERENCE_CHAR_LIMIT 即停(容量护栏)。
+    合并后 core 是单一类型,不再分"身份/偏好"两组——扁平单列表呈现。
+    P0:真正的限制器是字符预算 CORE_CHAR_BUDGET(按 importance 优先顺序填到满),
+    而非固定条数;memories 已由 retrieve_core_memories 按 importance 降序排好。
+    最重要那条(memories[0])无条件收入——即使它本身已超预算,也强于返回空块
+    (真机遇到的话说明该条本身过长,后续 core 摘要机制会压缩它,这里先保底注入)。
     """
     if not memories:
         return ""
-    personas = [m for m in memories if m.get("memory_type") == MEMORY_TYPE_PERSONA]
-    prefs = [m for m in memories if m.get("memory_type") != MEMORY_TYPE_PERSONA]
-
     lines = ["## 关于用户(始终参考)"]
     used = 0
-    if personas:
-        lines.append("身份:")
-        for m in personas:
-            content = str(m.get("content", "")).strip()
-            if not content:
-                continue
-            if used + len(content) > RESIDENT_PREFERENCE_CHAR_LIMIT:
-                break
-            lines.append(f"- {content}")
-            used += len(content)
-    if prefs:
-        lines.append("偏好:")
-        for m in prefs:
-            content = str(m.get("content", "")).strip()
-            if not content:
-                continue
-            if used + len(content) > RESIDENT_PREFERENCE_CHAR_LIMIT:
-                break
-            lines.append(f"- {content}")
-            used += len(content)
+    for i, m in enumerate(memories):
+        content = str(m.get("content", "")).strip()
+        if not content:
+            continue
+        # 保底:第一条(importance 最高)无条件收入,即便本身已超预算
+        if i > 0 and used + len(content) > CORE_CHAR_BUDGET:
+            break
+        lines.append(f"- {content}")
+        used += len(content)
     return "\n".join(lines) if len(lines) > 1 else ""
 
 

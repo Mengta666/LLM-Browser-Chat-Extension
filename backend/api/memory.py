@@ -14,7 +14,7 @@ from pydantic import BaseModel
 from agent.memory import vector as V
 from agent.memory.config import (
     CHAT_USER_ID, SCOPE_GLOBAL,
-    MEMORY_TYPE_PERSONA, MEMORY_TYPE_PREFERENCE, MEMORY_TYPE_EPISODIC,
+    MEMORY_TYPE_CORE, MEMORY_TYPE_EPISODIC,
 )
 from rag.embedder import embed_text
 from observability.logger import get_logger
@@ -23,15 +23,15 @@ _mem_log = get_logger("memory_api")
 
 router = APIRouter(prefix="/v1/memory", tags=["记忆管理"])
 
-_CHAT_TYPES = {MEMORY_TYPE_PERSONA, MEMORY_TYPE_PREFERENCE, MEMORY_TYPE_EPISODIC}
-# 手动可新建的类型:只允许全局类(persona/preference)。
+_CHAT_TYPES = {MEMORY_TYPE_CORE, MEMORY_TYPE_EPISODIC}
+# 手动可新建的类型:只允许全局类 core。
 # episodic 是系统从对话自动抽的会话内事件,手动造会成"全局 episodic"(任何会话都召不回)死数据。
-_CREATABLE_TYPES = {MEMORY_TYPE_PERSONA, MEMORY_TYPE_PREFERENCE}
+_CREATABLE_TYPES = {MEMORY_TYPE_CORE}
 
 
 class MemoryCreate(BaseModel):
     content: str
-    memory_type: str = MEMORY_TYPE_PREFERENCE
+    memory_type: str = MEMORY_TYPE_CORE
 
 
 class MemoryPatch(BaseModel):
@@ -80,19 +80,21 @@ def get_memory(memory_id: str) -> dict[str, Any]:
 
 @router.post("")
 def create_memory(item: MemoryCreate) -> dict[str, Any]:
-    """用户手动新增一条记忆(对齐 ChatGPT『记住…』)。只允许全局类 persona/preference。"""
+    """用户手动新增一条记忆(对齐 ChatGPT『记住…』)。只允许全局类 core。"""
     content = item.content.strip()
     if not content:
         raise HTTPException(400, "content 不能为空")
     if item.memory_type not in _CREATABLE_TYPES:
         raise HTTPException(
-            400, "episodic 由系统从对话自动生成,不支持手动新增;手动记忆请用 persona 或 preference")
+            400, "episodic 由系统从对话自动生成,不支持手动新增;手动记忆请用 core")
     mtype = item.memory_type
     try:
         payload = V.insert_memory(
             content, vector=embed_text(content),
             memory_type=mtype, scope=SCOPE_GLOBAL, domain="",
-            user_id=CHAT_USER_ID, confidence=1.0, verified=True,  # 用户手动 = 已验证
+            # 手动条置 verified=True(用户明示、失效应更谨慎),但 confidence 给中性 0.7:
+            # 注入排序以 -confidence 为主键,若手动条用 1.0 会永久霸占注入窗、挤掉抽取/晋升的高价值 core。
+            user_id=CHAT_USER_ID, confidence=0.7, verified=True,
         )
     except Exception as exc:
         raise HTTPException(503, f"写入失败: {str(exc)[:160]}")

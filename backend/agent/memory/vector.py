@@ -20,7 +20,7 @@ from agent.memory.config import (
     QDRANT_URL, QDRANT_API_KEY, QDRANT_DISTANCE,
     MEMORY_COLLECTION, MEMORY_VECTOR_SIZE,
     DENSE_VECTOR_NAME, SPARSE_VECTOR_NAME,
-    MEMORY_TYPE_PREFERENCE, MEMORY_TYPE_EPISODIC,
+    MEMORY_TYPE_CORE, MEMORY_TYPE_EPISODIC,
     SCOPE_GLOBAL, DEFAULT_USER_ID, CHAT_USER_ID, CHAT_CORE_TYPES,
     EPISODIC_CAP, EPISODIC_KEEP_RATIO, EPISODIC_PRUNE_GRACE_HOURS,
 )
@@ -144,15 +144,18 @@ def _build_payload(memory_id: str, content: str, *,
                    keywords: Optional[list[str]] = None,
                    reinforce_count: int = 0, last_accessed_at: str = "",
                    valid: bool = True, invalid_at: str = "",
-                   chat_id: str = "") -> dict[str, Any]:
+                   chat_id: str = "",
+                   promoted_from: str = "") -> dict[str, Any]:
     """组装 point payload(事实源)。
 
     confidence/verified/reinforce_count 是生命周期门控;
     keywords 供 BM25 稀疏向量与检索;
     valid/invalid_at 是时间失效(矛盾时标记失效而非物理删除,可回溯,对齐 Zep)。
     chat_id 是第二级隔离键:episodic 带所属会话 id(仅本会话检索),
-    persona/preference 留空表全局(跨所有会话)。
+    core 留空表全局(跨所有会话)。
     confidence 兼作 importance 存储位(1-10 归一到 0.1-1.0,供检索三因子重排与 GC 排序)。
+    promoted_from(批次 B4):若非空,表示这条 core 是由 episodic 晋升上来的,
+    值为原 chat_id——供 demote_memory 回退,以及审计层留痕。
     其他 memory_type 用默认值。
     """
     return {
@@ -175,6 +178,7 @@ def _build_payload(memory_id: str, content: str, *,
         "last_accessed_at": last_accessed_at or "",
         "valid": bool(valid),
         "invalid_at": invalid_at or "",
+        "promoted_from": promoted_from or "",
     }
 
 
@@ -190,7 +194,7 @@ def _build_vectors(dense: list[float], content: str, keywords: Optional[list[str
 
 
 def insert_memory(content: str, *, vector: list[float],
-                  memory_type: str = MEMORY_TYPE_PREFERENCE,
+                  memory_type: str = MEMORY_TYPE_CORE,
                   scope: str = SCOPE_GLOBAL, domain: str = "",
                   user_id: str = DEFAULT_USER_ID,
                   confidence: float = 1.0, verified: bool = False,
@@ -233,7 +237,7 @@ def update_memory(memory_id: str, content: str, *, vector: list[float]) -> Optio
     kw = existing.get("keywords", [])
     payload = _build_payload(
         memory_id, content,
-        memory_type=existing.get("memory_type", MEMORY_TYPE_PREFERENCE),
+        memory_type=existing.get("memory_type", MEMORY_TYPE_CORE),
         scope=existing.get("scope", SCOPE_GLOBAL),
         domain=existing.get("domain", ""),
         user_id=existing.get("user_id", DEFAULT_USER_ID),
@@ -249,6 +253,7 @@ def update_memory(memory_id: str, content: str, *, vector: list[float]) -> Optio
         valid=existing.get("valid", True),
         invalid_at=existing.get("invalid_at", ""),
         chat_id=existing.get("chat_id", ""),
+        promoted_from=existing.get("promoted_from", ""),
     )
     get_client().upsert(
         collection_name=MEMORY_COLLECTION,
@@ -306,31 +311,40 @@ def touch_memories(memory_ids: list[str]) -> None:
             continue
 
 
-def _prune_items(items: list[dict[str, Any]], cap: int, keep_ratio: float) -> int:
-    """按 (reinforce_count 降序, last_accessed_at 降序) 保留高价值,删尾部。返回删除数。"""
-    if len(items) <= cap:
-        return 0
-    keep_n = int(cap * keep_ratio)
-    items.sort(key=lambda m: (int(m.get("reinforce_count", 0)), str(m.get("last_accessed_at", ""))),
-               reverse=True)
-    to_delete = items[keep_n:]
-    for m in to_delete:
-        mid = str(m.get("memory_id", ""))
-        if mid:
-            delete_memory(mid)
-    return len(to_delete)
+def prune_global_preferences(*, user_id: str = CHAT_USER_ID) -> int:
+    """core 遗忘剪枝(P0 后):只物理清除已软失效超宽限窗的僵尸条,活跃 core 永不物理删。
 
-
-def prune_global_preferences(*, user_id: str = CHAT_USER_ID,
-                             cap: int = 50, keep_ratio: float = 0.8) -> int:
-    """遗忘剪枝:core 记忆(persona/preference,scope=global)超 cap → 删到 cap*keep_ratio。
-
-    防无限堆积。保留高 reinforce_count 的。chat_id="" 只剪全局,别误剪会话候选。
+    对齐 MemGPT:core memory 永不按条数 evict。活跃身份/偏好的控量交给写路径的
+    UPDATE/DELETE 决策(矛盾软失效)+ 注入侧 CORE_CHAR_BUDGET 字符预算(importance 优先填充);
+    存量若最终超预算,靠后续的 core 摘要/合并压缩,而非在这里近随机物理删。
+    这里只回收超宽限窗的 valid=false 僵尸——**留出宽限窗是为了 include_invalid=True 的回溯**
+    功能有意义(记忆面板"恢复被删记忆")。宽限期内软失效条能被 CRUD 层看到并恢复,
+    过期后才真正回收存储。
+    chat_id="" 只扫全局 core,别误动会话 episodic。返回物理删除数。
     """
     ensure_collection()
     items = scroll_memories(user_id=user_id, memory_type=CHAT_CORE_TYPES,
-                            scope=SCOPE_GLOBAL, chat_id="", limit=1000)
-    return _prune_items(items, cap, keep_ratio)
+                            scope=SCOPE_GLOBAL, chat_id="", limit=1000,
+                            include_invalid=True)
+    now_ts = datetime.now(timezone.utc).timestamp()
+    grace_cutoff = now_ts - EPISODIC_PRUNE_GRACE_HOURS * 3600
+    removed = 0
+    for m in items:
+        if m.get("valid", True):
+            continue
+        # 宽限窗内的 invalid 保留(用户可回溯);超窗才物删
+        inv_at = str(m.get("invalid_at", ""))
+        if inv_at:
+            try:
+                if datetime.fromisoformat(inv_at).timestamp() >= grace_cutoff:
+                    continue
+            except ValueError:
+                pass  # 时间戳解析失败,当作过期处理(容错删除)
+        mid = str(m.get("memory_id", ""))
+        if mid:
+            delete_memory(mid)
+            removed += 1
+    return removed
 
 
 def prune_episodic(chat_id: str, *, user_id: str = CHAT_USER_ID,
@@ -338,9 +352,9 @@ def prune_episodic(chat_id: str, *, user_id: str = CHAT_USER_ID,
                    keep_ratio: float = EPISODIC_KEEP_RATIO) -> int:
     """会话级 episodic 遗忘剪枝:某会话的 episodic 超 cap → 软失效尾部到 cap*keep_ratio。
 
-    与 _prune_items 不同:①按 (verified 保留, importance/confidence 降序, reinforce_count 降序,
-    last_accessed_at 降序) 排序,把 importance 纳入淘汰键;②用 invalidate_memory 软失效
-    (可回溯)而非物理删;③跳过 verified=True 与 created_at 在宽限窗内的新记忆(防误删)。
+    与 core 剪枝(只清僵尸)不同,episodic 是容量 GC:①按 (verified 保留, importance/confidence 降序,
+    reinforce_count 降序, last_accessed_at 降序) 排序,把 importance 纳入淘汰键;②用 invalidate_memory
+    软失效(可回溯)而非物理删;③跳过 verified=True 与 created_at 在宽限窗内的新记忆(防误删)。
     只扫单个会话(几十条),在写入后同步调用,非后台全量扫描。返回失效条数。
     """
     if not chat_id:
@@ -420,11 +434,11 @@ def _build_filter(*, user_id: str, memory_type: Optional[Any],
     """组装 Qdrant payload 过滤条件。
 
     memory_type 可传 str(单类)或 list(多类,用 MatchAny)——
-    core 检索要同时查 persona+preference 两类。
+    memory_type 可传 str(单类)或 list(多类,用 MatchAny)——合并后 core 检索传单元素列表亦可。
     include_invalid=False(默认)时追加 valid==True,过滤掉已失效记忆
     (时间失效:矛盾记忆标记失效而非删除,检索默认不返回,但可回溯)。
     chat_id 是第二级隔离:None(默认)不加条件(向后兼容全局行为);
-    ""(空串)显式匹配全局记忆(persona/preference);"X" 仅匹配该会话(episodic)。
+    ""(空串)显式匹配全局记忆(core);"X" 仅匹配该会话(episodic)。
     """
     must: list[models.FieldCondition] = [
         models.FieldCondition(key="user_id", match=models.MatchValue(value=user_id)),

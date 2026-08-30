@@ -1,9 +1,9 @@
 """记忆子系统对外门面(chat 长期记忆)。
 
 chat 只跟这几个函数打交道(分层:core 常驻 + episodic 按需):
-- get_core_memories:每轮对话取常驻记忆(persona + preference),注入 prompt。
+- get_core_memories:每轮对话取常驻记忆(core),注入 prompt。
 - recall_episodic:按需召回事件记忆(过相关性闸门)。
-- write_chat_memory:对话结束后台抽取写入(persona/preference/episodic)。
+- write_chat_memory:对话结束后台抽取写入(core/episodic)。
 - build_core_block / build_episodic_block:记忆 → 注入文本块。
 
 所有函数都对异常宽容:记忆是"锦上添花",绝不能因为它出错而拖垮 chat 主流程。
@@ -18,7 +18,7 @@ from agent.memory.config import CHAT_USER_ID
 
 
 def get_core_memories(user_id: str = None) -> list[dict[str, Any]]:
-    """取 chat 常驻记忆(persona + preference),供每轮注入。异常降级为空。"""
+    """取 chat 常驻记忆(core),供每轮注入。异常降级为空。"""
     try:
         return R.retrieve_core_memories(user_id=user_id or CHAT_USER_ID)
     except Exception:
@@ -53,7 +53,7 @@ def build_episodic_block(memories: list[dict[str, Any]]) -> str:
 def write_chat_memory(user_msg: str, assistant_msg: str,
                       history_summary: str = "", user_id: str = None,
                       chat_id: str = "") -> dict[str, Any]:
-    """chat 对话抽取并写入记忆(persona/preference/episodic)。任何异常都吞掉。
+    """chat 对话抽取并写入记忆(core/episodic)。任何异常都吞掉。
 
     chat_id 用于 episodic 会话隔离;写后剪枝:全局 core 防堆积 + 本会话 episodic 容量 GC。
     """
@@ -62,7 +62,7 @@ def write_chat_memory(user_msg: str, assistant_msg: str,
         result = W.write_chat_memory(
             user_msg, assistant_msg, history_summary=history_summary,
             user_id=uid, chat_id=chat_id)
-        # 写后剪枝 core 层(persona/preference 属 global,防无限堆积)
+        # 写后剪枝 core 层(只清 valid=false 僵尸条,活跃 core 不物理删)
         try:
             V.prune_global_preferences(user_id=uid)
         except Exception:
@@ -73,6 +73,16 @@ def write_chat_memory(user_msg: str, assistant_msg: str,
                 V.prune_episodic(chat_id, user_id=uid)
             except Exception:
                 pass
+        # B5 core 摘要(异步,不阻塞主链):超预算触发 LLM 分组摘要
+        # 记忆是"锦上添花",压缩失败静默吞
+        try:
+            import threading
+            from agent.memory import summarize
+            threading.Thread(
+                target=summarize.maybe_compact_core, args=(uid,),
+                daemon=True, name="core-compact").start()
+        except Exception:
+            pass
         return result
     except Exception:
         return {"facts": [], "applied": [], "skipped_hash": 0}

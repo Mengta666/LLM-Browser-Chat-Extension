@@ -85,7 +85,7 @@ def _build_memory_system(query: str, chat_id: str = "") -> Optional[str]:
     """检索长期记忆 → 拼装成一条 system 注入文本。无记忆/异常返回 None。
 
     分层(对齐 MemGPT):
-    - core 层(persona+preference):常驻全量注入(量小、都重要,不过闸门),全局。
+    - core 层:常驻全量注入(量小、都重要,不过闸门),全局。
     - episodic 层:仅本会话(chat_id 隔离)、与 query 相关才注入(过双闸门 + 三因子重排)。
     复用 agent/memory service 门面,全程降级。落结构化日志供可观测(命中/注入/拦截)。
     """
@@ -179,7 +179,7 @@ def _schedule_memory_write(user_text: str, assistant_text: str, chat_id: str = "
     """一轮对话结束后,按 N 轮去抖决定是否触发后台抽取写入。绝不阻塞、绝不抛。
 
     攒够 N 轮才写(对齐 mem0 滚动窗口降成本);触发时调 write_chat_memory
-    抽取 persona/preference/episodic。chat 无站点,不涉及 url/success。
+    抽取 core/episodic。chat 无站点,不涉及 url/success。
     """
     if not user_text and not assistant_text:
         return

@@ -20,7 +20,7 @@ from agent.memory import vector as V
 from agent.memory import history as H
 from agent.memory.config import (
     WRITE_SEARCH_TOP_K, CHAT_USER_ID,
-    MEMORY_TYPE_PERSONA, MEMORY_TYPE_PREFERENCE, MEMORY_TYPE_EPISODIC,
+    MEMORY_TYPE_CORE, MEMORY_TYPE_EPISODIC,
     SCOPE_GLOBAL,
 )
 from agent.memory.prompts import (
@@ -127,7 +127,7 @@ def _apply_decision(event: str, temp_id: str, text: str,
 
     反幻觉:UPDATE/DELETE 的 temp_id 必须在 uuid_mapping 里(即来自本次检索的真实旧记忆)。
     不在 mapping 里的 UPDATE/DELETE 一律忽略(LLM 若编造 id 也无从生效)。
-    chat_id:episodic 落所属会话 id(会话隔离),persona/preference 落 ""(全局)。
+    chat_id:episodic 落所属会话 id(会话隔离),core 落 ""(全局)。
     """
     event = str(event or "").upper()
     real_id = uuid_mapping.get(str(temp_id))
@@ -146,16 +146,42 @@ def _apply_decision(event: str, temp_id: str, text: str,
             chat_id=chat_id,
         )
         H.add_history(payload["memory_id"], "ADD", "", text)
+
+        # B4 挂钩:episodic ADD 后触发跨会话晋升检测
+        # (记忆是"锦上添花",失败不阻塞主链路)
+        if fact_meta.get("memory_type") == MEMORY_TYPE_EPISODIC:
+            try:
+                from agent.memory import promotion
+                from agent.memory.config import PROMOTE_THRESHOLD
+                sibling_ids = promotion.detect_recurrence(text, chat_id, user_id)
+                sibling_ids.add(payload["memory_id"])   # 含刚写的自己
+                # 数 distinct chat_id(自动含当前 chat_id,因为自己已加入)
+                distinct = promotion.distinct_chat_ids_of(sibling_ids)
+                if len(distinct) >= PROMOTE_THRESHOLD:
+                    canonical = promotion.promote_memory(sibling_ids)
+                    if canonical:
+                        return f"ADD {payload['memory_id']} → PROMOTE {canonical}"
+            except Exception:
+                pass  # 晋升失败不影响 ADD 主链路
+
         return f"ADD {payload['memory_id']}"
 
     if event == "UPDATE":
         if not real_id or not text:
             return None  # 反幻觉:编造的 id 不生效
         prev = V.get_memory(real_id)
+        if prev is None:
+            return None
+        # B2 跨类污染守卫:episodic 事实不许 UPDATE 一条 core
+        # (否则一条项目进展文本会覆盖 core 的身份/偏好正文)
+        # DELETE 不加此守卫——episodic 明确矛盾 core 时软失效是合理的用户改主意行为。
+        if (fact_meta.get("memory_type") == MEMORY_TYPE_EPISODIC
+                and prev.get("memory_type") == MEMORY_TYPE_CORE):
+            return f"REJECT_CROSS_UPDATE {real_id}"
         updated = V.update_memory(real_id, text, vector=embed_text(text))
         if updated is None:
             return None
-        H.add_history(real_id, "UPDATE", (prev or {}).get("content", ""), text)
+        H.add_history(real_id, "UPDATE", prev.get("content", ""), text)
         return f"UPDATE {real_id}"
 
     if event == "DELETE":
@@ -177,14 +203,14 @@ def _consolidate_facts(facts: list[dict[str, Any]], *, user_id: str, chat_id: st
     """阶段二:对每条事实检索相似旧记忆 → hash 去重 → LLM 决策 → 落库。
 
     逐条事实处理,每条独立的临时 id 空间(反幻觉)。就地累加到 result["applied"]/["skipped_hash"]。
-    去重作用域按类型分流:episodic 仅在本会话(chat_id)内比对,persona/preference 在全局
-    (chat_id="")内比对——避免跨会话误去重,也让 persona/preference 的矛盾/更新作用于全局。
+    去重作用域按类型分流:episodic 仅在本会话(chat_id)内比对,core 在全局
+    (chat_id="")内比对——避免跨会话误去重,也让 core 的矛盾/更新作用于全局。
     """
     for fact in facts:
         content = fact["content"]
         memory_type = fact.get("memory_type", MEMORY_TYPE_EPISODIC)
         scope = fact.get("scope", SCOPE_GLOBAL)
-        # 作用域分流:episodic→本会话;persona/preference→全局("")
+        # 作用域分流:episodic→本会话;core→全局("")
         fact_chat_id = chat_id if memory_type == MEMORY_TYPE_EPISODIC else ""
         try:
             query_vec = embed_text(content)
@@ -192,6 +218,22 @@ def _consolidate_facts(facts: list[dict[str, Any]], *, user_id: str, chat_id: st
                 query_vec, query_text=content, top_k=WRITE_SEARCH_TOP_K, user_id=user_id,
                 memory_type=memory_type, scope=scope, chat_id=fact_chat_id,
             )
+            # B2 链路三:episodic 事实额外扫全局 core(供矛盾检测挤到已晋升的 core)
+            # core 走 scroll 全量(非 top_k)——core 量小、且注入侧也是"看全部",
+            # 检索侧不同步会导致超 10 条 core 时漏检矛盾。
+            if memory_type == MEMORY_TYPE_EPISODIC:
+                try:
+                    global_core = V.scroll_memories(
+                        user_id=user_id, memory_type=MEMORY_TYPE_CORE,
+                        scope=SCOPE_GLOBAL, chat_id="", limit=200,
+                    )
+                    # 按 id 去重合并
+                    seen_ids = {m.get("memory_id") for m in similar}
+                    for gm in global_core:
+                        if gm.get("memory_id") not in seen_ids:
+                            similar.append(gm)
+                except Exception:
+                    pass
         except Exception:
             similar = []
 
@@ -232,16 +274,16 @@ def _consolidate_facts(facts: list[dict[str, Any]], *, user_id: str, chat_id: st
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# chat 写入:从对话抽 persona/preference/episodic(单 prompt,无成败分流)
+# chat 写入:从对话抽 core/episodic(单 prompt,无成败分流)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def extract_chat_facts(user_msg: str, assistant_msg: str,
                        history_summary: str = "",
                        llm: LlmFn = _default_llm) -> list[dict[str, Any]]:
-    """chat 抽取阶段:从一轮(或多轮摘要+最近一轮)对话抽 persona/preference/episodic。
+    """chat 抽取阶段:从一轮(或多轮摘要+最近一轮)对话抽 core/episodic。
 
     返回 [{content, memory_type, scope, domain, keywords, confidence}]。content/keywords 过脱敏。
-    persona/preference→scope=global 常驻;episodic→scope=global 按需检索。domain 一律空(chat 无站点)。
+    core→scope=global 常驻;episodic→scope=global 按需检索。domain 一律空(chat 无站点)。
     """
     result = llm(CHAT_EXTRACT_SYSTEM_PROMPT,
                  build_chat_extract_user_prompt(user_msg, assistant_msg, history_summary))
@@ -259,7 +301,7 @@ def extract_chat_facts(user_msg: str, assistant_msg: str,
         if not content:
             continue
         mtype = f.get("memory_type", MEMORY_TYPE_EPISODIC)
-        if mtype not in (MEMORY_TYPE_PERSONA, MEMORY_TYPE_PREFERENCE, MEMORY_TYPE_EPISODIC):
+        if mtype not in (MEMORY_TYPE_CORE, MEMORY_TYPE_EPISODIC):
             mtype = MEMORY_TYPE_EPISODIC  # 拿不准归按需层(不轻进常驻 core)
         cleaned.append({
             "content": content,
@@ -281,7 +323,7 @@ def write_chat_memory(user_msg: str, assistant_msg: str,
     """chat 完整两阶段写入。返回 {facts, applied:[...], skipped_hash:int}。
 
     阶段一:extract_chat_facts;阶段二:复用 _consolidate_facts(检索相似→去重→决策→落库,
-    矛盾走失效)。chat_id 用于 episodic 会话隔离(persona/preference 仍落全局)。
+    矛盾走失效)。chat_id 用于 episodic 会话隔离(core 仍落全局)。
     对异常宽容,记忆写入是尽力而为。
     """
     result: dict[str, Any] = {"facts": [], "applied": [], "skipped_hash": 0}

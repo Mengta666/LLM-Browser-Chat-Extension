@@ -1302,7 +1302,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // ── 长期记忆管理(设置内:列出 / 删 / 改 / 加)──
 
-  const MEMORY_TYPE_LABELS = { persona: '身份', preference: '偏好', episodic: '事件' };
+  const MEMORY_TYPE_LABELS = { core: '画像', episodic: '事件' };
 
   async function loadMemoryPanel() {
     const listEl = document.getElementById('memoryList');
@@ -1322,8 +1322,8 @@ document.addEventListener('DOMContentLoaded', async () => {
       listEl.innerHTML = '<div class="memory-empty">还没有长期记忆</div>';
       return;
     }
-    // 按类型分组:persona → preference → episodic
-    const order = ['persona', 'preference', 'episodic'];
+    // 按类型分组:core → episodic
+    const order = ['core', 'episodic'];
     const grouped = {};
     for (const m of memories) (grouped[m.memory_type] = grouped[m.memory_type] || []).push(m);
     for (const type of order) {
@@ -1391,7 +1391,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (!content) return;
     try {
       const base = await backendBase();
-      await callBackendApi(buildBackendEndpointUrl(base, '/v1/memory'), 'POST', { content, memory_type: typeSel?.value || 'episodic' });
+      await callBackendApi(buildBackendEndpointUrl(base, '/v1/memory'), 'POST', { content, memory_type: typeSel?.value || 'core' });
       input.value = '';
       await loadMemoryPanel();
     } catch (e) {

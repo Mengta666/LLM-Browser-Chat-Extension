@@ -703,6 +703,9 @@ input { width: 100%; padding: 8px; margin-top: 5px; box-sizing: border-box; bord
 
 /* ── 长期记忆管理面板(设置内)── */
 .memory-section { margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--app-border); }
+/* memory tab 里作为唯一顶层内容时,去掉那条分割线和上边距(独立 tab 内容不需要"分节"视觉) */
+#memory .memory-section { margin-top: 0; padding-top: 0; border-top: none; }
+#memory .memory-head label { margin-top: 0; }
 .memory-head { display: flex; align-items: center; justify-content: space-between; }
 .memory-add { display: flex; gap: 6px; margin: 8px 0; }
 .memory-add input { flex: 1; min-width: 0; }
@@ -721,3 +724,56 @@ input { width: 100%; padding: 8px; margin-top: 5px; box-sizing: border-box; bord
 }
 .memory-item-actions button:hover { background: var(--app-accent-soft-hover); color: var(--app-text); }
 .memory-empty { padding: 12px; text-align: center; color: var(--app-muted); font-size: 13px; }
+
+/* 批次 E · P3:subject badge + superseded 灰化 + 一键整理 modal */
+.memory-item-subject {
+  display: inline-block; margin-right: 6px; padding: 1px 6px;
+  font-size: 11px; color: var(--app-accent, #4ECDC4);
+  background: var(--app-accent-soft, rgba(78, 205, 196, 0.12));
+  border-radius: 10px; white-space: nowrap;
+}
+.memory-item.superseded { opacity: 0.5; }
+.memory-item.superseded .memory-item-content::after {
+  content: " · 已被替代"; color: var(--app-muted); font-size: 11px;
+}
+.memory-item-expires {
+  display: inline-block; margin-left: 6px; padding: 1px 6px;
+  font-size: 11px; color: #C8621C;
+  background: rgba(200, 98, 28, 0.12);
+  border-radius: 10px; white-space: nowrap;
+}
+.memory-head-btns { display: inline-flex; gap: 6px; }
+
+/* 整理 modal */
+.rethink-modal {
+  position: fixed; inset: 0; background: rgba(0, 0, 0, 0.4);
+  display: flex; align-items: center; justify-content: center; z-index: 9999;
+}
+.rethink-modal-inner {
+  background: var(--app-surface, #fff); border-radius: 12px;
+  padding: 24px; min-width: 320px; max-width: 480px;
+  max-height: 70vh; display: flex; flex-direction: column;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+}
+.rethink-modal-title {
+  font-size: 15px; font-weight: 600; margin-bottom: 12px;
+  color: var(--app-text);
+}
+.rethink-modal-status {
+  font-size: 13px; color: var(--app-muted); margin-bottom: 10px;
+  min-height: 18px;
+}
+.rethink-modal-log {
+  flex: 1; overflow-y: auto; font-size: 12px; line-height: 1.5;
+  padding: 8px 10px; background: var(--app-surface-2, #f2f5f8);
+  border-radius: 6px; border: 1px solid var(--app-border);
+  color: var(--app-text); margin-bottom: 12px;
+  max-height: 300px; font-family: ui-monospace, "Menlo", monospace;
+}
+.rethink-modal-log .rethink-log-line { margin: 2px 0; }
+.rethink-modal-log .rethink-log-conflict { color: #C8621C; }
+.rethink-modal-log .rethink-log-expired { color: #6D5BD0; }
+.rethink-modal-log .rethink-log-merge { color: var(--app-accent, #0E9C90); }
+.rethink-modal-log .rethink-log-error { color: #C0392B; }
+.rethink-modal-log .rethink-log-info { color: var(--app-muted); font-style: italic; }
+.rethink-modal-actions { display: flex; justify-content: flex-end; }

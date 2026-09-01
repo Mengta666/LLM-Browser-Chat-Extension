@@ -73,7 +73,7 @@ def _ensure_payload_indexes() -> None:
     重复建同名同型索引是 no-op;异常静默(索引缺失只影响性能不影响正确性)。
     """
     client = get_client()
-    keyword_fields = ["user_id", "memory_type", "chat_id", "scope"]
+    keyword_fields = ["user_id", "memory_type", "chat_id", "scope", "subject"]
     for field in keyword_fields:
         try:
             client.create_payload_index(
@@ -145,7 +145,11 @@ def _build_payload(memory_id: str, content: str, *,
                    reinforce_count: int = 0, last_accessed_at: str = "",
                    valid: bool = True, invalid_at: str = "",
                    chat_id: str = "",
-                   promoted_from: str = "") -> dict[str, Any]:
+                   promoted_from: str = "",
+                   stability_score: float = 0.5,
+                   subject: str = "",
+                   expires_at: str = "",
+                   superseded_by: str = "") -> dict[str, Any]:
     """组装 point payload(事实源)。
 
     confidence/verified/reinforce_count 是生命周期门控;
@@ -156,6 +160,18 @@ def _build_payload(memory_id: str, content: str, *,
     confidence 兼作 importance 存储位(1-10 归一到 0.1-1.0,供检索三因子重排与 GC 排序)。
     promoted_from(批次 B4):若非空,表示这条 core 是由 episodic 晋升上来的,
     值为原 chat_id——供 demote_memory 回退,以及审计层留痕。
+    stability_score(批次 D):LLM 抽取时打分——这条 fact 有多稳定(0=一次性事件,1=长期不变属性)。
+    与 memory_type 独立,供 consolidate LLM 判 promote 时使用。缺省 0.5 中性。
+    subject(批次 E · P1):LLM 抽取时的主题短语(自由文本,如"回答语言偏好""编程语言")。
+    供 CONSOLIDATE 候选拉取加副通道——按 subject 硬匹配,补 embedding 相似度低但同主题的漏检。
+    抽不到明确主题给空串,不进 subject 副通道(退化到 embedding 单通道)。
+    expires_at(批次 E · P2):预计失效时刻(未来 ISO 时间);EXTRACT 明确抽到时限
+    信号词("这周""下周""临时"等)才 set,身份/长期偏好留空。
+    rethink 整理时若 expires_at < now 归为 expired 组。**与 invalid_at 语义分工**:
+    invalid_at 是"已失效时刻(过去)",expires_at 是"预计失效时刻(未来)"。
+    superseded_by(批次 E · P2):若非空,表示这条被某条更新的取代,值为新 memory_id。
+    不软失效、只标注——留给应答 LLM 参考、或用户手动清理。rethink 判 conflict/merge
+    时,failed(被替代)条会同时被 invalidate + set superseded_by。
     其他 memory_type 用默认值。
     """
     return {
@@ -179,6 +195,10 @@ def _build_payload(memory_id: str, content: str, *,
         "valid": bool(valid),
         "invalid_at": invalid_at or "",
         "promoted_from": promoted_from or "",
+        "stability_score": float(stability_score),
+        "subject": str(subject or "")[:64],
+        "expires_at": expires_at or "",
+        "superseded_by": superseded_by or "",
     }
 
 
@@ -200,7 +220,11 @@ def insert_memory(content: str, *, vector: list[float],
                   confidence: float = 1.0, verified: bool = False,
                   entry_url: str = "", intent_keywords: Optional[list[str]] = None,
                   keywords: Optional[list[str]] = None,
-                  reinforce_count: int = 0, chat_id: str = "") -> dict[str, Any]:
+                  reinforce_count: int = 0, chat_id: str = "",
+                  promoted_from: str = "",
+                  stability_score: float = 0.5,
+                  subject: str = "",
+                  expires_at: str = "") -> dict[str, Any]:
     """写入一条新记忆(dense+sparse 双向量),返回落库的 payload(含生成的 memory_id)。"""
     ensure_collection()
     memory_id = make_memory_id()
@@ -211,6 +235,8 @@ def insert_memory(content: str, *, vector: list[float],
         confidence=confidence, verified=verified,
         entry_url=entry_url, intent_keywords=intent_keywords,
         keywords=keywords, reinforce_count=reinforce_count, chat_id=chat_id,
+        promoted_from=promoted_from, stability_score=stability_score,
+        subject=subject, expires_at=expires_at,
     )
     get_client().upsert(
         collection_name=MEMORY_COLLECTION,
@@ -221,6 +247,11 @@ def insert_memory(content: str, *, vector: list[float],
         )],
         wait=True,
     )
+    try:
+        from agent.memory import list_cache
+        list_cache.invalidate_all()
+    except Exception:
+        pass
     return payload
 
 
@@ -254,6 +285,10 @@ def update_memory(memory_id: str, content: str, *, vector: list[float]) -> Optio
         invalid_at=existing.get("invalid_at", ""),
         chat_id=existing.get("chat_id", ""),
         promoted_from=existing.get("promoted_from", ""),
+        stability_score=existing.get("stability_score", 0.5),
+        subject=existing.get("subject", ""),
+        expires_at=existing.get("expires_at", ""),
+        superseded_by=existing.get("superseded_by", ""),
     )
     get_client().upsert(
         collection_name=MEMORY_COLLECTION,
@@ -264,6 +299,11 @@ def update_memory(memory_id: str, content: str, *, vector: list[float]) -> Optio
         )],
         wait=True,
     )
+    try:
+        from agent.memory import list_cache
+        list_cache.invalidate_all()
+    except Exception:
+        pass
     return payload
 
 
@@ -281,6 +321,11 @@ def invalidate_memory(memory_id: str) -> Optional[dict[str, Any]]:
     get_client().set_payload(
         collection_name=MEMORY_COLLECTION, payload=patch,
         points=[_point_id(memory_id)], wait=True)
+    try:
+        from agent.memory import list_cache
+        list_cache.invalidate_all()
+    except Exception:
+        pass
     return {**existing, **patch}
 
 
@@ -407,6 +452,11 @@ def delete_memory(memory_id: str) -> None:
         points_selector=models.PointIdsList(points=[_point_id(memory_id)]),
         wait=True,
     )
+    try:
+        from agent.memory import list_cache
+        list_cache.invalidate_all()
+    except Exception:
+        pass
 
 
 def get_memory(memory_id: str) -> Optional[dict[str, Any]]:
@@ -430,7 +480,8 @@ def get_memory(memory_id: str) -> Optional[dict[str, Any]]:
 def _build_filter(*, user_id: str, memory_type: Optional[Any],
                   scope: Optional[str], domain: Optional[str],
                   include_invalid: bool = False,
-                  chat_id: Optional[str] = None) -> models.Filter:
+                  chat_id: Optional[str] = None,
+                  subject: Optional[str] = None) -> models.Filter:
     """组装 Qdrant payload 过滤条件。
 
     memory_type 可传 str(单类)或 list(多类,用 MatchAny)——
@@ -439,6 +490,8 @@ def _build_filter(*, user_id: str, memory_type: Optional[Any],
     (时间失效:矛盾记忆标记失效而非删除,检索默认不返回,但可回溯)。
     chat_id 是第二级隔离:None(默认)不加条件(向后兼容全局行为);
     ""(空串)显式匹配全局记忆(core);"X" 仅匹配该会话(episodic)。
+    subject(批次 E · P1):None 不过滤;非 None 精确匹配 payload.subject
+    (含空串,用于 subject 副通道硬匹配;调用方保证只对非空 subject 用它)。
     """
     must: list[models.FieldCondition] = [
         models.FieldCondition(key="user_id", match=models.MatchValue(value=user_id)),
@@ -456,6 +509,8 @@ def _build_filter(*, user_id: str, memory_type: Optional[Any],
         must.append(models.FieldCondition(key="domain", match=models.MatchValue(value=domain)))
     if chat_id is not None:
         must.append(models.FieldCondition(key="chat_id", match=models.MatchValue(value=chat_id)))
+    if subject is not None:
+        must.append(models.FieldCondition(key="subject", match=models.MatchValue(value=subject)))
     if not include_invalid:
         must.append(models.FieldCondition(key="valid", match=models.MatchValue(value=True)))
     return models.Filter(must=must)
@@ -468,17 +523,20 @@ def search_memories(query_vector: list[float], *, top_k: int,
                     scope: Optional[str] = None,
                     domain: Optional[str] = None,
                     include_invalid: bool = False,
-                    chat_id: Optional[str] = None) -> list[dict[str, Any]]:
+                    chat_id: Optional[str] = None,
+                    subject: Optional[str] = None) -> list[dict[str, Any]]:
     """hybrid 检索:dense(语义)+ sparse(BM25)双路 prefetch → RRF 融合。
 
     query_text 用于算 sparse 向量;为空或稀疏不可用时,sparse 路命中为空,
     RRF 自动退化为纯 dense。memory_type 可传 str 或 list(多类)。
     include_invalid=False 默认过滤已失效记忆。chat_id 见 _build_filter(会话隔离)。
+    subject 见 _build_filter(批次 E P1 subject 副通道)。
     collection 不存在时返回空。返回 [{memory_id, content, score, ...payload}]，融合分降序。
     """
     ensure_collection()
     flt = _build_filter(user_id=user_id, memory_type=memory_type, scope=scope,
-                        domain=domain, include_invalid=include_invalid, chat_id=chat_id)
+                        domain=domain, include_invalid=include_invalid,
+                        chat_id=chat_id, subject=subject)
     limit = max(1, int(top_k))
     prefetch = [
         models.Prefetch(query=query_vector, using=DENSE_VECTOR_NAME, filter=flt, limit=limit * 2),
@@ -515,15 +573,18 @@ def dense_scores(query_vector: list[float], *, top_k: int,
                  scope: Optional[str] = None,
                  domain: Optional[str] = None,
                  include_invalid: bool = False,
-                 chat_id: Optional[str] = None) -> dict[str, float]:
+                 chat_id: Optional[str] = None,
+                 subject: Optional[str] = None) -> dict[str, float]:
     """纯 dense 检索,返回 {memory_id: cosine}(Cosine 距离下 query_points 的 score 即余弦)。
 
     供相关性闸门用:hybrid RRF 分数量级极小、绝对阈值不可用,故单独取 dense 余弦判绝对相关性。
-    chat_id 见 _build_filter(会话隔离)。collection 不存在返回空 dict。
+    chat_id 见 _build_filter(会话隔离)。subject 见 _build_filter(批次 E P1)。
+    collection 不存在返回空 dict。
     """
     ensure_collection()
     flt = _build_filter(user_id=user_id, memory_type=memory_type, scope=scope,
-                        domain=domain, include_invalid=include_invalid, chat_id=chat_id)
+                        domain=domain, include_invalid=include_invalid,
+                        chat_id=chat_id, subject=subject)
     try:
         result = get_client().query_points(
             collection_name=MEMORY_COLLECTION,
@@ -549,11 +610,13 @@ def scroll_memories(*, user_id: str = DEFAULT_USER_ID,
                     domain: Optional[str] = None,
                     limit: int = 200,
                     include_invalid: bool = False,
-                    chat_id: Optional[str] = None) -> list[dict[str, Any]]:
+                    chat_id: Optional[str] = None,
+                    subject: Optional[str] = None) -> list[dict[str, Any]]:
     """filter-only 拉取记忆(不做相似度检索),供常驻偏好全量取回 / 遗忘剪枝 / CRUD 列表用。
 
     与向量无关,按 payload 过滤条件 scroll。include_invalid=True 时含已失效记忆
-    (CRUD 回溯用)。chat_id 见 _build_filter(会话隔离)。collection 不存在返回空。
+    (CRUD 回溯用)。chat_id 见 _build_filter(会话隔离)。subject 见 _build_filter
+    (批次 E P1 · subject 副通道硬匹配用)。collection 不存在返回空。
     """
     ensure_collection()
     try:
@@ -561,7 +624,8 @@ def scroll_memories(*, user_id: str = DEFAULT_USER_ID,
             collection_name=MEMORY_COLLECTION,
             scroll_filter=_build_filter(
                 user_id=user_id, memory_type=memory_type, scope=scope,
-                domain=domain, include_invalid=include_invalid, chat_id=chat_id),
+                domain=domain, include_invalid=include_invalid,
+                chat_id=chat_id, subject=subject),
             limit=max(1, int(limit)),
             with_payload=True,
         )
@@ -576,17 +640,19 @@ def count_memories(user_id: str = DEFAULT_USER_ID, *,
                    memory_type: Optional[Any] = None,
                    domain: Optional[str] = None,
                    include_invalid: bool = False,
-                   chat_id: Optional[str] = None) -> int:
+                   chat_id: Optional[str] = None,
+                   subject: Optional[str] = None) -> int:
     """统计记忆条数(测试/一致性校验用)。
 
-    可按 memory_type、domain、chat_id 过滤。include_invalid=False 默认只数有效记忆。
+    可按 memory_type、domain、chat_id、subject 过滤。include_invalid=False 默认只数有效记忆。
     """
     ensure_collection()
     result = get_client().count(
         collection_name=MEMORY_COLLECTION,
         count_filter=_build_filter(
             user_id=user_id, memory_type=memory_type, scope=None,
-            domain=domain, include_invalid=include_invalid, chat_id=chat_id),
+            domain=domain, include_invalid=include_invalid,
+            chat_id=chat_id, subject=subject),
         exact=True,
     )
     return int(result.count)

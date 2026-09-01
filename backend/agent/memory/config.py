@@ -138,3 +138,18 @@ CORE_COMPACT_TRIGGER_RATIO = float(os.getenv("MEMORY_CORE_COMPACT_RATIO", "3.0")
 # 超预算多少倍触发(默认 3.0 → 4500 字符,约 150 条身份类 core)
 CORE_COMPACT_MIN_GROUP = int(os.getenv("MEMORY_CORE_COMPACT_MIN_GROUP", "2"))
 # 至少 N 条同主题才合并(1 条不需要"合并")
+
+# ── 批次 E · P2:core 冲突整理(rethink)──
+# 周期性/写后/一键触发 LLM 全库扫 core,判 conflicts/expired/merges → 落库。
+# 与 core 摘要正交:摘要是"同主题多条压成一条",rethink 是"冲突判决 + 过期清理"。
+# 三触发共用一把并发锁,防同时跑两次消耗 token + 中间状态污染。
+RETHINK_CORE_INTERVAL_HOURS = float(os.getenv("MEMORY_RETHINK_INTERVAL_HOURS", "24"))
+# 后台 daemon 周期(小时);拍脑袋默认,看真机 conflicts_resolved 数据再调整
+RETHINK_CORE_MAX_GROUPS_PER_RUN = int(os.getenv("MEMORY_RETHINK_MAX_GROUPS", "10"))
+# 单次最多处理 conflict+expired+merge 组数(防单次 LLM 输出过多误伤)
+RETHINK_MIN_CORE_COUNT = int(os.getenv("MEMORY_RETHINK_MIN_CORE", "3"))
+# core 少于 N 条不触发(避免噪音;至少要有比对空间才有整理意义)
+RETHINK_MAX_ELAPSED_SEC = int(os.getenv("MEMORY_RETHINK_MAX_ELAPSED", "300"))
+# 僵死锁兜底(秒):新请求见到超此时长的旧锁 → 视为进程僵死,强制回收
+RETHINK_DAEMON_ENABLED = os.getenv("MEMORY_RETHINK_DAEMON_ENABLED", "1") == "1"
+# 后台 daemon 开关(测试/调试时可关)

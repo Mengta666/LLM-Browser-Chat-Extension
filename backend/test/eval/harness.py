@@ -51,6 +51,7 @@ def seed_one(content: str, *,
              memory_type: str = MEMORY_TYPE_CORE,
              chat_id: str = "",
              confidence: float = 0.8,
+             stability_score: float = 0.5,
              reinforce_count: int = 0,
              verified: bool = False,
              created_iso: Optional[str] = None,
@@ -78,6 +79,7 @@ def seed_one(content: str, *,
         confidence=confidence,
         reinforce_count=reinforce_count,
         verified=verified,
+        stability_score=stability_score,
     )
     if created_iso:
         V.get_client().set_payload(
@@ -97,13 +99,14 @@ def seed_case(case: dict) -> dict[str, str]:
     """
     tag_to_id: dict[str, str] = {}
     for s in case.get("seed_memories", []):
-        # 复现类必须用真向量,别的可零向量
-        use_zero = case.get("type") != "promotion"
+        # 复现类/更新类必须用真向量(需 CONSOLIDATE 检索真能拉出候选)
+        use_zero = case.get("type") not in ("promotion", "update", "progression")
         mid = seed_one(
             content=s["content"],
             memory_type=s.get("memory_type", MEMORY_TYPE_CORE),
             chat_id=s.get("chat_id", ""),
             confidence=s.get("confidence", 0.8),
+            stability_score=s.get("stability_score", 0.5),
             reinforce_count=s.get("reinforce_count", 0),
             verified=s.get("verified", False),
             created_iso=s.get("created_at"),

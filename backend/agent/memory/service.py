@@ -73,8 +73,11 @@ def write_chat_memory(user_msg: str, assistant_msg: str,
                 V.prune_episodic(chat_id, user_id=uid)
             except Exception:
                 pass
-        # B5 core 摘要(异步,不阻塞主链):超预算触发 LLM 分组摘要
+        # B5 core 摘要(异步,不阻塞主链):超预算才触发 LLM 分组摘要
         # 记忆是"锦上添花",压缩失败静默吞
+        # 注:rethink 冲突整理**不在这里触发**——每次写记忆都跑 LLM 全库扫过于激进,
+        # 且 chat 首次配置阶段就会带来不必要的 LLM 消耗。
+        # 只在两处触发:①用户手动点前端"整理"按钮 ②后台 daemon 每 24h 周期
         try:
             import threading
             from agent.memory import summarize

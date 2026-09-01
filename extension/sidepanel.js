@@ -910,7 +910,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     btn.addEventListener('click', (e) => {
       const target = e.currentTarget.dataset.target;
       activateTab(target);
-      if (target === 'settings') loadMemoryPanel().catch((err) => console.warn('加载记忆面板失败', err));
+      // 记忆 tab 首次/每次打开都加载列表(仅列表,不触发整理——整理必须用户点按钮)
+      // 兜底:切进记忆 tab 时主动隐藏残留的整理 modal(防上次未正常关闭)
+      if (target === 'memory') {
+        const modal = document.getElementById('rethinkModal');
+        if (modal) modal.style.display = 'none';
+        loadMemoryPanel().catch((err) => console.warn('加载记忆面板失败', err));
+      }
     });
   });
 
@@ -1304,19 +1310,37 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   const MEMORY_TYPE_LABELS = { core: '画像', episodic: '事件' };
 
+  // 并发保护:同时多次点刷新/多入口触发时,只保留最后一次结果,防止重复渲染
+  let _memoryLoadSeq = 0;
+
   async function loadMemoryPanel() {
     const listEl = document.getElementById('memoryList');
     if (!listEl) return;
+    const seq = ++_memoryLoadSeq;
+    // 立即显示"加载中"提示(不等 await)——防用户以为无反应
+    // 只有本次是最新的 seq 时才占位;并发的旧 call 不覆盖
     listEl.replaceChildren();
+    listEl.innerHTML = '<div class="memory-empty">加载中...</div>';
     let base;
-    try { base = await backendBase(); } catch { listEl.innerHTML = '<div class="memory-empty">需先在设置里配置后端地址</div>'; return; }
+    try { base = await backendBase(); }
+    catch {
+      if (seq !== _memoryLoadSeq) return;   // 有更新的请求发出,丢弃本次
+      listEl.replaceChildren();
+      listEl.innerHTML = '<div class="memory-empty">需先在设置里配置后端地址</div>';
+      return;
+    }
     let data;
     try {
       data = await callBackendApi(buildBackendEndpointUrl(base, '/v1/memory/list'), 'GET');
     } catch (e) {
+      if (seq !== _memoryLoadSeq) return;
+      listEl.replaceChildren();
       listEl.innerHTML = '<div class="memory-empty">记忆库不可用</div>';
       return;
     }
+    // 关键:所有 await 完后再检查 seq,只有"最新"那次真正渲染
+    if (seq !== _memoryLoadSeq) return;
+    listEl.replaceChildren();   // 清空必须在渲染前(而非请求前)
     const memories = data?.memories || [];
     if (!memories.length) {
       listEl.innerHTML = '<div class="memory-empty">还没有长期记忆</div>';
@@ -1340,9 +1364,36 @@ document.addEventListener('DOMContentLoaded', async () => {
   function buildMemoryItem(m) {
     const item = document.createElement('div');
     item.className = 'memory-item';
+    // 已被 rethink 替代的条目灰化(P3)
+    if (m.superseded_by) item.classList.add('superseded');
+
     const content = document.createElement('div');
     content.className = 'memory-item-content';
-    content.textContent = m.content;
+    // subject badge(P3):有 subject 时前缀显示,视觉分组
+    if (m.subject) {
+      const badge = document.createElement('span');
+      badge.className = 'memory-item-subject';
+      badge.textContent = m.subject;
+      badge.title = `主题:${m.subject}`;
+      content.appendChild(badge);
+    }
+    const textNode = document.createElement('span');
+    textNode.textContent = m.content;
+    content.appendChild(textNode);
+    // expires_at badge(P3):有明确时限时后缀显示
+    if (m.expires_at) {
+      const exp = document.createElement('span');
+      exp.className = 'memory-item-expires';
+      // 转成本地日期展示
+      try {
+        const d = new Date(m.expires_at);
+        exp.textContent = '⏰ ' + d.toLocaleDateString();
+      } catch {
+        exp.textContent = '⏰ ' + m.expires_at.slice(0, 10);
+      }
+      exp.title = `到期时间:${m.expires_at}`;
+      content.appendChild(exp);
+    }
     item.appendChild(content);
 
     const actions = document.createElement('div');
@@ -1399,6 +1450,158 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
+  // ── 一键整理 SSE(批次 E · P3)──
+  // POST /v1/memory/rethink 返回 SSE 流,实时显示进度。
+  // 事件序列:start / scanning / llm_call / applied(kind=conflicts/expired/merges) / done / error
+  // 进行中拒绝重入:后端返 error {code:"in_progress"} + [DONE]
+  async function rethinkMemories() {
+    const modal = document.getElementById('rethinkModal');
+    const statusEl = document.getElementById('rethinkModalStatus');
+    const logEl = document.getElementById('rethinkModalLog');
+    const closeBtn = document.getElementById('rethinkModalCloseBtn');
+    if (!modal || !statusEl || !logEl || !closeBtn) return;
+
+    modal.style.display = 'flex';
+    statusEl.textContent = '连接后端...';
+    logEl.replaceChildren();
+    closeBtn.style.display = 'none';
+
+    const appendLog = (cls, text) => {
+      const line = document.createElement('div');
+      line.className = 'rethink-log-line ' + cls;
+      line.textContent = text;
+      logEl.appendChild(line);
+      logEl.scrollTop = logEl.scrollHeight;
+    };
+
+    let base;
+    try { base = await backendBase(); }
+    catch {
+      statusEl.textContent = '未配置后端地址';
+      closeBtn.style.display = 'inline-flex';
+      return;
+    }
+
+    let resp;
+    try {
+      resp = await fetch(buildBackendEndpointUrl(base, '/v1/memory/rethink'), {
+        method: 'POST',
+        headers: { 'Accept': 'text/event-stream' },
+      });
+    } catch (e) {
+      statusEl.textContent = '连接失败: ' + (e?.message || '');
+      closeBtn.style.display = 'inline-flex';
+      return;
+    }
+    if (!resp.ok || !resp.body) {
+      statusEl.textContent = `请求失败:HTTP ${resp.status}`;
+      closeBtn.style.display = 'inline-flex';
+      return;
+    }
+
+    // 手动解析 SSE(fetch + ReadableStream,兼容 POST + SSE)
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let buffer = '';
+    let currentEvent = 'message';
+    let counts = { conflicts: 0, expired: 0, merges: 0 };
+
+    const handleEvent = (name, dataStr) => {
+      let data = {};
+      try { data = JSON.parse(dataStr); } catch { /* 保留空对象 */ }
+      switch (name) {
+        case 'start':
+          statusEl.textContent = `扫描到 ${data.total_core || 0} 条 core 记忆`;
+          appendLog('rethink-log-info', `开始整理:${data.total_core} 条 core`);
+          break;
+        case 'scanning':
+          statusEl.textContent = data.progress || '扫描中...';
+          break;
+        case 'llm_call':
+          statusEl.textContent = data.progress || 'LLM 分析中...';
+          appendLog('rethink-log-info', '⏳ ' + (data.progress || 'LLM 分析中...'));
+          break;
+        case 'applied': {
+          const kind = data.kind || '';
+          if (kind === 'conflicts') {
+            counts.conflicts++;
+            const inv = Array.isArray(data.invalidate) ? data.invalidate.length : 0;
+            appendLog('rethink-log-conflict',
+              `⚔ 冲突:保留 "${(data.keep_content || '').slice(0, 40)}",失效 ${inv} 条`);
+          } else if (kind === 'expired') {
+            counts.expired++;
+            appendLog('rethink-log-expired',
+              `⏰ 过期:"${(data.content || '').slice(0, 40)}"`);
+          } else if (kind === 'merges') {
+            counts.merges++;
+            const mem = Array.isArray(data.members) ? data.members.length : 0;
+            appendLog('rethink-log-merge',
+              `⊕ 合并 ${mem} 条 → "${(data.merged_content || '').slice(0, 40)}"`);
+          }
+          statusEl.textContent = `已处理:冲突 ${counts.conflicts} · 过期 ${counts.expired} · 合并 ${counts.merges}`;
+          break;
+        }
+        case 'done': {
+          const parts = [];
+          if (data.conflicts) parts.push(`${data.conflicts} 组冲突`);
+          if (data.expired) parts.push(`${data.expired} 条过期`);
+          if (data.merges) parts.push(`${data.merges} 组合并`);
+          if (data.skipped === 'not_enough_core') {
+            statusEl.textContent = `core 少于 3 条,无需整理`;
+          } else if (!parts.length) {
+            statusEl.textContent = `整理完成:未发现需处理的条目`;
+          } else {
+            statusEl.textContent = `整理完成:${parts.join(' · ')} · 耗时 ${Math.round((data.elapsed_ms || 0) / 100) / 10}s`;
+          }
+          appendLog('rethink-log-info', `✓ 完成`);
+          break;
+        }
+        case 'error': {
+          if (data.code === 'in_progress') {
+            statusEl.textContent = data.message || '整理已在进行中,请稍候';
+            appendLog('rethink-log-info',
+              `⚠ 已有整理在跑,已耗时 ${Math.round((data.elapsed_ms || 0) / 1000)} 秒`);
+          } else {
+            statusEl.textContent = `失败:${data.message || data.code || '未知错误'}`;
+            appendLog('rethink-log-error', `✗ ${data.code}: ${data.message || ''}`);
+          }
+          break;
+        }
+      }
+    };
+
+    // 读 SSE 流(整块包 try/finally:任何异常都保证关闭按钮可见,不残留卡死态)
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        // 按 \n\n 切分事件块
+        const parts = buffer.split('\n\n');
+        buffer = parts.pop() || '';
+        for (const block of parts) {
+          if (!block.trim()) continue;
+          let evName = 'message';
+          let dataStr = '';
+          for (const line of block.split('\n')) {
+            if (line.startsWith('event: ')) evName = line.slice(7).trim();
+            else if (line.startsWith('data: ')) dataStr = line.slice(6);
+          }
+          if (dataStr === '[DONE]') { /* 流结束,不用处理 */ continue; }
+          handleEvent(evName, dataStr);
+        }
+      }
+    } catch (e) {
+      statusEl.textContent = `连接中断: ${e?.message || e}`;
+      appendLog('rethink-log-error', `✗ 连接异常: ${e?.message || e}`);
+    } finally {
+      // 无论正常/异常都露出关闭按钮,防 modal 卡死
+      closeBtn.style.display = 'inline-flex';
+    }
+    // 完成后刷新记忆列表
+    try { await loadMemoryPanel(); } catch { /* 静默 */ }
+  }
+
   // 5. 绑定各种交互事件
   getOrCreateCurrentChatId().catch(console.error);
 
@@ -1418,11 +1621,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     closeDrawer();
   });
 
-  // 记忆面板:刷新 / 添加(添加支持 Enter)
+  // 记忆面板:刷新 / 添加(添加支持 Enter)/ 一键整理(P3)
   document.getElementById('refreshMemoryBtn')?.addEventListener('click', () => loadMemoryPanel());
   document.getElementById('memoryAddBtn')?.addEventListener('click', addMemory);
   document.getElementById('memoryAddInput')?.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') { e.preventDefault(); addMemory(); }
+  });
+  document.getElementById('rethinkMemoryBtn')?.addEventListener('click', () => rethinkMemories());
+  document.getElementById('rethinkModalCloseBtn')?.addEventListener('click', () => {
+    const m = document.getElementById('rethinkModal');
+    if (m) m.style.display = 'none';
   });
 
   document.getElementById('uploadImageBtn').addEventListener('click', () => {

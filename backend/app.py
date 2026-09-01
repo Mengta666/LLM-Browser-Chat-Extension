@@ -35,6 +35,14 @@ try:
 except Exception:
     pass
 
+# 批次 E · P2:core 冲突整理后台 daemon(24h 周期)
+# 三触发共用 rethink.try_acquire 同一把锁,daemon 见"进行中"跳过本轮
+try:
+    from agent.memory import rethink as _rethink
+    _rethink.start_rethink_daemon()
+except Exception:
+    pass
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

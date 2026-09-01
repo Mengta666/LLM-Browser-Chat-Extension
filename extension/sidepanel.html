@@ -11,6 +11,7 @@
   <!-- 顶部导航栏 -->
   <div class="tabs">
     <button class="tab-btn active" data-target="chat">🤖 自动化</button>
+    <button class="tab-btn" data-target="memory">🧠 记忆</button>
     <button class="tab-btn" data-target="settings">⚙️ 设置</button>
   </div>
 
@@ -67,14 +68,19 @@
     <button id="saveSettingsBtn">保存配置</button>
     <button id="clearApiKeyBtn" type="button">清除 API Key</button>
     <div id="saveMsg"></div>
+  </div>
 
-    <!-- 长期记忆管理 -->
+  <!-- 记忆 Tab(批次 E · P3:独立 tab,与自动化/设置并列)-->
+  <div id="memory" class="tab-content">
     <div class="memory-section">
       <div class="memory-head">
         <label>🧠 长期记忆</label>
-        <button id="refreshMemoryBtn" class="tool-btn secondary" type="button" title="刷新">↻ 刷新</button>
+        <div class="memory-head-btns">
+          <button id="rethinkMemoryBtn" class="tool-btn secondary" type="button" title="LLM 整理:找冲突/过期/合并">✨ 整理</button>
+          <button id="refreshMemoryBtn" class="tool-btn secondary" type="button" title="刷新">↻ 刷新</button>
+        </div>
       </div>
-      <div class="settings-hint">Claude 从对话中学到的关于你的长期事实。可删除、编辑或手动添加,下次对话会参考。</div>
+      <div class="settings-hint">Claude 从对话中学到的关于你的长期事实。可删除、编辑或手动添加,下次对话会参考。<strong>点"整理"</strong>会用 LLM 扫全库找冲突/过期条,新覆盖旧。</div>
       <div class="memory-add">
         <input type="text" id="memoryAddInput" placeholder="手动添加一条记忆,如「我偏好用 TypeScript」">
         <select id="memoryAddType">
@@ -83,6 +89,18 @@
         <button id="memoryAddBtn" class="tool-btn" type="button">添加</button>
       </div>
       <div id="memoryList" class="memory-list"></div>
+    </div>
+
+    <!-- 整理进度 modal(rethink SSE) -->
+    <div id="rethinkModal" class="rethink-modal" style="display:none">
+      <div class="rethink-modal-inner">
+        <div class="rethink-modal-title">正在整理长期记忆</div>
+        <div id="rethinkModalStatus" class="rethink-modal-status">初始化...</div>
+        <div id="rethinkModalLog" class="rethink-modal-log"></div>
+        <div class="rethink-modal-actions">
+          <button id="rethinkModalCloseBtn" class="tool-btn secondary" type="button" style="display:none">关闭</button>
+        </div>
+      </div>
     </div>
   </div>
 

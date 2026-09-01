@@ -1,6 +1,6 @@
 {
   "embed_model": "Qwen3-Embedding-8B-joybuilder",
-  "RECALL_MIN_COSINE": 0.49,
+  "RECALL_MIN_COSINE": 0.40,
   "RECALL_GAP_REF": 0.1,
-  "PROMOTE_SIM_COSINE": 0.85
+  "PROMOTE_SIM_COSINE": 0.75
 }

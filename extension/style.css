@@ -705,6 +705,7 @@ input { width: 100%; padding: 8px; margin-top: 5px; box-sizing: border-box; bord
 .memory-section { margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--app-border); }
 /* memory tab 里作为唯一顶层内容时,去掉那条分割线和上边距(独立 tab 内容不需要"分节"视觉) */
 #memory .memory-section { margin-top: 0; padding-top: 0; border-top: none; }
+#memory { position: relative; }
 #memory .memory-head label { margin-top: 0; }
 .memory-head { display: flex; align-items: center; justify-content: space-between; }
 .memory-add { display: flex; gap: 6px; margin: 8px 0; }
@@ -746,8 +747,8 @@ input { width: 100%; padding: 8px; margin-top: 5px; box-sizing: border-box; bord
 
 /* 整理 modal */
 .rethink-modal {
-  position: fixed; inset: 0; background: rgba(0, 0, 0, 0.4);
-  display: flex; align-items: center; justify-content: center; z-index: 9999;
+  position: absolute; inset: 0; background: rgba(0, 0, 0, 0.4);
+  display: flex; align-items: center; justify-content: center; z-index: 100;
 }
 .rethink-modal-inner {
   background: var(--app-surface, #fff); border-radius: 12px;

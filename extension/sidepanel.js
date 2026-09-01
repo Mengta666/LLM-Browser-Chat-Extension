@@ -910,11 +910,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     btn.addEventListener('click', (e) => {
       const target = e.currentTarget.dataset.target;
       activateTab(target);
-      // 记忆 tab 首次/每次打开都加载列表(仅列表,不触发整理——整理必须用户点按钮)
-      // 兜底:切进记忆 tab 时主动隐藏残留的整理 modal(防上次未正常关闭)
+      // 记忆 tab:切回时刷新列表;modal 只在 idle 时才隐藏(running/done 保持显示)
       if (target === 'memory') {
         const modal = document.getElementById('rethinkModal');
-        if (modal) modal.style.display = 'none';
+        if (modal && _rethinkState === 'idle') modal.style.display = 'none';
         loadMemoryPanel().catch((err) => console.warn('加载记忆面板失败', err));
       }
     });
@@ -1437,15 +1436,19 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   async function addMemory() {
     const input = document.getElementById('memoryAddInput');
-    const typeSel = document.getElementById('memoryAddType');
     const content = String(input?.value || '').trim();
     if (!content) return;
+    const addBtn = document.getElementById('memoryAddBtn');
     try {
+      if (addBtn) { addBtn.disabled = true; addBtn.textContent = '添加中...'; }
       const base = await backendBase();
-      await callBackendApi(buildBackendEndpointUrl(base, '/v1/memory'), 'POST', { content, memory_type: typeSel?.value || 'core' });
+      await callBackendApi(buildBackendEndpointUrl(base, '/v1/memory'), 'POST', { content, memory_type: 'core' });
       input.value = '';
+      if (addBtn) { addBtn.textContent = '✓ 已添加'; }
+      setTimeout(() => { if (addBtn) { addBtn.disabled = false; addBtn.textContent = '添加'; } }, 1500);
       await loadMemoryPanel();
     } catch (e) {
+      if (addBtn) { addBtn.disabled = false; addBtn.textContent = '添加'; }
       alert('添加失败: ' + (e?.message || ''));
     }
   }
@@ -1454,6 +1457,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   // POST /v1/memory/rethink 返回 SSE 流,实时显示进度。
   // 事件序列:start / scanning / llm_call / applied(kind=conflicts/expired/merges) / done / error
   // 进行中拒绝重入:后端返 error {code:"in_progress"} + [DONE]
+  // _rethinkState: 'idle' | 'running' | 'done'
+  // idle=没在整理(modal 该隐藏),running=进行中,done=完成但用户还没关闭
+  let _rethinkState = 'idle';
+
   async function rethinkMemories() {
     const modal = document.getElementById('rethinkModal');
     const statusEl = document.getElementById('rethinkModalStatus');
@@ -1461,6 +1468,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const closeBtn = document.getElementById('rethinkModalCloseBtn');
     if (!modal || !statusEl || !logEl || !closeBtn) return;
 
+    _rethinkState = 'running';
     modal.style.display = 'flex';
     statusEl.textContent = '连接后端...';
     logEl.replaceChildren();
@@ -1595,7 +1603,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       statusEl.textContent = `连接中断: ${e?.message || e}`;
       appendLog('rethink-log-error', `✗ 连接异常: ${e?.message || e}`);
     } finally {
-      // 无论正常/异常都露出关闭按钮,防 modal 卡死
+      _rethinkState = 'done';
       closeBtn.style.display = 'inline-flex';
     }
     // 完成后刷新记忆列表
@@ -1631,6 +1639,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   document.getElementById('rethinkModalCloseBtn')?.addEventListener('click', () => {
     const m = document.getElementById('rethinkModal');
     if (m) m.style.display = 'none';
+    _rethinkState = 'idle';
   });
 
   document.getElementById('uploadImageBtn').addEventListener('click', () => {

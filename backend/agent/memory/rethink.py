@@ -117,23 +117,22 @@ RETHINK_SYSTEM_PROMPT = """你是记忆整理器,负责对用户的全部 core �
 
 1. **冲突判定 conflicts**:
    - 触发条件:两条或多条 fact 讲同一主题(subject 相同或语义等价),但当前值互斥
+   - **即使 subject 为空或不同,只要 content 语义明确矛盾就判冲突**(如一条说"用中文回答",另一条说"用英文回答")
    - 例:一条"用户希望用中文",另一条"用户希望用英文";两条"用户名字"字面不同
    - 保留策略:
-     * verified=True 的手动条**永远保留**(不能进 invalidate_ids)
      * 优先 created_at 新的
      * 若 created_at 接近,优先 stability_score 高的
+     * verified=True 的手动条**可以被判为冲突方**(rethink 是用户主动触发,不同于 CONSOLIDATE 的自动保护)
    - 输出 keep_id + invalidate_ids
 
 2. **过期判定 expired**:
    - 触发条件:expires_at 非空且已过当前时间
    - 直接归 expired 组,不需要 keep_id
-   - verified=True 的手动条**不能进 expired**(用户明示,尊重)
 
 3. **合并判定 merges**:
    - 触发条件:两条或多条 fact 同主题、信息互补(不矛盾),合并后信息更完整
    - 例:一条"用户是后端工程师",一条"用户主要用 Go" → 合并"用户是后端工程师,主要用 Go"
    - 合并前提:merged 必须比原总和更短(否则视为非压缩)
-   - verified=True 手动条**不参与合并**
    - 输出 member_ids + merged_content
 
 4. **临时 id 反幻觉**:所有 ids 只能是候选里的整数 id 字符串,不能编造。
@@ -161,6 +160,22 @@ RETHINK_SYSTEM_PROMPT = """你是记忆整理器,负责对用户的全部 core �
   ]
 }
 ```
+
+**few-shot 示例 1(冲突,subject 为空也能判)**:
+输入:[
+  {"id":"0","content":"以后都用中文回答吧","subject":"","stability_score":0.5,"created_at":"2026-08-01T00:00:00Z","expires_at":"","verified":false},
+  {"id":"1","content":"以后都使用英文回答吧","subject":"","stability_score":0.5,"created_at":"2026-09-01T00:00:00Z","expires_at":"","verified":false},
+  {"id":"2","content":"用户偏好简洁回答","subject":"回答风格偏好","stability_score":0.85,"created_at":"2026-08-15T00:00:00Z","expires_at":"","verified":false}
+]
+输出:{"conflicts":[{"member_ids":["0","1"],"keep_id":"1","invalidate_ids":["0"],"reason":"中文 vs 英文回答语言矛盾,保留新的(id=1 created_at 更近)"}],"expired":[],"merges":[]}
+说明:id=0 和 id=1 的 subject 都为空,但 content 语义明显矛盾(中文 vs 英文),必须判冲突。
+
+**few-shot 示例 2(合并)**:
+输入:[
+  {"id":"0","content":"用户是后端工程师","subject":"用户身份","stability_score":0.95,"created_at":"2026-08-01T00:00:00Z","expires_at":"","verified":false},
+  {"id":"1","content":"用户在做跨境电商领域","subject":"用户身份","stability_score":0.9,"created_at":"2026-08-10T00:00:00Z","expires_at":"","verified":false}
+]
+输出:{"conflicts":[],"expired":[],"merges":[{"member_ids":["0","1"],"merged_content":"用户是跨境电商领域的后端工程师","reason":"同 subject 互补信息合并"}]}
 
 **候选记忆格式**(user 消息里给出):list,每条含 id(临时整数)、content、subject、
 stability_score、created_at、expires_at、verified、now(用于判 expires_at 是否已过)。
@@ -385,9 +400,6 @@ def _apply_conflict(group: dict[str, Any],
         m = V.get_memory(real)
         if not m or not m.get("valid", True):
             continue
-        # 兜底:verified core 不能被 rethink 自动删
-        if m.get("verified") and m.get("memory_type") == MEMORY_TYPE_CORE:
-            continue
         _mark_superseded(real, keep_real)
         H.add_history(real, "RETHINK_CONFLICT",
                       m.get("content", ""), f"superseded_by={keep_real}")
@@ -413,8 +425,6 @@ def _apply_expired(item: dict[str, Any],
         return None
     m = V.get_memory(real)
     if not m or not m.get("valid", True):
-        return None
-    if m.get("verified") and m.get("memory_type") == MEMORY_TYPE_CORE:
         return None
     V.invalidate_memory(real)
     H.add_history(real, "RETHINK_EXPIRED", m.get("content", ""),
@@ -450,9 +460,6 @@ def _apply_merge(group: dict[str, Any], id_map: dict[str, str],
             continue
         m = V.get_memory(real)
         if not m or not m.get("valid", True):
-            continue
-        # verified 兜底
-        if m.get("verified") and m.get("memory_type") == MEMORY_TYPE_CORE:
             continue
         member_reals.append(real)
         member_mems.append(m)

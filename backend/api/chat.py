@@ -84,10 +84,9 @@ def _extract_last_user_text(messages: list[dict[str, Any]]) -> str:
 def _build_memory_system(query: str, chat_id: str = "") -> Optional[str]:
     """检索长期记忆 → 拼装成一条 system 注入文本。无记忆/异常返回 None。
 
-    分层(对齐 MemGPT):
-    - core 层:常驻全量注入(量小、都重要,不过闸门),全局。
-    - episodic 层:仅本会话(chat_id 隔离)、与 query 相关才注入(过双闸门 + 三因子重排)。
-    复用 agent/memory service 门面,全程降级。落结构化日志供可观测(命中/注入/拦截)。
+    只注入 core(全局常驻):用户身份/偏好等跨会话稳定事实。
+    episodic 不注入——当前会话已有完整对话历史(chatMessages),
+    episodic 注入是重复信息;episodic 只用于 promote 积累证据。
     """
     try:
         from agent.memory import service as memory_service
@@ -96,8 +95,6 @@ def _build_memory_system(query: str, chat_id: str = "") -> Optional[str]:
 
     blocks: list[str] = []
     core_n = 0
-    ep_n = 0
-    ep_hits: list[dict[str, Any]] = []
     # core:常驻(scroll 全量,不依赖 query,全局)
     try:
         core = memory_service.get_core_memories()
@@ -109,31 +106,12 @@ def _build_memory_system(query: str, chat_id: str = "") -> Optional[str]:
     except Exception:
         pass
 
-    # episodic:按需(仅本会话,过相关性闸门 + 三因子重排,空则不拼)
-    if query:
-        try:
-            episodic = memory_service.recall_episodic(query, chat_id=chat_id)
-            if episodic:
-                ep_hits = episodic
-                ep_block = memory_service.build_episodic_block(episodic)
-                if ep_block:
-                    ep_n = len(episodic)
-                    blocks.append(ep_block)
-        except Exception:
-            pass
-
-    # 可观测:记录本轮记忆注入情况(命中 episodic 的 id + 分数、core/episodic 注入数)
+    # 可观测
     try:
         _chat_log.info("chat_memory_injected", data={
             "chat_id": chat_id,
             "query_head": (query or "")[:60],
             "core_injected": core_n,
-            "episodic_injected": ep_n,
-            "episodic_hits": [
-                {"memory_id": h.get("memory_id", ""),
-                 "cosine": round(float(h.get("cosine", 0.0)), 3),
-                 "score3": round(float(h.get("_score3", 0.0)), 3)}
-                for h in ep_hits[:5]],
         })
     except Exception:
         pass

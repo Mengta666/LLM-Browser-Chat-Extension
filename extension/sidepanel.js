@@ -2421,9 +2421,14 @@ document.addEventListener('DOMContentLoaded', async () => {
           continue;
         }
 
-        // 智能等待页面稳定
+        // 智能等待页面稳定（导航期间 executeScript 可能永远不返回,外层超时兜底）
         const activeTab = await getActiveBrowserTab().catch(() => null);
-        if (activeTab?.id) await waitForPageSettle(activeTab.id);
+        if (activeTab?.id) {
+          await Promise.race([
+            waitForPageSettle(activeTab.id),
+            new Promise(r => setTimeout(r, 5000))   // 5s 硬上限,防导航中 executeScript 挂死
+          ]);
+        }
 
         // 导航后移鼠标到中性位收残留浮层，再观察
         const preObserveTab = await getActiveBrowserTab().catch(() => null);
@@ -2440,7 +2445,10 @@ document.addEventListener('DOMContentLoaded', async () => {
           } catch (e) { /* ignore */ }
         }
 
-        const newPageState = await observePageState();
+        const newPageState = await Promise.race([
+          observePageState(),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('observe 超时')), 30000))
+        ]).catch(() => pageState);  // 观察超时时沿用上一步状态,不卡死循环
 
         // inline 组兜底：成簇新增 → 合成 active_popup，让 popup_appeared 成立、格式化置顶
         if (!newPageState.active_popup) {

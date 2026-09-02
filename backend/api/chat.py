@@ -1,17 +1,16 @@
-"""Chat 后端(OpenAI 兼容)+ 长期记忆注入。
+"""Chat 后端(OpenAI 兼容)+ 长期记忆注入 + 联网搜索。
 
 链路:接收前端聊天请求 → 检索长期记忆并注入为一条 system → 转发 OpenAI 兼容模型
 → SSE 流式返回(标准 OpenAI 格式,前端零改)→ 对话结束后台异步抽取写入记忆。
 
+联网搜索(批次 F):
+- 自动搜索:SEARCH_ENABLED 时第一次 LLM 调用带 tools=[web_search],LLM 自主判断
+  是否搜索;返回 tool_call → 调 SearXNG → 二次 LLM 调用带搜索结果生成回答
+- 手动搜索:前端点"🔍"按钮 → ChatRequest.search_query 非空 → 直接搜索注入 system
+- 降级:模型不支持 tools 时 catch 400/422 → 去 tools 重试
+
 记忆能力复用 agent/memory 子系统(service 门面),全部 try/except 降级:
 记忆是"锦上添花",Qdrant/embedding 不可用时 chat 照常对话。
-
-模块拆分(不做旧版 607 行巨函数):
-- _extract_last_user_text:取最后一条 user 文本(记忆检索的 query)
-- _build_memory_system:检索记忆 → 拼装一条 system 注入消息(空则 None)
-- _inject_memory:把 system 注入消息插到 messages 最前
-- _schedule_memory_write:后台线程抽取写入(复用 write_chat_memory)
-- stream_chat / sync_chat:流式 / 非流式转发,主体不重复
 """
 
 import json
@@ -56,6 +55,7 @@ class ChatRequest(BaseModel):
     messages: list[dict[str, Any]] = []
     stream: bool = True
     chat_id: str = ""          # 前端会话标识(可选,用于日志关联)
+    search_query: str = ""     # 手动搜索:非空时直接搜→注入→LLM(不走 function calling)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -287,6 +287,37 @@ def _save_history(chat_id: str, user_text: str, assistant_text: str) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# 联网搜索(批次 F)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+try:
+    from search.tools import (
+        WEB_SEARCH_TOOL, handle_tool_call, format_search_results_for_manual,
+    )
+    from search import search_web, SEARCH_ENABLED as _SEARCH_ON
+except ImportError:
+    _SEARCH_ON = False
+    WEB_SEARCH_TOOL = None
+
+
+def _is_tools_unsupported(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(kw in msg for kw in ("400", "422", "tool", "unsupported", "not support"))
+
+
+def _sse_search_meta(results) -> str:
+    """SSE 自定义 chunk:搜索结果元数据,供前端渲染引用面板。"""
+    meta = []
+    for i, r in enumerate(results):
+        meta.append({"index": i + 1, "title": r.title, "url": r.url, "snippet": (r.snippet or "")[:200]})
+    return _sse({
+        "choices": [{"delta": {"content": ""}, "finish_reason": None, "index": 0}],
+        "search_results": meta,
+        "object": "chat.completion.chunk",
+    })
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # 转发(流式 / 非流式)
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -295,48 +326,180 @@ def _sse(data: dict[str, Any]) -> str:
 
 
 def stream_chat(model: str, messages: list[dict[str, Any]],
-                user_text: str, chat_id: str) -> StreamingResponse:
-    """SSE 流式转发:标准 OpenAI 格式逐块吐 + [DONE];累积全文,结束后台写入记忆。"""
+                user_text: str, chat_id: str,
+                use_tools: bool = False,
+                search_results: list = None) -> StreamingResponse:
+    """SSE 流式转发。use_tools=True 时走 function calling 链路。"""
+
     def _gen():
         full_text = ""
+        _sr = search_results or []
+
+        # 手动搜索时先 yield 搜索元数据
+        if _sr:
+            yield _sse_search_meta(_sr)
+
+        create_kwargs = dict(model=model, messages=messages, stream=True,
+                             timeout=CHAT_LLM_TIMEOUT)
+        if use_tools and WEB_SEARCH_TOOL:
+            create_kwargs["tools"] = [WEB_SEARCH_TOOL]
+
         try:
-            resp = _llm_client.chat.completions.create(
-                model=model, messages=messages, stream=True, timeout=CHAT_LLM_TIMEOUT)
+            resp = _llm_client.chat.completions.create(**create_kwargs)
+        except Exception as exc:
+            if use_tools and _is_tools_unsupported(exc):
+                _chat_log.warn("tools_unsupported_fallback", data={
+                    "chat_id": chat_id, "error": str(exc)[:120]})
+                create_kwargs.pop("tools", None)
+                resp = _llm_client.chat.completions.create(**create_kwargs)
+            else:
+                _chat_log.error("chat_stream_failed", data={
+                    "chat_id": chat_id, "error": str(exc)[:200]})
+                yield _sse({"choices": [{"delta": {"content": f"\n[对话出错: {str(exc)[:120]}]"},
+                                         "finish_reason": "error", "index": 0}]})
+                yield "data: [DONE]\n\n"
+                return
+
+        tool_calls_buf = {}
+
+        try:
             for chunk in resp:
-                full_text += (chunk.choices[0].delta.content or "") if chunk.choices else ""
-                yield _sse(chunk.model_dump())
+                choice = chunk.choices[0] if chunk.choices else None
+                if not choice:
+                    continue
+                delta = choice.delta
+
+                if choice.finish_reason == "tool_calls":
+                    break
+
+                if delta and delta.tool_calls:
+                    for tc in delta.tool_calls:
+                        idx = tc.index
+                        if idx not in tool_calls_buf:
+                            tool_calls_buf[idx] = {"id": tc.id or "", "name": "", "arguments": ""}
+                        if tc.function:
+                            if tc.function.name:
+                                tool_calls_buf[idx]["name"] = tc.function.name
+                            if tc.function.arguments:
+                                tool_calls_buf[idx]["arguments"] += tc.function.arguments
+                    continue
+
+                if delta and delta.content:
+                    full_text += delta.content
+                    yield _sse(chunk.model_dump())
         except Exception as exc:
             _chat_log.error("chat_stream_failed", data={"chat_id": chat_id, "error": str(exc)[:200]})
             yield _sse({"choices": [{"delta": {"content": f"\n[对话出错: {str(exc)[:120]}]"},
                                      "finish_reason": "error", "index": 0}]})
-        finally:
-            yield "data: [DONE]\n\n"
-            if full_text.strip():
-                _save_history(chat_id, user_text, full_text)
-                _schedule_memory_write(user_text, full_text, chat_id)
+
+        # ── 有 tool_call → 执行搜索 → 二次 LLM ──
+        if tool_calls_buf:
+            for tc_info in tool_calls_buf.values():
+                if tc_info["name"] != "web_search":
+                    continue
+                query = ""
+                try:
+                    query = json.loads(tc_info["arguments"]).get("query", "")
+                except Exception:
+                    pass
+                yield _sse({"choices": [{"delta": {"content": f"\n🔍 正在搜索: {query}\n"},
+                                         "finish_reason": None, "index": 0}],
+                            "object": "chat.completion.chunk"})
+
+                tool_result_text, _sr = handle_tool_call(tc_info["name"], tc_info["arguments"])
+                if _sr:
+                    yield _sse_search_meta(_sr)
+
+                assistant_msg = {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": tc_info["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tc_info["name"],
+                            "arguments": tc_info["arguments"],
+                        }
+                    }]
+                }
+                tool_msg = {
+                    "role": "tool",
+                    "tool_call_id": tc_info["id"],
+                    "content": tool_result_text,
+                }
+                messages_2 = list(messages) + [assistant_msg, tool_msg]
+
+                try:
+                    resp2 = _llm_client.chat.completions.create(
+                        model=model, messages=messages_2, stream=True,
+                        timeout=CHAT_LLM_TIMEOUT)
+                    for chunk2 in resp2:
+                        if chunk2.choices and chunk2.choices[0].delta:
+                            c = chunk2.choices[0].delta.content or ""
+                            if c:
+                                full_text += c
+                        yield _sse(chunk2.model_dump())
+                except Exception as exc:
+                    yield _sse({"choices": [{"delta": {"content":
+                        f"\n[搜索后生成回答失败: {str(exc)[:100]}]"},
+                        "finish_reason": "error", "index": 0}]})
+                break
+
+        yield "data: [DONE]\n\n"
+        if full_text.strip():
+            _save_history(chat_id, user_text, full_text)
+            _schedule_memory_write(user_text, full_text, chat_id)
 
     return StreamingResponse(_gen(), media_type="text/event-stream")
 
 
 def sync_chat(model: str, messages: list[dict[str, Any]],
-              user_text: str, chat_id: str) -> JSONResponse:
-    """非流式转发:一次拿全,返回标准 OpenAI JSON;结束后台写入记忆。"""
+              user_text: str, chat_id: str,
+              use_tools: bool = False) -> JSONResponse:
+    """非流式转发。use_tools=True 时支持 function calling。"""
+    create_kwargs = dict(model=model, messages=messages, stream=False,
+                         timeout=CHAT_LLM_TIMEOUT)
+    if use_tools and WEB_SEARCH_TOOL:
+        create_kwargs["tools"] = [WEB_SEARCH_TOOL]
     try:
-        resp = _llm_client.chat.completions.create(
-            model=model, messages=messages, stream=False, timeout=CHAT_LLM_TIMEOUT)
-        payload = resp.model_dump()
-        text = ""
-        try:
-            text = resp.choices[0].message.content or ""
-        except Exception:
-            pass
-        if text.strip():
-            _save_history(chat_id, user_text, text)
-            _schedule_memory_write(user_text, text, chat_id)
-        return JSONResponse(payload)
+        resp = _llm_client.chat.completions.create(**create_kwargs)
     except Exception as exc:
-        _chat_log.error("chat_sync_failed", data={"chat_id": chat_id, "error": str(exc)[:200]})
-        return JSONResponse(status_code=502, content={"error": f"对话出错: {str(exc)[:160]}"})
+        if use_tools and _is_tools_unsupported(exc):
+            create_kwargs.pop("tools", None)
+            resp = _llm_client.chat.completions.create(**create_kwargs)
+        else:
+            _chat_log.error("chat_sync_failed", data={"chat_id": chat_id, "error": str(exc)[:200]})
+            return JSONResponse(status_code=502, content={"error": f"对话出错: {str(exc)[:160]}"})
+
+    msg = resp.choices[0].message if resp.choices else None
+    if msg and msg.tool_calls:
+        tc = msg.tool_calls[0]
+        if tc.function.name == "web_search":
+            tool_result_text, _ = handle_tool_call(tc.function.name, tc.function.arguments)
+            messages_2 = list(messages) + [
+                msg.model_dump(),
+                {"role": "tool", "tool_call_id": tc.id, "content": tool_result_text},
+            ]
+            try:
+                resp = _llm_client.chat.completions.create(
+                    model=model, messages=messages_2, stream=False,
+                    timeout=CHAT_LLM_TIMEOUT)
+            except Exception as exc:
+                _chat_log.error("chat_sync_search_failed", data={
+                    "chat_id": chat_id, "error": str(exc)[:200]})
+                return JSONResponse(status_code=502, content={
+                    "error": f"搜索后生成回答失败: {str(exc)[:160]}"})
+
+    payload = resp.model_dump()
+    text = ""
+    try:
+        text = resp.choices[0].message.content or ""
+    except Exception:
+        pass
+    if text.strip():
+        _save_history(chat_id, user_text, text)
+        _schedule_memory_write(user_text, text, chat_id)
+    return JSONResponse(payload)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -345,13 +508,30 @@ def sync_chat(model: str, messages: list[dict[str, Any]],
 
 @router.post("/chat/completions")
 def chat_completions(item: ChatRequest):
-    """OpenAI 兼容对话端点 + 长期记忆注入。stream 由请求体决定。"""
+    """OpenAI 兼容对话端点 + 长期记忆注入 + 联网搜索。"""
     messages = _inject_memory(item.messages, chat_id=item.chat_id)
     user_text = _extract_last_user_text(item.messages)
     _chat_log.info("chat_request", data={
         "chat_id": item.chat_id, "model": item.model, "stream": item.stream,
-        "msg_count": len(item.messages), "injected": len(messages) > len(item.messages)})
+        "msg_count": len(item.messages), "injected": len(messages) > len(item.messages),
+        "search_query": item.search_query[:60] if item.search_query else ""})
 
+    # 手动搜索:search_query 非空 → 直接搜索注入 system → LLM(不走 tools)
+    if item.search_query.strip():
+        results = search_web(item.search_query.strip()) if _SEARCH_ON else []
+        if not results:
+            from search.searxng import search_searxng
+            results = search_searxng(item.search_query.strip())
+        search_system = format_search_results_for_manual(results)
+        messages = [{"role": "system", "content": search_system}] + list(messages)
+        if item.stream:
+            return stream_chat(item.model, messages, user_text, item.chat_id,
+                               search_results=results)
+        return sync_chat(item.model, messages, user_text, item.chat_id)
+
+    # 自动搜索:SEARCH_ENABLED 时带 tools
     if item.stream:
-        return stream_chat(item.model, messages, user_text, item.chat_id)
-    return sync_chat(item.model, messages, user_text, item.chat_id)
+        return stream_chat(item.model, messages, user_text, item.chat_id,
+                           use_tools=_SEARCH_ON)
+    return sync_chat(item.model, messages, user_text, item.chat_id,
+                     use_tools=_SEARCH_ON)

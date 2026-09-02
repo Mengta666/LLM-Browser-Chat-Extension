@@ -216,7 +216,12 @@ async function handleCallLlmStream(request) {
         return;
       }
       try {
-        const chunk = extractChunkText(JSON.parse(dataStr));
+        const parsed = JSON.parse(dataStr);
+        // 联网搜索:识别 search_results 自定义字段,转发给前端渲染引用面板
+        if (parsed.search_results) {
+          sendLlmMessage(msgId, 'LLM_SEARCH_RESULTS', { search_results: parsed.search_results });
+        }
+        const chunk = extractChunkText(parsed);
         if (chunk) sendLlmMessage(msgId, 'LLM_CHUNK', { chunk });
       } catch {
         // 忽略无法解析的流式碎片

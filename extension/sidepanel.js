@@ -1065,7 +1065,15 @@ document.addEventListener('DOMContentLoaded', async () => {
       } else {
         input.value = '';
         if (attachedImage) clearAttachedImage();
-        await runPlainChat(text, image);
+        // 搜索模式开启时,把输入文本作为 search_query 强制搜索;发送后自动关闭搜索模式
+        const searchQuery = isSearchMode() ? text : '';
+        if (searchQuery) {
+          const st = document.getElementById('webSearchToggle');
+          const sb = document.getElementById('webSearchBtn');
+          if (st) st.checked = false;
+          if (sb) sb.classList.remove('is-active');
+        }
+        await runPlainChat(text, image, searchQuery);
       }
     } finally {
       _sendingLock = false;
@@ -1074,7 +1082,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   // 轻量直连聊天：不点自动化按钮时,消息直接发给用户配置的 OpenAI 兼容接口,流式返回。
-  async function runPlainChat(text, image) {
+  // search_query 非空时附带搜索参数(手动搜索)。
+  async function runPlainChat(text, image, search_query = '') {
     let apiKey, modelName, safeApiUrl;
     try {
       ({ apiKey, modelName, safeApiUrl } = await resolveApiRequestConfig());
@@ -1114,7 +1123,8 @@ document.addEventListener('DOMContentLoaded', async () => {
       model: safeModelName,
       messages: [...chatMessages, { role: 'user', content: userContent }],
       stream: true,
-      chat_id: chatId
+      chat_id: chatId,
+      search_query: search_query || '',
     };
     const requestHeaders = { 'Content-Type': 'application/json' };
     if (String(apiKey || '').trim()) {
@@ -1124,6 +1134,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const msgId = createMessageId();
     let fullReply = '';
     let done = false;
+    let _searchSources = [];  // 联网搜索结果元数据
     const streamer = createMarkdownStreamer(aiBubble);
 
     await new Promise((resolve) => {
@@ -1133,7 +1144,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (!fullReply) aiBubble.textContent = '响应为空。';
         else {
           streamer.finalize(fullReply);
-          // 存这轮到多轮历史(仅文本;图片轮用占位符,不把 base64 塞进历史)。
+          // 联网搜索:渲染引用 [1][2] 为可点击链接 + 来源面板
+          if (_searchSources.length) {
+            renderSearchCitations(aiBubble, _searchSources);
+          }
           chatMessages.push({ role: 'user', content: image ? (text || '[图片]') : text });
           chatMessages.push({ role: 'assistant', content: fullReply });
           if (chatMessages.length > MAX_CHAT_HISTORY_MESSAGES) {
@@ -1149,6 +1163,8 @@ document.addEventListener('DOMContentLoaded', async () => {
           fullReply += msg.chunk;
           streamer.update(fullReply);
           scrollToBottom();
+        } else if (msg.type === 'LLM_SEARCH_RESULTS') {
+          _searchSources = msg.search_results || [];
         } else if (msg.type === 'LLM_DONE') {
           finalize();
         } else if (msg.type === 'LLM_ERROR') {
@@ -1610,6 +1626,48 @@ document.addEventListener('DOMContentLoaded', async () => {
     try { await loadMemoryPanel(); } catch { /* 静默 */ }
   }
 
+  // ── 联网搜索:引用渲染 + 来源面板 ──
+
+  function renderSearchCitations(bubbleEl, sources) {
+    if (!sources || !sources.length) return;
+    // 把回答里的 [1] [2] 渲染为可点击引用链接
+    const contentEl = bubbleEl.querySelector('.markdown-body') || bubbleEl;
+    if (contentEl.innerHTML) {
+      contentEl.innerHTML = contentEl.innerHTML.replace(/\[(\d+)\]/g, (match, num) => {
+        const idx = parseInt(num) - 1;
+        const src = sources[idx];
+        if (!src) return match;
+        const safeTitle = (src.title || '').replace(/"/g, '&quot;');
+        return `<a class="search-citation" href="${src.url}" target="_blank" rel="noopener" title="${safeTitle}">[${num}]</a>`;
+      });
+    }
+    // 来源面板
+    const panel = document.createElement('div');
+    panel.className = 'search-sources-panel';
+    const toggle = document.createElement('div');
+    toggle.className = 'search-sources-toggle';
+    toggle.textContent = `📎 来源 (${sources.length})`;
+    const list = document.createElement('div');
+    list.className = 'search-sources-list';
+    list.style.display = 'none';
+    for (let i = 0; i < sources.length; i++) {
+      const s = sources[i];
+      const a = document.createElement('a');
+      a.className = 'search-source-item';
+      a.href = s.url;
+      a.target = '_blank';
+      a.rel = 'noopener';
+      a.innerHTML = `<span class="search-source-num">[${i + 1}]</span> ${(s.title || '').replace(/</g, '&lt;')}`;
+      list.appendChild(a);
+    }
+    toggle.addEventListener('click', () => {
+      list.style.display = list.style.display === 'none' ? 'block' : 'none';
+    });
+    panel.appendChild(toggle);
+    panel.appendChild(list);
+    bubbleEl.appendChild(panel);
+  }
+
   // 5. 绑定各种交互事件
   getOrCreateCurrentChatId().catch(console.error);
 
@@ -1617,6 +1675,20 @@ document.addEventListener('DOMContentLoaded', async () => {
   document.getElementById('chatInput').addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); }
   });
+
+  // 联网搜索切换按钮(toggle,和自动化按钮同模式)
+  const _searchBtn = document.getElementById('webSearchBtn');
+  const _searchToggle = document.getElementById('webSearchToggle');
+  if (_searchBtn && _searchToggle) {
+    _searchBtn.addEventListener('click', () => {
+      _searchToggle.checked = !_searchToggle.checked;
+      _searchBtn.classList.toggle('is-active', _searchToggle.checked);
+    });
+  }
+  function isSearchMode() {
+    const t = document.getElementById('webSearchToggle');
+    return t && t.checked;
+  }
 
   // 会话抽屉:开/关/遮罩/新建
   document.getElementById('openSessionsBtn')?.addEventListener('click', openDrawer);

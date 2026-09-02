@@ -367,9 +367,11 @@ def _consolidate_facts(facts: list[dict[str, Any]], *, user_id: str, chat_id: st
         except Exception:
             similar = []
 
-        # hash 去重:与已有完全相同 → 跳过(连 CONSOLIDATE LLM 都不调)
+        # hash 去重:与已有**活跃**(valid=True)记忆完全相同 → 跳过
+        # 注意:只对 valid 条去重——已被 invalidate 的旧条不算重复,
+        # 用户重新表达被删掉的偏好应视为"重新激活",进 CONSOLIDATE 判决。
         new_hash = V.content_hash(content)
-        if any(m.get("hash") == new_hash for m in similar):
+        if any(m.get("hash") == new_hash and m.get("valid", True) for m in similar):
             result["skipped_hash"] += 1
             continue
 

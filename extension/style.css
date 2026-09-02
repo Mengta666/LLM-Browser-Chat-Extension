@@ -778,3 +778,17 @@ input { width: 100%; padding: 8px; margin-top: 5px; box-sizing: border-box; bord
 .rethink-modal-log .rethink-log-error { color: #C0392B; }
 .rethink-modal-log .rethink-log-info { color: var(--app-muted); font-style: italic; }
 .rethink-modal-actions { display: flex; justify-content: flex-end; }
+
+/* ── 联网搜索引用 ── */
+.search-citation { color: var(--app-accent, #0E9C90); cursor: pointer; font-size: 0.85em;
+  font-weight: 600; text-decoration: none; border-bottom: 1px dashed var(--app-accent, #0E9C90); }
+.search-citation:hover { opacity: 0.7; }
+.search-sources-panel { margin-top: 10px; border-top: 1px solid var(--app-border, #dce3ea); padding-top: 8px; }
+.search-sources-toggle { font-size: 12px; color: var(--app-muted, #5b6b7b); cursor: pointer;
+  user-select: none; }
+.search-sources-toggle:hover { color: var(--app-text, #1b2733); }
+.search-sources-list { margin-top: 6px; }
+.search-source-item { display: block; font-size: 12px; color: var(--app-muted, #5b6b7b);
+  text-decoration: none; padding: 3px 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.search-source-item:hover { color: var(--app-accent, #0E9C90); }
+.search-source-num { font-weight: 600; margin-right: 4px; }

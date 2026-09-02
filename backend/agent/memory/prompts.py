@@ -16,7 +16,7 @@ CONSOLIDATE_SYSTEM_PROMPT = """你是一个记忆管理器,负责判定一条**�
 给你三样东西:
 1. **当前会话 id**(chat_id,如 "sess_A"、"sess_B" 等)
 2. **新抽取的事实**:{content, stability_score(0-1), memory_type_hint(core/episodic), subject(主题短语,可为空)}
-3. **候选相似记忆**:list,每条有整数 id、content、chat_id、memory_type、stability_score、subject、valid
+3. **候选相似记忆**:list,每条有整数 id、content、chat_id、memory_type、stability_score、subject(全部是 valid=true 的活跃记忆,已失效的旧记忆不在候选中)
    * 候选池由两个通道 union 得到:embedding 相似(top 20)∪ 同 subject 硬匹配(scroll 20)。
    * 若两条 subject 相同(尤其"回答语言偏好""编程语言""UI 主题偏好"等偏好类),这是<strong>强矛盾/更新信号</strong>——LLM 应重点判 update/delete。
 
@@ -46,7 +46,7 @@ CONSOLIDATE_SYSTEM_PROMPT = """你是一个记忆管理器,负责判定一条**�
 few-shot 示例:
 
 【skip 示例 1】完全等价
-候选:[{"id":"0", "content":"用户是后端工程师主要用 Go", "memory_type":"core", "chat_id":"", "stability_score":0.95, "valid":true}]
+候选:[{"id":"0", "content":"用户是后端工程师主要用 Go", "memory_type":"core", "chat_id":"", "stability_score":0.95}]
 新事实:{"content":"用户是后端工程师,主要使用 Go", "stability_score":0.90, "memory_type_hint":"core"}
 输出:{"action":"skip", "target_ids":["0"], "reason":"与旧条同义无新信息"}
 
@@ -56,25 +56,25 @@ few-shot 示例:
 输出:{"action":"skip", "target_ids":[], "reason":"闲聊,不值得记忆"}
 
 【add 示例】独立事实
-候选:[{"id":"0", "content":"用户偏好用中文回答", "memory_type":"core", "chat_id":"", "stability_score":0.90, "valid":true}]
+候选:[{"id":"0", "content":"用户偏好用中文回答", "memory_type":"core", "chat_id":"", "stability_score":0.90}]
 新事实:{"content":"用户在准备一场技术分享", "stability_score":0.60, "memory_type_hint":"episodic"}
 输出:{"action":"add", "target_ids":[], "reason":"独立事件,与已有偏好无关"}
 
 【update 示例】同主题细化
-候选:[{"id":"0", "content":"用户喜欢喝咖啡", "memory_type":"core", "chat_id":"", "stability_score":0.75, "valid":true}]
+候选:[{"id":"0", "content":"用户喜欢喝咖啡", "memory_type":"core", "chat_id":"", "stability_score":0.75}]
 新事实:{"content":"用户喜欢喝不加糖的美式咖啡", "stability_score":0.80, "memory_type_hint":"core"}
 输出:{"action":"update", "target_ids":["0"], "canonical_content":"用户喜欢喝不加糖的美式咖啡", "reason":"同主题信息更精确"}
 
 【delete 示例】明确矛盾
-候选:[{"id":"0", "content":"用户常用语言是 Python", "memory_type":"core", "chat_id":"", "stability_score":0.90, "valid":true}]
+候选:[{"id":"0", "content":"用户常用语言是 Python", "memory_type":"core", "chat_id":"", "stability_score":0.90}]
 新事实:{"content":"用户现在主要用 Go,不再用 Python", "stability_score":0.90, "memory_type_hint":"core"}
 输出:{"action":"delete", "target_ids":["0"], "canonical_content":"用户现在主要用 Go,不再用 Python", "reason":"直接矛盾:Python→Go 主语言变化"}
 
 【promote 示例 1】跨 3 会话稳定事实(核心场景)
 当前会话:sess_L3
 候选:[
-  {"id":"0", "content":"我最近在负责一个订单系统迁移的项目,老 MySQL 拆到分库分表", "memory_type":"episodic", "chat_id":"sess_L1", "stability_score":0.70, "valid":true},
-  {"id":"1", "content":"我们订单迁移最近一直在解决双写一致性问题", "memory_type":"episodic", "chat_id":"sess_L2", "stability_score":0.65, "valid":true}
+  {"id":"0", "content":"我最近在负责一个订单系统迁移的项目,老 MySQL 拆到分库分表", "memory_type":"episodic", "chat_id":"sess_L1", "stability_score":0.70},
+  {"id":"1", "content":"我们订单迁移最近一直在解决双写一致性问题", "memory_type":"episodic", "chat_id":"sess_L2", "stability_score":0.65}
 ]
 新事实:{"content":"忙订单那个迁移的项目,还没搞完", "stability_score":0.72, "memory_type_hint":"episodic"}
 输出:{"action":"promote", "target_ids":["0","1"], "canonical_content":"用户在做订单迁移项目", "reason":"sess_L1/L2/L3 三个会话都陈述'用户在做订单迁移'这个稳定活动(排除具体细节),晋升为 core"}
@@ -82,8 +82,8 @@ few-shot 示例:
 【promote 反例】3 会话但都是"进展",不 promote
 当前会话:sess_P3
 候选:[
-  {"id":"0", "content":"订单迁移刚开始设计", "memory_type":"episodic", "chat_id":"sess_P1", "stability_score":0.55, "valid":true},
-  {"id":"1", "content":"订单迁移遇到并发瓶颈需要优化", "memory_type":"episodic", "chat_id":"sess_P2", "stability_score":0.50, "valid":true}
+  {"id":"0", "content":"订单迁移刚开始设计", "memory_type":"episodic", "chat_id":"sess_P1", "stability_score":0.55},
+  {"id":"1", "content":"订单迁移遇到并发瓶颈需要优化", "memory_type":"episodic", "chat_id":"sess_P2", "stability_score":0.50}
 ]
 新事实:{"content":"订单迁移下周一上线", "stability_score":0.45, "memory_type_hint":"episodic"}
 输出:{"action":"add", "target_ids":[], "reason":"三条都是订单迁移的不同时序进展,不是同一稳定事实,不 promote"}
@@ -91,7 +91,7 @@ few-shot 示例:
 【add 反例】只有 2 个会话不够 promote 阈值
 当前会话:sess_A(第 2 个会话)
 候选:[
-  {"id":"0", "content":"用户在做订单迁移项目", "memory_type":"episodic", "chat_id":"sess_L1", "stability_score":0.72, "valid":true}
+  {"id":"0", "content":"用户在做订单迁移项目", "memory_type":"episodic", "chat_id":"sess_L1", "stability_score":0.72}
 ]
 新事实:{"content":"用户负责订单系统迁移", "stability_score":0.70, "memory_type_hint":"episodic"}
 输出:{"action":"add", "target_ids":[], "reason":"虽然与旧条同一稳定事实,但只跨 2 个会话不足 3 个,先 add 等下次凑够"}

@@ -337,6 +337,8 @@ def _consolidate_facts(facts: list[dict[str, Any]], *, user_id: str, chat_id: st
         fact_subject = fact.get("subject", "")
         # D 版:候选池不再按 fact 类型分流,一次拉全部相似记忆(跨 chat + 跨 memory_type)
         # 让 CONSOLIDATE LLM 看到完整上下文自主判 action(含 promote)
+        # 只拉 valid=True 的活跃记忆:已失效的 episodic 是之前 promote/GC 已消费过的旧证据,
+        # 不应再让 LLM 看到(否则会重复计入 promote 覆盖数,导致重复晋升)。
         try:
             query_vec = embed_text(content)
             # 通道 A(embedding):hybrid dense+sparse RRF top 20
@@ -344,7 +346,7 @@ def _consolidate_facts(facts: list[dict[str, Any]], *, user_id: str, chat_id: st
                 query_vec, query_text=content, top_k=WRITE_SEARCH_TOP_K * 2,  # 20
                 user_id=user_id, memory_type=None,      # 关键:不限类型
                 chat_id=None,                            # 关键:跨会话
-                include_invalid=True,                    # 含被 GC 的,防漏计数
+                include_invalid=False,                   # 只看活跃记忆,已消费旧证据不传 LLM
             )
             # 通道 B(批次 E · P1 · subject 硬匹配):
             # 补 embedding 相似度低但同 subject 的漏检("改用英文"↔"用户希望用中文")。
@@ -353,7 +355,7 @@ def _consolidate_facts(facts: list[dict[str, Any]], *, user_id: str, chat_id: st
                 try:
                     subject_matches = V.scroll_memories(
                         user_id=user_id, subject=fact_subject,
-                        include_invalid=True, limit=WRITE_SEARCH_TOP_K * 2,
+                        include_invalid=False, limit=WRITE_SEARCH_TOP_K * 2,
                     )
                 except Exception:
                     subject_matches = []
@@ -367,15 +369,14 @@ def _consolidate_facts(facts: list[dict[str, Any]], *, user_id: str, chat_id: st
         except Exception:
             similar = []
 
-        # hash 去重:与已有**活跃**(valid=True)记忆完全相同 → 跳过
-        # 注意:只对 valid 条去重——已被 invalidate 的旧条不算重复,
-        # 用户重新表达被删掉的偏好应视为"重新激活",进 CONSOLIDATE 判决。
+        # hash 去重:与已有活跃记忆完全相同 → 跳过(连 CONSOLIDATE 都不调)
+        # similar 里已经只有 valid=True 的条(include_invalid=False),无需再判 valid。
         new_hash = V.content_hash(content)
-        if any(m.get("hash") == new_hash and m.get("valid", True) for m in similar):
+        if any(m.get("hash") == new_hash for m in similar):
             result["skipped_hash"] += 1
             continue
 
-        # 构造临时 id 映射(反幻觉)+ 完整候选结构(带类型/chat_id/稳定度/subject)
+        # 构造临时 id 映射(反幻觉)+ 候选结构(只含活跃记忆,不传 valid 字段——全是 True)
         uuid_mapping: dict[str, str] = {}
         candidates_for_llm: list[dict[str, Any]] = []
         for idx, mem in enumerate(similar):
@@ -387,7 +388,6 @@ def _consolidate_facts(facts: list[dict[str, Any]], *, user_id: str, chat_id: st
                 "memory_type": str(mem.get("memory_type", "")),
                 "stability_score": float(mem.get("stability_score", 0.5)),
                 "subject": str(mem.get("subject", "")),
-                "valid": bool(mem.get("valid", True)),
             })
 
         # 单一 CONSOLIDATE LLM 判五 action

@@ -1,7 +1,14 @@
-"""Chat 后端(OpenAI 兼容)+ 长期记忆注入 + 联网搜索。
+"""Chat 后端(OpenAI 兼容)+ 长期记忆注入 + 上下文压缩 + 联网搜索。
 
-链路:接收前端聊天请求 → 检索长期记忆并注入为一条 system → 转发 OpenAI 兼容模型
-→ SSE 流式返回(标准 OpenAI 格式,前端零改)→ 对话结束后台异步抽取写入记忆。
+链路:接收前端聊天请求 → 检索长期记忆并注入为一条 system → 加载会话摘要 →
+判断 token 是否需要压缩 → 转发 OpenAI 兼容模型 → SSE 流式返回(标准 OpenAI 格式,
+前端零改)→ 对话结束后台异步抽取写入记忆。
+
+上下文压缩(批次 G):
+- 70% 阈值:后台线程预压缩(下次生效,用户无感)
+- 90% 阈值:同步兜底,阻塞当次请求(~2-5s 延迟)
+- 压缩不改原始 chat_messages,只生成摘要存入 chat_sessions.summary
+- 会话恢复时读 summary + tail 原文,不重新压缩
 
 联网搜索(批次 F):
 - 自动搜索:SEARCH_ENABLED 时第一次 LLM 调用带 tools=[web_search],LLM 自主判断
@@ -128,6 +135,120 @@ def _inject_memory(messages: list[dict[str, Any]], chat_id: str = "") -> list[di
     if not mem_system:
         return messages
     return [{"role": "system", "content": mem_system}] + list(messages)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 上下文压缩(批次 G)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _load_session_summary_block(chat_id: str) -> Optional[str]:
+    """读取会话摘要,组装为 system 注入文本。无摘要返回 None。"""
+    if not chat_id:
+        return None
+    try:
+        from storage import chat_store
+        info = chat_store.get_summary(chat_id)
+        summary = info.get("summary", "")
+        if not summary:
+            return None
+        return ("以下是本会话此前的对话摘要(仅供参考,若与当前问题无关可忽略):\n\n"
+                + summary)
+    except Exception:
+        return None
+
+
+def _merge_system_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """将 messages 开头的多条 system 消息合并为一条,用分隔线拼接。
+
+    部分模型(如 o1/o3、某些国产模型)只接受单条 system。合并后语义不变,
+    兼容性更好。非 system 消息保持原顺序不动。
+    """
+    if not messages:
+        return messages
+    system_parts: list[str] = []
+    rest: list[dict[str, Any]] = []
+    for msg in messages:
+        if msg.get("role") == "system" and not rest:
+            content = str(msg.get("content", "")).strip()
+            if content:
+                system_parts.append(content)
+        else:
+            rest.append(msg)
+    if not system_parts:
+        return messages
+    merged = {"role": "system", "content": "\n\n---\n\n".join(system_parts)}
+    return [merged] + rest
+
+
+def _prepare_messages(item: ChatRequest) -> list[dict[str, Any]]:
+    """准备发送给 LLM 的 messages(记忆注入 + 摘要注入 + token 压缩判断)。
+
+    流程:
+      1. 注入 core 记忆 system
+      2. 注入会话摘要 system
+      3. 合并所有 system 消息为单条(兼容只支持单 system 的模型)
+      4. 计算 token 总量,三档判断:
+         - < 70%:直接返回
+         - 70%-90%:后台预压缩 + 直接返回(下次生效)
+         - ≥ 90%:同步阻塞压缩,重新构造 messages
+    """
+    messages = _inject_memory(item.messages, chat_id=item.chat_id)
+
+    # 注入会话摘要
+    summary_block = _load_session_summary_block(item.chat_id)
+    if summary_block:
+        insert_pos = 1 if messages and messages[0].get("role") == "system" else 0
+        messages = (list(messages[:insert_pos])
+                    + [{"role": "system", "content": summary_block}]
+                    + list(messages[insert_pos:]))
+
+    # token 判断 + 压缩
+    if not item.chat_id:
+        return _merge_system_messages(messages)
+
+    try:
+        from agent.memory.chat_compact import needs_compact, compact_chat, schedule_background_compact
+        mode = needs_compact(item.messages, summary_block or "")
+        if not mode:
+            return _merge_system_messages(messages)
+
+        _chat_log.info("chat_compact_check", data={
+            "chat_id": item.chat_id, "mode": mode})
+
+        if mode == "async":
+            schedule_background_compact(item.chat_id)
+            return _merge_system_messages(messages)
+
+        # mode == "sync":同步兜底
+        result = compact_chat(item.chat_id, force=True)
+        if result.get("compacted"):
+            # 重新构造:core 记忆 + 新摘要 + 尾部 K 对原文
+            from agent.memory.config import CHAT_COMPACT_KEEP_PAIRS
+            new_summary_block = _load_session_summary_block(item.chat_id)
+            new_messages: list[dict[str, Any]] = []
+
+            # core 记忆
+            query = _extract_last_user_text(item.messages)
+            mem_system = _build_memory_system(query, chat_id=item.chat_id)
+            if mem_system:
+                new_messages.append({"role": "system", "content": mem_system})
+
+            # 新摘要
+            if new_summary_block:
+                new_messages.append({"role": "system", "content": new_summary_block})
+
+            # 尾部原文(从前端发来的消息取)
+            keep_count = CHAT_COMPACT_KEEP_PAIRS * 2
+            tail = list(item.messages[-keep_count:]) if len(item.messages) > keep_count else list(item.messages)
+            new_messages.extend(tail)
+
+            return _merge_system_messages(new_messages)
+
+        return _merge_system_messages(messages)
+    except Exception as exc:
+        _chat_log.warn("chat_compact_prepare_failed", data={
+            "chat_id": item.chat_id, "error": str(exc)[:160]})
+        return _merge_system_messages(messages)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -270,7 +391,7 @@ def _save_history(chat_id: str, user_text: str, assistant_text: str) -> None:
 
 try:
     from search.tools import (
-        WEB_SEARCH_TOOL, handle_tool_call, format_search_results_for_manual,
+        WEB_SEARCH_TOOL, handle_tool_call,
     )
     from search import search_web, SEARCH_ENABLED as _SEARCH_ON
 except ImportError:
@@ -486,22 +607,38 @@ def sync_chat(model: str, messages: list[dict[str, Any]],
 
 @router.post("/chat/completions")
 def chat_completions(item: ChatRequest):
-    """OpenAI 兼容对话端点 + 长期记忆注入 + 联网搜索。"""
-    messages = _inject_memory(item.messages, chat_id=item.chat_id)
+    """OpenAI 兼容对话端点 + 长期记忆注入 + 上下文压缩 + 联网搜索。"""
+    messages = _prepare_messages(item)
     user_text = _extract_last_user_text(item.messages)
     _chat_log.info("chat_request", data={
         "chat_id": item.chat_id, "model": item.model, "stream": item.stream,
         "msg_count": len(item.messages), "injected": len(messages) > len(item.messages),
         "search_query": item.search_query[:60] if item.search_query else ""})
 
-    # 手动搜索:search_query 非空 → 直接搜索注入 system → LLM(不走 tools)
+    # 手动搜索:search_query 非空 → 搜索结果以 tool 消息注入,走二次 LLM(与自动搜索路径一致)
     if item.search_query.strip():
+        from search.tools import format_search_results
         results = search_web(item.search_query.strip()) if _SEARCH_ON else []
         if not results:
             from search.searxng import search_searxng
             results = search_searxng(item.search_query.strip())
-        search_system = format_search_results_for_manual(results)
-        messages = [{"role": "system", "content": search_system}] + list(messages)
+        tool_result_text = format_search_results(results)
+        arguments = json.dumps({"query": item.search_query.strip()}, ensure_ascii=False)
+        assistant_msg = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "manual_search_0",
+                "type": "function",
+                "function": {"name": "web_search", "arguments": arguments},
+            }],
+        }
+        tool_msg = {
+            "role": "tool",
+            "tool_call_id": "manual_search_0",
+            "content": tool_result_text,
+        }
+        messages = list(messages) + [assistant_msg, tool_msg]
         if item.stream:
             return stream_chat(item.model, messages, user_text, item.chat_id,
                                search_results=results)

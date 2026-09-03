@@ -73,6 +73,16 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             "CREATE INDEX IF NOT EXISTS idx_chat_messages_chat "
             "ON chat_messages(chat_id, created_at);"
         )
+        # 上下文压缩:摘要字段(兼容存量库,列已存在则忽略)
+        for col, typedef in [
+            ("summary",            "TEXT NOT NULL DEFAULT ''"),
+            ("summary_msg_count",  "INTEGER NOT NULL DEFAULT 0"),
+            ("summary_updated_at", "TEXT NOT NULL DEFAULT ''"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE chat_sessions ADD COLUMN {col} {typedef}")
+            except sqlite3.OperationalError:
+                pass  # duplicate column — 存量库已有
 
 
 def ensure_session(chat_id: str, first_user_text: str = "") -> bool:
@@ -192,3 +202,67 @@ def soft_delete(chat_id: str) -> bool:
             (_now_iso(), _now_iso(), chat_id),
         )
         return cur.rowcount > 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 上下文压缩(Context Compaction)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def get_summary(chat_id: str) -> dict[str, Any]:
+    """读取会话摘要。返回 {summary, msg_count, updated_at}。会话不存在返回全空/零。"""
+    if not chat_id:
+        return {"summary": "", "msg_count": 0, "updated_at": ""}
+    conn = _get_conn()
+    with _lock:
+        row = conn.execute(
+            "SELECT summary, summary_msg_count, summary_updated_at "
+            "FROM chat_sessions WHERE chat_id = ?", (chat_id,),
+        ).fetchone()
+    if row is None:
+        return {"summary": "", "msg_count": 0, "updated_at": ""}
+    return {
+        "summary": row["summary"] or "",
+        "msg_count": int(row["summary_msg_count"] or 0),
+        "updated_at": row["summary_updated_at"] or "",
+    }
+
+
+def set_summary(chat_id: str, summary: str, msg_count: int) -> bool:
+    """更新会话摘要(覆盖式)。summary_updated_at 自动设为当前时间。"""
+    if not chat_id:
+        return False
+    conn = _get_conn()
+    with _lock, conn:
+        cur = conn.execute(
+            "UPDATE chat_sessions SET summary = ?, summary_msg_count = ?, "
+            "summary_updated_at = ? WHERE chat_id = ?",
+            (summary, max(0, int(msg_count)), _now_iso(), chat_id),
+        )
+        return cur.rowcount > 0
+
+
+def count_messages(chat_id: str) -> int:
+    """统计某会话的消息总数。"""
+    if not chat_id:
+        return 0
+    conn = _get_conn()
+    with _lock:
+        row = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM chat_messages WHERE chat_id = ?",
+            (chat_id,),
+        ).fetchone()
+    return int(row["cnt"]) if row else 0
+
+
+def get_messages_after(chat_id: str, offset: int, limit: int = 500) -> list[dict[str, Any]]:
+    """取摘要覆盖点之后的原文(按时间正序)。offset=0 等同 get_messages。"""
+    if not chat_id:
+        return []
+    conn = _get_conn()
+    with _lock:
+        rows = conn.execute(
+            "SELECT role, content, created_at FROM chat_messages "
+            "WHERE chat_id = ? ORDER BY created_at LIMIT ? OFFSET ?",
+            (chat_id, max(1, int(limit)), max(0, int(offset))),
+        ).fetchall()
+    return [dict(r) for r in rows]

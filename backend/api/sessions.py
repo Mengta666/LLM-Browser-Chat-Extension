@@ -33,12 +33,23 @@ def list_sessions() -> dict[str, Any]:
 
 @router.get("/{chat_id}/messages")
 def get_session_messages(chat_id: str) -> dict[str, Any]:
-    """载入某会话的消息(时间正序,供续谈重建对话)。"""
+    """载入某会话的消息(时间正序,供续谈重建对话)。含会话摘要(如有)供前端恢复上下文。"""
     try:
         messages = CS.get_messages(chat_id)
     except Exception as exc:
         raise HTTPException(503, f"会话历史不可用: {str(exc)[:160]}")
-    return {"chat_id": chat_id, "messages": messages, "count": len(messages)}
+    # 会话摘要(上下文压缩产物)
+    try:
+        summary_info = CS.get_summary(chat_id)
+    except Exception:
+        summary_info = {"summary": "", "msg_count": 0}
+    return {
+        "chat_id": chat_id,
+        "messages": messages,
+        "count": len(messages),
+        "summary": summary_info.get("summary", ""),
+        "summary_msg_count": summary_info.get("msg_count", 0),
+    }
 
 
 @router.patch("/{chat_id}")

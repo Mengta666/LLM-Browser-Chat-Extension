@@ -66,6 +66,8 @@ try:
 except Exception:
     _tok_enc = None
 
+from agent.token_utils import estimate_tokens as _estimate_tokens_shared
+
 
 def _cleanup_expired_sessions():
     """回收空闲会话。基于 last_activity（非创建时间）：活跃任务不断刷新，永不被误清。
@@ -636,45 +638,7 @@ def _result_summary(result: ActionResult, page_state: PageState) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _estimate_tokens(messages: list) -> dict:
-    def _count(text: str) -> int:
-        if not text:
-            return 0
-        if _tok_enc is not None:
-            try:
-                return len(_tok_enc.encode(text))
-            except Exception:
-                pass
-        zh = sum(1 for c in text if ord(c) > 127)
-        return int((len(text) - zh) / 4 + zh / 1.5)
-
-    def _msg_text(m) -> str:
-        c = m.get("content") if isinstance(m, dict) else None
-        if isinstance(c, str):
-            return c
-        if isinstance(c, list):
-            # 多模态：只计文本部分；图片按固定成本估（不把 base64 dataURL 算进去）
-            texts = []
-            for part in c:
-                if isinstance(part, dict) and part.get("type") == "text":
-                    texts.append(part.get("text", ""))
-            return "\n".join(texts)
-        return ""
-
-    def _img_count(m) -> int:
-        c = m.get("content") if isinstance(m, dict) else None
-        if isinstance(c, list):
-            return sum(1 for p in c if isinstance(p, dict) and p.get("type") == "image_url")
-        return 0
-
-    IMG_TOKEN = 1100   # 单张截图估算 token（粗略，避免 base64 撑爆计数）
-    text_tok = sum(_count(_msg_text(m)) for m in (messages or []))
-    n_img = sum(_img_count(m) for m in (messages or []))
-    return {
-        "total": text_tok + n_img * IMG_TOKEN,
-        "text": text_tok,
-        "images": n_img,
-        "method": "tiktoken" if _tok_enc is not None else "heuristic",
-    }
+    return _estimate_tokens_shared(messages)
 
 
 def _log_observation(session: AgentSession, page_state: PageState) -> None:

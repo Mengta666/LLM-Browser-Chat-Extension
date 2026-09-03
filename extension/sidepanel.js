@@ -1150,9 +1150,6 @@ document.addEventListener('DOMContentLoaded', async () => {
           }
           chatMessages.push({ role: 'user', content: image ? (text || '[图片]') : text });
           chatMessages.push({ role: 'assistant', content: fullReply });
-          if (chatMessages.length > MAX_CHAT_HISTORY_MESSAGES) {
-            chatMessages = chatMessages.slice(-MAX_CHAT_HISTORY_MESSAGES);
-          }
         }
         chrome.runtime.onMessage.removeListener(listener);
         resolve();
@@ -1267,14 +1264,24 @@ document.addEventListener('DOMContentLoaded', async () => {
       return;
     }
     const messages = data?.messages || [];
+    const summary = data?.summary || '';
+    const summaryMsgCount = data?.summary_msg_count || 0;
     // 切到该会话:重建内存历史 + DOM 气泡
     currentChatId = chatId;
     await chrome.storage.session.set({ [CURRENT_CHAT_ID_KEY]: chatId });
+    // chatMessages 用于发给 LLM:摘要 + tail 原文
     chatMessages = [];
+    if (summary) {
+      chatMessages.push({ role: 'system', content: '## 本会话此前摘要\n' + summary });
+    }
+    const tail = summaryMsgCount > 0 ? messages.slice(summaryMsgCount) : messages;
+    for (const m of tail) {
+      chatMessages.push({ role: m.role, content: m.content });
+    }
+    // DOM 全量渲染(用户看得到完整历史)
     const historyEl = document.getElementById('chatHistory');
     historyEl.replaceChildren();
     for (const m of messages) {
-      chatMessages.push({ role: m.role, content: m.content });
       const bubble = createMessageNode(m.role === 'user' ? 'user' : 'ai');
       if (m.role === 'user') {
         const node = document.createElement('div');
@@ -1283,10 +1290,6 @@ document.addEventListener('DOMContentLoaded', async () => {
       } else {
         renderMarkdownInto(bubble, m.content, { streaming: false });
       }
-    }
-    // 超长截断:只保留最近 N 条进上下文(DOM 全显示,发送时用 chatMessages 尾部)
-    if (chatMessages.length > MAX_CHAT_HISTORY_MESSAGES) {
-      chatMessages = chatMessages.slice(-MAX_CHAT_HISTORY_MESSAGES);
     }
     scrollToBottom();
     closeDrawer();

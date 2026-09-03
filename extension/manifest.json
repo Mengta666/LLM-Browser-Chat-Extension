@@ -39,7 +39,7 @@
     }
   },
   "content_security_policy": {
-    "extension_pages": "default-src 'self'; script-src 'self'; object-src 'none'; connect-src https: http:; img-src 'self' data: blob:; style-src 'self'; font-src 'self'; base-uri 'none';"
+    "extension_pages": "default-src 'self'; script-src 'self'; object-src 'none'; connect-src https: http:; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self'; base-uri 'none';"
   },
   "side_panel": {
     "default_path": "sidepanel.html"

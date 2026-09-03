@@ -67,8 +67,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     const backticks = (text.match(/`/g) || []).length;
     if (backticks % 2 === 1) text += '`';
     // 未完成链接 `[text](` 或 `[text` → 降级为纯文本,避免半截链接语法。
-    if (/\[[^\]]*\]\([^)]*$/.test(text) || /\[[^\]]*$/.test(text)) {
-      text = text.replace(/\[([^\]]*)\]\([^)]*$/, '$1').replace(/\[([^\]]*)$/, '$1');
+    // 例外:`[` 后紧跟换行(块公式裸括号形式,由 preprocessLaTeX 处理),不动。
+    if (/\[[^\n\]]*\]\([^)]*$/.test(text) || /\[[^\n\]]*$/.test(text)) {
+      text = text.replace(/\[([^\n\]]*)\]\([^)]*$/, '$1').replace(/\[([^\n\]]*)$/, '$1');
     }
     // 加粗 **:成对补全(不误伤 `- ` 列表项后的裸 **,故要求 ** 后紧跟非空白)。
     const boldCount = (text.match(/\*\*/g) || []).length;
@@ -99,20 +100,136 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
 
-  // 把 markdown 文本渲染进目标节点。opts.streaming=true 时补全未闭合标记且跳过 KaTeX;
-  // 流末(streaming=false)用原始文本渲染并跑一次 KaTeX。marked 缺失时降级纯文本。
+  // ═══════════════════════════════════════════════════════════════════════════
+  // preprocessLaTeX:模型输出的数学定界符归一,骨架抄自 LibreChat/NextChat。
+  // 目的:让 marked 看到 $$...$$ / $...$,同时保护 \/_ 等字符不被 markdown 吞。
+  // 顺序至关重要,不能颠倒:
+  //   1. 抽出代码块和行内 code(math 不能出现在代码里)
+  //   2. 抽出已闭合的 $$...$$、\[...\]、\(...\)、$...$(用占位符,marked 看不见)
+  //   3. 保守裸括号兜底:整行 [ 到 整行 ] 且含 LaTeX 特征 → 转 $$...$$
+  //      (裸行内 (...) 不动 —— 与 \left( 和散文括号无法可靠区分)
+  //   4. 货币兜底:$100 之类的 $ 前置反斜杠转义,不当行内公式定界
+  //   5. 送 marked / DOMPurify
+  //   6. 换回占位符(原始 math + code 源码回到 HTML,再交 KaTeX)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // 用 U+E000 私有区字符做占位符,不出现在正常文本里,零冲突。
+  const PH_CODE = '';
+  const PH_MATH = '';
+
+  // 步骤 1+2:抽出代码和已闭合的 math 段。返回 { text, code, math }。
+  function extractProtected(text) {
+    const code = [];
+    const math = [];
+    // 代码:fence 优先(``` 内可以有 `` `),再行内 `...`
+    let out = text.replace(/```[\s\S]*?```/g, (m) => {
+      code.push(m); return `${PH_CODE}${code.length - 1}${PH_CODE}`;
+    });
+    out = out.replace(/`[^`\n]+`/g, (m) => {
+      code.push(m); return `${PH_CODE}${code.length - 1}${PH_CODE}`;
+    });
+    // 已闭合的 math:$$...$$、\[...\]、\(...\)、$...$ 按此顺序抽,长的优先
+    const pushMath = (raw, display, body) => {
+      math.push({ display, body }); return `${PH_MATH}${math.length - 1}${PH_MATH}`;
+    };
+    out = out.replace(/\$\$([\s\S]+?)\$\$/g, (m, b) => pushMath(m, true, b));
+    out = out.replace(/\\\[([\s\S]+?)\\\]/g, (m, b) => pushMath(m, true, b));
+    out = out.replace(/\\\(([\s\S]+?)\\\)/g, (m, b) => pushMath(m, false, b));
+    // 单 $:同行内、非空、且 $ 前不是数字/字母/反斜杠(避免 $100、a$b、\$)
+    out = out.replace(/(^|[^\\\w])\$([^\n$]+?)\$(?!\d)/g, (m, pre, b) => pre + pushMath(m, false, b));
+    return { text: out, code, math };
+  }
+
+  // 步骤 3:裸 [ ... ] 兜底(仅当独占行 + 含 LaTeX 特征)
+  function convertBareBrackets(text, math) {
+    // 匹配"^ [ $"独占一行,到"^ ] $"独占一行,中间任意
+    return text.replace(
+      /^[ \t]*\[[ \t]*\r?\n([\s\S]*?)\r?\n[ \t]*\][ \t]*$/gm,
+      (m, body) => {
+        // LaTeX 特征:反斜杠命令 / 上下标 / 花括号 / \frac \sum 等
+        if (!/\\|[\^_{}]/.test(body)) return m;
+        math.push({ display: true, body });
+        return `${PH_MATH}${math.length - 1}${PH_MATH}`;
+      }
+    );
+  }
+
+  // 步骤 4:货币兜底 —— $ 后紧跟数字的独立 $,转义避免误当定界符残留
+  function escapeCurrency(text) {
+    return text.replace(/\$(?=\d)/g, '\\$');
+  }
+
+  // 步骤 6:把占位符换回。math 换回带定界符,让 KaTeX auto-render 再扫。
+  function restoreProtected(html, code, math) {
+    let out = html;
+    if (math.length) {
+      const re = new RegExp(`${PH_MATH}(\\d+)${PH_MATH}`, 'g');
+      out = out.replace(re, (_m, i) => {
+        const seg = math[Number(i)];
+        if (!seg) return '';
+        return seg.display ? `$$${seg.body}$$` : `$${seg.body}$`;
+      });
+    }
+    if (code.length) {
+      const re = new RegExp(`${PH_CODE}(\\d+)${PH_CODE}`, 'g');
+      out = out.replace(re, (_m, i) => code[Number(i)] || '');
+    }
+    return out;
+  }
+
+  function preprocessLaTeX(text) {
+    if (!text) return '';
+    const { text: t1, code, math } = extractProtected(text);
+    const t2 = convertBareBrackets(t1, math);
+    const t3 = escapeCurrency(t2);
+    return { text: t3, code, math };
+  }
+
+  // 流式期间截断未闭合的公式尾巴,避免字面 [ 或 $$ 闪现。
+  // 找 buffer 里最后一个"开了但没关"的 math 开定界符,截到它之前。
+  // 判定:$$ 数量奇 / \[ 数量 > \] 数量 / \( 数量 > \) 数量 → 尾部有未闭合
+  function truncateUnclosedMath(text) {
+    if (!text) return '';
+    // 简单方式:扫一遍找最后一个未闭合 opener 的位置
+    const openers = [];
+    // $$ 优先(会吞 \[)
+    let i = 0;
+    while (i < text.length) {
+      if (text[i] === '\\' && (text[i + 1] === '[' || text[i + 1] === '(')) {
+        const close = text[i + 1] === '[' ? '\\]' : '\\)';
+        const end = text.indexOf(close, i + 2);
+        if (end === -1) { openers.push(i); break; }
+        i = end + 2;
+      } else if (text[i] === '$' && text[i + 1] === '$') {
+        const end = text.indexOf('$$', i + 2);
+        if (end === -1) { openers.push(i); break; }
+        i = end + 2;
+      } else {
+        i++;
+      }
+    }
+    if (openers.length === 0) return text;
+    return text.slice(0, openers[0]);
+  }
+
+  // marked(解析) → 补全未闭合行内标记 → DOMPurify → innerHTML → KaTeX。
+  // 流式:先截未闭合公式,再补 markdown 悬空标记;非流式:完整跑。
   function renderMarkdownInto(el, text, opts) {
     const streaming = opts && opts.streaming;
-    const src = streaming ? closeOpenMarks(text) : (text || '');
+    let src = text || '';
+    if (streaming) src = truncateUnclosedMath(src);
+    if (streaming) src = closeOpenMarks(src);
+    const pre = preprocessLaTeX(src);
     let html;
     if (window.marked && typeof window.marked.parse === 'function') {
-      html = window.marked.parse(src);
+      html = window.marked.parse(pre.text);
       if (window.DOMPurify && typeof window.DOMPurify.sanitize === 'function') {
         html = window.DOMPurify.sanitize(html);
       }
+      html = restoreProtected(html, pre.code, pre.math);
       el.innerHTML = html;
       addCodeCopyButtons(el);
-      if (!streaming && typeof window.renderMathInElement === 'function') {
+      if (typeof window.renderMathInElement === 'function') {
         try {
           window.renderMathInElement(el, {
             delimiters: [

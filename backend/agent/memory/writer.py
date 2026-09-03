@@ -10,6 +10,7 @@ promote 新条以 core 直接落库、target_ids 兄弟软失效(合并了旧 de
 
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -27,7 +28,10 @@ from agent.memory.prompts import (
     CONSOLIDATE_SYSTEM_PROMPT, build_consolidate_user_prompt,
     CHAT_EXTRACT_SYSTEM_PROMPT, build_chat_extract_user_prompt,
 )
+from observability.logger import get_logger
 from rag.embedder import embed_text
+
+_log = get_logger("memory")
 
 
 __env_path = Path(__file__).resolve().parents[2] / "config" / ".env"
@@ -46,6 +50,7 @@ LlmFn = Callable[[str, str], Optional[dict]]
 def _default_llm(system_prompt: str, user_prompt: str) -> Optional[dict]:
     """默认 LLM 调用:JSON 模式,失败返回 None(记忆写入失败不该拖垮 agent)。"""
     try:
+        t0 = time.monotonic()
         resp = _llm_client.chat.completions.create(
             model=_MEMORY_MODEL,
             messages=[
@@ -55,9 +60,18 @@ def _default_llm(system_prompt: str, user_prompt: str) -> Optional[dict]:
             response_format={"type": "json_object"},
             timeout=60,
         )
+        duration_ms = int((time.monotonic() - t0) * 1000)
         raw = resp.choices[0].message.content or ""
-        return _parse_json(raw)
-    except Exception:
+        result = _parse_json(raw)
+        _log.info("memory_llm_call", data={
+            "model": _MEMORY_MODEL,
+            "prompt_tokens": getattr(getattr(resp, "usage", None), "prompt_tokens", None),
+            "completion_tokens": getattr(getattr(resp, "usage", None), "completion_tokens", None),
+            "ok": result is not None,
+        }, duration_ms=duration_ms)
+        return result
+    except Exception as exc:
+        _log.error("memory_llm_failed", data={"model": _MEMORY_MODEL, "error": str(exc)[:200]})
         return None
 
 
@@ -463,19 +477,40 @@ def write_chat_memory(user_msg: str, assistant_msg: str,
                       history_summary: str = "",
                       user_id: str = CHAT_USER_ID, chat_id: str = "",
                       llm: LlmFn = _default_llm) -> dict[str, Any]:
-    """chat 完整两阶段写入。返回 {facts, applied:[...], skipped_hash:int}。
-
-    阶段一:extract_chat_facts;阶段二:复用 _consolidate_facts(检索相似→去重→决策→落库,
-    矛盾走失效)。chat_id 用于 episodic 会话隔离(core 仍落全局)。
-    对异常宽容,记忆写入是尽力而为。
-    """
+    """chat 完整两阶段写入。返回 {facts, applied:[...], skipped_hash:int}。"""
     result: dict[str, Any] = {"facts": [], "applied": [], "skipped_hash": 0}
+    t0 = time.monotonic()
     try:
         facts = extract_chat_facts(user_msg, assistant_msg, history_summary, llm=llm)
-    except Exception:
+    except Exception as exc:
+        _log.error("memory_extract_failed", session_id=chat_id,
+                   data={"error": str(exc)[:200]})
         return result
+
     result["facts"] = facts
+    _log.info("memory_extract_done", session_id=chat_id, data={
+        "facts_count": len(facts),
+        "types": [f.get("memory_type") for f in facts],
+        "subjects": [f.get("subject", "") for f in facts if f.get("subject")],
+    })
+
     if not facts:
         return result
+
     _consolidate_facts(facts, user_id=user_id, chat_id=chat_id, llm=llm, result=result)
+
+    _log.info("memory_write_done", session_id=chat_id, duration_ms=int((time.monotonic() - t0) * 1000), data={
+        "facts_count": len(facts),
+        "applied": result.get("applied", []),
+        "skipped_hash": result.get("skipped_hash", 0),
+        "actions": _count_actions(result.get("applied", [])),
+    })
     return result
+
+
+def _count_actions(applied: list[str]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for a in applied:
+        key = a.split()[0].upper() if a else "UNKNOWN"
+        counts[key] = counts.get(key, 0) + 1
+    return counts

@@ -39,6 +39,9 @@ from agent.memory.config import (
     RETHINK_CORE_MAX_GROUPS_PER_RUN, RETHINK_MIN_CORE_COUNT,
     RETHINK_MAX_ELAPSED_SEC,
 )
+from observability.logger import get_logger
+
+_log = get_logger("memory")
 
 
 __env_path = Path(__file__).resolve().parents[2] / "config" / ".env"
@@ -195,16 +198,25 @@ def _build_rethink_user_prompt(items: list[dict[str, Any]], now_iso: str) -> str
 def _default_llm(system: str, user: str) -> Optional[dict]:
     """默认 LLM 调用。失败返 None(整理是"锦上添花",失败不影响主链路)。"""
     try:
+        t0 = time.monotonic()
         resp = _llm_client.chat.completions.create(
             model=_MEMORY_MODEL,
             messages=[{"role": "system", "content": system},
                       {"role": "user", "content": user}],
             response_format={"type": "json_object"},
-            timeout=120,  # 全库扫可能量大,给足时间
+            timeout=120,
         )
+        duration_ms = int((time.monotonic() - t0) * 1000)
         raw = resp.choices[0].message.content or ""
-        return _parse_json(raw)
-    except Exception:
+        result = _parse_json(raw)
+        _log.info("rethink_llm_call", duration_ms=duration_ms, data={
+            "model": _MEMORY_MODEL,
+            "prompt_tokens": getattr(getattr(resp, "usage", None), "prompt_tokens", None),
+            "ok": result is not None,
+        })
+        return result
+    except Exception as exc:
+        _log.error("rethink_llm_failed", data={"model": _MEMORY_MODEL, "error": str(exc)[:200]})
         return None
 
 
@@ -235,19 +247,16 @@ def _parse_json(raw: str) -> Optional[dict]:
 
 def rethink_core(user_id: str = CHAT_USER_ID,
                  llm: LlmFn = _default_llm) -> dict[str, Any]:
-    """同步跑一次 rethink 整理。返回 {conflicts, expired, merges, skipped, elapsed_ms}。
-
-    自动获取并发锁——若已在进行中直接返回 {"skipped": "in_progress", ...}。
-    daemon + 写后触发用这个入口。API 端点走 rethink_core_stream(SSE)。
-    """
+    """同步跑一次 rethink 整理。返回 {conflicts, expired, merges, skipped, elapsed_ms}。"""
     existing = try_acquire(user_id)
     if existing:
+        _log.info("rethink_skipped", data={"reason": "in_progress", **existing})
         return {"skipped": "in_progress", **existing}
+    _log.info("rethink_start", data={"user_id": user_id})
     try:
         events = list(_do_rethink(user_id, llm))
     finally:
         release(user_id)
-    # 折叠 events 为汇总结果
     counts = {"conflicts": 0, "expired": 0, "merges": 0}
     total_core = 0
     elapsed_ms = 0
@@ -260,6 +269,11 @@ def rethink_core(user_id: str = CHAT_USER_ID,
                 counts[k] += 1
         elif ev["event"] == "done":
             elapsed_ms = ev["data"].get("elapsed_ms", 0)
+    _log.info("rethink_done", duration_ms=elapsed_ms, data={
+        "user_id": user_id,
+        "total_core": total_core,
+        **counts,
+    })
     return {"total_core": total_core, **counts, "elapsed_ms": elapsed_ms}
 
 

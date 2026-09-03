@@ -23,6 +23,7 @@
 import json
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -433,8 +434,9 @@ def stream_chat(model: str, messages: list[dict[str, Any]],
     def _gen():
         full_text = ""
         _sr = search_results or []
+        t0 = time.monotonic()
+        search_used = bool(_sr)
 
-        # 手动搜索时先 yield 搜索元数据
         if _sr:
             yield _sse_search_meta(_sr)
 
@@ -452,7 +454,7 @@ def stream_chat(model: str, messages: list[dict[str, Any]],
                 create_kwargs.pop("tools", None)
                 resp = _llm_client.chat.completions.create(**create_kwargs)
             else:
-                _chat_log.error("chat_stream_failed", data={
+                _chat_log.error("chat_stream_failed", session_id=chat_id, data={
                     "chat_id": chat_id, "error": str(exc)[:200]})
                 yield _sse({"choices": [{"delta": {"content": f"\n[对话出错: {str(exc)[:120]}]"},
                                          "finish_reason": "error", "index": 0}]})
@@ -460,11 +462,17 @@ def stream_chat(model: str, messages: list[dict[str, Any]],
                 return
 
         tool_calls_buf = {}
+        prompt_tokens = None
+        completion_tokens = None
 
         try:
             for chunk in resp:
                 choice = chunk.choices[0] if chunk.choices else None
                 if not choice:
+                    # 从最后一个 chunk 捞 usage
+                    if hasattr(chunk, "usage") and chunk.usage:
+                        prompt_tokens = chunk.usage.prompt_tokens
+                        completion_tokens = chunk.usage.completion_tokens
                     continue
                 delta = choice.delta
 
@@ -487,7 +495,8 @@ def stream_chat(model: str, messages: list[dict[str, Any]],
                     full_text += delta.content
                     yield _sse(chunk.model_dump())
         except Exception as exc:
-            _chat_log.error("chat_stream_failed", data={"chat_id": chat_id, "error": str(exc)[:200]})
+            _chat_log.error("chat_stream_failed", session_id=chat_id, data={
+                "chat_id": chat_id, "error": str(exc)[:200]})
             yield _sse({"choices": [{"delta": {"content": f"\n[对话出错: {str(exc)[:120]}]"},
                                      "finish_reason": "error", "index": 0}]})
 
@@ -505,27 +514,19 @@ def stream_chat(model: str, messages: list[dict[str, Any]],
                                          "finish_reason": None, "index": 0}],
                             "object": "chat.completion.chunk"})
 
-                tool_result_text, _sr = handle_tool_call(tc_info["name"], tc_info["arguments"])
-                if _sr:
-                    yield _sse_search_meta(_sr)
+                tool_result_text, _sr2 = handle_tool_call(tc_info["name"], tc_info["arguments"])
+                if _sr2:
+                    search_used = True
+                    yield _sse_search_meta(_sr2)
 
                 assistant_msg = {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [{
-                        "id": tc_info["id"],
-                        "type": "function",
-                        "function": {
-                            "name": tc_info["name"],
-                            "arguments": tc_info["arguments"],
-                        }
-                    }]
+                    "role": "assistant", "content": None,
+                    "tool_calls": [{"id": tc_info["id"], "type": "function",
+                                    "function": {"name": tc_info["name"],
+                                                 "arguments": tc_info["arguments"]}}]
                 }
-                tool_msg = {
-                    "role": "tool",
-                    "tool_call_id": tc_info["id"],
-                    "content": tool_result_text,
-                }
+                tool_msg = {"role": "tool", "tool_call_id": tc_info["id"],
+                            "content": tool_result_text}
                 messages_2 = list(messages) + [assistant_msg, tool_msg]
 
                 try:
@@ -545,6 +546,14 @@ def stream_chat(model: str, messages: list[dict[str, Any]],
                 break
 
         yield "data: [DONE]\n\n"
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        _chat_log.info("chat_done", session_id=chat_id, duration_ms=duration_ms, data={
+            "chat_id": chat_id, "model": model, "stream": True,
+            "reply_chars": len(full_text),
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "search_used": search_used,
+        })
         if full_text.strip():
             _save_history(chat_id, user_text, full_text)
             _schedule_memory_write(user_text, full_text, chat_id)
@@ -556,6 +565,8 @@ def sync_chat(model: str, messages: list[dict[str, Any]],
               user_text: str, chat_id: str,
               use_tools: bool = False) -> JSONResponse:
     """非流式转发。use_tools=True 时支持 function calling。"""
+    t0 = time.monotonic()
+    search_used = False
     create_kwargs = dict(model=model, messages=messages, stream=False,
                          timeout=CHAT_LLM_TIMEOUT)
     if use_tools and WEB_SEARCH_TOOL:
@@ -567,13 +578,15 @@ def sync_chat(model: str, messages: list[dict[str, Any]],
             create_kwargs.pop("tools", None)
             resp = _llm_client.chat.completions.create(**create_kwargs)
         else:
-            _chat_log.error("chat_sync_failed", data={"chat_id": chat_id, "error": str(exc)[:200]})
+            _chat_log.error("chat_sync_failed", session_id=chat_id,
+                            data={"chat_id": chat_id, "error": str(exc)[:200]})
             return JSONResponse(status_code=502, content={"error": f"对话出错: {str(exc)[:160]}"})
 
     msg = resp.choices[0].message if resp.choices else None
     if msg and msg.tool_calls:
         tc = msg.tool_calls[0]
         if tc.function.name == "web_search":
+            search_used = True
             tool_result_text, _ = handle_tool_call(tc.function.name, tc.function.arguments)
             messages_2 = list(messages) + [
                 msg.model_dump(),
@@ -584,7 +597,7 @@ def sync_chat(model: str, messages: list[dict[str, Any]],
                     model=model, messages=messages_2, stream=False,
                     timeout=CHAT_LLM_TIMEOUT)
             except Exception as exc:
-                _chat_log.error("chat_sync_search_failed", data={
+                _chat_log.error("chat_sync_search_failed", session_id=chat_id, data={
                     "chat_id": chat_id, "error": str(exc)[:200]})
                 return JSONResponse(status_code=502, content={
                     "error": f"搜索后生成回答失败: {str(exc)[:160]}"})
@@ -595,6 +608,15 @@ def sync_chat(model: str, messages: list[dict[str, Any]],
         text = resp.choices[0].message.content or ""
     except Exception:
         pass
+
+    duration_ms = int((time.monotonic() - t0) * 1000)
+    _chat_log.info("chat_done", session_id=chat_id, duration_ms=duration_ms, data={
+        "chat_id": chat_id, "model": model, "stream": False,
+        "reply_chars": len(text),
+        "prompt_tokens": getattr(getattr(resp, "usage", None), "prompt_tokens", None),
+        "completion_tokens": getattr(getattr(resp, "usage", None), "completion_tokens", None),
+        "search_used": search_used,
+    })
     if text.strip():
         _save_history(chat_id, user_text, text)
         _schedule_memory_write(user_text, text, chat_id)

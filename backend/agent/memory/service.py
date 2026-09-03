@@ -15,6 +15,9 @@ from agent.memory import retriever as R
 from agent.memory import writer as W
 from agent.memory import vector as V
 from agent.memory.config import CHAT_USER_ID
+from observability.logger import get_logger
+
+_log = get_logger("memory")
 
 
 def get_core_memories(user_id: str = None) -> list[dict[str, Any]]:
@@ -53,31 +56,27 @@ def build_episodic_block(memories: list[dict[str, Any]]) -> str:
 def write_chat_memory(user_msg: str, assistant_msg: str,
                       history_summary: str = "", user_id: str = None,
                       chat_id: str = "") -> dict[str, Any]:
-    """chat 对话抽取并写入记忆(core/episodic)。任何异常都吞掉。
-
-    chat_id 用于 episodic 会话隔离;写后剪枝:全局 core 防堆积 + 本会话 episodic 容量 GC。
-    """
+    """chat 对话抽取并写入记忆(core/episodic)。任何异常都吞掉。"""
     uid = user_id or CHAT_USER_ID
     try:
         result = W.write_chat_memory(
             user_msg, assistant_msg, history_summary=history_summary,
             user_id=uid, chat_id=chat_id)
-        # 写后剪枝 core 层(只清 valid=false 僵尸条,活跃 core 不物理删)
         try:
-            V.prune_global_preferences(user_id=uid)
+            pruned = V.prune_global_preferences(user_id=uid)
+            if pruned:
+                _log.info("memory_prune_core", session_id=chat_id,
+                          data={"pruned_count": pruned if isinstance(pruned, int) else 0})
         except Exception:
             pass
-        # 写后剪枝本会话 episodic(容量上限,软失效可回溯;只扫这一个会话)
         if chat_id:
             try:
-                V.prune_episodic(chat_id, user_id=uid)
+                pruned_e = V.prune_episodic(chat_id, user_id=uid)
+                if pruned_e:
+                    _log.info("memory_prune_episodic", session_id=chat_id,
+                              data={"pruned_count": pruned_e if isinstance(pruned_e, int) else 0})
             except Exception:
                 pass
-        # B5 core 摘要(异步,不阻塞主链):超预算才触发 LLM 分组摘要
-        # 记忆是"锦上添花",压缩失败静默吞
-        # 注:rethink 冲突整理**不在这里触发**——每次写记忆都跑 LLM 全库扫过于激进,
-        # 且 chat 首次配置阶段就会带来不必要的 LLM 消耗。
-        # 只在两处触发:①用户手动点前端"整理"按钮 ②后台 daemon 每 24h 周期
         try:
             import threading
             from agent.memory import summarize
@@ -87,5 +86,7 @@ def write_chat_memory(user_msg: str, assistant_msg: str,
         except Exception:
             pass
         return result
-    except Exception:
+    except Exception as exc:
+        _log.error("memory_service_failed", session_id=chat_id,
+                   data={"error": str(exc)[:200]})
         return {"facts": [], "applied": [], "skipped_hash": 0}

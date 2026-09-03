@@ -24,6 +24,7 @@ from agent.memory import rethink as R
 from agent.memory.config import (
     CHAT_USER_ID, SCOPE_GLOBAL,
     MEMORY_TYPE_CORE, MEMORY_TYPE_EPISODIC,
+    SUBJECT_VOCAB,
 )
 from rag.embedder import embed_text
 from observability.logger import get_logger
@@ -153,11 +154,7 @@ def create_memory(item: MemoryCreate) -> dict[str, Any]:
     # subject:用户填了就用,没填则调 LLM 推断(复用现有 vocab 保证短语收敛)
     subject = item.subject.strip()[:64]
     if not subject:
-        try:
-            vocab = V.get_subject_vocab(user_id=CHAT_USER_ID)
-        except Exception:
-            vocab = []
-        subject = _infer_subject(content, vocab)
+        subject = _infer_subject(content, SUBJECT_VOCAB)
 
     try:
         payload = V.insert_memory(

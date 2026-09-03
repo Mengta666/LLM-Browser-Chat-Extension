@@ -656,24 +656,3 @@ def count_memories(user_id: str = DEFAULT_USER_ID, *,
         exact=True,
     )
     return int(result.count)
-
-
-def get_subject_vocab(user_id: str = DEFAULT_USER_ID, limit: int = 60) -> list[str]:
-    """取现有活跃记忆里所有非空 subject,去重排序,供 EXTRACT/手动推断时作枚举参考。
-
-    结果有限(通常 10-30 个),直接 scroll 全量 core 取 subject 字段即可,不走向量检索。
-    Qdrant 不可用/空库返回空列表。
-    """
-    try:
-        items = scroll_memories(
-            user_id=user_id, memory_type=None,
-            scope=SCOPE_GLOBAL, include_invalid=False, limit=limit)
-        seen: dict[str, int] = {}
-        for m in items:
-            s = str(m.get("subject", "")).strip()
-            if s:
-                seen[s] = seen.get(s, 0) + 1
-        # 按出现频次降序,让高频(稳定)主题排前面
-        return [s for s, _ in sorted(seen.items(), key=lambda x: -x[1])]
-    except Exception:
-        return []

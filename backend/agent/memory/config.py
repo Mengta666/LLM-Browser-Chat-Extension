@@ -95,6 +95,19 @@ CHAT_WRITE_EVERY_N_TURNS = int(os.getenv("CHAT_WRITE_EVERY_N_TURNS", "3"))
 # 官方要求 instruct 用英文写(与中文 query 可不同语言),典型提升 1-5% 召回。
 INSTRUCT_CHAT = "Retrieve facts about the user relevant to the current message"
 
+# ── subject 通用维度词表(硬编码,供 EXTRACT/手动推断时约束短语收敛)──
+# 项目类("项目:X")由 LLM 自由命名,不纳入硬编码。
+SUBJECT_VOCAB: list[str] = [
+    # 回答行为
+    "回答语言偏好", "回答格式偏好", "回答长度偏好", "回答内容偏好",
+    # 用户身份
+    "用户身份", "用户名字", "用户所在领域", "用户团队",
+    # 技术偏好
+    "编程语言", "测试工具偏好", "UI 主题偏好", "编辑器偏好", "框架偏好",
+    # 工作习惯
+    "工作方式偏好", "代码风格偏好", "沟通偏好",
+]
+
 # ── 会话隔离(路线乙)──
 # episodic 记忆按会话隔离:payload.chat_id 存所属会话 id、仅本会话检索;
 # core 是全局记忆,chat_id 留空(跨所有会话常驻)。

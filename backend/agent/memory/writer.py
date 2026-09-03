@@ -22,7 +22,7 @@ from agent.memory import history as H
 from agent.memory.config import (
     WRITE_SEARCH_TOP_K, CHAT_USER_ID,
     MEMORY_TYPE_CORE, MEMORY_TYPE_EPISODIC,
-    SCOPE_GLOBAL,
+    SCOPE_GLOBAL, SUBJECT_VOCAB,
 )
 from agent.memory.prompts import (
     CONSOLIDATE_SYSTEM_PROMPT, build_consolidate_user_prompt,
@@ -434,16 +434,11 @@ def extract_chat_facts(user_msg: str, assistant_msg: str,
                        llm: LlmFn = _default_llm) -> list[dict[str, Any]]:
     """chat 抽取阶段:从一轮(或多轮摘要+最近一轮)对话抽 core/episodic。
 
-    调用前拉取现有 subject 枚举注入 prompt,让 LLM 优先复用已有短语,减少漂移。
+    注入硬编码 SUBJECT_VOCAB 约束 subject 短语收敛,减少同主题漂移。
     """
-    try:
-        subject_vocab = V.get_subject_vocab(user_id=CHAT_USER_ID)
-    except Exception:
-        subject_vocab = []
-
     result = llm(CHAT_EXTRACT_SYSTEM_PROMPT,
                  build_chat_extract_user_prompt(user_msg, assistant_msg,
-                                                history_summary, subject_vocab=subject_vocab))
+                                                history_summary, subject_vocab=SUBJECT_VOCAB))
     if not result:
         return []
     facts = result.get("facts", [])

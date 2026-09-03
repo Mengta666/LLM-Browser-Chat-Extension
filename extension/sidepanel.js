@@ -914,6 +914,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (target === 'memory') {
         const modal = document.getElementById('rethinkModal');
         if (modal && _rethinkState === 'idle') modal.style.display = 'none';
+        renderAddMemoryBtn();   // 恢复添加按钮状态(添加中/已添加/idle)
         loadMemoryPanel().catch((err) => console.warn('加载记忆面板失败', err));
       }
     });
@@ -1453,25 +1454,53 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
+  // 添加记忆按钮三态:idle=可添加 / adding=添加中(不可点)/ done=✓ 已添加(1.5s 自动回 idle)
+  // 参照 rethink 模式,切 tab 后回来能正确恢复按钮显示。
+  let _addMemoryState = 'idle';
+  let _addMemoryDoneTimer = null;
+
+  function renderAddMemoryBtn() {
+    const btn = document.getElementById('memoryAddBtn');
+    if (!btn) return;
+    if (_addMemoryState === 'adding') {
+      btn.disabled = true;
+      btn.textContent = '添加中...';
+    } else if (_addMemoryState === 'done') {
+      btn.disabled = true;
+      btn.textContent = '✓ 已添加';
+    } else {
+      btn.disabled = false;
+      btn.textContent = '添加';
+    }
+  }
+
   async function addMemory() {
+    if (_addMemoryState === 'adding') return;   // 防重复点击
     const input = document.getElementById('memoryAddInput');
     const subjectInput = document.getElementById('memoryAddSubject');
     const content = String(input?.value || '').trim();
     if (!content) return;
     const subject = String(subjectInput?.value || '').trim();
-    const addBtn = document.getElementById('memoryAddBtn');
+    _addMemoryState = 'adding';
+    renderAddMemoryBtn();
     try {
-      if (addBtn) { addBtn.disabled = true; addBtn.textContent = '添加中...'; }
       const base = await backendBase();
       await callBackendApi(buildBackendEndpointUrl(base, '/v1/memory'), 'POST',
         { content, memory_type: 'core', subject });
       input.value = '';
       if (subjectInput) subjectInput.value = '';
-      if (addBtn) { addBtn.textContent = '✓ 已添加'; }
-      setTimeout(() => { if (addBtn) { addBtn.disabled = false; addBtn.textContent = '添加'; } }, 1500);
+      _addMemoryState = 'done';
+      renderAddMemoryBtn();
+      // 1.5s 后回 idle;切 tab 期间不受影响,回来时 renderAddMemoryBtn 会按状态渲染
+      if (_addMemoryDoneTimer) clearTimeout(_addMemoryDoneTimer);
+      _addMemoryDoneTimer = setTimeout(() => {
+        _addMemoryState = 'idle';
+        renderAddMemoryBtn();
+      }, 1500);
       await loadMemoryPanel();
     } catch (e) {
-      if (addBtn) { addBtn.disabled = false; addBtn.textContent = '添加'; }
+      _addMemoryState = 'idle';
+      renderAddMemoryBtn();
       alert('添加失败: ' + (e?.message || ''));
     }
   }

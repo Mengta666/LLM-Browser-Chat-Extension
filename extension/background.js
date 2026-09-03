@@ -1136,7 +1136,34 @@ function extractText(node) {
   for (const c of node.children) {
     if (c.nodeType === NODE_TYPE.TEXT && c.nodeValue) t += c.nodeValue;
   }
-  return t.replace(/\s+/g, ' ').trim();
+  t = t.replace(/\s+/g, ' ').trim();
+  if (t) return t.slice(0, 100);
+  // 纯图标按钮兜底:文本子节点为空时,依次退回 aria-label → title → svg use 的 href 图标名
+  // (如 <use href="#logout"> → "logout")。否则 LLM 看到一排 `<a/>` 空壳,无法分辨,不会选。
+  const attrs = node.attributes || {};
+  if (attrs['aria-label']) return attrs['aria-label'].replace(/\s+/g, ' ').trim().slice(0, 100);
+  if (attrs.title) return attrs.title.replace(/\s+/g, ' ').trim().slice(0, 100);
+  const iconName = findSvgIconName(node);
+  if (iconName) return iconName.slice(0, 100);
+  return '';
+}
+
+// 递归找后代 svg <use> 的 href/xlink:href 图标名(去 # 前缀)。剪枝已把 svg 内部整组丢弃,
+// 但 use 节点在 DOM 里仍存在(只是不进 serializer 输出),此处直接读原始 node 树。
+function findSvgIconName(node) {
+  const stack = [...(node.children || [])];
+  while (stack.length) {
+    const n = stack.pop();
+    if (!n) continue;
+    if ((n.nodeName || '').toLowerCase() === 'use') {
+      const a = n.attributes || {};
+      const h = a.href || a['xlink:href'] || '';
+      if (h.startsWith('#')) return h.slice(1);
+      if (h) return h;
+    }
+    if (n.children) for (const c of n.children) stack.push(c);
+  }
+  return '';
 }
 
 // 序列化：遍历 isInteractive && isVisible，分配 1..N selectorIndex，产出后端元素 dict + indexMap。

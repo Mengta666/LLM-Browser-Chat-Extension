@@ -1038,11 +1038,12 @@ document.addEventListener('DOMContentLoaded', async () => {
   });
 
   // 2. 加载与保存设置
-  const config = await chrome.storage.local.get(['apiUrl', 'modelName']);
+  const config = await chrome.storage.local.get(['apiUrl', 'modelName', 'agentLlmParams']);
   const storedCredential = await getStoredApiCredential();
   const apiUrlInput = document.getElementById('apiUrl');
   const apiKeyInput = document.getElementById('apiKey');
   const modelNameInput = document.getElementById('modelName');
+  const agentLlmParamsInput = document.getElementById('agentLlmParams');
   const apiKeyStatus = document.getElementById('apiKeyStatus');
   const saveMsg = document.getElementById('saveMsg');
 
@@ -1067,12 +1068,35 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   apiUrlInput.value = config.apiUrl || DEFAULT_API_URL;
   modelNameInput.value = config.modelName || 'gpt-3.5-turbo';
+  agentLlmParamsInput.value = config.agentLlmParams || '';
   updateApiKeyStatus(Boolean(storedCredential.apiKey), storedCredential.apiKeyApiUrl);
+
+  // 自定义 LLM 参数的黑名单键：由 harness 独占,用户不能覆盖。
+  const AGENT_LLM_PARAMS_FORBIDDEN = new Set(['model', 'messages', 'stream', 'api_key', 'apiKey', 'timeout', 'n']);
+
+  // 解析并校验用户填的 JSON。空串合法(返回 null)。返回 [parsed | null, errorMsg | ''].
+  function parseAgentLlmParams(raw) {
+    const text = (raw || '').trim();
+    if (!text) return [null, ''];
+    let obj;
+    try { obj = JSON.parse(text); } catch (e) { return [null, `JSON 语法错误: ${e.message}`]; }
+    if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) return [null, 'JSON 必须是对象(非数组/非字符串)'];
+    for (const k of Object.keys(obj)) {
+      if (AGENT_LLM_PARAMS_FORBIDDEN.has(k)) return [null, `禁止字段: ${k}(由系统管理)`];
+    }
+    if ('extra_body' in obj) {
+      const eb = obj.extra_body;
+      if (eb === null || typeof eb !== 'object' || Array.isArray(eb)) return [null, 'extra_body 必须是对象'];
+    }
+    return [obj, ''];
+  }
 
   document.getElementById('saveSettingsBtn').addEventListener('click', async () => {
     const apiUrl = apiUrlInput.value.replace(/\/$/, '');
     const enteredApiKey = apiKeyInput.value.trim();
     const modelName = modelNameInput.value.trim() || 'gpt-3.5-turbo';
+    const [parsedLlmParams, llmParamsErr] = parseAgentLlmParams(agentLlmParamsInput.value);
+    if (llmParamsErr) { showSettingsMessage(`自动化 LLM 参数无效: ${llmParamsErr}`, 'error'); return; }
     const savedCredential = await getStoredApiCredential();
     const effectiveApiKey = enteredApiKey || savedCredential.apiKey || '';
 
@@ -1097,7 +1121,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       await chrome.storage.session.set({ apiKey: enteredApiKey, apiKeyApiUrl: safeApiUrl });
     }
 
-    await chrome.storage.local.set({ apiUrl: safeApiUrl, modelName });
+    await chrome.storage.local.set({ apiUrl: safeApiUrl, modelName, agentLlmParams: agentLlmParamsInput.value.trim() });
     apiUrlInput.value = safeApiUrl;
     updateApiKeyStatus(Boolean(enteredApiKey || effectiveApiKey), safeApiUrl);
     showSettingsMessage('保存成功！', 'ok');
@@ -2450,6 +2474,17 @@ document.addEventListener('DOMContentLoaded', async () => {
       return;
     }
 
+    // 自动化专属:读取用户在设置面板配的 LLM 参数(JSON 字符串)。空/非法都当没配,execute 里默认不传。
+    let agentLlmParamsObj = null;
+    try {
+      const stored = await chrome.storage.local.get(['agentLlmParams']);
+      const raw = (stored.agentLlmParams || '').trim();
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) agentLlmParamsObj = parsed;
+      }
+    } catch { agentLlmParamsObj = null; }  // 保存时已校验过,这里出错静默降级
+
     const userBubble = createMessageNode('user');
     const userText = document.createElement('div');
     userText.textContent = `🤖 [自动化] ${task}`;
@@ -2495,7 +2530,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         session_id: sessionId,
         model: modelName || 'gpt-4o',
         require_confirmation: [],
-        task_image: taskImage || ''
+        task_image: taskImage || '',
+        llm_params: agentLlmParamsObj || {},   // 自定义 LLM 参数(思考模式开关等),后端仅自动化 loop 使用
       }, apiKey);
 
       const agentStartTime = Date.now();

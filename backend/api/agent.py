@@ -26,6 +26,7 @@ class AgentExecuteRequest(BaseModel):
     model: str = "gpt-4o"
     require_confirmation: list[str] = []
     task_image: str = ""   # 可选：任务附带的视觉上下文（上传图/框选截图 data URL）
+    llm_params: dict[str, Any] = {}   # 用户在设置面板配的自定义 LLM 参数(如关思考模式);仅自动化 loop 使用,chat 不受影响
 
 
 class AgentStepRequest(BaseModel):
@@ -68,6 +69,7 @@ def agent_execute(item: AgentExecuteRequest) -> dict[str, Any]:
             session_id=item.session_id, task=item.task, model=item.model,
             require_confirmation=item.require_confirmation,
             task_image=item.task_image,
+            llm_params=item.llm_params or {},
         )
     except RuntimeError as e:                       # 活跃会话到达容量上限
         raise HTTPException(503, str(e)) from e

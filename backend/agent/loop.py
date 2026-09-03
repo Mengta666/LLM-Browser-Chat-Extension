@@ -130,7 +130,8 @@ def get_session(session_id: str) -> Optional[AgentSession]:
 
 def create_session(session_id: str, task: str, model: str,
                    require_confirmation: Optional[list[str]] = None,
-                   task_image: str = "") -> AgentSession:
+                   task_image: str = "",
+                   llm_params: Optional[dict[str, Any]] = None) -> AgentSession:
     with _sessions_lock:
         _cleanup_expired_sessions()
         _evict_if_full()
@@ -142,10 +143,12 @@ def create_session(session_id: str, task: str, model: str,
             session_id=session_id, task=task, model=model,
             require_confirmation=require_confirmation or [],
             task_image=task_image or "",
+            llm_params=llm_params or {},
         )
         _sessions[session_id] = session
     _agent_log.info("session_create", session_id=session_id,
                     data={"task": task, "model": model, "has_image": bool(task_image),
+                          "llm_params": llm_params or {},   # 便于排查"关思考"是否真配上
                           "active_sessions": len(_sessions)})
     return session
 
@@ -442,11 +445,35 @@ def _call_llm(session: AgentSession) -> Optional[dict]:
     return None
 
 
+def _build_create_kwargs(model: str, messages: list, llm_params: dict) -> dict:
+    """把用户在设置面板配的自定义 LLM 参数合并进 chat.completions.create 的调用参数。
+
+    约定:llm_params 里 'extra_body' 键的值合并进 SDK 的 extra_body(供应商私有参数如
+    Claude thinking/Qwen enable_thinking/Gemini thinking_config);其余键作为顶层参数
+    展开(如 OpenAI reasoning_effort)。保存时前端已做黑名单校验(禁 model/messages 等),
+    这里再兜一层防跨版本被绕过。
+    """
+    FORBIDDEN = {'model', 'messages', 'stream', 'api_key', 'timeout', 'n'}
+    kwargs: dict[str, Any] = {'model': model, 'messages': messages, 'timeout': LLM_CALL_TIMEOUT}
+    if not llm_params or not isinstance(llm_params, dict):
+        return kwargs
+    extra = llm_params.get('extra_body') or {}
+    if isinstance(extra, dict) and extra:
+        kwargs['extra_body'] = dict(extra)
+    for k, v in llm_params.items():
+        if k == 'extra_body' or k in FORBIDDEN:
+            continue
+        kwargs[k] = v
+    return kwargs
+
+
 def _create_with_retry(client: OpenAI, model: str, messages: list, session: Optional[AgentSession] = None):
+    llm_params = (session.llm_params if session else None) or {}
+    create_kwargs = _build_create_kwargs(model, messages, llm_params)
     last_error = None
     for attempt in range(MAX_LLM_RETRIES):
         try:
-            return client.chat.completions.create(model=model, messages=messages, timeout=LLM_CALL_TIMEOUT)
+            return client.chat.completions.create(**create_kwargs)
         except RateLimitError as e:
             last_error = f"API 限流 (429): {getattr(e, 'message', str(e))}"
         except APITimeoutError:

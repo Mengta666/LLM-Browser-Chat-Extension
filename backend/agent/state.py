@@ -115,6 +115,10 @@ class AgentSession:
 
     task_image: str = ""                 # 任务附带的视觉上下文（用户上传图/框选截图，data URL）；随首条 user 消息注入
 
+    # 自定义 LLM 参数(前端设置面板配的 JSON,如关思考模式)。仅本 session 生效,chat 不受影响。
+    # 结构:{顶层参数(如 reasoning_effort), "extra_body": {供应商私有参数如 thinking/enable_thinking}}
+    llm_params: dict[str, Any] = field(default_factory=dict)
+
     # 长期记忆(分层):
     # - resident_preferences: 常驻用户偏好,每步无条件注入 prompt(首步检索一次)。
     # - task_domain: 当前任务站点域名,recall 工具/启发式兜底按它过滤。

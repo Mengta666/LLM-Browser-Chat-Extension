@@ -1,8 +1,7 @@
 """长期记忆子系统的配置常量。
 
 记忆存储对齐 mem0:Qdrant payload 是事实源,SQLite 只做变更审计日志。
-向量维度硬编为 4096(Qwen3-Embedding-8B 输出),不再信任 env 默认值,
-避免老系统 QDRANT_VECTOR_SIZE 默认 1024 的维度炸弹。
+所有参数均从 .env 读取,默认值对齐当前 Qwen3-Embedding-8B 部署。
 """
 
 import json
@@ -44,8 +43,8 @@ QDRANT_DISTANCE = os.getenv("QDRANT_DISTANCE", "Cosine")
 # 记忆专用 collection(与页面 RAG 的 browser_pages 分开)
 MEMORY_COLLECTION = os.getenv("QDRANT_MEMORY_COLLECTION", "agent_memories")
 
-# 向量维度硬编 + 启动校验:Qwen3-Embedding-8B 输出 4096 维,必须与之一致。
-MEMORY_VECTOR_SIZE = 4096
+# 向量维度:必须与 embedding 模型输出维度一致,换模型时同步修改 .env 并重建 collection。
+MEMORY_VECTOR_SIZE = int(os.getenv("MEMORY_VECTOR_SIZE", "4096"))
 
 # 具名向量:hybrid 检索需 dense(语义)+ sparse(BM25)双向量
 DENSE_VECTOR_NAME = "dense"
@@ -153,3 +152,17 @@ RETHINK_MAX_ELAPSED_SEC = int(os.getenv("MEMORY_RETHINK_MAX_ELAPSED", "300"))
 # 僵死锁兜底(秒):新请求见到超此时长的旧锁 → 视为进程僵死,强制回收
 RETHINK_DAEMON_ENABLED = os.getenv("MEMORY_RETHINK_DAEMON_ENABLED", "1") == "1"
 # 后台 daemon 开关(测试/调试时可关)
+
+# ─── Chat 对话上下文压缩(Context Compaction)───────────────────
+# 模型上下文窗口大小(token);标准 /v1/models 不返回此值,需手动配置。
+CHAT_CONTEXT_LENGTH = int(os.getenv("CHAT_CONTEXT_LENGTH", "128000"))
+# 后台预压缩阈值:超过此比例时触发后台异步压缩,当次请求不阻塞
+CHAT_COMPACT_TRIGGER_RATIO = float(os.getenv("CHAT_COMPACT_TRIGGER_RATIO", "0.70"))
+# 同步兜底阈值:超过此比例时当次请求同步阻塞压缩
+CHAT_COMPACT_HARD_RATIO = float(os.getenv("CHAT_COMPACT_HARD_RATIO", "0.90"))
+# 保留最近 N 对(user+assistant)原文不压缩
+CHAT_COMPACT_KEEP_PAIRS = int(os.getenv("CHAT_COMPACT_KEEP_PAIRS", "3"))
+# 摘要输出 token 上限(prompt 约束)
+CHAT_COMPACT_SUMMARY_MAX_TOKENS = int(os.getenv("CHAT_COMPACT_SUMMARY_MAX_TOKENS", "800"))
+# 中文字符/token 安全系数(tiktoken 对非 OpenAI 模型中文误差 20-40%,乘此系数粗估)
+CHAT_TOKEN_CHAR_RATIO_CN = float(os.getenv("CHAT_TOKEN_CHAR_RATIO_CN", "1.5"))

@@ -434,13 +434,16 @@ def extract_chat_facts(user_msg: str, assistant_msg: str,
                        llm: LlmFn = _default_llm) -> list[dict[str, Any]]:
     """chat 抽取阶段:从一轮(或多轮摘要+最近一轮)对话抽 core/episodic。
 
-    返回 [{content, memory_type, scope, domain, keywords, confidence, stability_score}]。
-    content/keywords 过脱敏。core→scope=global 常驻;episodic→scope=global 按需检索。
-    domain 一律空(chat 无站点)。
-    stability_score(批次 D):独立于 memory_type 的稳定度打分,供 consolidate 判 promote。
+    调用前拉取现有 subject 枚举注入 prompt,让 LLM 优先复用已有短语,减少漂移。
     """
+    try:
+        subject_vocab = V.get_subject_vocab(user_id=CHAT_USER_ID)
+    except Exception:
+        subject_vocab = []
+
     result = llm(CHAT_EXTRACT_SYSTEM_PROMPT,
-                 build_chat_extract_user_prompt(user_msg, assistant_msg, history_summary))
+                 build_chat_extract_user_prompt(user_msg, assistant_msg,
+                                                history_summary, subject_vocab=subject_vocab))
     if not result:
         return []
     facts = result.get("facts", [])

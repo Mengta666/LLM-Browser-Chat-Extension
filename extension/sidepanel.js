@@ -1455,14 +1455,18 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   async function addMemory() {
     const input = document.getElementById('memoryAddInput');
+    const subjectInput = document.getElementById('memoryAddSubject');
     const content = String(input?.value || '').trim();
     if (!content) return;
+    const subject = String(subjectInput?.value || '').trim();
     const addBtn = document.getElementById('memoryAddBtn');
     try {
       if (addBtn) { addBtn.disabled = true; addBtn.textContent = '添加中...'; }
       const base = await backendBase();
-      await callBackendApi(buildBackendEndpointUrl(base, '/v1/memory'), 'POST', { content, memory_type: 'core' });
+      await callBackendApi(buildBackendEndpointUrl(base, '/v1/memory'), 'POST',
+        { content, memory_type: 'core', subject });
       input.value = '';
+      if (subjectInput) subjectInput.value = '';
       if (addBtn) { addBtn.textContent = '✓ 已添加'; }
       setTimeout(() => { if (addBtn) { addBtn.disabled = false; addBtn.textContent = '添加'; } }, 1500);
       await loadMemoryPanel();

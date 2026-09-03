@@ -18,7 +18,8 @@ CONSOLIDATE_SYSTEM_PROMPT = """你是一个记忆管理器,负责判定一条**�
 2. **新抽取的事实**:{content, stability_score(0-1), memory_type_hint(core/episodic), subject(主题短语,可为空)}
 3. **候选相似记忆**:list,每条有整数 id、content、chat_id、memory_type、stability_score、subject(全部是 valid=true 的活跃记忆,已失效的旧记忆不在候选中)
    * 候选池由两个通道 union 得到:embedding 相似(top 20)∪ 同 subject 硬匹配(scroll 20)。
-   * 若两条 subject 相同(尤其"回答语言偏好""编程语言""UI 主题偏好"等偏好类),这是<strong>强矛盾/更新信号</strong>——LLM 应重点判 update/delete。
+   * 若两条 subject 相同(尤其"回答语言偏好""编程语言""UI 主题偏好"等偏好类),这是**强矛盾/更新信号**——LLM 应重点判 update/delete。
+   * **verified=true 的条是用户手动添加的**;subject 是由用户填写或系统推断的——与新事实 subject 相同时同样视为强冲突信号,按普通条一样判 update/delete,不因 verified 而豁免。
 
 判定一个 action(五选一):
 
@@ -286,11 +287,19 @@ few-shot 示例:
 
 
 def build_chat_extract_user_prompt(user_msg: str, assistant_msg: str,
-                                   history_summary: str = "") -> str:
-    """组装 chat 抽取的 user 消息。可选带最近若干轮的滚动摘要作上下文。"""
+                                   history_summary: str = "",
+                                   subject_vocab: list[str] | None = None) -> str:
+    """组装 chat 抽取的 user 消息。可选带最近若干轮的滚动摘要作上下文。
+
+    subject_vocab:现有记忆库里的 subject 短语列表(去重、频次降序)。
+    注入后 LLM 优先从中选取,保证同一主题 subject 收敛一致,减少漂移。
+    """
     ctx = f"\n【此前对话摘要】\n{history_summary}\n" if history_summary else ""
+    vocab_hint = ""
+    if subject_vocab:
+        vocab_hint = f"\n【已有 subject 短语(优先复用,避免漂移)】\n{', '.join(subject_vocab[:30])}\n"
     return f"""请从下面这轮对话中抽取值得长期记住的、关于用户的事实。
-{ctx}
+{ctx}{vocab_hint}
 【最近对话】
 用户:{user_msg}
 助手:{assistant_msg}

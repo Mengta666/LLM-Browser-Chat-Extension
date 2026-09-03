@@ -10,8 +10,11 @@
 """
 
 import json
+import os
+from pathlib import Path
 from typing import Any, Optional
 
+from dotenv import load_dotenv
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -34,10 +37,45 @@ _CHAT_TYPES = {MEMORY_TYPE_CORE, MEMORY_TYPE_EPISODIC}
 # episodic 是系统从对话自动抽的会话内事件,手动造会成"全局 episodic"(任何会话都召不回)死数据。
 _CREATABLE_TYPES = {MEMORY_TYPE_CORE}
 
+# ── subject 推断 LLM 客户端(复用 MEMORY_MODEL)──────────────────────
+_env_path = Path(__file__).resolve().parents[1] / "config" / ".env"
+load_dotenv(dotenv_path=_env_path)
+
+def _infer_subject(content: str, vocab: list[str]) -> str:
+    """用 LLM 从 content 推断 subject 短语,优先复用 vocab 中已有的短语。
+
+    失败时返回空串(不阻塞写入)。
+    """
+    try:
+        from openai import OpenAI
+        client = OpenAI(
+            base_url=os.getenv("MODEL_BASE_URL"),
+            api_key=os.getenv("OPENAI_API_KEY"),
+        )
+        model = os.getenv("MEMORY_MODEL") or os.getenv("AGENT_MODEL") or "gpt-4o"
+        vocab_hint = f"\n已有短语(优先从中选一个):{', '.join(vocab[:20])}" if vocab else ""
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content":
+                    "你是记忆管理器。给出一条记忆的「主题短语」:中文,≤16字,标准化表达。"
+                    "如「回答语言偏好」「编程语言」「用户身份」「项目:订单迁移」。"
+                    "若已有短语中有合适的,直接复用那个短语。"
+                    "只输出短语本身,不加任何解释。"},
+                {"role": "user", "content": f"记忆内容:{content}{vocab_hint}"},
+            ],
+            timeout=10,
+        )
+        raw = (resp.choices[0].message.content or "").strip().strip("「」【】“”‘’\"'").strip()
+        return raw[:64]
+    except Exception:
+        return ""
+
 
 class MemoryCreate(BaseModel):
     content: str
     memory_type: str = MEMORY_TYPE_CORE
+    subject: str = ""   # 留空时后端自动推断
 
 
 class MemoryPatch(BaseModel):
@@ -111,17 +149,29 @@ def create_memory(item: MemoryCreate) -> dict[str, Any]:
         raise HTTPException(
             400, "episodic 由系统从对话自动生成,不支持手动新增;手动记忆请用 core")
     mtype = item.memory_type
+
+    # subject:用户填了就用,没填则调 LLM 推断(复用现有 vocab 保证短语收敛)
+    subject = item.subject.strip()[:64]
+    if not subject:
+        try:
+            vocab = V.get_subject_vocab(user_id=CHAT_USER_ID)
+        except Exception:
+            vocab = []
+        subject = _infer_subject(content, vocab)
+
     try:
         payload = V.insert_memory(
             content, vector=embed_text(content),
             memory_type=mtype, scope=SCOPE_GLOBAL, domain="",
-            # 手动条置 verified=True(用户明示、失效应更谨慎),但 confidence 给中性 0.7:
-            # 注入排序以 -confidence 为主键,若手动条用 1.0 会永久霸占注入窗、挤掉抽取/晋升的高价值 core。
             user_id=CHAT_USER_ID, confidence=0.7, verified=True,
+            subject=subject,
         )
     except Exception as exc:
         raise HTTPException(503, f"写入失败: {str(exc)[:160]}")
-    _mem_log.info("memory_created", data={"memory_id": payload.get("memory_id"), "type": mtype})
+    _mem_log.info("memory_created", data={
+        "memory_id": payload.get("memory_id"), "type": mtype,
+        "subject": subject, "subject_inferred": not item.subject.strip(),
+    })
     return _view(payload)
 
 

@@ -708,8 +708,9 @@ input { width: 100%; padding: 8px; margin-top: 5px; box-sizing: border-box; bord
 #memory { position: relative; }
 #memory .memory-head label { margin-top: 0; }
 .memory-head { display: flex; align-items: center; justify-content: space-between; }
-.memory-add { display: flex; gap: 6px; margin: 8px 0; }
+.memory-add { display: flex; gap: 6px; margin: 8px 0; flex-wrap: wrap; }
 .memory-add input { flex: 1; min-width: 0; }
+.memory-add input#memoryAddSubject { flex: 0 0 150px; font-size: 12px; }
 .memory-add select { flex-shrink: 0; }
 .memory-list { display: flex; flex-direction: column; gap: 6px; }
 .memory-group-label { font-size: 12px; color: var(--app-muted); margin-top: 8px; font-weight: 600; }

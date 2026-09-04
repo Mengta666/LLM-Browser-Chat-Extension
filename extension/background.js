@@ -834,6 +834,16 @@ function constructEnhancedTree(domRoot, snapshotLookup, opts) {
     } else if ((nm === 'IFRAME' || nm === 'FRAME') && snap && snap.bounds) {
       childOffset = { x: totalFrameOffset.x + snap.bounds.x, y: totalFrameOffset.y + snap.bounds.y };
     }
+    // 诊断:主文档 HTML 节点为什么可能没减掉 scroll(SoM 画框偏移根源)
+    if (nm === 'HTML') {
+      console.log('[CDP诊断] HTML节点', {
+        nodeId: cdpNode.nodeId, frameId: cdpNode.frameId,
+        hasSnap: !!snap, hasScrollRects: !!(snap && snap.scrollRects),
+        scrollRects: snap && snap.scrollRects,
+        beforeOffset: totalFrameOffset, afterOffset: childOffset,
+        matched: nm === 'HTML' && !!cdpNode.frameId && !!snap && !!snap.scrollRects
+      });
+    }
 
     // 跨源 iframe：无 contentDocument（同进程拿不到内容）→ 记为待处理，交 handleAgentObserve
     // 用子 target 递归。frameId + 累积偏移随记录。

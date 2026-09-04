@@ -837,7 +837,9 @@ function constructEnhancedTree(domRoot, snapshotLookup, opts) {
     // 诊断:主文档 HTML 节点为什么可能没减掉 scroll(SoM 画框偏移根源)
     if (nm === 'HTML') {
       console.log('[CDP诊断] HTML节点', {
-        nodeId: cdpNode.nodeId, frameId: cdpNode.frameId,
+        nodeId: cdpNode.nodeId, backendNodeId: cdpNode.backendNodeId,
+        parentId: cdpNode.parentId, childCount: (cdpNode.children || []).length,
+        frameId: cdpNode.frameId,
         hasSnap: !!snap, hasScrollRects: !!(snap && snap.scrollRects),
         scrollRects: snap && snap.scrollRects,
         beforeOffset: totalFrameOffset, afterOffset: childOffset,
@@ -1183,10 +1185,29 @@ function serializeInteractive(allNodes, ctx) {
   const elements = [];
   const indexMap = {};
   let idx = 1;
+  let diagDone = false;   // 只打一个元素的父链诊断
   for (const node of allNodes) {
     if (!node.isInteractive || !node.isVisible) continue;
     if (node.ignoredByPaintOrder) continue;
     if (node.excludedByParent) continue;       // 被父按钮包含的冗余后代:不单独编号
+    // 诊断:第一个通过筛选的元素,打它的父链上溯到 HTML,看走的是哪个 HTML,以及最终 offset
+    if (!diagDone) {
+      diagDone = true;
+      const chain = [];
+      let cur = node;
+      let depth = 0;
+      while (cur && depth < 20) {
+        chain.push({
+          nodeId: cur.nodeId, tag: (cur.nodeName || '').toLowerCase(),
+          absPos: cur.absolutePosition,
+          bounds: cur.snapshot && cur.snapshot.bounds,
+          scrollRects: cur.snapshot && cur.snapshot.scrollRects,
+        });
+        cur = cur.parent;
+        depth++;
+      }
+      console.log('[CDP诊断] 第一个可交互元素父链(从元素→根)', chain);
+    }
     const attrs = node.attributes || {};
     const tag = (node.nodeName || '').toLowerCase();
     const text = extractText(node);

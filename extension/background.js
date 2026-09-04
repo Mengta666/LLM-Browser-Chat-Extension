@@ -834,18 +834,6 @@ function constructEnhancedTree(domRoot, snapshotLookup, opts) {
     } else if ((nm === 'IFRAME' || nm === 'FRAME') && snap && snap.bounds) {
       childOffset = { x: totalFrameOffset.x + snap.bounds.x, y: totalFrameOffset.y + snap.bounds.y };
     }
-    // 诊断:主文档 HTML 节点为什么可能没减掉 scroll(SoM 画框偏移根源)
-    if (nm === 'HTML') {
-      console.log('[CDP诊断] HTML节点', {
-        nodeId: cdpNode.nodeId, backendNodeId: cdpNode.backendNodeId,
-        parentId: cdpNode.parentId, childCount: (cdpNode.children || []).length,
-        frameId: cdpNode.frameId,
-        hasSnap: !!snap, hasScrollRects: !!(snap && snap.scrollRects),
-        scrollRects: snap && snap.scrollRects,
-        beforeOffset: totalFrameOffset, afterOffset: childOffset,
-        matched: nm === 'HTML' && !!cdpNode.frameId && !!snap && !!snap.scrollRects
-      });
-    }
 
     // 跨源 iframe：无 contentDocument（同进程拿不到内容）→ 记为待处理，交 handleAgentObserve
     // 用子 target 递归。frameId + 累积偏移随记录。
@@ -1178,42 +1166,38 @@ function findSvgIconName(node) {
   return '';
 }
 
-// 序列化：遍历 isInteractive && isVisible，分配 1..N selectorIndex，产出后端元素 dict + indexMap。
+// 序列化：遍历 isInteractive && isVisible，产出后端元素 dict + indexMap。
+// selector_index 首选 backend_node_id 本身,冲突用合成号(初值=全树最大 backend_node_id+1)。
 // element dict 字段对齐后端 context_builder._format_element 消费（全部 el.get(k,default) 容错）。
 // indexMap: index -> { backendNodeId, sessionId, frameId, targetId } 供 execute 侧 resolveIndex 查表。
 function serializeInteractive(allNodes, ctx) {
   const elements = [];
   const indexMap = {};
-  let idx = 1;
-  let diagDone = false;   // 只打一个元素的父链诊断
+  // 合成号初值 = 全树最大 backend_node_id + 1(冲突时才用,冲突极少)。
+  let nextSynthetic = 1;
+  for (const n of allNodes) {
+    if (n.backendNodeId && n.backendNodeId >= nextSynthetic) nextSynthetic = n.backendNodeId + 1;
+  }
+  const usedIds = new Set();
   for (const node of allNodes) {
     if (!node.isInteractive || !node.isVisible) continue;
     if (node.ignoredByPaintOrder) continue;
     if (node.excludedByParent) continue;       // 被父按钮包含的冗余后代:不单独编号
-    // 诊断:第一个通过筛选的元素,打它的父链上溯到 HTML,看走的是哪个 HTML,以及最终 offset
-    if (!diagDone) {
-      diagDone = true;
-      const chain = [];
-      let cur = node;
-      let depth = 0;
-      while (cur && depth < 20) {
-        chain.push({
-          nodeId: cur.nodeId, tag: (cur.nodeName || '').toLowerCase(),
-          absPos: cur.absolutePosition,
-          bounds: cur.snapshot && cur.snapshot.bounds,
-          scrollRects: cur.snapshot && cur.snapshot.scrollRects,
-        });
-        cur = cur.parent;
-        depth++;
-      }
-      console.log('[CDP诊断] 第一个可交互元素父链(从元素→根)', chain);
+    // selector_index 分配：首选 backend_node_id;冲突走合成号。
+    let id;
+    if (node.backendNodeId && !usedIds.has(node.backendNodeId)) {
+      id = node.backendNodeId;
+    } else {
+      while (usedIds.has(nextSynthetic)) nextSynthetic++;
+      id = nextSynthetic++;
     }
+    usedIds.add(id);
     const attrs = node.attributes || {};
     const tag = (node.nodeName || '').toLowerCase();
     const text = extractText(node);
     const box = node.absolutePosition || (node.snapshot && node.snapshot.bounds) || null;
     const el = {
-      id: idx,
+      id,
       tag,
       type: attrs.type || '',
       role: attrs.role || (node.ax && node.ax.role) || '',
@@ -1222,6 +1206,23 @@ function serializeInteractive(allNodes, ctx) {
       value: tag === 'input' && attrs.type === 'password' ? '' : (attrs.value || ''),  // 剔 password
       text: text.slice(0, 100),
       aria_label: attrs['aria-label'] || '',
+      // 对齐 browser-use DEFAULT_INCLUDE_ATTRIBUTES 的高价值属性:
+      title: attrs.title || '',
+      html_id: attrs.id || '',                          // HTML id 属性(避免与 selector_index 的 id 混淆)
+      alt: attrs.alt || '',
+      checked: attrs.checked !== undefined ? String(attrs.checked) : '',
+      aria_expanded: attrs['aria-expanded'] || '',
+      aria_checked: attrs['aria-checked'] || '',
+      disabled: attrs.disabled !== undefined ? String(attrs.disabled) : '',
+      pattern: attrs.pattern || '',
+      min: attrs.min || '',
+      max: attrs.max || '',
+      minlength: attrs.minlength || '',
+      maxlength: attrs.maxlength || '',
+      step: attrs.step || '',
+      contenteditable: attrs.contenteditable || '',
+      haspopup: attrs.haspopup || attrs['aria-haspopup'] || '',
+      date_format: attrs['data-date-format'] || attrs['format'] || attrs['expected_format'] || '',
       component: attrs['data-component-name'] || '',
       enabled: !(node.ax && node.ax.properties && node.ax.properties.disabled),
       occluded: !!node.ignoredByPaintOrder,
@@ -1231,13 +1232,12 @@ function serializeInteractive(allNodes, ctx) {
     };
     elements.push(el);
     // OOPIF：用节点自己的 session/target（跨源子树节点带子 session），主 target 节点为 null。
-    indexMap[idx] = {
+    indexMap[id] = {
       backendNodeId: node.backendNodeId,
       sessionId: node.sessionId || null,
       frameId: node.frameId || null,
       targetId: node.targetId || null,
     };
-    idx++;
   }
   return { elements, indexMap };
 }
@@ -1392,12 +1392,6 @@ async function handleAgentObserve(tabId) {
 
   // 路径铁证：在 SW 控制台打印，确认走的是 CDP 观察（区分新旧路径）。
   console.log(`[CDP观察] elems=${elements.length} jsClick=${jsClickCount} iframes=${iframeCount} dpr=${dpr.toFixed(2)} url=${(extras.url || '').slice(0, 60)}`);
-  // 诊断:截图/视口/dpr/滚动 全景(SoM 画框偏移只可能来自这几个)
-  console.log('[CDP诊断] 坐标系全景', {
-    dpr, viewport: extras.viewport, scroll_position: extras.scroll_position,
-    document_height: extras.document_height,
-    sample_element_absPos: elements[0] && elements[0].bounding_box,
-  });
 
   const pageState = {
     url: extras.url || '',

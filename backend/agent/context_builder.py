@@ -41,10 +41,10 @@ SYSTEM_PROMPT = """你是一个浏览器自动化助手。用户给你一个任�
 1. 每步先自评：上一步动作**真的生效了吗**？**如果提供了页面截图，以截图为准（ground truth）**——
    看截图确认页面实际状态，再结合文本观察（URL变了吗/面板开了吗/内容变了吗）判断；
    绝不能因为"我以为点了"就当成功。没生效就换方式，别盲目重复。
-   - 截图上每个可交互元素都用**彩色虚线框**标出，框内/框上方的**数字**就是该元素的编号 `[N]`——
-     这数字和文本列表里的 `[N]` 是同一个，动作 `index` 就填它。
-   - 有文字的元素（按钮/链接文字≥3字）框上可能不重复标数字——用文本列表里它的编号即可。
-   - **只操作截图里真的有框、或文本列表里真的有编号的元素**；截图里看着像按钮但没有框/没有编号的，不能凭空猜一个 index 去点（这是点错的主因）。
+   - **截图是裸图（未做任何标注/画框/数字）**，就是用户看到的原样。可交互元素只在文本列表里带编号 `[N]`。
+   - 判断"某个视觉元素对应哪个 `[N]`"：通过截图中该元素的**视觉位置**，结合文本列表里同位置元素的
+     `text/aria-label/placeholder/role`，双向对照找出编号。不确定就用文字最匹配的候选。
+   - **只操作文本列表里真的有编号的元素**；截图里看着像按钮但文本列表没有对应项的，不能凭空猜一个 index 去点（这是点错的主因）。
 2. 每次只做一个动作，做完看新观察再决定下一步。
 3. 复杂交互是多步的：触发→展开→选择。很多筛选器/下拉**点选项即时生效，没有"确定"按钮**——
    选中后找不到"确定"就是已生效，直接下一步，不要臆想确定按钮。
@@ -151,7 +151,7 @@ def build_messages(session: "AgentSession", page_state: PageState) -> list[dict[
     user_text = "\n\n".join(parts)
 
     # 多模态：user 消息可带多张图——任务附带的视觉上下文（用户上传/框选，仅前几步注入）
-    # + 当前观察截图（对齐 browser-use 截图 ground truth）。
+    # + 当前观察裸截图（LLM 靠视觉+文本列表 text/aria-label 双向对照识别编号）。
     image_blocks = []
     task_image = getattr(session, "task_image", "") or ""
     if task_image and session.current_step <= 1:
@@ -318,6 +318,10 @@ def _format_element(el: dict[str, Any]) -> str:
     text = el.get("text", "")
     if text:
         parts.append(f'"{text[:40]}"')
+    # 图标按钮/img 语义(aria-label > title > alt)——纯图标场景 LLM 靠这个识别按钮
+    label = (el.get("aria_label") or el.get("title") or el.get("alt") or "").strip()
+    if label and label != text:
+        parts.append(f'label="{label[:40]}"')
     if el.get("placeholder"):
         parts.append(f'placeholder="{el["placeholder"][:30]}"')
     if el.get("name") and not text:
@@ -326,6 +330,20 @@ def _format_element(el: dict[str, Any]) -> str:
         parts.append(f'当前值="{el["value"][:20]}"')
     if el.get("type") and tag == "input":
         parts.append(el["type"])
+    # 状态属性(勾选/展开/富文本/有弹出层/日期格式)——对 LLM 决策直接有用
+    checked = el.get("checked") or el.get("aria_checked")
+    if checked and checked not in ("false", "False", ""):
+        parts.append("checked" if checked in ("true", "True") else f"checked={checked}")
+    expanded = el.get("aria_expanded")
+    if expanded and expanded != "":
+        parts.append(f"expanded={expanded}")
+    if el.get("contenteditable") in ("true", ""):
+        if el.get("contenteditable") == "true":
+            parts.append("contenteditable")
+    if el.get("haspopup") and el.get("haspopup") not in ("false", "False"):
+        parts.append(f"haspopup={el['haspopup']}")
+    if el.get("date_format"):
+        parts.append(f'format={el["date_format"]}')
     status = " [禁用]" if not el.get("enabled", True) else ""
     if el.get("occluded"):
         status += " [被遮挡]"

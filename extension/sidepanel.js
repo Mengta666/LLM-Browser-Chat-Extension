@@ -2048,125 +2048,17 @@ document.addEventListener('DOMContentLoaded', async () => {
   // 没有这层标注，多模态反而有害：模型看得见按钮却猜不准编号，会反复点错。
   // ═══════════════════════════════════════════════════════════════════════════
 
-  // 按 tag 分色（同 browser-use ELEMENT_COLORS）
-  const SOM_ELEMENT_COLORS = {
-    button: '#FF6B6B', input: '#4ECDC4', select: '#45B7D1',
-    a: '#96CEB4', textarea: '#FF8C42', default: '#DDA0DD',
-  };
-
-  function somElementColor(tag, type) {
-    if (tag === 'input' && (type === 'button' || type === 'submit')) return SOM_ELEMENT_COLORS.button;
-    return SOM_ELEMENT_COLORS[tag] || SOM_ELEMENT_COLORS.default;
-  }
-
-  // 画一个元素的虚线框 + 编号方块（对齐 draw_enhanced_bounding_box_with_text）
-  function drawSomBox(ctx, box, color, label, imgW, imgH, dpr) {
-    // CSS 视口坐标 → 设备像素（截图是设备像素图；漏掉这步框会整体偏移）
-    const x1 = Math.max(0, Math.min(Math.round(box.x * dpr), imgW));
-    const y1 = Math.max(0, Math.min(Math.round(box.y * dpr), imgH));
-    const x2 = Math.max(x1, Math.min(Math.round((box.x + box.width) * dpr), imgW));
-    const y2 = Math.max(y1, Math.min(Math.round((box.y + box.height) * dpr), imgH));
-    if (x2 - x1 < 2 || y2 - y1 < 2) return;
-
-    // 虚线框：dash=4 gap=8 width=2
-    ctx.save();
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 2;
-    ctx.setLineDash([4, 8]);
-    ctx.strokeRect(x1 + 1, y1 + 1, x2 - x1 - 2, y2 - y1 - 2);
-    ctx.restore();
-
-    if (!label) return;
-
-    // 编号方块：字号随图宽缩放(10~20)，元素色底 + 白边 + 白字
-    const fontSize = Math.max(10, Math.min(20, Math.round(imgW * 0.01)));
-    const padding = Math.max(4, Math.min(10, Math.round(imgW * 0.005)));
-    ctx.save();
-    ctx.font = `bold ${fontSize}px Arial, sans-serif`;
-    ctx.textBaseline = 'top';
-    const textW = Math.ceil(ctx.measureText(label).width);
-    const textH = fontSize;
-    const cw = textW + padding * 2;
-    const ch = textH + padding * 2;
-    const elW = x2 - x1, elH = y2 - y1;
-
-    let bx = x1 + Math.floor((elW - cw) / 2);
-    // 小元素：编号放框上方，避免遮住图标内容；大元素：放框内顶部
-    let by = (elW < 60 || elH < 30) ? Math.max(0, y1 - ch - 5) : y1 + 2;
-    // 夹取到图像边界内
-    if (bx < 0) bx = 0;
-    if (by < 0) by = 0;
-    if (bx + cw > imgW) bx = imgW - cw;
-    if (by + ch > imgH) by = imgH - ch;
-
-    ctx.fillStyle = color;
-    ctx.strokeStyle = 'white';
-    ctx.lineWidth = 2;
-    ctx.setLineDash([]);
-    ctx.fillRect(bx, by, cw, ch);
-    ctx.strokeRect(bx, by, cw, ch);
-    ctx.fillStyle = 'white';
-    ctx.fillText(label, bx + padding, by + padding);
-    ctx.restore();
-  }
-
-  // 在裸截图上叠加所有可见元素的 SoM 标注，返回新 dataURL（失败回退原图）
-  async function annotateScreenshotSoM(dataUrl, elements, viewport) {
-    try {
-      if (!dataUrl || !elements?.length) return dataUrl;
-      const img = await new Promise((resolve, reject) => {
-        const im = new Image();
-        im.onload = () => resolve(im);
-        im.onerror = reject;
-        im.src = dataUrl;
-      });
-      const imgW = img.naturalWidth, imgH = img.naturalHeight;
-      // DPR = 截图设备像素宽 / CSS 视口宽（captureVisibleTab 截的是设备像素图）
-      const vpW = viewport?.width || imgW;
-      const dpr = vpW > 0 ? imgW / vpW : 1;
-      // 诊断:截图 vs viewport vs dpr 关系(排查 SoM 画框偏移)
-      console.log('[SoM诊断] 截图/视口/DPR', {
-        imgW, imgH, viewport, dpr_computed: dpr,
-        sample_element: elements[0] && { id: elements[0].id, bbox: elements[0].bounding_box },
-      });
-
-      const canvas = document.createElement('canvas');
-      canvas.width = imgW; canvas.height = imgH;
-      const ctx = canvas.getContext('2d');
-      ctx.drawImage(img, 0, 0);
-
-      for (const el of elements) {
-        const box = el.bounding_box;
-        if (!box) continue;
-        // 只标视口内可见元素（框在截图范围内）
-        if (box.x + box.width <= 0 || box.x >= vpW) continue;
-        if (box.y + box.height <= 0 || box.y >= (viewport?.height || imgH)) continue;
-        // filter_highlight_ids：有足够文字的元素不画编号(文字本身可定位)，只画框
-        const meaningful = (el.text || el.aria_label || el.placeholder || '').trim();
-        const label = meaningful.length >= 3 ? '' : String(el.id);
-        const color = somElementColor(el.tag, el.type);
-        drawSomBox(ctx, box, color, label, imgW, imgH, dpr);
-      }
-      return canvas.toDataURL('image/jpeg', 0.6);
-    } catch (e) {
-      console.warn('[SoM] 标注失败，回退裸图:', e);
-      return dataUrl;
-    }
-  }
-
   async function observePageState() {
     const tab = await getActiveBrowserTab();
     if (!tab?.id) throw new Error('无法获取当前标签页');
 
-    // CDP 三源观察：background 融合返回 pageState，本地补截图 + SoM 标注（SW 无 DOM/Canvas）。
+    // CDP 三源观察：background 融合返回 pageState；截图裸传给 LLM(不叠 SoM 标注),
+    // LLM 靠文本 [N] 列表 + 视觉位置自行对齐(对齐 browser-use)。
     const resp = await chrome.runtime.sendMessage({ type: 'AGENT_OBSERVE', tabId: tab.id });
     if (!resp || !resp.ok) throw new Error(resp?.error || 'CDP 观察失败');
     const pageState = resp.pageState;
     try {
-      const raw = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'jpeg', quality: 60 });
-      pageState.screenshot = await annotateScreenshotSoM(
-        raw, pageState.interactive_elements, pageState.viewport
-      );
+      pageState.screenshot = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'jpeg', quality: 60 });
     } catch (e) {
       pageState.screenshot = '';
     }

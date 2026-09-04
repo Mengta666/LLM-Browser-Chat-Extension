@@ -1392,6 +1392,12 @@ async function handleAgentObserve(tabId) {
 
   // 路径铁证：在 SW 控制台打印，确认走的是 CDP 观察（区分新旧路径）。
   console.log(`[CDP观察] elems=${elements.length} jsClick=${jsClickCount} iframes=${iframeCount} dpr=${dpr.toFixed(2)} url=${(extras.url || '').slice(0, 60)}`);
+  // 诊断:截图/视口/dpr/滚动 全景(SoM 画框偏移只可能来自这几个)
+  console.log('[CDP诊断] 坐标系全景', {
+    dpr, viewport: extras.viewport, scroll_position: extras.scroll_position,
+    document_height: extras.document_height,
+    sample_element_absPos: elements[0] && elements[0].bounding_box,
+  });
 
   const pageState = {
     url: extras.url || '',

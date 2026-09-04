@@ -2124,6 +2124,11 @@ document.addEventListener('DOMContentLoaded', async () => {
       // DPR = 截图设备像素宽 / CSS 视口宽（captureVisibleTab 截的是设备像素图）
       const vpW = viewport?.width || imgW;
       const dpr = vpW > 0 ? imgW / vpW : 1;
+      // 诊断:截图 vs viewport vs dpr 关系(排查 SoM 画框偏移)
+      console.log('[SoM诊断] 截图/视口/DPR', {
+        imgW, imgH, viewport, dpr_computed: dpr,
+        sample_element: elements[0] && { id: elements[0].id, bbox: elements[0].bounding_box },
+      });
 
       const canvas = document.createElement('canvas');
       canvas.width = imgW; canvas.height = imgH;

@@ -115,16 +115,28 @@ async def upload_doc(
     if len(content) == 0:
         raise HTTPException(400, "文件内容为空")
 
-    # 3. 存临时文件
+    # 3. KB 存在性校验
+    from storage import kb_store as KS
+    kb = KS.get_kb(kb_id)
+    if not kb or kb.get("deleted_at"):
+        raise HTTPException(404, f"知识库不存在: {kb_id}")
+
+    # 4. 文件 hash 去重
+    import hashlib
+    file_hash = hashlib.md5(content).hexdigest()
+    dup = KS.find_duplicate_doc(kb_id, file_hash)
+    if dup:
+        raise HTTPException(409, f"该知识库已存在相同内容的文档: {dup['filename']} (状态: {dup['status']})")
+
+    # 5. 存临时文件
     with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as tmp:
         tmp.write(content)
         tmp_path = tmp.name
 
-    # 4. 交给 rag.kb 后台处理(daemon 线程)
+    # 6. 交给 rag.kb 后台处理(daemon 线程)
     try:
-        result = KB.add_doc(kb_id, tmp_path, filename, ext)
+        result = KB.add_doc(kb_id, tmp_path, filename, ext, content_hash=file_hash)
     finally:
-        # 临时文件由 rag.kb 后台线程读完后负责删除,这里不删(后台还没读)
         pass
 
     return result

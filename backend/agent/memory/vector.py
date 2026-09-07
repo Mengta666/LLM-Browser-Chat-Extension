@@ -271,6 +271,48 @@ def insert_memory(content: str, *, vector: list[float],
     return payload
 
 
+def batch_insert_memories(items: list[dict[str, Any]], *, batch_size: int = 64) -> list[dict[str, Any]]:
+    """批量写入记忆(KB chunk 专用),返回所有 payload。
+
+    每条 item 需包含:content, vector, 以及 _build_payload 的关键字参数。
+    内部按 batch_size 分批调用 Qdrant upsert,比逐条快 10-50 倍。
+    """
+    ensure_collection()
+    all_payloads: list[dict[str, Any]] = []
+
+    for start in range(0, len(items), batch_size):
+        batch = items[start:start + batch_size]
+        points = []
+        for item in batch:
+            memory_id = make_memory_id()
+            now = _now_iso()
+            content = item["content"]
+            vector = item["vector"]
+            kwargs = {k: v for k, v in item.items() if k not in ("content", "vector")}
+            payload = _build_payload(
+                memory_id, content, created_at=now, updated_at=now, **kwargs,
+            )
+            points.append(models.PointStruct(
+                id=_point_id(memory_id),
+                vector=_build_vectors(vector, content, kwargs.get("keywords")),
+                payload=payload,
+            ))
+            all_payloads.append(payload)
+
+        get_client().upsert(
+            collection_name=MEMORY_COLLECTION,
+            points=points,
+            wait=True,
+        )
+
+    try:
+        from agent.memory import list_cache
+        list_cache.invalidate_all()
+    except Exception:
+        pass
+    return all_payloads
+
+
 def update_memory(memory_id: str, content: str, *, vector: list[float]) -> Optional[dict[str, Any]]:
     """更新已存记忆的正文与双向量,保留其余字段、刷新 updated_at。
 

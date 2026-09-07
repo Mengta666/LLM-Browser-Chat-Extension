@@ -69,18 +69,14 @@ def delete_kb(kb_id: str) -> None:
 # ─── Doc ──────────────────────────────────────────────────────────
 
 
-def add_doc(kb_id: str, file_path: str | Path, filename: str, file_type: str) -> dict[str, Any]:
-    """上传文档,立刻返回 {doc_id, status: "pending"},后台处理。
-
-    file_path:临时文件路径(上传后存到 /tmp),由调用方负责清理。
-    filename:原始文件名,供展示。
-    file_type:"pdf" / "md" / "txt"。
-    """
+def add_doc(kb_id: str, file_path: str | Path, filename: str, file_type: str,
+            content_hash: str = "") -> dict[str, Any]:
+    """上传文档,立刻返回 {doc_id, status: "pending"},后台处理。"""
     path = Path(file_path)
     file_bytes = path.stat().st_size
     doc_id = _make_doc_id()
     now = _now_iso()
-    KS.create_doc(doc_id, kb_id, filename, file_type, file_bytes, now)
+    KS.create_doc(doc_id, kb_id, filename, file_type, file_bytes, now, content_hash=content_hash)
 
     # 后台处理
     def _worker():
@@ -96,38 +92,47 @@ def add_doc(kb_id: str, file_path: str | Path, filename: str, file_type: str) ->
 
 def _process_doc(kb_id: str, doc_id: str, path: Path, file_type: str) -> None:
     """后台处理:parse → chunk → embed → insert。"""
-    # 1. parse
-    text = parser.parse(path, file_type)
+    try:
+        # 1. parse
+        text = parser.parse(path, file_type)
 
-    # 2. chunk
-    chunks = chunker.chunk_document(text, KB_CHUNK_SIZE, KB_CHUNK_OVERLAP)
-    if not chunks:
-        raise ValueError("切片结果为空")
+        # 2. chunk
+        chunks = chunker.chunk_document(text, KB_CHUNK_SIZE, KB_CHUNK_OVERLAP)
+        if not chunks:
+            raise ValueError("切片结果为空")
 
-    # 3. embed
-    chunk_texts = [c["text"] for c in chunks]
-    vectors = embed_texts(chunk_texts)
+        # 3. embed (分批,每批 32 条)
+        chunk_texts = [c["text"] for c in chunks]
+        vectors = embed_texts(chunk_texts, batch_size=32)
 
-    # 4. insert
-    filename = KS.get_doc(doc_id)["filename"]
-    for i, (chunk, vec) in enumerate(zip(chunks, vectors)):
-        V.insert_memory(
-            content=chunk["text"],
-            vector=vec,
-            memory_type=MEMORY_TYPE_KB_CHUNK,
-            user_id=CHAT_USER_ID,
-            confidence=1.0,
-            verified=False,
-            chat_id="",                     # KB 是全局资源,不属于任何会话
-            kb_id=kb_id,
-            doc_id=doc_id,
-            source=filename,
-            chunk_idx=i,
-            keywords=[],                    # P0 不抽取关键词,让 sparse 通道从 content 走 jieba
-        )
+        # 4. batch insert (每批 64 条 upsert)
+        filename = KS.get_doc(doc_id)["filename"]
+        items = [
+            {
+                "content": chunk["text"],
+                "vector": vec,
+                "memory_type": MEMORY_TYPE_KB_CHUNK,
+                "user_id": CHAT_USER_ID,
+                "confidence": 1.0,
+                "verified": False,
+                "chat_id": "",
+                "kb_id": kb_id,
+                "doc_id": doc_id,
+                "source": filename,
+                "chunk_idx": i,
+                "keywords": [],
+            }
+            for i, (chunk, vec) in enumerate(zip(chunks, vectors))
+        ]
+        V.batch_insert_memories(items, batch_size=64)
 
-    # 5. 更新状态
-    KS.update_doc_status(doc_id, "indexed", chunk_count=len(chunks), indexed_at=_now_iso())
+        # 5. 更新状态
+        KS.update_doc_status(doc_id, "indexed", chunk_count=len(chunks), indexed_at=_now_iso())
+    finally:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def list_docs(kb_id: str) -> list[dict[str, Any]]:
@@ -160,18 +165,20 @@ def delete_doc(kb_id: str, doc_id: str) -> None:
 
 
 def _invalidate_doc_chunks(kb_id: str, doc_id: str) -> None:
-    """遍历该 doc 所有 chunks,软失效。"""
-    # scroll(memory_type=kb_chunk, kb_id=kb_id, doc_id=doc_id, include_invalid=False)
-    chunks = V.scroll_memories(
-        user_id=CHAT_USER_ID,
-        memory_type=MEMORY_TYPE_KB_CHUNK,
-        kb_id=kb_id,
-        doc_id=doc_id,
-        limit=1000,  # 单 doc 假设 <1000 chunks,否则分页
-        include_invalid=False,
-    )
-    for chunk in chunks:
-        V.invalidate_memory(chunk["memory_id"])
+    """遍历该 doc 所有 chunks,软失效(分页处理)。"""
+    while True:
+        chunks = V.scroll_memories(
+            user_id=CHAT_USER_ID,
+            memory_type=MEMORY_TYPE_KB_CHUNK,
+            kb_id=kb_id,
+            doc_id=doc_id,
+            limit=500,
+            include_invalid=False,
+        )
+        if not chunks:
+            break
+        for chunk in chunks:
+            V.invalidate_memory(chunk["memory_id"])
 
 
 # ─── 检索 ─────────────────────────────────────────────────────────

@@ -44,8 +44,8 @@ def embed_text(text: str, model: str | None = None) -> list[float]:
     return embedding
 
 
-def embed_texts(texts: list[str], model: str | None = None) -> list[list[float]]:
-    """对一组文本批量生成 embedding 向量。"""
+def embed_texts(texts: list[str], model: str | None = None, batch_size: int = 32) -> list[list[float]]:
+    """对一组文本批量生成 embedding 向量。自动按 batch_size 分批调用,避免大文档超时。"""
     if not isinstance(texts, list):
         raise ValueError("texts must be a list")
     if not texts:
@@ -57,17 +57,23 @@ def embed_texts(texts: list[str], model: str | None = None) -> list[list[float]]
         if not text.strip():
             raise ValueError(f"text at index {index} must not be empty")
 
-    response = __embedding_client.embeddings.create(
-        input=texts,
-        model=_resolve_embedding_model(model),
-    )
-    if len(response.data) != len(texts):
-        raise RuntimeError("embedding response size mismatch")
+    resolved = _resolve_embedding_model(model)
+    all_embeddings: list[list[float]] = []
 
-    embeddings = [data.embedding for data in response.data]
-    if any(not embedding for embedding in embeddings):
-        raise RuntimeError("embedding response contains empty vector")
-    return embeddings
+    for start in range(0, len(texts), batch_size):
+        batch = texts[start:start + batch_size]
+        response = __embedding_client.embeddings.create(
+            input=batch,
+            model=resolved,
+        )
+        if len(response.data) != len(batch):
+            raise RuntimeError(f"embedding response size mismatch: expected {len(batch)}, got {len(response.data)}")
+        for data in response.data:
+            if not data.embedding:
+                raise RuntimeError("embedding response contains empty vector")
+            all_embeddings.append(data.embedding)
+
+    return all_embeddings
 
 
 def embed_query(text: str, task_instruct: str, model: str | None = None) -> list[float]:

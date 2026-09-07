@@ -137,13 +137,8 @@ def _format_kb_chunks(chunks: list[dict]) -> str:
         source = chunk.get("source", "unknown")
         chunk_idx = chunk.get("chunk_idx", 0)
         content = chunk.get("content", "")
-        lines.append(f"[{i}] doc=\"{source}\" chunk#{chunk_idx}: {content[:200]}...")
+        lines.append(f"[{i}] doc=\"{source}\" chunk#{chunk_idx}:\n{content}")
         lines.append("")
-
-    return "\n".join(lines)
-
-
-def format_kb_chunks_for_manual(chunks: list[dict]) -> str:
     """手动 KB 搜索的格式(与手动 web 搜索同构)。"""
     if not chunks:
         return "用户请求知识库检索,但未找到相关片段。请基于你已有的知识回答。"
@@ -155,7 +150,7 @@ def format_kb_chunks_for_manual(chunks: list[dict]) -> str:
         source = chunk.get("source", "unknown")
         chunk_idx = chunk.get("chunk_idx", 0)
         content = chunk.get("content", "")
-        lines.append(f"[{i}] doc=\"{source}\" chunk#{chunk_idx}: {content[:200]}...")
+        lines.append(f"[{i}] doc=\"{source}\" chunk#{chunk_idx}:\n{content}")
         lines.append("")
 
     return "\n".join(lines)

@@ -423,7 +423,15 @@ def _sse_search_meta(results) -> str:
     """SSE 自定义 chunk:搜索结果元数据,供前端渲染引用面板。"""
     meta = []
     for i, r in enumerate(results):
-        meta.append({"index": i + 1, "title": r.title, "url": r.url, "snippet": (r.snippet or "")[:200]})
+        if isinstance(r, dict):
+            meta.append({
+                "index": i + 1,
+                "title": r.get("source", ""),
+                "url": f"chunk#{r.get('chunk_idx', 0)}",
+                "snippet": str(r.get("content", ""))[:200],
+            })
+        else:
+            meta.append({"index": i + 1, "title": r.title, "url": r.url, "snippet": (r.snippet or "")[:200]})
     return _sse({
         "choices": [{"delta": {"content": ""}, "finish_reason": None, "index": 0}],
         "search_results": meta,

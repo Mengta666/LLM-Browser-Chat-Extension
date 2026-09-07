@@ -62,6 +62,11 @@ def _ensure_tables() -> None:
             CREATE INDEX IF NOT EXISTS idx_kb_docs_kb
             ON kb_docs(kb_id, deleted_at)
         """)
+        # 兼容迁移:存量库补 content_hash 列
+        try:
+            conn.execute("ALTER TABLE kb_docs ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''")
+        except Exception:
+            pass
         conn.commit()
 
 
@@ -123,17 +128,29 @@ def delete_kb(kb_id: str, deleted_at: str) -> None:
 
 
 def create_doc(doc_id: str, kb_id: str, filename: str, file_type: str,
-               file_bytes: int, created_at: str) -> None:
+               file_bytes: int, created_at: str, content_hash: str = "") -> None:
     """建 doc(status 默认 pending)。"""
     with _lock, _get_conn() as conn:
         conn.execute(
             """
-            INSERT INTO kb_docs (doc_id, kb_id, filename, file_type, file_bytes, created_at, status)
-            VALUES (?, ?, ?, ?, ?, ?, 'pending')
+            INSERT INTO kb_docs (doc_id, kb_id, filename, file_type, file_bytes, created_at, status, content_hash)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
             """,
-            (doc_id, kb_id, filename, file_type, file_bytes, created_at),
+            (doc_id, kb_id, filename, file_type, file_bytes, created_at, content_hash),
         )
         conn.commit()
+
+
+def find_duplicate_doc(kb_id: str, content_hash: str) -> Optional[dict[str, Any]]:
+    """查同 KB 下是否已有相同 hash 的未删除文档。"""
+    if not content_hash:
+        return None
+    with _lock, _get_conn() as conn:
+        row = conn.execute(
+            "SELECT doc_id, filename, status FROM kb_docs WHERE kb_id = ? AND content_hash = ? AND deleted_at = ''",
+            (kb_id, content_hash),
+        ).fetchone()
+    return dict(row) if row else None
 
 
 def list_docs(kb_id: str) -> list[dict[str, Any]]:

@@ -64,6 +64,8 @@ class ChatRequest(BaseModel):
     stream: bool = True
     chat_id: str = ""          # 前端会话标识(可选,用于日志关联)
     search_query: str = ""     # 手动搜索:非空时直接搜→注入→LLM(不走 function calling)
+    kb_id: str = ""            # 当前选中的知识库 id(前端选中后传入,供 LLM tool_call 时用)
+    kb_search_query: str = ""  # 手动 KB 搜索:非空时直接检索→注入→LLM(不走 function calling)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -182,13 +184,14 @@ def _merge_system_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any
 
 
 def _prepare_messages(item: ChatRequest) -> list[dict[str, Any]]:
-    """准备发送给 LLM 的 messages(记忆注入 + 摘要注入 + token 压缩判断)。
+    """准备发送给 LLM 的 messages(记忆注入 + 摘要注入 + token 压缩判断 + kb_id 提示)。
 
     流程:
       1. 注入 core 记忆 system
       2. 注入会话摘要 system
-      3. 合并所有 system 消息为单条(兼容只支持单 system 的模型)
-      4. 计算 token 总量,三档判断:
+      3. 若 kb_id 非空,拼一条 system 提示 LLM 当前绑定了哪个 KB
+      4. 合并所有 system 消息为单条(兼容只支持单 system 的模型)
+      5. 计算 token 总量,三档判断:
          - < 70%:直接返回
          - 70%-90%:后台预压缩 + 直接返回(下次生效)
          - ≥ 90%:同步阻塞压缩,重新构造 messages
@@ -201,6 +204,17 @@ def _prepare_messages(item: ChatRequest) -> list[dict[str, Any]]:
         insert_pos = 1 if messages and messages[0].get("role") == "system" else 0
         messages = (list(messages[:insert_pos])
                     + [{"role": "system", "content": summary_block}]
+                    + list(messages[insert_pos:]))
+
+    # 若选中 KB,拼 system 提示(供 LLM tool_call 时传 kb_id)
+    if item.kb_id.strip():
+        kb_hint = (
+            f"当前绑定的知识库 id: {item.kb_id}。"
+            f"如需查阅用户上传的文档,请调用 kb_search 工具,传入该 kb_id。"
+        )
+        insert_pos = 1 if messages and messages[0].get("role") == "system" else 0
+        messages = (list(messages[:insert_pos])
+                    + [{"role": "system", "content": kb_hint}]
                     + list(messages[insert_pos:]))
 
     # token 判断 + 压缩
@@ -428,8 +442,12 @@ def _sse(data: dict[str, Any]) -> str:
 def stream_chat(model: str, messages: list[dict[str, Any]],
                 user_text: str, chat_id: str,
                 use_tools: bool = False,
-                search_results: list = None) -> StreamingResponse:
-    """SSE 流式转发。use_tools=True 时走 function calling 链路。"""
+                search_results: list = None,
+                tools_list: list[str] = None) -> StreamingResponse:
+    """SSE 流式转发。use_tools=True 时走 function calling 链路。
+
+    tools_list: ["web_search", "kb_search"] 显式指定启用哪些 tool。
+    """
 
     def _gen():
         full_text = ""
@@ -442,8 +460,21 @@ def stream_chat(model: str, messages: list[dict[str, Any]],
 
         create_kwargs = dict(model=model, messages=messages, stream=True,
                              timeout=CHAT_LLM_TIMEOUT)
-        if use_tools and WEB_SEARCH_TOOL:
-            create_kwargs["tools"] = [WEB_SEARCH_TOOL]
+        if use_tools:
+            from search.tools import WEB_SEARCH_TOOL, KB_SEARCH_TOOL, SEARCH_ENABLED
+            tools = []
+            if not tools_list:
+                # 向后兼容:默认行为(只 web_search)
+                if SEARCH_ENABLED:
+                    tools.append(WEB_SEARCH_TOOL)
+            else:
+                # 新行为:显式传 tools_list
+                if "web_search" in tools_list and SEARCH_ENABLED:
+                    tools.append(WEB_SEARCH_TOOL)
+                if "kb_search" in tools_list:
+                    tools.append(KB_SEARCH_TOOL)
+            if tools:
+                create_kwargs["tools"] = tools
 
         try:
             resp = _llm_client.chat.completions.create(**create_kwargs)
@@ -500,24 +531,44 @@ def stream_chat(model: str, messages: list[dict[str, Any]],
             yield _sse({"choices": [{"delta": {"content": f"\n[对话出错: {str(exc)[:120]}]"},
                                      "finish_reason": "error", "index": 0}]})
 
-        # ── 有 tool_call → 执行搜索 → 二次 LLM ──
+        # ── 有 tool_call → 执行搜索/KB 检索 → 二次 LLM ──
         if tool_calls_buf:
             for tc_info in tool_calls_buf.values():
-                if tc_info["name"] != "web_search":
+                tool_name = tc_info["name"]
+                if tool_name not in ("web_search", "kb_search"):
                     continue
-                query = ""
-                try:
-                    query = json.loads(tc_info["arguments"]).get("query", "")
-                except Exception:
-                    pass
-                yield _sse({"choices": [{"delta": {"content": f"\n🔍 正在搜索: {query}\n"},
-                                         "finish_reason": None, "index": 0}],
-                            "object": "chat.completion.chunk"})
 
-                tool_result_text, _sr2 = handle_tool_call(tc_info["name"], tc_info["arguments"])
-                if _sr2:
-                    search_used = True
-                    yield _sse_search_meta(_sr2)
+                if tool_name == "web_search":
+                    query = ""
+                    try:
+                        query = json.loads(tc_info["arguments"]).get("query", "")
+                    except Exception:
+                        pass
+                    yield _sse({"choices": [{"delta": {"content": f"\n🔍 正在搜索: {query}\n"},
+                                             "finish_reason": None, "index": 0}],
+                                "object": "chat.completion.chunk"})
+                    tool_result_text, _sr2 = handle_tool_call(tc_info["name"], tc_info["arguments"])
+                    if _sr2:
+                        search_used = True
+                        yield _sse_search_meta(_sr2)
+
+                elif tool_name == "kb_search":
+                    try:
+                        args = json.loads(tc_info["arguments"]) if isinstance(tc_info["arguments"], str) else tc_info["arguments"]
+                        kb_id_arg = args.get("kb_id", "")
+                        query_arg = args.get("query", "")
+                    except Exception:
+                        kb_id_arg, query_arg = "", ""
+                    yield _sse({"choices": [{"delta": {"content": f"\n📚 正在检索知识库: {query_arg}\n"},
+                                             "finish_reason": None, "index": 0}],
+                                "object": "chat.completion.chunk"})
+                    from search.tools import handle_kb_search
+                    tool_result_text, _sr2 = handle_kb_search(kb_id_arg, query_arg)
+                    if _sr2:
+                        search_used = True
+                        yield _sse_search_meta(_sr2)  # KB chunks 也用 _sse_search_meta
+                    else:
+                        tool_result_text = tool_result_text or "未找到相关文档片段。"
 
                 assistant_msg = {
                     "role": "assistant", "content": None,
@@ -563,14 +614,31 @@ def stream_chat(model: str, messages: list[dict[str, Any]],
 
 def sync_chat(model: str, messages: list[dict[str, Any]],
               user_text: str, chat_id: str,
-              use_tools: bool = False) -> JSONResponse:
-    """非流式转发。use_tools=True 时支持 function calling。"""
+              use_tools: bool = False,
+              tools_list: list[str] = None) -> JSONResponse:
+    """非流式转发。use_tools=True 时支持 function calling。
+
+    tools_list: ["web_search", "kb_search"] 显式指定启用哪些 tool。
+    """
     t0 = time.monotonic()
     search_used = False
     create_kwargs = dict(model=model, messages=messages, stream=False,
                          timeout=CHAT_LLM_TIMEOUT)
-    if use_tools and WEB_SEARCH_TOOL:
-        create_kwargs["tools"] = [WEB_SEARCH_TOOL]
+    if use_tools:
+        from search.tools import WEB_SEARCH_TOOL, KB_SEARCH_TOOL, SEARCH_ENABLED
+        tools = []
+        if not tools_list:
+            # 向后兼容:默认行为(只 web_search)
+            if SEARCH_ENABLED:
+                tools.append(WEB_SEARCH_TOOL)
+        else:
+            # 新行为:显式传 tools_list
+            if "web_search" in tools_list and SEARCH_ENABLED:
+                tools.append(WEB_SEARCH_TOOL)
+            if "kb_search" in tools_list:
+                tools.append(KB_SEARCH_TOOL)
+        if tools:
+            create_kwargs["tools"] = tools
     try:
         resp = _llm_client.chat.completions.create(**create_kwargs)
     except Exception as exc:
@@ -585,22 +653,36 @@ def sync_chat(model: str, messages: list[dict[str, Any]],
     msg = resp.choices[0].message if resp.choices else None
     if msg and msg.tool_calls:
         tc = msg.tool_calls[0]
-        if tc.function.name == "web_search":
+        tool_name = tc.function.name
+        if tool_name == "web_search":
             search_used = True
             tool_result_text, _ = handle_tool_call(tc.function.name, tc.function.arguments)
-            messages_2 = list(messages) + [
-                msg.model_dump(),
-                {"role": "tool", "tool_call_id": tc.id, "content": tool_result_text},
-            ]
+        elif tool_name == "kb_search":
+            search_used = True
             try:
-                resp = _llm_client.chat.completions.create(
-                    model=model, messages=messages_2, stream=False,
-                    timeout=CHAT_LLM_TIMEOUT)
-            except Exception as exc:
-                _chat_log.error("chat_sync_search_failed", session_id=chat_id, data={
-                    "chat_id": chat_id, "error": str(exc)[:200]})
-                return JSONResponse(status_code=502, content={
-                    "error": f"搜索后生成回答失败: {str(exc)[:160]}"})
+                args = json.loads(tc.function.arguments) if isinstance(tc.function.arguments, str) else tc.function.arguments
+                kb_id_arg = args.get("kb_id", "")
+                query_arg = args.get("query", "")
+            except Exception:
+                kb_id_arg, query_arg = "", ""
+            from search.tools import handle_kb_search
+            tool_result_text, _ = handle_kb_search(kb_id_arg, query_arg)
+        else:
+            tool_result_text = f"未知工具: {tool_name}"
+
+        messages_2 = list(messages) + [
+            msg.model_dump(),
+            {"role": "tool", "tool_call_id": tc.id, "content": tool_result_text},
+        ]
+        try:
+            resp = _llm_client.chat.completions.create(
+                model=model, messages=messages_2, stream=False,
+                timeout=CHAT_LLM_TIMEOUT)
+        except Exception as exc:
+            _chat_log.error("chat_sync_search_failed", session_id=chat_id, data={
+                "chat_id": chat_id, "error": str(exc)[:200]})
+            return JSONResponse(status_code=502, content={
+                "error": f"搜索后生成回答失败: {str(exc)[:160]}"})
 
     payload = resp.model_dump()
     text = ""
@@ -629,13 +711,40 @@ def sync_chat(model: str, messages: list[dict[str, Any]],
 
 @router.post("/chat/completions")
 def chat_completions(item: ChatRequest):
-    """OpenAI 兼容对话端点 + 长期记忆注入 + 上下文压缩 + 联网搜索。"""
+    """OpenAI 兼容对话端点 + 长期记忆注入 + 上下文压缩 + 联网搜索 + KB 检索。"""
     messages = _prepare_messages(item)
     user_text = _extract_last_user_text(item.messages)
     _chat_log.info("chat_request", data={
         "chat_id": item.chat_id, "model": item.model, "stream": item.stream,
         "msg_count": len(item.messages), "injected": len(messages) > len(item.messages),
-        "search_query": item.search_query[:60] if item.search_query else ""})
+        "search_query": item.search_query[:60] if item.search_query else "",
+        "kb_id": item.kb_id[:16] if item.kb_id else "",
+        "kb_search_query": item.kb_search_query[:60] if item.kb_search_query else ""})
+
+    # 手动 KB 搜索:kb_search_query 非空 → 检索结果以 tool 消息注入,走二次 LLM
+    if item.kb_search_query.strip() and item.kb_id.strip():
+        from search.tools import handle_kb_search
+        tool_result_text, chunks = handle_kb_search(item.kb_id, item.kb_search_query.strip())
+        arguments = json.dumps({"kb_id": item.kb_id, "query": item.kb_search_query.strip()}, ensure_ascii=False)
+        assistant_msg = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "manual_kb_0",
+                "type": "function",
+                "function": {"name": "kb_search", "arguments": arguments},
+            }],
+        }
+        tool_msg = {
+            "role": "tool",
+            "tool_call_id": "manual_kb_0",
+            "content": tool_result_text,
+        }
+        messages = list(messages) + [assistant_msg, tool_msg]
+        if item.stream:
+            return stream_chat(item.model, messages, user_text, item.chat_id,
+                               search_results=chunks)  # chunks 作为 search_results 推元数据
+        return sync_chat(item.model, messages, user_text, item.chat_id)
 
     # 手动搜索:search_query 非空 → 搜索结果以 tool 消息注入,走二次 LLM(与自动搜索路径一致)
     if item.search_query.strip():
@@ -666,9 +775,15 @@ def chat_completions(item: ChatRequest):
                                search_results=results)
         return sync_chat(item.model, messages, user_text, item.chat_id)
 
-    # 自动搜索:SEARCH_ENABLED 时带 tools
+    # 自动搜索/KB 检索:根据 kb_id 和 _SEARCH_ON 决定 tools 列表
+    use_tools_list = []
+    if _SEARCH_ON:
+        use_tools_list.append("web_search")
+    if item.kb_id.strip():
+        use_tools_list.append("kb_search")
+
     if item.stream:
         return stream_chat(item.model, messages, user_text, item.chat_id,
-                           use_tools=_SEARCH_ON)
+                           use_tools=bool(use_tools_list), tools_list=use_tools_list)
     return sync_chat(item.model, messages, user_text, item.chat_id,
-                     use_tools=_SEARCH_ON)
+                     use_tools=bool(use_tools_list), tools_list=use_tools_list)

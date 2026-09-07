@@ -66,14 +66,14 @@ def get_client() -> QdrantClient:
 
 
 def _ensure_payload_indexes() -> None:
-    """为高频过滤字段建 payload 索引(幂等):user_id/memory_type/chat_id/valid。
+    """为高频过滤字段建 payload 索引(幂等):user_id/memory_type/chat_id/valid/kb_id/doc_id。
 
     _build_filter 的每个 must 条件都需要索引,否则 Qdrant 走线性全表扫描
     (无索引时几十个点的 scroll 就要十几秒)。keyword 型精确匹配,bool 用 bool 型。
     重复建同名同型索引是 no-op;异常静默(索引缺失只影响性能不影响正确性)。
     """
     client = get_client()
-    keyword_fields = ["user_id", "memory_type", "chat_id", "scope", "subject"]
+    keyword_fields = ["user_id", "memory_type", "chat_id", "scope", "subject", "kb_id", "doc_id"]
     for field in keyword_fields:
         try:
             client.create_payload_index(
@@ -149,7 +149,11 @@ def _build_payload(memory_id: str, content: str, *,
                    stability_score: float = 0.5,
                    subject: str = "",
                    expires_at: str = "",
-                   superseded_by: str = "") -> dict[str, Any]:
+                   superseded_by: str = "",
+                   kb_id: str = "",
+                   doc_id: str = "",
+                   source: str = "",
+                   chunk_idx: int = 0) -> dict[str, Any]:
     """组装 point payload(事实源)。
 
     confidence/verified/reinforce_count 是生命周期门控;
@@ -172,6 +176,9 @@ def _build_payload(memory_id: str, content: str, *,
     superseded_by(批次 E · P2):若非空,表示这条被某条更新的取代,值为新 memory_id。
     不软失效、只标注——留给应答 LLM 参考、或用户手动清理。rethink 判 conflict/merge
     时,failed(被替代)条会同时被 invalidate + set superseded_by。
+    kb_id/doc_id/source/chunk_idx(批次 G · KB RAG):knowledge base chunk 专用字段。
+    memory_type=kb_chunk 时,kb_id 是知识库标识(检索时 filter),doc_id 是文档标识(删除时批量失效),
+    source 是原文件名(展示引用),chunk_idx 是文档内序号(不索引,用于还原上下文)。
     其他 memory_type 用默认值。
     """
     return {
@@ -199,6 +206,10 @@ def _build_payload(memory_id: str, content: str, *,
         "subject": str(subject or "")[:64],
         "expires_at": expires_at or "",
         "superseded_by": superseded_by or "",
+        "kb_id": kb_id or "",
+        "doc_id": doc_id or "",
+        "source": source or "",
+        "chunk_idx": int(chunk_idx),
     }
 
 
@@ -224,7 +235,11 @@ def insert_memory(content: str, *, vector: list[float],
                   promoted_from: str = "",
                   stability_score: float = 0.5,
                   subject: str = "",
-                  expires_at: str = "") -> dict[str, Any]:
+                  expires_at: str = "",
+                  kb_id: str = "",
+                  doc_id: str = "",
+                  source: str = "",
+                  chunk_idx: int = 0) -> dict[str, Any]:
     """写入一条新记忆(dense+sparse 双向量),返回落库的 payload(含生成的 memory_id)。"""
     ensure_collection()
     memory_id = make_memory_id()
@@ -237,6 +252,7 @@ def insert_memory(content: str, *, vector: list[float],
         keywords=keywords, reinforce_count=reinforce_count, chat_id=chat_id,
         promoted_from=promoted_from, stability_score=stability_score,
         subject=subject, expires_at=expires_at,
+        kb_id=kb_id, doc_id=doc_id, source=source, chunk_idx=chunk_idx,
     )
     get_client().upsert(
         collection_name=MEMORY_COLLECTION,
@@ -481,7 +497,9 @@ def _build_filter(*, user_id: str, memory_type: Optional[Any],
                   scope: Optional[str], domain: Optional[str],
                   include_invalid: bool = False,
                   chat_id: Optional[str] = None,
-                  subject: Optional[str] = None) -> models.Filter:
+                  subject: Optional[str] = None,
+                  kb_id: Optional[str] = None,
+                  doc_id: Optional[str] = None) -> models.Filter:
     """组装 Qdrant payload 过滤条件。
 
     memory_type 可传 str(单类)或 list(多类,用 MatchAny)——
@@ -492,6 +510,8 @@ def _build_filter(*, user_id: str, memory_type: Optional[Any],
     ""(空串)显式匹配全局记忆(core);"X" 仅匹配该会话(episodic)。
     subject(批次 E · P1):None 不过滤;非 None 精确匹配 payload.subject
     (含空串,用于 subject 副通道硬匹配;调用方保证只对非空 subject 用它)。
+    kb_id/doc_id(批次 G · KB RAG):KB chunk 检索时加这两条 filter——
+    kb_id 是主隔离键(检索时必传),doc_id 可选(删文档时批量失效该 doc 所有 chunks)。
     """
     must: list[models.FieldCondition] = [
         models.FieldCondition(key="user_id", match=models.MatchValue(value=user_id)),
@@ -511,6 +531,10 @@ def _build_filter(*, user_id: str, memory_type: Optional[Any],
         must.append(models.FieldCondition(key="chat_id", match=models.MatchValue(value=chat_id)))
     if subject is not None:
         must.append(models.FieldCondition(key="subject", match=models.MatchValue(value=subject)))
+    if kb_id is not None:
+        must.append(models.FieldCondition(key="kb_id", match=models.MatchValue(value=kb_id)))
+    if doc_id is not None:
+        must.append(models.FieldCondition(key="doc_id", match=models.MatchValue(value=doc_id)))
     if not include_invalid:
         must.append(models.FieldCondition(key="valid", match=models.MatchValue(value=True)))
     return models.Filter(must=must)
@@ -524,19 +548,22 @@ def search_memories(query_vector: list[float], *, top_k: int,
                     domain: Optional[str] = None,
                     include_invalid: bool = False,
                     chat_id: Optional[str] = None,
-                    subject: Optional[str] = None) -> list[dict[str, Any]]:
+                    subject: Optional[str] = None,
+                    kb_id: Optional[str] = None,
+                    doc_id: Optional[str] = None) -> list[dict[str, Any]]:
     """hybrid 检索:dense(语义)+ sparse(BM25)双路 prefetch → RRF 融合。
 
     query_text 用于算 sparse 向量;为空或稀疏不可用时,sparse 路命中为空,
     RRF 自动退化为纯 dense。memory_type 可传 str 或 list(多类)。
     include_invalid=False 默认过滤已失效记忆。chat_id 见 _build_filter(会话隔离)。
     subject 见 _build_filter(批次 E P1 subject 副通道)。
+    kb_id/doc_id 见 _build_filter(批次 G KB RAG)。
     collection 不存在时返回空。返回 [{memory_id, content, score, ...payload}]，融合分降序。
     """
     ensure_collection()
     flt = _build_filter(user_id=user_id, memory_type=memory_type, scope=scope,
                         domain=domain, include_invalid=include_invalid,
-                        chat_id=chat_id, subject=subject)
+                        chat_id=chat_id, subject=subject, kb_id=kb_id, doc_id=doc_id)
     limit = max(1, int(top_k))
     prefetch = [
         models.Prefetch(query=query_vector, using=DENSE_VECTOR_NAME, filter=flt, limit=limit * 2),
@@ -611,12 +638,15 @@ def scroll_memories(*, user_id: str = DEFAULT_USER_ID,
                     limit: int = 200,
                     include_invalid: bool = False,
                     chat_id: Optional[str] = None,
-                    subject: Optional[str] = None) -> list[dict[str, Any]]:
+                    subject: Optional[str] = None,
+                    kb_id: Optional[str] = None,
+                    doc_id: Optional[str] = None) -> list[dict[str, Any]]:
     """filter-only 拉取记忆(不做相似度检索),供常驻偏好全量取回 / 遗忘剪枝 / CRUD 列表用。
 
     与向量无关,按 payload 过滤条件 scroll。include_invalid=True 时含已失效记忆
     (CRUD 回溯用)。chat_id 见 _build_filter(会话隔离)。subject 见 _build_filter
-    (批次 E P1 · subject 副通道硬匹配用)。collection 不存在返回空。
+    (批次 E P1 · subject 副通道硬匹配用)。kb_id/doc_id 见 _build_filter
+    (批次 G KB RAG,删 doc 时批量失效该 doc 所有 chunks)。collection 不存在返回空。
     """
     ensure_collection()
     try:
@@ -625,7 +655,7 @@ def scroll_memories(*, user_id: str = DEFAULT_USER_ID,
             scroll_filter=_build_filter(
                 user_id=user_id, memory_type=memory_type, scope=scope,
                 domain=domain, include_invalid=include_invalid,
-                chat_id=chat_id, subject=subject),
+                chat_id=chat_id, subject=subject, kb_id=kb_id, doc_id=doc_id),
             limit=max(1, int(limit)),
             with_payload=True,
         )

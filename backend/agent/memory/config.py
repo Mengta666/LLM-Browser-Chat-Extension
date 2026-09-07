@@ -179,3 +179,22 @@ CHAT_COMPACT_KEEP_PAIRS = int(os.getenv("CHAT_COMPACT_KEEP_PAIRS", "3"))
 CHAT_COMPACT_SUMMARY_MAX_TOKENS = int(os.getenv("CHAT_COMPACT_SUMMARY_MAX_TOKENS", "800"))
 # 中文字符/token 安全系数(tiktoken 对非 OpenAI 模型中文误差 20-40%,乘此系数粗估)
 CHAT_TOKEN_CHAR_RATIO_CN = float(os.getenv("CHAT_TOKEN_CHAR_RATIO_CN", "1.5"))
+
+# ─── KB · 知识库 RAG ───────────────────────────────────────────────
+MEMORY_TYPE_KB_CHUNK = "kb_chunk"
+
+# 切片参数:RecursiveCharacterTextSplitter.from_tiktoken_encoder
+KB_CHUNK_SIZE = int(os.getenv("KB_CHUNK_SIZE", "512"))          # tokens
+KB_CHUNK_OVERLAP = int(os.getenv("KB_CHUNK_OVERLAP", "64"))     # tokens
+
+# 检索参数
+KB_SEARCH_TOP_K = int(os.getenv("KB_SEARCH_TOP_K", "5"))
+
+# 上传限制:前端预检 + 后端 body 限制共同约束
+KB_MAX_FILE_BYTES = int(os.getenv("KB_MAX_FILE_BYTES", str(50 * 1024 * 1024)))  # 50 MB
+
+# 扫描件检测:单页平均字符数低于此值判定为扫描件(无文本层),拒绝上传
+KB_SCANNED_PDF_CHAR_THRESHOLD = int(os.getenv("KB_SCANNED_PDF_CHAR_THRESHOLD", "10"))
+
+# 非对称 embedding:KB 检索用英文 instruct(与 INSTRUCT_CHAT 独立,可分别调优)
+INSTRUCT_KB = "Retrieve document chunks relevant to the user's question"

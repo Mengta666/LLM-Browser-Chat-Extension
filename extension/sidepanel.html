@@ -12,6 +12,7 @@
   <div class="tabs">
     <button class="tab-btn active" data-target="chat">🤖 自动化</button>
     <button class="tab-btn" data-target="memory">🧠 记忆</button>
+    <button class="tab-btn" data-target="kb">📚 知识库</button>
     <button class="tab-btn" data-target="settings">⚙️ 设置</button>
   </div>
 
@@ -136,6 +137,32 @@
     </div>
     <div id="sessionList" class="session-list"></div>
   </aside>
+
+  <!-- 知识库 Tab (批次 G) -->
+  <div id="kb" class="tab-content">
+    <div class="kb-header">
+      <h3>我的知识库</h3>
+      <button id="createKbBtn" class="tool-btn">+ 新建知识库</button>
+    </div>
+
+    <div id="kbList" class="kb-cards">
+      <!-- 动态填充 KB 卡片 -->
+    </div>
+
+    <!-- 当前选中 KB 的文档列表 -->
+    <div id="kbDocsSection" style="display: none;">
+      <div class="kb-docs-header">
+        <h4 id="currentKbName"></h4>
+        <button id="uploadDocBtn" class="tool-btn">📎 上传文档</button>
+        <input type="file" id="fileInput" accept=".pdf,.md,.txt" style="display:none">
+      </div>
+      <div id="docList" class="doc-list">
+        <!-- 动态填充文档列表 -->
+      </div>
+    </div>
+
+    <p class="usage-hint">💡 选中知识库后,在对话中提到相关内容,LLM 会自动检索。</p>
+  </div>
 
   <script src="vendor/marked.umd.js"></script>
   <script src="vendor/purify.min.js"></script>

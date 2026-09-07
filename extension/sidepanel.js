@@ -1261,12 +1261,15 @@ document.addEventListener('DOMContentLoaded', async () => {
       : text;
     // 带上多轮历史 + chat_id:后端据此做上下文续写与记忆抽取(chat_id 让"攒 N 轮"去抖生效)。
     const chatId = await getOrCreateCurrentChatId();
+    const currentKbId = window.getCurrentKbId ? window.getCurrentKbId() : '';
     const requestBody = {
       model: safeModelName,
       messages: [...chatMessages, { role: 'user', content: userContent }],
       stream: true,
       chat_id: chatId,
       search_query: search_query || '',
+      kb_id: currentKbId,
+      kb_search_query: '',
     };
     const requestHeaders = { 'Content-Type': 'application/json' };
     if (String(apiKey || '').trim()) {
@@ -2692,3 +2695,185 @@ document.addEventListener('DOMContentLoaded', async () => {
   // ═══════════════════════════════════════════════════════════════════
 });
 
+
+// ═══════════════════════════════════════════════════════════════════
+// 知识库管理(批次 G)
+// ═══════════════════════════════════════════════════════════════════
+(function initKB() {
+  let currentKbId = sessionStorage.getItem('kb_id') || '';
+  let kbs = [];
+  let docs = [];
+
+  const API_BASE = 'http://localhost:8000';
+
+  async function loadKBs() {
+    try {
+      const res = await fetch(`${API_BASE}/v1/kb`);
+      kbs = await res.json();
+      renderKBList();
+    } catch (err) {
+      console.error('加载知识库失败:', err);
+    }
+  }
+
+  function renderKBList() {
+    const container = document.getElementById('kbList');
+    if (!container) return;
+    container.innerHTML = kbs.map(kb => `
+      <div class="kb-card ${kb.kb_id === currentKbId ? 'selected' : ''}" data-kb-id="${kb.kb_id}">
+        <div class="kb-card-name">${escapeHtml(kb.name)}</div>
+        <div class="kb-card-desc">${escapeHtml(kb.description || '')}</div>
+        <button class="kb-card-delete" data-kb-id="${kb.kb_id}">删除</button>
+      </div>
+    `).join('');
+  }
+
+  document.getElementById('createKbBtn')?.addEventListener('click', async () => {
+    const name = prompt('知识库名称:');
+    if (!name || !name.trim()) return;
+    const description = prompt('描述(可选):') || '';
+    try {
+      await fetch(`${API_BASE}/v1/kb`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({name: name.trim(), description: description.trim()})
+      });
+      await loadKBs();
+    } catch (err) {
+      alert('创建失败: ' + err.message);
+    }
+  });
+
+  document.getElementById('kbList')?.addEventListener('click', async (e) => {
+    const card = e.target.closest('.kb-card');
+    const delBtn = e.target.closest('.kb-card-delete');
+    
+    if (delBtn) {
+      e.stopPropagation();
+      const kb_id = delBtn.dataset.kbId;
+      if (!confirm('确定删除此知识库及所有文档?')) return;
+      try {
+        await fetch(`${API_BASE}/v1/kb/${kb_id}`, {method: 'DELETE'});
+        if (currentKbId === kb_id) {
+          currentKbId = '';
+          sessionStorage.removeItem('kb_id');
+          document.getElementById('kbDocsSection').style.display = 'none';
+        }
+        await loadKBs();
+      } catch (err) {
+        alert('删除失败: ' + err.message);
+      }
+      return;
+    }
+
+    if (card) {
+      currentKbId = card.dataset.kbId;
+      sessionStorage.setItem('kb_id', currentKbId);
+      renderKBList();
+      await loadDocs(currentKbId);
+      document.getElementById('kbDocsSection').style.display = 'block';
+      const kb = kbs.find(k => k.kb_id === currentKbId);
+      document.getElementById('currentKbName').textContent = kb ? kb.name : '';
+    }
+  });
+
+  document.getElementById('uploadDocBtn')?.addEventListener('click', () => {
+    document.getElementById('fileInput').click();
+  });
+
+  document.getElementById('fileInput')?.addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    if (file.size > 50 * 1024 * 1024) {
+      alert('文件过大,上限 50MB');
+      return;
+    }
+    const formData = new FormData();
+    formData.append('file', file);
+    try {
+      const res = await fetch(`${API_BASE}/v1/kb/${currentKbId}/docs`, {
+        method: 'POST',
+        body: formData
+      });
+      const data = await res.json();
+      e.target.value = '';
+      await loadDocs(currentKbId);
+      pollDocStatus(currentKbId, data.doc_id);
+    } catch (err) {
+      alert('上传失败: ' + err.message);
+    }
+  });
+
+  async function loadDocs(kb_id) {
+    try {
+      const res = await fetch(`${API_BASE}/v1/kb/${kb_id}/docs`);
+      docs = await res.json();
+      renderDocList();
+    } catch (err) {
+      console.error('加载文档失败:', err);
+    }
+  }
+
+  function renderDocList() {
+    const container = document.getElementById('docList');
+    if (!container) return;
+    container.innerHTML = docs.map(doc => `
+      <div class="doc-item" data-doc-id="${doc.doc_id}">
+        <span class="doc-name">${escapeHtml(doc.filename)}</span>
+        <span class="doc-status ${doc.status}">${statusIcon(doc.status)}</span>
+        <span class="doc-size">${(doc.file_bytes / 1024).toFixed(1)} KB</span>
+        <button class="doc-delete" data-doc-id="${doc.doc_id}">删除</button>
+      </div>
+    `).join('');
+  }
+
+  function statusIcon(status) {
+    if (status === 'pending') return '⏳';
+    if (status === 'indexed') return '✅';
+    if (status === 'failed') return '❌';
+    return status;
+  }
+
+  async function pollDocStatus(kb_id, doc_id) {
+    const maxRetries = 60;
+    for (let i = 0; i < maxRetries; i++) {
+      await new Promise(r => setTimeout(r, 2000));
+      try {
+        const res = await fetch(`${API_BASE}/v1/kb/${kb_id}/docs/${doc_id}/status`);
+        const data = await res.json();
+        if (data.status === 'indexed' || data.status === 'failed') {
+          await loadDocs(kb_id);
+          break;
+        }
+      } catch (err) {
+        console.error('轮询状态失败:', err);
+        break;
+      }
+    }
+  }
+
+  document.getElementById('docList')?.addEventListener('click', async (e) => {
+    const delBtn = e.target.closest('.doc-delete');
+    if (delBtn) {
+      e.stopPropagation();
+      const doc_id = delBtn.dataset.docId;
+      if (!confirm('确定删除此文档?')) return;
+      try {
+        await fetch(`${API_BASE}/v1/kb/${currentKbId}/docs/${doc_id}`, {method: 'DELETE'});
+        await loadDocs(currentKbId);
+      } catch (err) {
+        alert('删除失败: ' + err.message);
+      }
+    }
+  });
+
+  function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+  }
+
+  loadKBs();
+
+  window.getCurrentKbId = () => currentKbId;
+})();

@@ -76,3 +76,87 @@ def format_search_results_for_manual(results: list[SearchResult]) -> str:
         lines.append(f"    URL: {r.url}")
         lines.append("")
     return "\n".join(lines)
+
+
+# ─── KB Search Tool (批次 G) ─────────────────────────────────────
+
+
+KB_SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "kb_search",
+        "description": (
+            "从用户绑定的知识库检索相关片段。当用户的问题涉及他们上传的文档"
+            "(如技术手册、合同、研究报告等)时使用。返回若干带编号的文档片段,"
+            "回答时引用编号 [N]。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "kb_id": {"type": "string", "description": "知识库标识"},
+                "query": {"type": "string", "description": "检索关键词"}
+            },
+            "required": ["kb_id", "query"]
+        }
+    }
+}
+
+
+def handle_kb_search(kb_id: str, query: str) -> tuple[str, list[dict]]:
+    """执行 KB 检索,返回 (格式化结果字符串, chunks 列表)。
+
+    chunks 列表供 chat.py _sse_search_meta 推送元数据(前端引用面板)。
+    """
+    try:
+        from rag import kb as KB
+    except ImportError:
+        return "知识库模块未加载", []
+
+    if not kb_id or not query:
+        return "kb_id 或 query 为空", []
+
+    try:
+        chunks = KB.search_kb(kb_id, query.strip())
+    except Exception as exc:
+        return f"知识库检索失败: {exc}", []
+
+    return _format_kb_chunks(chunks), chunks
+
+
+def _format_kb_chunks(chunks: list[dict]) -> str:
+    """格式化 KB chunks 为带编号的引用格式,供 LLM 引用。"""
+    if not chunks:
+        return "未在知识库中找到相关片段。请基于你已有的知识回答用户问题。"
+
+    lines = [
+        "以下是知识库中检索到的相关片段,请参考回答用户问题。",
+        "在回答中用 [1][2] 等标注你引用了哪个片段,可多引 [1][2]。",
+        "不要在编号之外添加参考或来源字样。\n",
+    ]
+    for i, chunk in enumerate(chunks, 1):
+        source = chunk.get("source", "unknown")
+        chunk_idx = chunk.get("chunk_idx", 0)
+        content = chunk.get("content", "")
+        lines.append(f"[{i}] doc=\"{source}\" chunk#{chunk_idx}: {content[:200]}...")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def format_kb_chunks_for_manual(chunks: list[dict]) -> str:
+    """手动 KB 搜索的格式(与手动 web 搜索同构)。"""
+    if not chunks:
+        return "用户请求知识库检索,但未找到相关片段。请基于你已有的知识回答。"
+
+    lines = [
+        "用户主动检索了知识库中的以下片段,请参考回答。用 [1][2] 标注引用来源。\n",
+    ]
+    for i, chunk in enumerate(chunks, 1):
+        source = chunk.get("source", "unknown")
+        chunk_idx = chunk.get("chunk_idx", 0)
+        content = chunk.get("content", "")
+        lines.append(f"[{i}] doc=\"{source}\" chunk#{chunk_idx}: {content[:200]}...")
+        lines.append("")
+
+    return "\n".join(lines)
+

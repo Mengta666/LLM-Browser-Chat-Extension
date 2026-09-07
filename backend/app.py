@@ -47,6 +47,13 @@ except Exception as e:
     _modules_failed.append(f"sessions: {str(e)[:80]}")
 
 try:
+    from api.kb import router as kb_router
+    app.include_router(kb_router)
+    _modules_loaded.append("kb")
+except Exception as e:
+    _modules_failed.append(f"kb: {str(e)[:80]}")
+
+try:
     from agent.memory import rethink as _rethink
     _rethink.start_rethink_daemon()
     _modules_loaded.append("rethink_daemon")

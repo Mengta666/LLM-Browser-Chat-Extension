@@ -795,3 +795,32 @@ input { width: 100%; padding: 8px; margin-top: 5px; box-sizing: border-box; bord
   text-decoration: none; padding: 3px 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .search-source-item:hover { color: var(--app-accent, #0E9C90); }
 .search-source-num { font-weight: 600; margin-right: 4px; }
+
+/* ── 知识库(批次 G)── */
+.kb-header { display: flex; align-items: center; justify-content: space-between; padding: 12px 16px; border-bottom: 1px solid var(--app-border, #dce3ea); }
+.kb-header h3 { font-size: 15px; font-weight: 600; margin: 0; }
+.kb-cards { display: flex; flex-wrap: wrap; gap: 8px; padding: 12px 16px; }
+.kb-card { border: 1px solid var(--app-border, #dce3ea); border-radius: 6px; padding: 10px 12px; cursor: pointer; min-width: 140px; transition: all 0.2s; }
+.kb-card:hover { border-color: var(--app-accent, #0E9C90); background: rgba(14, 156, 144, 0.05); }
+.kb-card.selected { border-color: var(--app-accent, #0E9C90); background: rgba(14, 156, 144, 0.1); }
+.kb-card-name { font-size: 13px; font-weight: 600; color: var(--app-text, #1b2733); margin-bottom: 4px; }
+.kb-card-desc { font-size: 11px; color: var(--app-muted, #5b6b7b); }
+.kb-card-delete { font-size: 11px; color: #C0392B; background: none; border: none; cursor: pointer; padding: 2px 4px; margin-top: 6px; }
+.kb-card-delete:hover { text-decoration: underline; }
+
+.kb-docs-header { display: flex; align-items: center; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--app-border, #dce3ea); border-bottom: 1px solid var(--app-border, #dce3ea); background: var(--app-surface-2, #f2f5f8); }
+.kb-docs-header h4 { font-size: 13px; font-weight: 600; margin: 0; flex: 1; }
+
+.doc-list { padding: 8px 16px; max-height: 300px; overflow-y: auto; }
+.doc-item { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-bottom: 1px solid var(--app-border-light, #eef2f5); font-size: 12px; }
+.doc-item:hover { background: var(--app-surface-2, #f2f5f8); }
+.doc-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.doc-status { font-size: 11px; padding: 2px 6px; border-radius: 3px; }
+.doc-status.pending { color: #ff9800; background: rgba(255, 152, 0, 0.1); }
+.doc-status.indexed { color: #4caf50; background: rgba(76, 175, 80, 0.1); }
+.doc-status.failed { color: #f44336; background: rgba(244, 67, 54, 0.1); }
+.doc-size { font-size: 11px; color: var(--app-muted, #5b6b7b); }
+.doc-delete { font-size: 11px; color: #C0392B; background: none; border: none; cursor: pointer; padding: 2px 4px; }
+.doc-delete:hover { text-decoration: underline; }
+
+.usage-hint { padding: 16px; font-size: 12px; color: var(--app-muted, #5b6b7b); line-height: 1.6; text-align: center; }

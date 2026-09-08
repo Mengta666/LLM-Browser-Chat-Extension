@@ -25,7 +25,7 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 from dotenv import load_dotenv
 from fastapi import APIRouter

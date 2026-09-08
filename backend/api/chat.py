@@ -64,8 +64,7 @@ class ChatRequest(BaseModel):
     stream: bool = True
     chat_id: str = ""          # 前端会话标识(可选,用于日志关联)
     search_query: str = ""     # 手动搜索:非空时直接搜→注入→LLM(不走 function calling)
-    kb_id: str = ""            # 当前选中的知识库 id(前端选中后传入,供 LLM tool_call 时用)
-    kb_search_query: str = ""  # 手动 KB 搜索:非空时直接检索→注入→LLM(不走 function calling)
+    kb_id: str = ""            # 当前绑定的知识库 id(前端 chip 选中后传入)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -206,11 +205,14 @@ def _prepare_messages(item: ChatRequest) -> list[dict[str, Any]]:
                     + [{"role": "system", "content": summary_block}]
                     + list(messages[insert_pos:]))
 
-    # 若选中 KB,拼 system 提示(供 LLM tool_call 时传 kb_id)
+    # 若绑定 KB,拼 system 提示(供 LLM 自主决定是否 tool_call kb_search)
     if item.kb_id.strip():
+        from storage import kb_store as _KS
+        _kb_info = _KS.get_kb(item.kb_id)
+        _kb_name = _kb_info["name"] if _kb_info else item.kb_id
         kb_hint = (
-            f"当前绑定的知识库 id: {item.kb_id}。"
-            f"如需查阅用户上传的文档,请调用 kb_search 工具,传入该 kb_id。"
+            f"当前已绑定知识库「{_kb_name}」(id: {item.kb_id})。"
+            f"当用户问题可能涉及该知识库中的文档内容时,请调用 kb_search 工具检索相关片段。"
         )
         insert_pos = 1 if messages and messages[0].get("role") == "system" else 0
         messages = (list(messages[:insert_pos])
@@ -726,33 +728,7 @@ def chat_completions(item: ChatRequest):
         "chat_id": item.chat_id, "model": item.model, "stream": item.stream,
         "msg_count": len(item.messages), "injected": len(messages) > len(item.messages),
         "search_query": item.search_query[:60] if item.search_query else "",
-        "kb_id": item.kb_id[:16] if item.kb_id else "",
-        "kb_search_query": item.kb_search_query[:60] if item.kb_search_query else ""})
-
-    # 手动 KB 搜索:kb_search_query 非空 → 检索结果以 tool 消息注入,走二次 LLM
-    if item.kb_search_query.strip() and item.kb_id.strip():
-        from search.tools import handle_kb_search
-        tool_result_text, chunks = handle_kb_search(item.kb_id, item.kb_search_query.strip())
-        arguments = json.dumps({"kb_id": item.kb_id, "query": item.kb_search_query.strip()}, ensure_ascii=False)
-        assistant_msg = {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [{
-                "id": "manual_kb_0",
-                "type": "function",
-                "function": {"name": "kb_search", "arguments": arguments},
-            }],
-        }
-        tool_msg = {
-            "role": "tool",
-            "tool_call_id": "manual_kb_0",
-            "content": tool_result_text,
-        }
-        messages = list(messages) + [assistant_msg, tool_msg]
-        if item.stream:
-            return stream_chat(item.model, messages, user_text, item.chat_id,
-                               search_results=chunks)  # chunks 作为 search_results 推元数据
-        return sync_chat(item.model, messages, user_text, item.chat_id)
+        "kb_id": item.kb_id[:16] if item.kb_id else ""})
 
     # 手动搜索:search_query 非空 → 搜索结果以 tool 消息注入,走二次 LLM(与自动搜索路径一致)
     if item.search_query.strip():

@@ -1261,15 +1261,13 @@ document.addEventListener('DOMContentLoaded', async () => {
       : text;
     // 带上多轮历史 + chat_id:后端据此做上下文续写与记忆抽取(chat_id 让"攒 N 轮"去抖生效)。
     const chatId = await getOrCreateCurrentChatId();
-    const currentKbId = window.getCurrentKbId ? window.getCurrentKbId() : '';
     const requestBody = {
       model: safeModelName,
       messages: [...chatMessages, { role: 'user', content: userContent }],
       stream: true,
       chat_id: chatId,
       search_query: search_query || '',
-      kb_id: currentKbId,
-      kb_search_query: '',
+      kb_id: window._kbBoundId || '',
     };
     const requestHeaders = { 'Content-Type': 'application/json' };
     if (String(apiKey || '').trim()) {
@@ -2697,6 +2695,102 @@ document.addEventListener('DOMContentLoaded', async () => {
 
 
 // ═══════════════════════════════════════════════════════════════════
+// KB 绑定 chip + 选择器(聊天 tab 内)
+// ═══════════════════════════════════════════════════════════════════
+(function initKbChip() {
+  const API_BASE = 'http://localhost:8000';
+  let _kbListCache = [];
+
+  window._kbBoundId = sessionStorage.getItem('kb_id') || '';
+
+  async function _fetchKbList() {
+    try {
+      const res = await fetch(`${API_BASE}/v1/kb`);
+      _kbListCache = await res.json();
+    } catch { _kbListCache = []; }
+    return _kbListCache;
+  }
+
+  function _escHtml(t) { const d = document.createElement('div'); d.textContent = t; return d.innerHTML; }
+
+  async function renderKbChip() {
+    const bar = document.getElementById('kb-chip-bar');
+    const nameSpan = document.getElementById('kb-chip-name');
+    if (!bar || !nameSpan) return;
+
+    if (!window._kbBoundId) {
+      bar.style.display = 'none';
+      return;
+    }
+
+    if (!_kbListCache.length) await _fetchKbList();
+    const kb = _kbListCache.find(k => k.kb_id === window._kbBoundId);
+    if (kb) {
+      nameSpan.textContent = kb.name;
+      bar.style.display = 'flex';
+    } else {
+      window._kbBoundId = '';
+      sessionStorage.removeItem('kb_id');
+      bar.style.display = 'none';
+    }
+  }
+
+  async function showKbSelector() {
+    const selector = document.getElementById('kbSelector');
+    const list = document.getElementById('kbSelectorList');
+    if (!selector || !list) return;
+
+    await _fetchKbList();
+    if (!_kbListCache.length) {
+      list.innerHTML = '<div class="kb-selector-empty">暂无知识库，请先在 📚 知识库 tab 创建</div>';
+    } else {
+      list.innerHTML = _kbListCache.map(kb => `
+        <div class="kb-selector-item ${kb.kb_id === window._kbBoundId ? 'active' : ''}" data-kb-id="${kb.kb_id}">
+          <div class="kb-selector-item-name">${_escHtml(kb.name)}</div>
+          <div class="kb-selector-item-desc">${_escHtml(kb.description || '')}</div>
+        </div>
+      `).join('');
+    }
+    selector.style.display = 'flex';
+  }
+
+  function hideKbSelector() {
+    const s = document.getElementById('kbSelector');
+    if (s) s.style.display = 'none';
+  }
+
+  document.getElementById('kbSelectBtn')?.addEventListener('click', showKbSelector);
+  document.getElementById('kbSelectorCancel')?.addEventListener('click', hideKbSelector);
+
+  document.getElementById('kbSelectorList')?.addEventListener('click', (e) => {
+    const item = e.target.closest('.kb-selector-item');
+    if (!item) return;
+    window._kbBoundId = item.dataset.kbId;
+    sessionStorage.setItem('kb_id', window._kbBoundId);
+    hideKbSelector();
+    renderKbChip();
+  });
+
+  document.getElementById('kb-chip-remove')?.addEventListener('click', () => {
+    window._kbBoundId = '';
+    sessionStorage.removeItem('kb_id');
+    renderKbChip();
+  });
+
+  window.addEventListener('kb-changed', (e) => {
+    window._kbBoundId = e.detail.kb_id || '';
+    if (window._kbBoundId) {
+      sessionStorage.setItem('kb_id', window._kbBoundId);
+    } else {
+      sessionStorage.removeItem('kb_id');
+    }
+    renderKbChip();
+  });
+
+  renderKbChip();
+})();
+
+// ═══════════════════════════════════════════════════════════════════
 // 知识库管理(批次 G)
 // ═══════════════════════════════════════════════════════════════════
 (function initKB() {
@@ -2786,6 +2880,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (card) {
       currentKbId = card.dataset.kbId;
       sessionStorage.setItem('kb_id', currentKbId);
+      window.dispatchEvent(new CustomEvent('kb-changed', {detail: {kb_id: currentKbId}}));
       renderKBList();
       await loadDocs(currentKbId);
       document.getElementById('kbDocsSection').style.display = 'block';

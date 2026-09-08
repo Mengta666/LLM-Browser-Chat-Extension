@@ -117,6 +117,17 @@ document.addEventListener('DOMContentLoaded', async () => {
   const PH_CODE = '';
   const PH_MATH = '';
 
+  // 步骤 0(兜底):fence 前后补空行,marked 要求 fence 独占段落。
+  // 模型常直接接在段落后 "text\n```",或 fence 后无空行 "```\ntext",导致不识别。
+  function fixFenceSpacing(text) {
+    if (!text) return '';
+    // fence 前非空行 → 补空行
+    let out = text.replace(/([^\n])\n(```)/g, '$1\n\n$2');
+    // fence 后非空行 → 补空行(fence 行可带语言标识,如 ```python)
+    out = out.replace(/(```[^\n]*)\n([^\n])/g, '$1\n\n$2');
+    return out;
+  }
+
   // 步骤 1+2:抽出代码和已闭合的 math 段。返回 { text, code, math }。
   function extractProtected(text) {
     const code = [];
@@ -178,8 +189,9 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function preprocessLaTeX(text) {
-    if (!text) return '';
-    const { text: t1, code, math } = extractProtected(text);
+    if (!text) return { text: '', code: [], math: [] };
+    const t0 = fixFenceSpacing(text);
+    const { text: t1, code, math } = extractProtected(t0);
     const t2 = convertBareBrackets(t1, math);
     const t3 = escapeCurrency(t2);
     return { text: t3, code, math };

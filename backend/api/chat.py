@@ -182,10 +182,26 @@ def _merge_system_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any
     return [merged] + rest
 
 
+# 聊天输出 markdown 格式规范(前端用 marked + KaTeX 渲染)
+_CHAT_BASE_SYSTEM = """输出格式规则:
+- 数学公式用 $$...$$ (块)或 $...$ (行内),不要用裸括号 [ ] 或 ( )
+- 代码块 ``` 前后必须留空行,否则显示成普通文本
+"""
+
+
+def _inject_base_system(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """在所有动态 system 之前插入 base system prompt。"""
+    if not messages:
+        return [{"role": "system", "content": _CHAT_BASE_SYSTEM}]
+    # 插到最前面,让动态 system(记忆/摘要/KB 提示)在它之后
+    return [{"role": "system", "content": _CHAT_BASE_SYSTEM}] + list(messages)
+
+
 def _prepare_messages(item: ChatRequest) -> list[dict[str, Any]]:
     """准备发送给 LLM 的 messages(记忆注入 + 摘要注入 + token 压缩判断 + kb_id 提示)。
 
     流程:
+      0. 注入 base system(格式规范)
       1. 注入 core 记忆 system
       2. 注入会话摘要 system
       3. 若 kb_id 非空,拼一条 system 提示 LLM 当前绑定了哪个 KB
@@ -195,7 +211,8 @@ def _prepare_messages(item: ChatRequest) -> list[dict[str, Any]]:
          - 70%-90%:后台预压缩 + 直接返回(下次生效)
          - ≥ 90%:同步阻塞压缩,重新构造 messages
     """
-    messages = _inject_memory(item.messages, chat_id=item.chat_id)
+    messages = _inject_base_system(item.messages)
+    messages = _inject_memory(messages, chat_id=item.chat_id)
 
     # 注入会话摘要
     summary_block = _load_session_summary_block(item.chat_id)

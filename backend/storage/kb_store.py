@@ -67,6 +67,11 @@ def _ensure_tables() -> None:
             conn.execute("ALTER TABLE kb_docs ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''")
         except Exception:
             pass
+        # 兼容迁移:存量库补 deleted_reason 列(区分级联删 vs 独立删)
+        try:
+            conn.execute("ALTER TABLE kb_docs ADD COLUMN deleted_reason TEXT NOT NULL DEFAULT ''")
+        except Exception:
+            pass
         conn.commit()
 
 
@@ -193,12 +198,12 @@ def update_doc_status(doc_id: str, status: str, error_msg: str = "",
         conn.commit()
 
 
-def delete_doc(doc_id: str, deleted_at: str) -> None:
-    """软删 doc。"""
+def delete_doc(doc_id: str, deleted_at: str, reason: str = "") -> None:
+    """软删 doc。reason='cascade_from_kb' 表级联删,空串表用户独立删。"""
     with _lock, _get_conn() as conn:
         conn.execute(
-            "UPDATE kb_docs SET deleted_at = ? WHERE doc_id = ?",
-            (deleted_at, doc_id),
+            "UPDATE kb_docs SET deleted_at = ?, deleted_reason = ? WHERE doc_id = ?",
+            (deleted_at, reason, doc_id),
         )
         conn.commit()
 
@@ -217,3 +222,79 @@ def list_docs_by_kb(kb_id: str, include_deleted: bool = False) -> list[dict[str,
                 (kb_id,),
             ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ─── 回收站(trash) ──────────────────────────────────────────────
+
+
+def list_deleted_kbs(user_id: str) -> list[dict[str, Any]]:
+    """列已软删的 KB(回收站列表)。"""
+    with _lock, _get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT kb_id, name, description, created_at, updated_at, deleted_at
+            FROM kb_kbs
+            WHERE user_id = ? AND deleted_at != ''
+            ORDER BY deleted_at DESC
+            """,
+            (user_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def count_docs_by_kb(kb_id: str) -> int:
+    """统计该 KB 下文档总数(含软删)。"""
+    with _lock, _get_conn() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) as cnt FROM kb_docs WHERE kb_id = ?",
+            (kb_id,),
+        ).fetchone()
+    return row["cnt"] if row else 0
+
+
+def restore_kb(kb_id: str) -> None:
+    """还原 KB(清 deleted_at)。"""
+    with _lock, _get_conn() as conn:
+        conn.execute(
+            "UPDATE kb_kbs SET deleted_at = '' WHERE kb_id = ?",
+            (kb_id,),
+        )
+        conn.commit()
+
+
+def restore_docs_by_kb_cascade(kb_id: str) -> list[str]:
+    """还原该 KB 下所有级联软删的 doc,返回被还原的 doc_id 列表。"""
+    with _lock, _get_conn() as conn:
+        rows = conn.execute(
+            "SELECT doc_id FROM kb_docs WHERE kb_id = ? AND deleted_reason = 'cascade_from_kb' AND deleted_at != ''",
+            (kb_id,),
+        ).fetchall()
+        doc_ids = [r["doc_id"] for r in rows]
+        if doc_ids:
+            conn.execute(
+                "UPDATE kb_docs SET deleted_at = '', deleted_reason = '' WHERE kb_id = ? AND deleted_reason = 'cascade_from_kb'",
+                (kb_id,),
+            )
+            conn.commit()
+    return doc_ids
+
+
+def hard_delete_docs_by_kb(kb_id: str) -> int:
+    """物删该 KB 下所有 doc 行(含已软删)。"""
+    with _lock, _get_conn() as conn:
+        cur = conn.execute(
+            "DELETE FROM kb_docs WHERE kb_id = ?",
+            (kb_id,),
+        )
+        conn.commit()
+    return cur.rowcount
+
+
+def hard_delete_kb(kb_id: str) -> None:
+    """物删 KB 行。"""
+    with _lock, _get_conn() as conn:
+        conn.execute(
+            "DELETE FROM kb_kbs WHERE kb_id = ?",
+            (kb_id,),
+        )
+        conn.commit()

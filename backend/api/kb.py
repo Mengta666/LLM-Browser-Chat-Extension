@@ -68,6 +68,21 @@ class UploadDocResponse(BaseModel):
     filename: str
 
 
+class TrashKBItem(BaseModel):
+    kb_id: str
+    name: str
+    description: str
+    created_at: str
+    deleted_at: str
+    doc_count: int
+
+
+class HardDeleteResponse(BaseModel):
+    ok: bool
+    chunks_deleted: int
+    docs_deleted: int
+
+
 # ─── Endpoints ────────────────────────────────────────────────────
 
 
@@ -81,6 +96,32 @@ def create_kb(item: CreateKBRequest):
 def list_kbs():
     """列 KB(不含软删)。"""
     return KB.list_kbs()
+
+
+@router.get("/trash", response_model=list[TrashKBItem])
+def list_trash():
+    """列已软删 KB(回收站)。"""
+    return KB.list_deleted_kbs()
+
+
+@router.post("/{kb_id}/restore")
+def restore_kb(kb_id: str):
+    """还原 KB + 级联恢复文档 + 恢复 chunks。"""
+    try:
+        KB.restore_kb(kb_id)
+        return {"ok": True}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@router.delete("/{kb_id}/hard", response_model=HardDeleteResponse)
+def hard_delete_kb(kb_id: str):
+    """彻底删除 KB:物删 chunks + docs + KB 行。"""
+    try:
+        result = KB.hard_delete_kb(kb_id)
+        return {"ok": True, **result}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 
 @router.delete("/{kb_id}")

@@ -20,7 +20,7 @@ from agent.memory.config import (
     QDRANT_URL, QDRANT_API_KEY, QDRANT_DISTANCE,
     MEMORY_COLLECTION, MEMORY_VECTOR_SIZE,
     DENSE_VECTOR_NAME, SPARSE_VECTOR_NAME,
-    MEMORY_TYPE_CORE, MEMORY_TYPE_EPISODIC,
+    MEMORY_TYPE_CORE, MEMORY_TYPE_EPISODIC, MEMORY_TYPE_KB_CHUNK,
     SCOPE_GLOBAL, DEFAULT_USER_ID, CHAT_USER_ID, CHAT_CORE_TYPES,
     EPISODIC_CAP, EPISODIC_KEEP_RATIO, EPISODIC_PRUNE_GRACE_HOURS,
 )
@@ -289,6 +289,8 @@ def batch_insert_memories(items: list[dict[str, Any]], *, batch_size: int = 64) 
             content = item["content"]
             vector = item["vector"]
             kwargs = {k: v for k, v in item.items() if k not in ("content", "vector")}
+            kwargs.setdefault("scope", SCOPE_GLOBAL)
+            kwargs.setdefault("domain", "")
             payload = _build_payload(
                 memory_id, content, created_at=now, updated_at=now, **kwargs,
             )
@@ -385,6 +387,90 @@ def invalidate_memory(memory_id: str) -> Optional[dict[str, Any]]:
     except Exception:
         pass
     return {**existing, **patch}
+
+
+def restore_memory(memory_id: str) -> Optional[dict[str, Any]]:
+    """恢复软失效记忆(invalidate_memory 的反向操作)。"""
+    ensure_collection()
+    existing = get_memory(memory_id)
+    if existing is None:
+        return None
+    patch = {"valid": True, "invalid_at": ""}
+    get_client().set_payload(
+        collection_name=MEMORY_COLLECTION, payload=patch,
+        points=[_point_id(memory_id)], wait=True)
+    try:
+        from agent.memory import list_cache
+        list_cache.invalidate_all()
+    except Exception:
+        pass
+    return {**existing, **patch}
+
+
+def restore_memories_by_filter(*, user_id: str, kb_id: str,
+                               doc_id: Optional[str] = None) -> None:
+    """按 filter 批量恢复 chunks 的 valid=True(一次 Qdrant API 调用)。"""
+    ensure_collection()
+    flt = _build_filter(
+        user_id=user_id, memory_type=MEMORY_TYPE_KB_CHUNK,
+        scope=None, domain=None,
+        include_invalid=True, kb_id=kb_id, doc_id=doc_id,
+    )
+    get_client().set_payload(
+        collection_name=MEMORY_COLLECTION,
+        payload={"valid": True, "invalid_at": ""},
+        points=models.FilterSelector(filter=flt),
+        wait=True,
+    )
+    try:
+        from agent.memory import list_cache
+        list_cache.invalidate_all()
+    except Exception:
+        pass
+
+
+def invalidate_memories_by_filter(*, user_id: str, kb_id: str,
+                                  doc_id: Optional[str] = None) -> None:
+    """按 filter 批量软失效 chunks(一次 Qdrant API 调用)。"""
+    ensure_collection()
+    flt = _build_filter(
+        user_id=user_id, memory_type=MEMORY_TYPE_KB_CHUNK,
+        scope=None, domain=None,
+        include_invalid=False, kb_id=kb_id, doc_id=doc_id,
+    )
+    get_client().set_payload(
+        collection_name=MEMORY_COLLECTION,
+        payload={"valid": False, "invalid_at": _now_iso()},
+        points=models.FilterSelector(filter=flt),
+        wait=True,
+    )
+    try:
+        from agent.memory import list_cache
+        list_cache.invalidate_all()
+    except Exception:
+        pass
+
+
+def delete_memories_by_filter(*, user_id: str, kb_id: str,
+                              doc_id: Optional[str] = None) -> int:
+    """按 filter 批量物删 chunks(一次 Qdrant API 调用)。"""
+    ensure_collection()
+    flt = _build_filter(
+        user_id=user_id, memory_type=MEMORY_TYPE_KB_CHUNK,
+        scope=None, domain=None,
+        include_invalid=True, kb_id=kb_id, doc_id=doc_id,
+    )
+    get_client().delete(
+        collection_name=MEMORY_COLLECTION,
+        points_selector=models.FilterSelector(filter=flt),
+        wait=True,
+    )
+    try:
+        from agent.memory import list_cache
+        list_cache.invalidate_all()
+    except Exception:
+        pass
+    return 0
 
 
 def touch_memories(memory_ids: list[str]) -> None:

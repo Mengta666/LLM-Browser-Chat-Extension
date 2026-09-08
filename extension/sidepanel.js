@@ -2703,6 +2703,9 @@ document.addEventListener('DOMContentLoaded', async () => {
   let currentKbId = sessionStorage.getItem('kb_id') || '';
   let kbs = [];
   let docs = [];
+  let viewMode = 'active';
+  let trashKbs = [];
+  const _busy = new Map();  // key → {text, done}  操作中状态追踪
 
   const API_BASE = 'http://localhost:8000';
 
@@ -2719,28 +2722,36 @@ document.addEventListener('DOMContentLoaded', async () => {
   function renderKBList() {
     const container = document.getElementById('kbList');
     if (!container) return;
-    container.innerHTML = kbs.map(kb => `
+    container.innerHTML = kbs.map(kb => {
+      const b = _busy.get('kb-del-' + kb.kb_id);
+      const btnText = b ? b.text : '删除';
+      const btnDis = b ? 'disabled' : '';
+      return `
       <div class="kb-card ${kb.kb_id === currentKbId ? 'selected' : ''}" data-kb-id="${kb.kb_id}">
         <div class="kb-card-name">${escapeHtml(kb.name)}</div>
         <div class="kb-card-desc">${escapeHtml(kb.description || '')}</div>
-        <button class="kb-card-delete" data-kb-id="${kb.kb_id}">删除</button>
-      </div>
-    `).join('');
+        <button class="kb-card-delete" data-kb-id="${kb.kb_id}" ${btnDis}>${btnText}</button>
+      </div>`;
+    }).join('');
   }
 
   document.getElementById('createKbBtn')?.addEventListener('click', async () => {
     const name = prompt('知识库名称:');
     if (!name || !name.trim()) return;
     const description = prompt('描述(可选):') || '';
+    const btn = document.getElementById('createKbBtn');
+    btn.disabled = true; btn.textContent = '创建中...';
     try {
       await fetch(`${API_BASE}/v1/kb`, {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({name: name.trim(), description: description.trim()})
       });
-      await loadKBs();
+      btn.textContent = '✓ 已创建';
+      setTimeout(() => { btn.disabled = false; btn.textContent = '+ 新建知识库'; loadKBs(); }, 800);
     } catch (err) {
-      alert('创建失败: ' + err.message);
+      btn.textContent = '创建失败';
+      setTimeout(() => { btn.disabled = false; btn.textContent = '+ 新建知识库'; }, 1500);
     }
   });
 
@@ -2752,6 +2763,8 @@ document.addEventListener('DOMContentLoaded', async () => {
       e.stopPropagation();
       const kb_id = delBtn.dataset.kbId;
       if (!confirm('确定删除此知识库及所有文档?')) return;
+      _busy.set('kb-del-' + kb_id, {text: '删除中...'});
+      renderKBList();
       try {
         await fetch(`${API_BASE}/v1/kb/${kb_id}`, {method: 'DELETE'});
         if (currentKbId === kb_id) {
@@ -2759,9 +2772,13 @@ document.addEventListener('DOMContentLoaded', async () => {
           sessionStorage.removeItem('kb_id');
           document.getElementById('kbDocsSection').style.display = 'none';
         }
-        await loadKBs();
+        _busy.set('kb-del-' + kb_id, {text: '✓ 已删除'});
+        renderKBList();
+        setTimeout(() => { _busy.delete('kb-del-' + kb_id); loadKBs(); }, 800);
       } catch (err) {
-        alert('删除失败: ' + err.message);
+        _busy.set('kb-del-' + kb_id, {text: '删除失败'});
+        renderKBList();
+        setTimeout(() => { _busy.delete('kb-del-' + kb_id); renderKBList(); }, 1500);
       }
       return;
     }
@@ -2817,14 +2834,18 @@ document.addEventListener('DOMContentLoaded', async () => {
   function renderDocList() {
     const container = document.getElementById('docList');
     if (!container) return;
-    container.innerHTML = docs.map(doc => `
+    container.innerHTML = docs.map(doc => {
+      const b = _busy.get('doc-del-' + doc.doc_id);
+      const btnText = b ? b.text : '删除';
+      const btnDis = b ? 'disabled' : '';
+      return `
       <div class="doc-item" data-doc-id="${doc.doc_id}">
         <span class="doc-name">${escapeHtml(doc.filename)}</span>
         <span class="doc-status ${doc.status}">${statusIcon(doc.status)}</span>
         <span class="doc-size">${(doc.file_bytes / 1024).toFixed(1)} KB</span>
-        <button class="doc-delete" data-doc-id="${doc.doc_id}">删除</button>
-      </div>
-    `).join('');
+        <button class="doc-delete" data-doc-id="${doc.doc_id}" ${btnDis}>${btnText}</button>
+      </div>`;
+    }).join('');
   }
 
   function statusIcon(status) {
@@ -2858,11 +2879,17 @@ document.addEventListener('DOMContentLoaded', async () => {
       e.stopPropagation();
       const doc_id = delBtn.dataset.docId;
       if (!confirm('确定删除此文档?')) return;
+      _busy.set('doc-del-' + doc_id, {text: '删除中...'});
+      renderDocList();
       try {
         await fetch(`${API_BASE}/v1/kb/${currentKbId}/docs/${doc_id}`, {method: 'DELETE'});
-        await loadDocs(currentKbId);
+        _busy.set('doc-del-' + doc_id, {text: '✓ 已删除'});
+        renderDocList();
+        setTimeout(() => { _busy.delete('doc-del-' + doc_id); loadDocs(currentKbId); }, 800);
       } catch (err) {
-        alert('删除失败: ' + err.message);
+        _busy.set('doc-del-' + doc_id, {text: '删除失败'});
+        renderDocList();
+        setTimeout(() => { _busy.delete('doc-del-' + doc_id); renderDocList(); }, 1500);
       }
     }
   });
@@ -2872,6 +2899,125 @@ document.addEventListener('DOMContentLoaded', async () => {
     div.textContent = text;
     return div.innerHTML;
   }
+
+  // ─── 回收站 ─────────────────────────────────────────────────────
+
+  async function loadTrash() {
+    try {
+      const res = await fetch(`${API_BASE}/v1/kb/trash`);
+      trashKbs = await res.json();
+      renderTrashList();
+    } catch (err) {
+      console.error('加载回收站失败:', err);
+    }
+  }
+
+  function renderTrashList() {
+    const container = document.getElementById('kbTrashList');
+    const empty = document.getElementById('kbTrashEmpty');
+    if (!container) return;
+    if (!trashKbs.length) {
+      container.innerHTML = '';
+      container.style.display = 'none';
+      if (empty) empty.style.display = 'block';
+      return;
+    }
+    if (empty) empty.style.display = 'none';
+    container.style.display = '';
+    container.innerHTML = trashKbs.map(kb => {
+      const br = _busy.get('kb-restore-' + kb.kb_id);
+      const bh = _busy.get('kb-hard-' + kb.kb_id);
+      const restText = br ? br.text : '还原';
+      const restDis = br ? 'disabled' : '';
+      const hardText = bh ? bh.text : '彻底删除';
+      const hardDis = bh ? 'disabled' : '';
+      return `
+      <div class="kb-card trash" data-kb-id="${kb.kb_id}">
+        <div class="kb-card-name">${escapeHtml(kb.name)}</div>
+        <div class="kb-card-desc">${escapeHtml(kb.description || '')}</div>
+        <div class="kb-trash-meta">${kb.doc_count} 篇文档 · 删除于 ${kb.deleted_at.slice(0, 10)}</div>
+        <div class="kb-card-actions">
+          <button class="kb-card-restore" data-kb-id="${kb.kb_id}" data-kb-name="${escapeHtml(kb.name)}" ${restDis}>${restText}</button>
+          <button class="kb-card-hard-delete" data-kb-id="${kb.kb_id}" data-kb-name="${escapeHtml(kb.name)}" ${hardDis}>${hardText}</button>
+        </div>
+      </div>`;
+    }).join('');
+  }
+
+  function enterTrash() {
+    viewMode = 'trash';
+    document.getElementById('kbList').style.display = 'none';
+    document.getElementById('kbDocsSection').style.display = 'none';
+    document.getElementById('kbHeaderTitle').textContent = '回收站';
+    document.getElementById('createKbBtn').style.display = 'none';
+    document.getElementById('kbTrashBtn').textContent = '← 返回';
+    loadTrash();
+  }
+
+  function exitTrash() {
+    viewMode = 'active';
+    document.getElementById('kbTrashList').style.display = 'none';
+    const empty = document.getElementById('kbTrashEmpty');
+    if (empty) empty.style.display = 'none';
+    document.getElementById('kbList').style.display = '';
+    document.getElementById('kbHeaderTitle').textContent = '我的知识库';
+    document.getElementById('createKbBtn').style.display = '';
+    document.getElementById('kbTrashBtn').textContent = '🗑 回收站';
+    loadKBs();
+  }
+
+  document.getElementById('kbTrashBtn')?.addEventListener('click', () => {
+    viewMode === 'active' ? enterTrash() : exitTrash();
+  });
+
+  document.getElementById('kbTrashList')?.addEventListener('click', async (e) => {
+    const restoreBtn = e.target.closest('.kb-card-restore');
+    const hardDelBtn = e.target.closest('.kb-card-hard-delete');
+
+    if (restoreBtn) {
+      e.stopPropagation();
+      const kb_id = restoreBtn.dataset.kbId;
+      if (!confirm('还原此知识库及其文档?')) return;
+      _busy.set('kb-restore-' + kb_id, {text: '还原中...'});
+      renderTrashList();
+      try {
+        await fetch(`${API_BASE}/v1/kb/${kb_id}/restore`, {method: 'POST'});
+        _busy.set('kb-restore-' + kb_id, {text: '✓ 已还原'});
+        renderTrashList();
+        setTimeout(() => { _busy.delete('kb-restore-' + kb_id); loadTrash(); }, 800);
+      } catch (err) {
+        _busy.set('kb-restore-' + kb_id, {text: '还原失败'});
+        renderTrashList();
+        setTimeout(() => { _busy.delete('kb-restore-' + kb_id); renderTrashList(); }, 1500);
+      }
+      return;
+    }
+
+    if (hardDelBtn) {
+      e.stopPropagation();
+      const kb_id = hardDelBtn.dataset.kbId;
+      const kb_name = hardDelBtn.dataset.kbName;
+      if (!confirm('⚠️ 此操作不可逆，将永久删除该知识库及所有文档和向量数据！')) return;
+      const input = prompt(`请输入知识库名字「${kb_name}」以确认删除:`);
+      if (input !== kb_name) {
+        alert('名字不匹配,取消删除');
+        return;
+      }
+      _busy.set('kb-hard-' + kb_id, {text: '删除中...'});
+      renderTrashList();
+      try {
+        await fetch(`${API_BASE}/v1/kb/${kb_id}/hard`, {method: 'DELETE'});
+        _busy.set('kb-hard-' + kb_id, {text: '✓ 已删除'});
+        renderTrashList();
+        setTimeout(() => { _busy.delete('kb-hard-' + kb_id); loadTrash(); }, 800);
+      } catch (err) {
+        _busy.set('kb-hard-' + kb_id, {text: '删除失败'});
+        renderTrashList();
+        setTimeout(() => { _busy.delete('kb-hard-' + kb_id); renderTrashList(); }, 1500);
+      }
+      return;
+    }
+  });
 
   loadKBs();
 

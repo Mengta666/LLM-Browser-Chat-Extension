@@ -58,11 +58,9 @@ def list_kbs() -> list[dict[str, Any]]:
 def delete_kb(kb_id: str) -> None:
     """软删 KB + 级联软删所有 doc + 失效所有 chunks。"""
     now = _now_iso()
-    # 1. 软删所有 doc
     docs = KS.list_docs_by_kb(kb_id, include_deleted=False)
     for doc in docs:
-        delete_doc(kb_id, doc["doc_id"])
-    # 2. 软删 KB
+        delete_doc(kb_id, doc["doc_id"], reason="cascade_from_kb")
     KS.delete_kb(kb_id, now)
 
 
@@ -155,30 +153,16 @@ def get_doc_status(kb_id: str, doc_id: str) -> dict[str, Any]:
     }
 
 
-def delete_doc(kb_id: str, doc_id: str) -> None:
+def delete_doc(kb_id: str, doc_id: str, reason: str = "") -> None:
     """软删 doc + 失效该 doc 所有 chunks。"""
     now = _now_iso()
-    # 1. 失效所有 chunks(遍历 Qdrant scroll 该 doc,逐条 invalidate)
     _invalidate_doc_chunks(kb_id, doc_id)
-    # 2. 软删 doc
-    KS.delete_doc(doc_id, now)
+    KS.delete_doc(doc_id, now, reason=reason)
 
 
 def _invalidate_doc_chunks(kb_id: str, doc_id: str) -> None:
-    """遍历该 doc 所有 chunks,软失效(分页处理)。"""
-    while True:
-        chunks = V.scroll_memories(
-            user_id=CHAT_USER_ID,
-            memory_type=MEMORY_TYPE_KB_CHUNK,
-            kb_id=kb_id,
-            doc_id=doc_id,
-            limit=500,
-            include_invalid=False,
-        )
-        if not chunks:
-            break
-        for chunk in chunks:
-            V.invalidate_memory(chunk["memory_id"])
+    """批量软失效该 doc 所有 chunks(一次 Qdrant API 调用)。"""
+    V.invalidate_memories_by_filter(user_id=CHAT_USER_ID, kb_id=kb_id, doc_id=doc_id)
 
 
 # ─── 检索 ─────────────────────────────────────────────────────────
@@ -196,3 +180,36 @@ def search_kb(kb_id: str, query: str, top_k: int = KB_SEARCH_TOP_K) -> list[dict
         kb_id=kb_id,
         include_invalid=False,
     )
+
+
+# ─── 回收站(trash) ──────────────────────────────────────────────
+
+
+def list_deleted_kbs() -> list[dict[str, Any]]:
+    """列已软删的 KB(附文档统计)。"""
+    kbs = KS.list_deleted_kbs(CHAT_USER_ID)
+    for kb in kbs:
+        kb["doc_count"] = KS.count_docs_by_kb(kb["kb_id"])
+    return kbs
+
+
+def restore_kb(kb_id: str) -> None:
+    """还原 KB + 级联恢复文档 + 恢复 Qdrant chunks。"""
+    kb = KS.get_kb(kb_id)
+    if not kb or not kb.get("deleted_at"):
+        raise ValueError("KB 不在回收站")
+    KS.restore_kb(kb_id)
+    restored_doc_ids = KS.restore_docs_by_kb_cascade(kb_id)
+    for doc_id in restored_doc_ids:
+        V.restore_memories_by_filter(user_id=CHAT_USER_ID, kb_id=kb_id, doc_id=doc_id)
+
+
+def hard_delete_kb(kb_id: str) -> dict[str, Any]:
+    """彻底删除 KB:Qdrant 物删所有 chunks + SQLite 物删 docs + KB 行。"""
+    kb = KS.get_kb(kb_id)
+    if not kb or not kb.get("deleted_at"):
+        raise ValueError("必须先软删,再从回收站彻底删除")
+    chunks_deleted = V.delete_memories_by_filter(user_id=CHAT_USER_ID, kb_id=kb_id)
+    docs_deleted = KS.hard_delete_docs_by_kb(kb_id)
+    KS.hard_delete_kb(kb_id)
+    return {"chunks_deleted": chunks_deleted, "docs_deleted": docs_deleted}

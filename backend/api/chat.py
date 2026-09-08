@@ -443,13 +443,17 @@ def _sse_search_meta(results) -> str:
     meta = []
     for i, r in enumerate(results):
         if isinstance(r, dict):
+            # KB chunk: 用 kb:// 协议区分
+            source = r.get("source", "unknown")
+            chunk_idx = r.get("chunk_idx", 0)
             meta.append({
                 "index": i + 1,
-                "title": r.get("source", ""),
-                "url": f"chunk#{r.get('chunk_idx', 0)}",
+                "title": f"{source} (片段 {chunk_idx})",
+                "url": f"kb://{source}#chunk{chunk_idx}",  # kb:// 协议，前端识别
                 "snippet": str(r.get("content", ""))[:200],
             })
         else:
+            # Web 搜索结果
             meta.append({"index": i + 1, "title": r.title, "url": r.url, "snippet": (r.snippet or "")[:200]})
     return _sse({
         "choices": [{"delta": {"content": ""}, "finish_reason": None, "index": 0}],
@@ -621,7 +625,7 @@ def stream_chat(model: str, messages: list[dict[str, Any]],
                     yield _sse({"choices": [{"delta": {"content":
                         f"\n[搜索后生成回答失败: {str(exc)[:100]}]"},
                         "finish_reason": "error", "index": 0}]})
-                break
+                # 删除 break，让循环继续处理其他 tool_call
 
         yield "data: [DONE]\n\n"
         duration_ms = int((time.monotonic() - t0) * 1000)
@@ -681,28 +685,45 @@ def sync_chat(model: str, messages: list[dict[str, Any]],
     search_results_web = []
     search_results_kb = []
     if msg and msg.tool_calls:
-        tc = msg.tool_calls[0]
-        tool_name = tc.function.name
-        if tool_name == "web_search":
-            search_used = True
-            tool_result_text, search_results_web = handle_tool_call(tc.function.name, tc.function.arguments)
-        elif tool_name == "kb_search":
-            search_used = True
-            try:
-                args = json.loads(tc.function.arguments) if isinstance(tc.function.arguments, str) else tc.function.arguments
-                kb_id_arg = args.get("kb_id", "")
-                query_arg = args.get("query", "")
-            except Exception:
-                kb_id_arg, query_arg = "", ""
-            from search.tools import handle_kb_search
-            tool_result_text, search_results_kb = handle_kb_search(kb_id_arg, query_arg)
-        else:
-            tool_result_text = f"未知工具: {tool_name}"
+        # 循环处理所有 tool_call（支持同时 web_search + kb_search）
+        all_tool_results = []
+        for tc in msg.tool_calls:
+            tool_name = tc.function.name
+            tool_result_text = ""
 
-        messages_2 = list(messages) + [
-            msg.model_dump(),
-            {"role": "tool", "tool_call_id": tc.id, "content": tool_result_text},
-        ]
+            if tool_name == "web_search":
+                search_used = True
+                tool_result_text, results_web = handle_tool_call(tc.function.name, tc.function.arguments)
+                search_results_web.extend(results_web)
+            elif tool_name == "kb_search":
+                search_used = True
+                try:
+                    args = json.loads(tc.function.arguments) if isinstance(tc.function.arguments, str) else tc.function.arguments
+                    kb_id_arg = args.get("kb_id", "")
+                    query_arg = args.get("query", "")
+                except Exception:
+                    kb_id_arg, query_arg = "", ""
+                from search.tools import handle_kb_search
+                tool_result_text, results_kb = handle_kb_search(kb_id_arg, query_arg)
+                search_results_kb.extend(results_kb)
+            else:
+                tool_result_text = f"未知工具: {tool_name}"
+
+            all_tool_results.append({
+                "tool_call_id": tc.id,
+                "content": tool_result_text
+            })
+
+        # 拼接所有 tool 消息
+        messages_2 = list(messages) + [msg.model_dump()]
+        for tool_result in all_tool_results:
+            messages_2.append({
+                "role": "tool",
+                "tool_call_id": tool_result["tool_call_id"],
+                "content": tool_result["content"]
+            })
+
+        # 二次 LLM 调用
         try:
             resp = _llm_client.chat.completions.create(
                 model=model, messages=messages_2, stream=False,

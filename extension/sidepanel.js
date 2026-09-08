@@ -1825,7 +1825,12 @@ document.addEventListener('DOMContentLoaded', async () => {
         const idx = parseInt(num) - 1;
         const src = sources[idx];
         if (!src) return match;
+        const isKb = src.url && src.url.startsWith('kb://');
         const safeTitle = (src.title || '').replace(/"/g, '&quot;');
+        if (isKb) {
+          // KB 引用：不跳转，仅 tooltip 提示
+          return `<span class="search-citation kb-citation-inline" title="${safeTitle}">[${num}]</span>`;
+        }
         return `<a class="search-citation" href="${src.url}" target="_blank" rel="noopener" title="${safeTitle}">[${num}]</a>`;
       });
     }
@@ -1840,13 +1845,30 @@ document.addEventListener('DOMContentLoaded', async () => {
     list.style.display = 'none';
     for (let i = 0; i < sources.length; i++) {
       const s = sources[i];
-      const a = document.createElement('a');
-      a.className = 'search-source-item';
-      a.href = s.url;
-      a.target = '_blank';
-      a.rel = 'noopener';
-      a.innerHTML = `<span class="search-source-num">[${i + 1}]</span> ${(s.title || '').replace(/</g, '&lt;')}`;
-      list.appendChild(a);
+      const isKb = s.url && s.url.startsWith('kb://');
+      const item = document.createElement('div');
+      item.className = 'search-source-item' + (isKb ? ' kb-source-item' : '');
+
+      if (isKb) {
+        // KB 来源：不可点击，显示文档名 + snippet
+        item.innerHTML = `
+          <span class="search-source-num">[${i + 1}]</span>
+          <span class="kb-source-icon">📚</span>
+          <div class="kb-source-detail">
+            <div class="kb-source-title">${(s.title || '').replace(/</g, '&lt;')}</div>
+            ${s.snippet ? `<div class="kb-source-snippet">${s.snippet.replace(/</g, '&lt;')}</div>` : ''}
+          </div>`;
+      } else {
+        // Web 来源：可点击链接
+        const a = document.createElement('a');
+        a.className = 'search-source-link';
+        a.href = s.url;
+        a.target = '_blank';
+        a.rel = 'noopener';
+        a.innerHTML = `<span class="search-source-num">[${i + 1}]</span> ${(s.title || '').replace(/</g, '&lt;')}`;
+        item.appendChild(a);
+      }
+      list.appendChild(item);
     }
     toggle.addEventListener('click', () => {
       list.style.display = list.style.display === 'none' ? 'block' : 'none';

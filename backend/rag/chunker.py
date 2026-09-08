@@ -75,7 +75,7 @@ def chunk_document(text: str, chunk_size: int = 512, chunk_overlap: int = 64) ->
 
     chunks = []
     offset = 0
-    for doc in docs:
+    for idx, doc in enumerate(docs):
         chunk_text = doc.page_content
         # 简化:假设 chunk 按原文顺序出现,用 str.find 逐个定位
         start = text.find(chunk_text, offset)
@@ -85,6 +85,7 @@ def chunk_document(text: str, chunk_size: int = 512, chunk_overlap: int = 64) ->
         end = start + len(chunk_text) if start != -1 else offset
         chunks.append({
             "text": chunk_text,
+            "chunk_id": idx,  # 新增：chunk 序号，用于窗口扩展
             "start": start if start != -1 else offset,
             "end": end,
         })

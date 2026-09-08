@@ -153,7 +153,10 @@ def _build_payload(memory_id: str, content: str, *,
                    kb_id: str = "",
                    doc_id: str = "",
                    source: str = "",
-                   chunk_idx: int = 0) -> dict[str, Any]:
+                   chunk_idx: int = 0,
+                   chunk_id: Optional[int] = None,
+                   prev_chunk_id: Optional[int] = None,
+                   next_chunk_id: Optional[int] = None) -> dict[str, Any]:
     """组装 point payload(事实源)。
 
     confidence/verified/reinforce_count 是生命周期门控;
@@ -210,6 +213,9 @@ def _build_payload(memory_id: str, content: str, *,
         "doc_id": doc_id or "",
         "source": source or "",
         "chunk_idx": int(chunk_idx),
+        "chunk_id": chunk_id,
+        "prev_chunk_id": prev_chunk_id,
+        "next_chunk_id": next_chunk_id,
     }
 
 

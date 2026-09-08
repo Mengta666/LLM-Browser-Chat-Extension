@@ -132,11 +132,9 @@ document.addEventListener('DOMContentLoaded', async () => {
   function extractProtected(text) {
     const code = [];
     const math = [];
-    // 代码:fence 优先(``` 内可以有 `` `),再行内 `...`
-    let out = text.replace(/```[\s\S]*?```/g, (m) => {
-      code.push(m); return `${PH_CODE}${code.length - 1}${PH_CODE}`;
-    });
-    out = out.replace(/`[^`\n]+`/g, (m) => {
+    // 只抽行内 code(fence 留给 marked 原生处理,抽走会破坏段落结构)
+    // 行内 code 可能和 $...$ 冲突,必须先抽
+    let out = text.replace(/`[^`\n]+`/g, (m) => {
       code.push(m); return `${PH_CODE}${code.length - 1}${PH_CODE}`;
     });
     // 已闭合的 math:$$...$$、\[...\]、\(...\)、$...$ 按此顺序抽,长的优先

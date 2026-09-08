@@ -678,12 +678,14 @@ def sync_chat(model: str, messages: list[dict[str, Any]],
             return JSONResponse(status_code=502, content={"error": f"对话出错: {str(exc)[:160]}"})
 
     msg = resp.choices[0].message if resp.choices else None
+    search_results_web = []
+    search_results_kb = []
     if msg and msg.tool_calls:
         tc = msg.tool_calls[0]
         tool_name = tc.function.name
         if tool_name == "web_search":
             search_used = True
-            tool_result_text, _ = handle_tool_call(tc.function.name, tc.function.arguments)
+            tool_result_text, search_results_web = handle_tool_call(tc.function.name, tc.function.arguments)
         elif tool_name == "kb_search":
             search_used = True
             try:
@@ -693,7 +695,7 @@ def sync_chat(model: str, messages: list[dict[str, Any]],
             except Exception:
                 kb_id_arg, query_arg = "", ""
             from search.tools import handle_kb_search
-            tool_result_text, _ = handle_kb_search(kb_id_arg, query_arg)
+            tool_result_text, search_results_kb = handle_kb_search(kb_id_arg, query_arg)
         else:
             tool_result_text = f"未知工具: {tool_name}"
 
@@ -729,6 +731,11 @@ def sync_chat(model: str, messages: list[dict[str, Any]],
     if text.strip():
         _save_history(chat_id, user_text, text)
         _schedule_memory_write(user_text, text, chat_id)
+
+    # 加上搜索结果元数据（前端引用面板需要）
+    if search_results_web or search_results_kb:
+        payload["search_results"] = search_results_web + search_results_kb
+
     return JSONResponse(payload)
 
 

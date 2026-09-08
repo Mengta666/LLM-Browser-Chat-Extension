@@ -139,19 +139,6 @@ def _format_kb_chunks(chunks: list[dict]) -> str:
         content = chunk.get("content", "")
         lines.append(f"[{i}] doc=\"{source}\" chunk#{chunk_idx}:\n{content}")
         lines.append("")
-    """手动 KB 搜索的格式(与手动 web 搜索同构)。"""
-    if not chunks:
-        return "用户请求知识库检索,但未找到相关片段。请基于你已有的知识回答。"
-
-    lines = [
-        "用户主动检索了知识库中的以下片段,请参考回答。用 [1][2] 标注引用来源。\n",
-    ]
-    for i, chunk in enumerate(chunks, 1):
-        source = chunk.get("source", "unknown")
-        chunk_idx = chunk.get("chunk_idx", 0)
-        content = chunk.get("content", "")
-        lines.append(f"[{i}] doc=\"{source}\" chunk#{chunk_idx}:\n{content}")
-        lines.append("")
 
     return "\n".join(lines)
 

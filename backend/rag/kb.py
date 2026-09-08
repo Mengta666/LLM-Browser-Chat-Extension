@@ -169,9 +169,20 @@ def _invalidate_doc_chunks(kb_id: str, doc_id: str) -> None:
 
 
 def search_kb(kb_id: str, query: str, top_k: int = KB_SEARCH_TOP_K) -> list[dict[str, Any]]:
-    """检索 KB,返回 top-K chunks(带 doc/source/chunk_idx)。"""
+    """检索 KB,返回 top-K chunks(带 doc/source/chunk_idx)。
+
+    流程: 粗召回(hybrid search) → rerank(可选) → 相关性过滤 → 日志
+    """
+    import time
+    from agent.memory.config import KB_RECALL_MIN_SCORE, KB_RERANK_ENABLED
+    from .reranker import rerank_chunks
+    from observability.logger import get_logger
+
+    start = time.time()
     query_vec = embed_query(query, INSTRUCT_KB)
-    return V.search_memories(
+
+    # 粗召回（KB_SEARCH_TOP_K 根据 rerank 开关自适应为 20 或 5）
+    results = V.search_memories(
         query_vector=query_vec,
         query_text=query,
         top_k=top_k,
@@ -180,6 +191,35 @@ def search_kb(kb_id: str, query: str, top_k: int = KB_SEARCH_TOP_K) -> list[dict
         kb_id=kb_id,
         include_invalid=False,
     )
+    raw_count = len(results)
+
+    # Rerank（如果启用）
+    results = rerank_chunks(query, results)
+
+    # 相关性过滤
+    filtered = []
+    for chunk in results:
+        score = chunk.get("rerank_score") or chunk.get("score", 0)
+        if score >= KB_RECALL_MIN_SCORE:
+            filtered.append(chunk)
+
+    # 日志
+    try:
+        _kb_log = get_logger("kb")
+        _kb_log.info("kb_search", data={
+            "kb_id": kb_id,
+            "query_head": query[:60],
+            "raw_count": raw_count,
+            "reranked_count": len(results),
+            "filtered_count": len(filtered),
+            "rerank_enabled": KB_RERANK_ENABLED,
+            "top_score": filtered[0].get("rerank_score") or filtered[0].get("score", 0) if filtered else 0,
+            "elapsed_ms": int((time.time() - start) * 1000)
+        })
+    except Exception:
+        pass
+
+    return filtered
 
 
 # ─── 回收站(trash) ──────────────────────────────────────────────

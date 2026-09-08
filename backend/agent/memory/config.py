@@ -185,10 +185,18 @@ MEMORY_TYPE_KB_CHUNK = "kb_chunk"
 
 # 切片参数:RecursiveCharacterTextSplitter.from_tiktoken_encoder
 KB_CHUNK_SIZE = int(os.getenv("KB_CHUNK_SIZE", "512"))          # tokens
-KB_CHUNK_OVERLAP = int(os.getenv("KB_CHUNK_OVERLAP", "64"))     # tokens
+KB_CHUNK_OVERLAP = int(os.getenv("KB_CHUNK_OVERLAP", "0"))      # tokens (研究表明 overlap 无收益)
 
-# 检索参数
-KB_SEARCH_TOP_K = int(os.getenv("KB_SEARCH_TOP_K", "5"))
+# Reranker 配置（可选，不配置则直接用向量检索）
+KB_RERANK_ENABLED = os.getenv("KB_RERANK_ENABLED", "false").lower() == "true"
+KB_RERANK_API_URL = os.getenv("KB_RERANK_API_URL", "")  # 例如 https://api.zerank.ai/v1/rerank
+KB_RERANK_API_KEY = os.getenv("KB_RERANK_API_KEY", "")
+KB_RERANK_MODEL = os.getenv("KB_RERANK_MODEL", "zerank-2")  # zerank-2 / bge-reranker-v2-m3 / cohere-rerank-3.5
+KB_RERANK_TOP_K = int(os.getenv("KB_RERANK_TOP_K", "5"))    # 精排后取 top N
+
+# 检索参数（启用 reranker 时粗召回 20，否则直出 5）
+KB_SEARCH_TOP_K = 20 if KB_RERANK_ENABLED else int(os.getenv("KB_SEARCH_TOP_K", "5"))
+KB_RECALL_MIN_SCORE = float(os.getenv("KB_RECALL_MIN_SCORE", "0.5"))  # 最低相关性阈值
 
 # 上传限制:前端预检 + 后端 body 限制共同约束
 KB_MAX_FILE_BYTES = int(os.getenv("KB_MAX_FILE_BYTES", str(50 * 1024 * 1024)))  # 50 MB

@@ -564,11 +564,14 @@ def stream_chat(model: str, messages: list[dict[str, Any]],
 
         # ── 有 tool_call → 执行搜索/KB 检索 → 二次 LLM ──
         if tool_calls_buf:
+            # 先执行所有 tool，收集结果
+            all_tool_results = []
             for tc_info in tool_calls_buf.values():
                 tool_name = tc_info["name"]
                 if tool_name not in ("web_search", "kb_search"):
                     continue
 
+                tool_result_text = ""
                 if tool_name == "web_search":
                     query = ""
                     try:
@@ -597,35 +600,56 @@ def stream_chat(model: str, messages: list[dict[str, Any]],
                     tool_result_text, _sr2 = handle_kb_search(kb_id_arg, query_arg)
                     if _sr2:
                         search_used = True
-                        yield _sse_search_meta(_sr2)  # KB chunks 也用 _sse_search_meta
+                        yield _sse_search_meta(_sr2)
                     else:
                         tool_result_text = tool_result_text or "未找到相关文档片段。"
 
-                assistant_msg = {
-                    "role": "assistant", "content": None,
-                    "tool_calls": [{"id": tc_info["id"], "type": "function",
-                                    "function": {"name": tc_info["name"],
-                                                 "arguments": tc_info["arguments"]}}]
-                }
-                tool_msg = {"role": "tool", "tool_call_id": tc_info["id"],
-                            "content": tool_result_text}
-                messages_2 = list(messages) + [assistant_msg, tool_msg]
+                all_tool_results.append({
+                    "tool_call_info": tc_info,
+                    "result": tool_result_text
+                })
 
-                try:
-                    resp2 = _llm_client.chat.completions.create(
-                        model=model, messages=messages_2, stream=True,
-                        timeout=CHAT_LLM_TIMEOUT)
-                    for chunk2 in resp2:
-                        if chunk2.choices and chunk2.choices[0].delta:
-                            c = chunk2.choices[0].delta.content or ""
-                            if c:
-                                full_text += c
-                        yield _sse(chunk2.model_dump())
-                except Exception as exc:
-                    yield _sse({"choices": [{"delta": {"content":
-                        f"\n[搜索后生成回答失败: {str(exc)[:100]}]"},
-                        "finish_reason": "error", "index": 0}]})
-                # 删除 break，让循环继续处理其他 tool_call
+            # 构造完整的 assistant_msg（包含所有 tool_calls）
+            assistant_msg = {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": r["tool_call_info"]["id"],
+                        "type": "function",
+                        "function": {
+                            "name": r["tool_call_info"]["name"],
+                            "arguments": r["tool_call_info"]["arguments"]
+                        }
+                    }
+                    for r in all_tool_results
+                ]
+            }
+
+            # 拼接所有 tool 消息
+            messages_2 = list(messages) + [assistant_msg]
+            for r in all_tool_results:
+                messages_2.append({
+                    "role": "tool",
+                    "tool_call_id": r["tool_call_info"]["id"],
+                    "content": r["result"]
+                })
+
+            # 只做一次二次 LLM 调用
+            try:
+                resp2 = _llm_client.chat.completions.create(
+                    model=model, messages=messages_2, stream=True,
+                    timeout=CHAT_LLM_TIMEOUT)
+                for chunk2 in resp2:
+                    if chunk2.choices and chunk2.choices[0].delta:
+                        c = chunk2.choices[0].delta.content or ""
+                        if c:
+                            full_text += c
+                    yield _sse(chunk2.model_dump())
+            except Exception as exc:
+                yield _sse({"choices": [{"delta": {"content":
+                    f"\n[搜索后生成回答失败: {str(exc)[:100]}]"},
+                    "finish_reason": "error", "index": 0}]})
 
         yield "data: [DONE]\n\n"
         duration_ms = int((time.monotonic() - t0) * 1000)

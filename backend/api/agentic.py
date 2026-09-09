@@ -197,6 +197,13 @@ def _clear_old_tool_results(messages: list[dict], keep: int = 3) -> list[dict]:
 
 
 def _estimate_tokens(messages: list[dict]) -> int:
-    """粗估 token 数（字符数 / 1.5）"""
-    total_chars = sum(len(str(m.get("content", ""))) for m in messages)
+    """粗估 token 数（字符数 / 1.5）。统计 content + tool_calls。"""
+    total_chars = 0
+    for m in messages:
+        # content 字段
+        total_chars += len(str(m.get("content", "")))
+        # tool_calls 字段（assistant 消息）
+        if m.get("tool_calls"):
+            import json
+            total_chars += len(json.dumps(m["tool_calls"]))
     return int(total_chars / 1.5)

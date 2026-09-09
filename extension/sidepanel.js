@@ -1288,13 +1288,19 @@ document.addEventListener('DOMContentLoaded', async () => {
     let fullReply = '';
     let done = false;
     let _searchSources = [];  // 联网搜索结果元数据
-    const streamer = createMarkdownStreamer(aiBubble);
+    // aiBubble 内部结构分离：增强卡片区 + markdown 内容区
+    // streamer 只渲染 markdown 内容区，不影响增强卡片
+    aiBubble.textContent = '';
+    const mdBody = document.createElement('div');
+    mdBody.className = 'markdown-body';
+    aiBubble.appendChild(mdBody);
+    const streamer = createMarkdownStreamer(mdBody);
 
     await new Promise((resolve) => {
       const finalize = () => {
         if (done) return;
         done = true;
-        if (!fullReply) aiBubble.textContent = '响应为空。';
+        if (!fullReply) mdBody.textContent = '响应为空。';
         else {
           streamer.finalize(fullReply);
           // 联网搜索:渲染引用 [1][2] 为可点击链接 + 来源面板

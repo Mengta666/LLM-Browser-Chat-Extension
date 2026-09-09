@@ -858,6 +858,106 @@ input { width: 100%; padding: 8px; margin-top: 5px; box-sizing: border-box; bord
 .kb-selector-btn:hover { background: var(--app-bg-raised, #f5f7fa); }
 .kb-selector-empty { padding: 20px; text-align: center; font-size: 12px; color: var(--app-muted, #5b6b7b); }
 
+/* 增强卡片样式 */
+.enhancement-card {
+  background: #f8f9fa;
+  border-left: 3px solid #6c757d;
+  border-radius: 6px;
+  margin-bottom: 12px;
+  font-size: 12px;
+  overflow: hidden;
+  transition: all 0.3s ease;
+}
+
+.enhancement-card[data-status="loading"] {
+  border-left-color: #007bff;
+}
+
+.enhancement-card[data-status="done"] {
+  border-left-color: #28a745;
+}
+
+.enhancement-card.collapsed .enhancement-body {
+  display: none;
+}
+
+.enhancement-header {
+  padding: 8px 12px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  user-select: none;
+  transition: background 0.2s ease;
+}
+
+.enhancement-header:hover {
+  background: rgba(0, 0, 0, 0.03);
+}
+
+.enhancement-icon {
+  font-size: 14px;
+  flex-shrink: 0;
+}
+
+.enhancement-title {
+  flex: 1;
+  font-weight: 500;
+  color: #495057;
+}
+
+.enhancement-arrow {
+  font-size: 10px;
+  color: #6c757d;
+  transition: transform 0.2s ease;
+}
+
+.enhancement-body {
+  padding: 4px 12px 8px 12px;
+}
+
+.enhancement-step {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 0;
+  color: #6c757d;
+}
+
+.enhancement-step[data-status="running"] .step-text {
+  color: #007bff;
+}
+
+.enhancement-step[data-status="done"] .step-text {
+  color: #28a745;
+}
+
+.step-icon {
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.step-text {
+  flex: 1;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.step-spinner {
+  font-size: 10px;
+  animation: spin 1s linear infinite;
+}
+
+.step-check {
+  font-size: 10px;
+  color: #28a745;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
 /* KB 引用样式 */
 .kb-citation-inline { cursor: default; color: #0E9C90; font-weight: 600; border-bottom: 1px dotted #0E9C90; }
 .kb-source-item { display: flex; align-items: flex-start; gap: 8px; padding: 8px 10px; border-radius: 6px; background: #e8f4f8; border-left: 3px solid #0E9C90; margin-bottom: 4px; }

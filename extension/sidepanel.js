@@ -1315,6 +1315,9 @@ document.addEventListener('DOMContentLoaded', async () => {
           scrollToBottom();
         } else if (msg.type === 'LLM_SEARCH_RESULTS') {
           _searchSources = msg.search_results || [];
+        } else if (msg.type === 'LLM_ENHANCEMENT_STEP') {
+          // 增强步骤事件：更新增强卡片
+          updateEnhancementCard(aiBubble, msg.step);
         } else if (msg.type === 'LLM_DONE') {
           finalize();
         } else if (msg.type === 'LLM_ERROR') {
@@ -1815,6 +1818,93 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   // ── 联网搜索:引用渲染 + 来源面板 ──
+
+  // ─── 增强卡片相关函数 ─────────────────────────────────────────
+
+  function getOrCreateEnhancementCard(bubbleEl) {
+    let card = bubbleEl.querySelector('.enhancement-card');
+    if (!card) {
+      card = document.createElement('div');
+      card.className = 'enhancement-card';
+      card.setAttribute('data-status', 'loading');
+      card.innerHTML = `
+        <div class="enhancement-header">
+          <span class="enhancement-icon">⚡</span>
+          <span class="enhancement-title">增强回答中...</span>
+          <span class="enhancement-arrow">▼</span>
+        </div>
+        <div class="enhancement-body"></div>
+      `;
+      // 点击 header 切换折叠
+      card.querySelector('.enhancement-header').addEventListener('click', () => {
+        card.classList.toggle('collapsed');
+        const arrow = card.querySelector('.enhancement-arrow');
+        arrow.textContent = card.classList.contains('collapsed') ? '▶' : '▼';
+      });
+      // 插入到回答内容之前
+      const markdownBody = bubbleEl.querySelector('.markdown-body');
+      if (markdownBody) {
+        bubbleEl.insertBefore(card, markdownBody);
+      } else {
+        bubbleEl.appendChild(card);
+      }
+    }
+    return card;
+  }
+
+  function updateEnhancementCard(bubbleEl, step) {
+    const card = getOrCreateEnhancementCard(bubbleEl);
+    const body = card.querySelector('.enhancement-body');
+    const title = card.querySelector('.enhancement-title');
+
+    const stepId = `${step.type}_${step.query || ''}`;
+    let stepEl = body.querySelector(`[data-step-id="${CSS.escape(stepId)}"]`);
+
+    if (step.status === 'running') {
+      if (!stepEl) {
+        stepEl = document.createElement('div');
+        stepEl.className = 'enhancement-step';
+        stepEl.setAttribute('data-step-id', stepId);
+        stepEl.setAttribute('data-status', 'running');
+        body.appendChild(stepEl);
+      }
+
+      const icon = step.type === 'web_search' ? '🔍' : '📚';
+      const label = step.type === 'web_search' ? '正在搜索' : '正在检索知识库';
+      stepEl.innerHTML = `
+        <span class="step-icon">${icon}</span>
+        <span class="step-text">${label}: ${escapeHtml(step.query || '')}</span>
+        <span class="step-spinner">⏳</span>
+      `;
+    } else if (step.status === 'done') {
+      if (stepEl) {
+        stepEl.setAttribute('data-status', 'done');
+        const icon = step.type === 'web_search' ? '🔍' : '📚';
+        const label = step.type === 'web_search' ? '搜索完成' : '检索完成';
+        const count = step.result_count || 0;
+        stepEl.innerHTML = `
+          <span class="step-icon">${icon}</span>
+          <span class="step-text">${label}: ${escapeHtml(step.query || '')} (${count} 项)</span>
+          <span class="step-check">✓</span>
+        `;
+      }
+
+      // 检查是否所有步骤都完成
+      const allSteps = body.querySelectorAll('.enhancement-step');
+      const allDone = Array.from(allSteps).every(s => s.getAttribute('data-status') === 'done');
+      if (allDone && allSteps.length > 0) {
+        card.setAttribute('data-status', 'done');
+        title.textContent = `✓ 已增强 (${allSteps.length} 项)`;
+        // 自动折叠
+        setTimeout(() => {
+          card.classList.add('collapsed');
+          card.querySelector('.enhancement-arrow').textContent = '▶';
+        }, 800);
+      }
+    }
+  }
+
+  // ─── 引用相关函数 ─────────────────────────────────────────
 
   function renderSearchCitations(bubbleEl, sources) {
     if (!sources || !sources.length) return;

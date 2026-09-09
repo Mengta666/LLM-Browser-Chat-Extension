@@ -221,6 +221,10 @@ async function handleCallLlmStream(request) {
         if (parsed.search_results) {
           sendLlmMessage(msgId, 'LLM_SEARCH_RESULTS', { search_results: parsed.search_results });
         }
+        // 增强步骤:识别 enhancement_step 字段,转发给前端显示增强卡片
+        if (parsed.enhancement_step) {
+          sendLlmMessage(msgId, 'LLM_ENHANCEMENT_STEP', { step: parsed.enhancement_step });
+        }
         const chunk = extractChunkText(parsed);
         if (chunk) sendLlmMessage(msgId, 'LLM_CHUNK', { chunk });
       } catch {

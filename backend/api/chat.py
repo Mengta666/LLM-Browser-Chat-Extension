@@ -578,13 +578,31 @@ def stream_chat(model: str, messages: list[dict[str, Any]],
                         query = json.loads(tc_info["arguments"]).get("query", "")
                     except Exception:
                         pass
-                    yield _sse({"choices": [{"delta": {"content": f"\n🔍 正在搜索: {query}\n"},
-                                             "finish_reason": None, "index": 0}],
-                                "object": "chat.completion.chunk"})
+                    # 发送结构化增强事件（不进入正文）
+                    yield _sse({
+                        "choices": [{"delta": {"content": ""}, "finish_reason": None, "index": 0}],
+                        "object": "chat.completion.chunk",
+                        "enhancement_step": {
+                            "type": "web_search",
+                            "status": "running",
+                            "query": query
+                        }
+                    })
                     tool_result_text, _sr2 = handle_tool_call(tc_info["name"], tc_info["arguments"])
                     if _sr2:
                         search_used = True
                         yield _sse_search_meta(_sr2)
+                    # 发送完成事件
+                    yield _sse({
+                        "choices": [{"delta": {"content": ""}, "finish_reason": None, "index": 0}],
+                        "object": "chat.completion.chunk",
+                        "enhancement_step": {
+                            "type": "web_search",
+                            "status": "done",
+                            "query": query,
+                            "result_count": len(_sr2) if _sr2 else 0
+                        }
+                    })
 
                 elif tool_name == "kb_search":
                     try:
@@ -593,9 +611,17 @@ def stream_chat(model: str, messages: list[dict[str, Any]],
                         query_arg = args.get("query", "")
                     except Exception:
                         kb_id_arg, query_arg = "", ""
-                    yield _sse({"choices": [{"delta": {"content": f"\n📚 正在检索知识库: {query_arg}\n"},
-                                             "finish_reason": None, "index": 0}],
-                                "object": "chat.completion.chunk"})
+                    # 发送结构化增强事件
+                    yield _sse({
+                        "choices": [{"delta": {"content": ""}, "finish_reason": None, "index": 0}],
+                        "object": "chat.completion.chunk",
+                        "enhancement_step": {
+                            "type": "kb_search",
+                            "status": "running",
+                            "query": query_arg,
+                            "kb_id": kb_id_arg
+                        }
+                    })
                     from search.tools import handle_kb_search
                     tool_result_text, _sr2 = handle_kb_search(kb_id_arg, query_arg)
                     if _sr2:
@@ -603,6 +629,18 @@ def stream_chat(model: str, messages: list[dict[str, Any]],
                         yield _sse_search_meta(_sr2)
                     else:
                         tool_result_text = tool_result_text or "未找到相关文档片段。"
+                    # 发送完成事件
+                    yield _sse({
+                        "choices": [{"delta": {"content": ""}, "finish_reason": None, "index": 0}],
+                        "object": "chat.completion.chunk",
+                        "enhancement_step": {
+                            "type": "kb_search",
+                            "status": "done",
+                            "query": query_arg,
+                            "kb_id": kb_id_arg,
+                            "result_count": len(_sr2) if _sr2 else 0
+                        }
+                    })
 
                 all_tool_results.append({
                     "tool_call_info": tc_info,

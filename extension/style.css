@@ -858,104 +858,54 @@ input { width: 100%; padding: 8px; margin-top: 5px; box-sizing: border-box; bord
 .kb-selector-btn:hover { background: var(--app-bg-raised, #f5f7fa); }
 .kb-selector-empty { padding: 20px; text-align: center; font-size: 12px; color: var(--app-muted, #5b6b7b); }
 
-/* 增强卡片样式 */
+/* 增强卡片样式 — ChatGPT/Codex 风格：无边框，灰色小字 */
 .enhancement-card {
-  background: #f8f9fa;
-  border-left: 3px solid #6c757d;
-  border-radius: 6px;
-  margin-bottom: 12px;
-  font-size: 12px;
-  overflow: hidden;
-  transition: all 0.3s ease;
-}
-
-.enhancement-card[data-status="loading"] {
-  border-left-color: #007bff;
-}
-
-.enhancement-card[data-status="done"] {
-  border-left-color: #28a745;
-}
-
-.enhancement-card.collapsed .enhancement-body {
-  display: none;
-}
-
-.enhancement-header {
-  padding: 8px 12px;
-  cursor: pointer;
+  margin-bottom: 10px;
   display: flex;
-  align-items: center;
-  gap: 8px;
-  user-select: none;
-  transition: background 0.2s ease;
-}
-
-.enhancement-header:hover {
-  background: rgba(0, 0, 0, 0.03);
-}
-
-.enhancement-icon {
-  font-size: 14px;
-  flex-shrink: 0;
-}
-
-.enhancement-title {
-  flex: 1;
-  font-weight: 500;
-  color: #495057;
-}
-
-.enhancement-arrow {
-  font-size: 10px;
-  color: #6c757d;
-  transition: transform 0.2s ease;
-}
-
-.enhancement-body {
-  padding: 4px 12px 8px 12px;
+  flex-direction: column;
+  gap: 4px;
 }
 
 .enhancement-step {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 4px 0;
-  color: #6c757d;
-}
-
-.enhancement-step[data-status="running"] .step-text {
-  color: #007bff;
-}
-
-.enhancement-step[data-status="done"] .step-text {
-  color: #28a745;
+  font-size: 12px;
+  color: #8e8ea0;
+  line-height: 1.5;
 }
 
 .step-icon {
   font-size: 12px;
   flex-shrink: 0;
+  opacity: 0.7;
 }
 
 .step-text {
   flex: 1;
-  font-size: 11px;
-  line-height: 1.4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.step-spinner {
-  font-size: 10px;
-  animation: spin 1s linear infinite;
+/* 进行中：文字微光流动动画 */
+.enhancement-step.running .step-text {
+  background: linear-gradient(90deg, #8e8ea0 25%, #c5c5d2 50%, #8e8ea0 75%);
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: shimmer 1.5s linear infinite;
 }
 
-.step-check {
-  font-size: 10px;
-  color: #28a745;
+/* 完成：静态灰字 */
+.enhancement-step.done {
+  color: #8e8ea0;
 }
 
-@keyframes spin {
-  from { transform: rotate(0deg); }
-  to { transform: rotate(360deg); }
+@keyframes shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
 }
 
 /* KB 引用样式 */

@@ -393,12 +393,14 @@ def _generate_title(user_text: str, assistant_text: str) -> str:
         return ""
 
 
-def _save_history(chat_id: str, user_text: str, assistant_text: str) -> None:
+def _save_history(chat_id: str, user_text: str, assistant_text: str, tools_json: str = "") -> None:
     """把这一轮对话存进会话历史(供会话列表 + 续谈)。绝不阻塞、绝不抛。
 
     与记忆写入不同:历史**每轮都存**(续谈需完整对话,不去抖)。chat_id 空则跳过
     (无法归属会话)。存储失败静默——历史是附加能力,不能拖垮 chat。
     会话首次创建时,后台用 LLM 起一个语义标题(失败则保留截断标题)。
+
+    tools_json: assistant 消息的工具调用步骤(JSON 字符串)。
     """
     if not chat_id:
         return
@@ -410,7 +412,7 @@ def _save_history(chat_id: str, user_text: str, assistant_text: str) -> None:
             if user_text.strip():
                 chat_store.add_message(chat_id, "user", user_text)
             if assistant_text.strip():
-                chat_store.add_message(chat_id, "assistant", assistant_text)
+                chat_store.add_message(chat_id, "assistant", assistant_text, tools=tools_json)
             # 新会话:LLM 起语义标题(截断标题作兜底,已由 ensure_session 落好)
             if is_new:
                 title = _generate_title(user_text, assistant_text)
@@ -489,6 +491,7 @@ def stream_chat(model: str, messages: list[dict[str, Any]],
 
     def _gen():
         full_text = ""
+        tools_steps = []  # 收集工具调用步骤
         _sr = search_results or []
         t0 = time.monotonic()
         search_used = bool(_sr)
@@ -557,6 +560,7 @@ def stream_chat(model: str, messages: list[dict[str, Any]],
                                 search_used = True
                         elif event["type"] == "final":
                             full_text = event["content"]
+                            tools_steps = event.get("steps", [])
                             if full_text:
                                 yield _sse({"choices": [{"delta": {"content": full_text}, "finish_reason": None, "index": 0}],
                                            "object": "chat.completion.chunk"})
@@ -579,7 +583,8 @@ def stream_chat(model: str, messages: list[dict[str, Any]],
             "search_used": search_used,
         })
         if full_text.strip():
-            _save_history(chat_id, user_text, full_text)
+            tools_json = json.dumps(tools_steps, ensure_ascii=False) if tools_steps else ""
+            _save_history(chat_id, user_text, full_text, tools_json=tools_json)
             _schedule_memory_write(user_text, full_text, chat_id)
 
     return StreamingResponse(_gen(), media_type="text/event-stream")
@@ -594,6 +599,7 @@ def sync_chat(model: str, messages: list[dict[str, Any]],
     t0 = time.monotonic()
     search_used = bool(search_results)
     prompt_tokens, completion_tokens = 0, 0
+    tools_steps = []
 
     if not use_tools:
         # 无工具：原有逻辑
@@ -640,6 +646,7 @@ def sync_chat(model: str, messages: list[dict[str, Any]],
                             search_used = True
                     elif event["type"] == "final":
                         text = event["content"]
+                        tools_steps = event.get("steps", [])
                         break
                     elif event["type"] == "error":
                         return JSONResponse(status_code=502, content={"error": event["content"]})
@@ -656,7 +663,8 @@ def sync_chat(model: str, messages: list[dict[str, Any]],
     })
 
     if text.strip():
-        _save_history(chat_id, user_text, text)
+        tools_json = json.dumps(tools_steps, ensure_ascii=False) if tools_steps else ""
+        _save_history(chat_id, user_text, text, tools_json=tools_json)
         _schedule_memory_write(user_text, text, chat_id)
 
     return JSONResponse(content={"choices": [{"message": {"role": "assistant", "content": text}}]})

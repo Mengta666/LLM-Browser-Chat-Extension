@@ -1454,7 +1454,30 @@ document.addEventListener('DOMContentLoaded', async () => {
         node.textContent = m.content;
         bubble.appendChild(node);
       } else {
-        renderMarkdownInto(bubble, m.content, { streaming: false });
+        // AI 消息:先渲染工具调用步骤(如果有),再渲染正文 + 引用面板
+        let toolSteps = [];
+        if (m.tools) {
+          try { toolSteps = typeof m.tools === 'string' ? JSON.parse(m.tools) : m.tools; } catch {}
+        }
+        if (toolSteps.length) {
+          for (const step of toolSteps) {
+            updateEnhancementCard(bubble, step);
+          }
+        }
+        const mdBody = document.createElement('div');
+        mdBody.className = 'markdown-body';
+        bubble.appendChild(mdBody);
+        renderMarkdownInto(mdBody, m.content, { streaming: false });
+        // 从工具步骤提取引用来源
+        const allSources = [];
+        for (const step of toolSteps) {
+          if (step.sources && step.sources.length) {
+            for (const s of step.sources) allSources.push(s);
+          }
+        }
+        if (allSources.length) {
+          renderSearchCitations(bubble, allSources);
+        }
       }
     }
     scrollToBottom();

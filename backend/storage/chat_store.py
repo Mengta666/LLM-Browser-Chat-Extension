@@ -84,6 +84,12 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             except sqlite3.OperationalError:
                 pass  # duplicate column — 存量库已有
 
+        # 工具调用步骤(assistant 消息专用,JSON 字符串)
+        try:
+            conn.execute("ALTER TABLE chat_messages ADD COLUMN tools TEXT NOT NULL DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
+
 
 def ensure_session(chat_id: str, first_user_text: str = "") -> bool:
     """会话不存在则新建(标题暂取首条 user 消息前 N 字);存在则刷新 updated_at。
@@ -136,16 +142,19 @@ def set_title(chat_id: str, title: str) -> bool:
         return cur.rowcount > 0
 
 
-def add_message(chat_id: str, role: str, content: str) -> None:
-    """追加一条消息。role ∈ user/assistant。空 chat_id/content 忽略。"""
+def add_message(chat_id: str, role: str, content: str, tools: str = "") -> None:
+    """追加一条消息。role ∈ user/assistant。空 chat_id/content 忽略。
+
+    tools: assistant 消息的工具调用步骤(JSON 字符串,user 消息传空)。
+    """
     if not chat_id or not str(content or "").strip():
         return
     conn = _get_conn()
     with _lock, conn:
         conn.execute(
-            "INSERT INTO chat_messages (message_id, chat_id, role, content, created_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (uuid4().hex, chat_id, role, content, _now_iso()),
+            "INSERT INTO chat_messages (message_id, chat_id, role, content, tools, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (uuid4().hex, chat_id, role, content, tools, _now_iso()),
         )
 
 
@@ -168,7 +177,7 @@ def get_messages(chat_id: str, limit: int = 200) -> list[dict[str, Any]]:
     conn = _get_conn()
     with _lock:
         rows = conn.execute(
-            "SELECT role, content, created_at FROM chat_messages "
+            "SELECT role, content, tools, created_at FROM chat_messages "
             "WHERE chat_id = ? ORDER BY created_at LIMIT ?",
             (chat_id, max(1, int(limit))),
         ).fetchall()

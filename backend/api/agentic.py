@@ -45,7 +45,8 @@ def run_agentic_loop(
         max_rounds = AGENTIC_MAX_ROUNDS
 
     working_messages = list(messages)
-    citation_index = 1  # 全局引用编号计数器
+    citation_index = 1
+    all_steps = []  # 收集所有工具调用步骤(供持久化)
 
     for round_idx in range(max_rounds):
         _chat_log.debug("agentic_round", session_id=chat_id, data={"round": round_idx + 1})
@@ -89,7 +90,7 @@ def run_agentic_loop(
         # 4. 无 tool_call → 最终回答，结束循环
         if not has_tool_calls:
             final_content = msg.content or ""
-            yield {"type": "final", "content": final_content, "messages": working_messages}
+            yield {"type": "final", "content": final_content, "messages": working_messages, "steps": all_steps}
             return
 
         # 5. 有 tool_call → 执行所有工具
@@ -156,18 +157,17 @@ def run_agentic_loop(
                         })
                 citation_index += len(search_results)
 
-            # 发送 enhancement_step 事件（done）
-            yield {
-                "type": "enhancement_step",
-                "step": {
-                    "type": tool_name,
-                    "status": "done",
-                    "query": query,
-                    "kb_id": kb_id_arg,
-                    "result_count": len(search_results) if search_results else 0,
-                    "sources": sources_meta,
-                }
+            # 发送 enhancement_step 事件（done）+ 收集到 all_steps
+            done_step = {
+                "type": tool_name,
+                "status": "done",
+                "query": query,
+                "kb_id": kb_id_arg,
+                "result_count": len(search_results) if search_results else 0,
+                "sources": sources_meta,
             }
+            all_steps.append(done_step)
+            yield {"type": "enhancement_step", "step": done_step}
 
             # 追加工具结果
             working_messages.append({

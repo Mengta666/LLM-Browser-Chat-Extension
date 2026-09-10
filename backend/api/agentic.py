@@ -45,6 +45,7 @@ def run_agentic_loop(
         max_rounds = AGENTIC_MAX_ROUNDS
 
     working_messages = list(messages)
+    citation_index = 1  # 全局引用编号计数器
 
     for round_idx in range(max_rounds):
         _chat_log.debug("agentic_round", session_id=chat_id, data={"round": round_idx + 1})
@@ -124,7 +125,36 @@ def run_agentic_loop(
             }
 
             # 执行工具
-            result_text, search_results = _execute_tool(tool_name, tool_args_str, args_dict)
+            result_text, search_results = _execute_tool(tool_name, tool_args_str, args_dict, start_index=citation_index)
+
+            # 构建搜索结果元数据(供前端渲染引用面板)
+            sources_meta = []
+            if search_results:
+                for i, r in enumerate(search_results):
+                    num = citation_index + i
+                    if tool_name == "kb_search" and isinstance(r, dict):
+                        doc_name = r.get("source", "未知文档")
+                        sources_meta.append({
+                            "index": num,
+                            "title": doc_name,
+                            "url": f"kb://{kb_id_arg}/{doc_name}",
+                            "snippet": str(r.get("content", ""))[:200],
+                        })
+                    elif isinstance(r, dict):
+                        sources_meta.append({
+                            "index": num,
+                            "title": r.get("title", ""),
+                            "url": r.get("url", ""),
+                            "snippet": str(r.get("content", ""))[:200],
+                        })
+                    else:
+                        sources_meta.append({
+                            "index": num,
+                            "title": getattr(r, "title", ""),
+                            "url": getattr(r, "url", ""),
+                            "snippet": (getattr(r, "snippet", "") or "")[:200],
+                        })
+                citation_index += len(search_results)
 
             # 发送 enhancement_step 事件（done）
             yield {
@@ -134,7 +164,8 @@ def run_agentic_loop(
                     "status": "done",
                     "query": query,
                     "kb_id": kb_id_arg,
-                    "result_count": len(search_results) if search_results else 0
+                    "result_count": len(search_results) if search_results else 0,
+                    "sources": sources_meta,
                 }
             }
 
@@ -152,16 +183,16 @@ def run_agentic_loop(
     yield {"type": "error", "content": f"达到最大轮数 {max_rounds}，强制结束"}
 
 
-def _execute_tool(tool_name: str, tool_args_str: str, args_dict: dict) -> tuple[str, list]:
+def _execute_tool(tool_name: str, tool_args_str: str, args_dict: dict, start_index: int = 1) -> tuple[str, list]:
     """执行单个工具，返回 (result_text, search_results)"""
     if tool_name == "web_search":
         from search.tools import handle_tool_call
-        return handle_tool_call(tool_name, tool_args_str)
+        return handle_tool_call(tool_name, tool_args_str, start_index=start_index)
     elif tool_name == "kb_search":
         from search.tools import handle_kb_search
         kb_id = args_dict.get("kb_id", "")
         query = args_dict.get("query", "")
-        return handle_kb_search(kb_id, query)
+        return handle_kb_search(kb_id, query, start_index=start_index)
     else:
         return f"未知工具: {tool_name}", []
 

@@ -1324,6 +1324,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         } else if (msg.type === 'LLM_ENHANCEMENT_STEP') {
           // 增强步骤事件：更新增强卡片
           updateEnhancementCard(aiBubble, msg.step);
+          // 工具调用完成时收集搜索来源(供 finalize 渲染引用面板)
+          if (msg.step.status === 'done' && msg.step.sources && msg.step.sources.length) {
+            _searchSources = _searchSources.concat(msg.step.sources);
+          }
         } else if (msg.type === 'LLM_DONE') {
           finalize();
         } else if (msg.type === 'LLM_ERROR') {

@@ -33,7 +33,7 @@ WEB_SEARCH_TOOL = {
 }
 
 
-def handle_tool_call(name: str, arguments: str) -> tuple[str, list[SearchResult]]:
+def handle_tool_call(name: str, arguments: str, start_index: int = 1) -> tuple[str, list[SearchResult]]:
     if name != "web_search":
         return f"未知工具: {name}", []
     try:
@@ -44,18 +44,19 @@ def handle_tool_call(name: str, arguments: str) -> tuple[str, list[SearchResult]
     if not query:
         return "搜索词为空", []
     results = search_web(query, count=SEARCH_RESULT_COUNT)
-    return format_search_results(results), results
+    return format_search_results(results, start_index=start_index), results
 
 
-def format_search_results(results: list[SearchResult]) -> str:
+def format_search_results(results: list[SearchResult], start_index: int = 1) -> str:
     if not results:
         return "未找到相关搜索结果。请基于你已有的知识回答用户问题。"
     lines = [
         "以下是网络搜索结果,请参考回答用户问题。",
-        "在回答中用 [1][2] 等标注你引用了哪条搜索结果。\n",
+        "在回答中用 [N] 标注你引用了哪条搜索结果。\n",
     ]
-    for i, r in enumerate(results, 1):
-        lines.append(f"[{i}] {r.title}")
+    for i, r in enumerate(results):
+        num = start_index + i
+        lines.append(f"[{num}] {r.title}")
         if r.snippet:
             lines.append(f"    {r.snippet}")
         lines.append(f"    URL: {r.url}")
@@ -102,7 +103,7 @@ KB_SEARCH_TOOL = {
 }
 
 
-def handle_kb_search(kb_id: str, query: str) -> tuple[str, list[dict]]:
+def handle_kb_search(kb_id: str, query: str, start_index: int = 1) -> tuple[str, list[dict]]:
     """执行 KB 检索,返回 (格式化结果字符串, chunks 列表)。
 
     chunks 列表供 chat.py _sse_search_meta 推送元数据(前端引用面板)。
@@ -120,24 +121,25 @@ def handle_kb_search(kb_id: str, query: str) -> tuple[str, list[dict]]:
     except Exception as exc:
         return f"知识库检索失败: {exc}", []
 
-    return _format_kb_chunks(chunks), chunks
+    return _format_kb_chunks(chunks, start_index=start_index), chunks
 
 
-def _format_kb_chunks(chunks: list[dict]) -> str:
+def _format_kb_chunks(chunks: list[dict], start_index: int = 1) -> str:
     """格式化 KB chunks 为带编号的引用格式,供 LLM 引用。"""
     if not chunks:
         return "未在知识库中找到相关片段。请基于你已有的知识回答用户问题。"
 
     lines = [
         "以下是知识库中检索到的相关片段,请参考回答用户问题。",
-        "在回答中用 [1][2] 等标注你引用了哪个片段,可多引 [1][2]。",
+        "在回答中用 [N] 标注你引用了哪个片段。",
         "不要在编号之外添加参考或来源字样。\n",
     ]
-    for i, chunk in enumerate(chunks, 1):
+    for i, chunk in enumerate(chunks):
+        num = start_index + i
         source = chunk.get("source", "unknown")
         chunk_idx = chunk.get("chunk_idx", 0)
         content = chunk.get("content", "")
-        lines.append(f"[{i}] doc=\"{source}\" chunk#{chunk_idx}:\n{content}")
+        lines.append(f"[{num}] doc=\"{source}\" chunk#{chunk_idx}:\n{content}")
         lines.append("")
 
     return "\n".join(lines)

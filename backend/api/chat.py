@@ -662,6 +662,7 @@ def sync_chat(model: str, messages: list[dict[str, Any]],
     return JSONResponse(content={"choices": [{"message": {"role": "assistant", "content": text}}]})
 
 
+@router.post("/chat/completions")
 def chat_completions(item: ChatRequest):
     """OpenAI 兼容对话端点 + 长期记忆注入 + 上下文压缩 + 联网搜索 + KB 检索。"""
     messages = _prepare_messages(item)

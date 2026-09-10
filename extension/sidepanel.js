@@ -1846,6 +1846,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   function updateEnhancementCard(bubbleEl, step) {
     const card = getOrCreateEnhancementCard(bubbleEl);
+    const esc = (t) => String(t || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
     const stepId = `${step.type}_${step.query || ''}`;
     let stepEl = card.querySelector(`[data-step-id="${CSS.escape(stepId)}"]`);
@@ -1860,7 +1861,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         card.appendChild(stepEl);
       }
       const label = step.type === 'web_search' ? '正在搜索' : '正在检索知识库';
-      stepEl.innerHTML = `<span class="step-icon">${icon}</span><span class="step-text">${label} “${escapeHtml(step.query || '')}”</span>`;
+      stepEl.innerHTML = `<span class="step-icon">${icon}</span><span class="step-text">${label} “${esc(step.query)}”</span>`;
     } else if (step.status === 'done') {
       if (!stepEl) {
         stepEl = document.createElement('div');
@@ -1871,7 +1872,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       const label = step.type === 'web_search' ? '已搜索' : '已检索知识库';
       const count = step.result_count || 0;
       const countText = count > 0 ? ` · ${count} 项` : '';
-      stepEl.innerHTML = `<span class="step-icon">${icon}</span><span class="step-text">${label} “${escapeHtml(step.query || '')}”${countText}</span>`;
+      stepEl.innerHTML = `<span class="step-icon">${icon}</span><span class="step-text">${label} “${esc(step.query)}”${countText}</span>`;
     }
   }
 

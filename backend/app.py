@@ -75,5 +75,11 @@ async def _on_shutdown():
     _log.info("app_shutdown", data={"uptime_seconds": uptime, "pid": os.getpid()})
 
 
+@app.on_event('startup')
+def _init_chat_sessions():
+    from storage import chat_store
+    chat_store._get_conn()
+
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

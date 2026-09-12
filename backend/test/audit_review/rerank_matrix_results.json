@@ -1,0 +1,1699 @@
+[
+  {
+    "event": "matrix_start",
+    "timestamp": "2026-09-12T14:42:04.988033+00:00",
+    "model": "qwen3-reranker-4b-awq-int4",
+    "cases": 16,
+    "repeats": 2,
+    "chunks": 6,
+    "threshold": 0.5,
+    "top_k": 5
+  },
+  {
+    "event": "matrix_case",
+    "case": "alarm_natural",
+    "repeat": 1,
+    "query": "Atlas-R7 出现 E731 后需要等待多久，按哪个颜色的复位按钮、按多久？",
+    "expected": [
+      "atlas-r7-operations.md"
+    ],
+    "retained": [
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.9964808821678162
+      },
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.9808006882667542
+      }
+    ],
+    "scores": [
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.9964808821678162
+      },
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.9808006882667542
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 1,
+        "score": 0.04735519737005234
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 0,
+        "score": 0.012989398092031479
+      },
+      {
+        "source": "atlas-r7-parts.md",
+        "chunk_id": 0,
+        "score": 0.0020156423561275005
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 2,
+        "score": 0.0020115594379603863
+      }
+    ],
+    "pass": true,
+    "elapsed_s": 0.515
+  },
+  {
+    "event": "matrix_case",
+    "case": "alarm_keywords",
+    "repeat": 1,
+    "query": "Atlas-R7 E731 等待时间 按钮颜色 按压时长",
+    "expected": [
+      "atlas-r7-operations.md"
+    ],
+    "retained": [
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.8540452718734741
+      }
+    ],
+    "scores": [
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.8540452718734741
+      },
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.30097219347953796
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 1,
+        "score": 0.21504689753055573
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 0,
+        "score": 0.014947998337447643
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 2,
+        "score": 0.014351814985275269
+      },
+      {
+        "source": "atlas-r7-parts.md",
+        "chunk_id": 0,
+        "score": 0.0013171529863029718
+      }
+    ],
+    "pass": true,
+    "elapsed_s": 0.308
+  },
+  {
+    "event": "matrix_case",
+    "case": "alarm_english",
+    "repeat": 1,
+    "query": "For Atlas-R7 E731, how long should I wait and which reset button should I hold for how many seconds?",
+    "expected": [
+      "atlas-r7-operations.md"
+    ],
+    "retained": [
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.9493553042411804
+      },
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.9298149347305298
+      }
+    ],
+    "scores": [
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.9493553042411804
+      },
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.9298149347305298
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 1,
+        "score": 0.20815840363502502
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 0,
+        "score": 0.018753625452518463
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 2,
+        "score": 0.0021139876917004585
+      },
+      {
+        "source": "atlas-r7-parts.md",
+        "chunk_id": 0,
+        "score": 0.0010618132073432207
+      }
+    ],
+    "pass": true,
+    "elapsed_s": 0.32
+  },
+  {
+    "event": "matrix_case",
+    "case": "boreal_natural",
+    "repeat": 1,
+    "query": "Boreal-T2 的 E731 表示什么故障，复位前要等待多少分钟？",
+    "expected": [
+      "boreal-t2-handbook.md"
+    ],
+    "retained": [
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.9975462555885315
+      },
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.9698348641395569
+      }
+    ],
+    "scores": [
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.9975462555885315
+      },
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.9698348641395569
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 1,
+        "score": 0.01326480321586132
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 0,
+        "score": 0.012745650485157967
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 2,
+        "score": 0.006184599362313747
+      },
+      {
+        "source": "atlas-r7-parts.md",
+        "chunk_id": 0,
+        "score": 0.002521907677873969
+      }
+    ],
+    "pass": true,
+    "elapsed_s": 0.319
+  },
+  {
+    "event": "matrix_case",
+    "case": "boreal_keywords",
+    "repeat": 1,
+    "query": "Boreal-T2 E731 故障含义 复位前等待时间",
+    "expected": [
+      "boreal-t2-handbook.md"
+    ],
+    "retained": [
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.893464982509613
+      },
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.516638994216919
+      }
+    ],
+    "scores": [
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.893464982509613
+      },
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.516638994216919
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 1,
+        "score": 0.17284713685512543
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 0,
+        "score": 0.03914807736873627
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 2,
+        "score": 0.025060880929231644
+      },
+      {
+        "source": "atlas-r7-parts.md",
+        "chunk_id": 0,
+        "score": 0.021922720596194267
+      }
+    ],
+    "pass": true,
+    "elapsed_s": 0.312
+  },
+  {
+    "event": "matrix_case",
+    "case": "parts_natural",
+    "repeat": 1,
+    "query": "Atlas-R7 备用电容的容量是多少？输送带厚度低于多少需要更换？",
+    "expected": [
+      "atlas-r7-parts.md"
+    ],
+    "retained": [
+      {
+        "source": "atlas-r7-parts.md",
+        "chunk_id": 0,
+        "score": 0.9981695413589478
+      },
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.9056055545806885
+      }
+    ],
+    "scores": [
+      {
+        "source": "atlas-r7-parts.md",
+        "chunk_id": 0,
+        "score": 0.9981695413589478
+      },
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.9056055545806885
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 1,
+        "score": 0.0425557941198349
+      },
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.03126377612352371
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 0,
+        "score": 0.006069387774914503
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 2,
+        "score": 0.0031767617911100388
+      }
+    ],
+    "pass": true,
+    "elapsed_s": 0.31
+  },
+  {
+    "event": "matrix_case",
+    "case": "parts_keywords",
+    "repeat": 1,
+    "query": "Atlas-R7 备用电容容量 输送带厚度 更换阈值",
+    "expected": [
+      "atlas-r7-parts.md"
+    ],
+    "retained": [
+      {
+        "source": "atlas-r7-parts.md",
+        "chunk_id": 0,
+        "score": 0.5073001384735107
+      }
+    ],
+    "scores": [
+      {
+        "source": "atlas-r7-parts.md",
+        "chunk_id": 0,
+        "score": 0.5073001384735107
+      },
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.26549801230430603
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 1,
+        "score": 0.12330655753612518
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 0,
+        "score": 0.01749551109969616
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 2,
+        "score": 0.002444107551127672
+      },
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.0022101588547229767
+      }
+    ],
+    "pass": true,
+    "elapsed_s": 0.315
+  },
+  {
+    "event": "matrix_case",
+    "case": "parts_english",
+    "repeat": 1,
+    "query": "What is the spare capacitor capacity and minimum conveyor belt thickness for Atlas-R7?",
+    "expected": [
+      "atlas-r7-parts.md"
+    ],
+    "retained": [
+      {
+        "source": "atlas-r7-parts.md",
+        "chunk_id": 0,
+        "score": 0.9870365858078003
+      },
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.9516990184783936
+      }
+    ],
+    "scores": [
+      {
+        "source": "atlas-r7-parts.md",
+        "chunk_id": 0,
+        "score": 0.9870365858078003
+      },
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.9516990184783936
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 1,
+        "score": 0.18653035163879395
+      },
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.03836408630013466
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 0,
+        "score": 0.026086263358592987
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 2,
+        "score": 0.0005975313251838088
+      }
+    ],
+    "pass": true,
+    "elapsed_s": 0.319
+  },
+  {
+    "event": "matrix_case",
+    "case": "calibration_natural",
+    "repeat": 1,
+    "query": "Atlas-R7 校准标准块编号是什么，允许测量偏差是多少？",
+    "expected": [
+      "atlas-r7-operations.md"
+    ],
+    "retained": [
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.9994035959243774
+      },
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.9251006245613098
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 1,
+        "score": 0.7436133027076721
+      }
+    ],
+    "scores": [
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.9994035959243774
+      },
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.9251006245613098
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 1,
+        "score": 0.7436133027076721
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 0,
+        "score": 0.02866656705737114
+      },
+      {
+        "source": "atlas-r7-parts.md",
+        "chunk_id": 0,
+        "score": 0.0010434669675305486
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 2,
+        "score": 0.0006860714056529105
+      }
+    ],
+    "pass": true,
+    "elapsed_s": 0.319
+  },
+  {
+    "event": "matrix_case",
+    "case": "calibration_keywords",
+    "repeat": 1,
+    "query": "Atlas-R7 校准 标准块编号 测量偏差",
+    "expected": [
+      "atlas-r7-operations.md"
+    ],
+    "retained": [
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.994412362575531
+      },
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.7272076606750488
+      }
+    ],
+    "scores": [
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.994412362575531
+      },
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.7272076606750488
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 1,
+        "score": 0.23797497153282166
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 0,
+        "score": 0.14259536564350128
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 2,
+        "score": 0.0033223298378288746
+      },
+      {
+        "source": "atlas-r7-parts.md",
+        "chunk_id": 0,
+        "score": 0.0013168412260711193
+      }
+    ],
+    "pass": true,
+    "elapsed_s": 0.317
+  },
+  {
+    "event": "matrix_case",
+    "case": "interlock_natural",
+    "repeat": 1,
+    "query": "Atlas-R7 进料闸门全闭位置阈值和联锁延时分别是多少？",
+    "expected": [
+      "atlas-r7-interlock.md"
+    ],
+    "retained": [
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 1,
+        "score": 0.9997705817222595
+      }
+    ],
+    "scores": [
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 1,
+        "score": 0.9997705817222595
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 0,
+        "score": 0.04184717684984207
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 2,
+        "score": 0.005462141241878271
+      },
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.0030666894745081663
+      },
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.0012045197654515505
+      },
+      {
+        "source": "atlas-r7-parts.md",
+        "chunk_id": 0,
+        "score": 0.00006632867007283494
+      }
+    ],
+    "pass": true,
+    "elapsed_s": 0.319
+  },
+  {
+    "event": "matrix_case",
+    "case": "cross_document",
+    "repeat": 1,
+    "query": "Atlas-R7 校准用什么标准块，送料轴承又是什么型号？",
+    "expected": [
+      "atlas-r7-operations.md",
+      "atlas-r7-parts.md"
+    ],
+    "retained": [
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.9969894289970398
+      },
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.6539740562438965
+      }
+    ],
+    "scores": [
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.9969894289970398
+      },
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.6539740562438965
+      },
+      {
+        "source": "atlas-r7-parts.md",
+        "chunk_id": 0,
+        "score": 0.09216904640197754
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 0,
+        "score": 0.04473716393113136
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 1,
+        "score": 0.0061817835085093975
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 2,
+        "score": 0.0015404974110424519
+      }
+    ],
+    "pass": false,
+    "elapsed_s": 0.316
+  },
+  {
+    "event": "matrix_case",
+    "case": "split_calibration",
+    "repeat": 1,
+    "query": "Atlas-R7 校准用什么标准块？",
+    "expected": [
+      "atlas-r7-operations.md"
+    ],
+    "retained": [
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.999779999256134
+      },
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.9783404469490051
+      }
+    ],
+    "scores": [
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.999779999256134
+      },
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.9783404469490051
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 0,
+        "score": 0.29765868186950684
+      },
+      {
+        "source": "atlas-r7-parts.md",
+        "chunk_id": 0,
+        "score": 0.07151597738265991
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 1,
+        "score": 0.030846327543258667
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 2,
+        "score": 0.0029356691520661116
+      }
+    ],
+    "pass": true,
+    "elapsed_s": 0.321
+  },
+  {
+    "event": "matrix_case",
+    "case": "split_bearing",
+    "repeat": 1,
+    "query": "Atlas-R7 送料轴承是什么型号？",
+    "expected": [
+      "atlas-r7-parts.md"
+    ],
+    "retained": [
+      {
+        "source": "atlas-r7-parts.md",
+        "chunk_id": 0,
+        "score": 0.9987106323242188
+      }
+    ],
+    "scores": [
+      {
+        "source": "atlas-r7-parts.md",
+        "chunk_id": 0,
+        "score": 0.9987106323242188
+      },
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.460991770029068
+      },
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.24065890908241272
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 1,
+        "score": 0.22663773596286774
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 0,
+        "score": 0.1927376389503479
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 2,
+        "score": 0.038705360144376755
+      }
+    ],
+    "pass": true,
+    "elapsed_s": 0.481
+  },
+  {
+    "event": "matrix_case",
+    "case": "absent_device",
+    "repeat": 1,
+    "query": "Luma-X9 水泵叶轮直径是多少毫米？",
+    "expected": [],
+    "retained": [],
+    "scores": [
+      {
+        "source": "atlas-r7-parts.md",
+        "chunk_id": 0,
+        "score": 0.0006727826548740268
+      },
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.0004817511944565922
+      },
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.0001689750060904771
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 1,
+        "score": 0.00012888490164186805
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 0,
+        "score": 0.000024243439838755876
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 2,
+        "score": 0.0000014468886320173624
+      }
+    ],
+    "pass": true,
+    "elapsed_s": 0.324
+  },
+  {
+    "event": "matrix_case",
+    "case": "absent_fact",
+    "repeat": 1,
+    "query": "Atlas-R7 主控芯片的时钟频率是多少 MHz？",
+    "expected": [],
+    "retained": [],
+    "scores": [
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.011967511847615242
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 0,
+        "score": 0.006314998958259821
+      },
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.001302821096032858
+      },
+      {
+        "source": "atlas-r7-parts.md",
+        "chunk_id": 0,
+        "score": 0.0012595922453328967
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 1,
+        "score": 0.0012574093416333199
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 2,
+        "score": 0.0002470052568241954
+      }
+    ],
+    "pass": true,
+    "elapsed_s": 0.328
+  },
+  {
+    "event": "matrix_case",
+    "case": "alarm_natural",
+    "repeat": 2,
+    "query": "Atlas-R7 出现 E731 后需要等待多久，按哪个颜色的复位按钮、按多久？",
+    "expected": [
+      "atlas-r7-operations.md"
+    ],
+    "retained": [
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.9964808821678162
+      },
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.9808006882667542
+      }
+    ],
+    "scores": [
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.9964808821678162
+      },
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.9808006882667542
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 1,
+        "score": 0.04735519737005234
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 0,
+        "score": 0.012989398092031479
+      },
+      {
+        "source": "atlas-r7-parts.md",
+        "chunk_id": 0,
+        "score": 0.0020156423561275005
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 2,
+        "score": 0.0020115594379603863
+      }
+    ],
+    "pass": true,
+    "elapsed_s": 0.321
+  },
+  {
+    "event": "matrix_case",
+    "case": "alarm_keywords",
+    "repeat": 2,
+    "query": "Atlas-R7 E731 等待时间 按钮颜色 按压时长",
+    "expected": [
+      "atlas-r7-operations.md"
+    ],
+    "retained": [
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.8560048937797546
+      }
+    ],
+    "scores": [
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.8560048937797546
+      },
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.2996690571308136
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 1,
+        "score": 0.21433395147323608
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 0,
+        "score": 0.014784310013055801
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 2,
+        "score": 0.014237327501177788
+      },
+      {
+        "source": "atlas-r7-parts.md",
+        "chunk_id": 0,
+        "score": 0.0013184889685362577
+      }
+    ],
+    "pass": true,
+    "elapsed_s": 0.323
+  },
+  {
+    "event": "matrix_case",
+    "case": "alarm_english",
+    "repeat": 2,
+    "query": "For Atlas-R7 E731, how long should I wait and which reset button should I hold for how many seconds?",
+    "expected": [
+      "atlas-r7-operations.md"
+    ],
+    "retained": [
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.9493553042411804
+      },
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.9298149347305298
+      }
+    ],
+    "scores": [
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.9493553042411804
+      },
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.9298149347305298
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 1,
+        "score": 0.20815840363502502
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 0,
+        "score": 0.018753625452518463
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 2,
+        "score": 0.0021139876917004585
+      },
+      {
+        "source": "atlas-r7-parts.md",
+        "chunk_id": 0,
+        "score": 0.0010618132073432207
+      }
+    ],
+    "pass": true,
+    "elapsed_s": 0.323
+  },
+  {
+    "event": "matrix_case",
+    "case": "boreal_natural",
+    "repeat": 2,
+    "query": "Boreal-T2 的 E731 表示什么故障，复位前要等待多少分钟？",
+    "expected": [
+      "boreal-t2-handbook.md"
+    ],
+    "retained": [
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.9975462555885315
+      },
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.9698348641395569
+      }
+    ],
+    "scores": [
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.9975462555885315
+      },
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.9698348641395569
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 1,
+        "score": 0.01326480321586132
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 0,
+        "score": 0.012745650485157967
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 2,
+        "score": 0.006184599362313747
+      },
+      {
+        "source": "atlas-r7-parts.md",
+        "chunk_id": 0,
+        "score": 0.002521907677873969
+      }
+    ],
+    "pass": true,
+    "elapsed_s": 0.32
+  },
+  {
+    "event": "matrix_case",
+    "case": "boreal_keywords",
+    "repeat": 2,
+    "query": "Boreal-T2 E731 故障含义 复位前等待时间",
+    "expected": [
+      "boreal-t2-handbook.md"
+    ],
+    "retained": [
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.893464982509613
+      },
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.516638994216919
+      }
+    ],
+    "scores": [
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.893464982509613
+      },
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.516638994216919
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 1,
+        "score": 0.17284713685512543
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 0,
+        "score": 0.03914807736873627
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 2,
+        "score": 0.025060880929231644
+      },
+      {
+        "source": "atlas-r7-parts.md",
+        "chunk_id": 0,
+        "score": 0.021922720596194267
+      }
+    ],
+    "pass": true,
+    "elapsed_s": 0.315
+  },
+  {
+    "event": "matrix_case",
+    "case": "parts_natural",
+    "repeat": 2,
+    "query": "Atlas-R7 备用电容的容量是多少？输送带厚度低于多少需要更换？",
+    "expected": [
+      "atlas-r7-parts.md"
+    ],
+    "retained": [
+      {
+        "source": "atlas-r7-parts.md",
+        "chunk_id": 0,
+        "score": 0.9981538653373718
+      },
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.9041671752929688
+      }
+    ],
+    "scores": [
+      {
+        "source": "atlas-r7-parts.md",
+        "chunk_id": 0,
+        "score": 0.9981538653373718
+      },
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.9041671752929688
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 1,
+        "score": 0.042269010096788406
+      },
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.030801838263869286
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 0,
+        "score": 0.006187079474329948
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 2,
+        "score": 0.0031091708224266768
+      }
+    ],
+    "pass": true,
+    "elapsed_s": 0.316
+  },
+  {
+    "event": "matrix_case",
+    "case": "parts_keywords",
+    "repeat": 2,
+    "query": "Atlas-R7 备用电容容量 输送带厚度 更换阈值",
+    "expected": [
+      "atlas-r7-parts.md"
+    ],
+    "retained": [
+      {
+        "source": "atlas-r7-parts.md",
+        "chunk_id": 0,
+        "score": 0.5058602690696716
+      }
+    ],
+    "scores": [
+      {
+        "source": "atlas-r7-parts.md",
+        "chunk_id": 0,
+        "score": 0.5058602690696716
+      },
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.2604106664657593
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 1,
+        "score": 0.12279555201530457
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 0,
+        "score": 0.017530174925923347
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 2,
+        "score": 0.0024234645534306765
+      },
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.0022185419220477343
+      }
+    ],
+    "pass": true,
+    "elapsed_s": 0.327
+  },
+  {
+    "event": "matrix_case",
+    "case": "parts_english",
+    "repeat": 2,
+    "query": "What is the spare capacitor capacity and minimum conveyor belt thickness for Atlas-R7?",
+    "expected": [
+      "atlas-r7-parts.md"
+    ],
+    "retained": [
+      {
+        "source": "atlas-r7-parts.md",
+        "chunk_id": 0,
+        "score": 0.9870365858078003
+      },
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.9516990184783936
+      }
+    ],
+    "scores": [
+      {
+        "source": "atlas-r7-parts.md",
+        "chunk_id": 0,
+        "score": 0.9870365858078003
+      },
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.9516990184783936
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 1,
+        "score": 0.18653035163879395
+      },
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.03836408630013466
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 0,
+        "score": 0.026086263358592987
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 2,
+        "score": 0.0005975313251838088
+      }
+    ],
+    "pass": true,
+    "elapsed_s": 0.317
+  },
+  {
+    "event": "matrix_case",
+    "case": "calibration_natural",
+    "repeat": 2,
+    "query": "Atlas-R7 校准标准块编号是什么，允许测量偏差是多少？",
+    "expected": [
+      "atlas-r7-operations.md"
+    ],
+    "retained": [
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.9994035959243774
+      },
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.9251006245613098
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 1,
+        "score": 0.7436133027076721
+      }
+    ],
+    "scores": [
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.9994035959243774
+      },
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.9251006245613098
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 1,
+        "score": 0.7436133027076721
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 0,
+        "score": 0.02866656705737114
+      },
+      {
+        "source": "atlas-r7-parts.md",
+        "chunk_id": 0,
+        "score": 0.0010434669675305486
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 2,
+        "score": 0.0006860714056529105
+      }
+    ],
+    "pass": true,
+    "elapsed_s": 0.32
+  },
+  {
+    "event": "matrix_case",
+    "case": "calibration_keywords",
+    "repeat": 2,
+    "query": "Atlas-R7 校准 标准块编号 测量偏差",
+    "expected": [
+      "atlas-r7-operations.md"
+    ],
+    "retained": [
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.994412362575531
+      },
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.7272076606750488
+      }
+    ],
+    "scores": [
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.994412362575531
+      },
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.7272076606750488
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 1,
+        "score": 0.23797497153282166
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 0,
+        "score": 0.14259536564350128
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 2,
+        "score": 0.0033223298378288746
+      },
+      {
+        "source": "atlas-r7-parts.md",
+        "chunk_id": 0,
+        "score": 0.0013168412260711193
+      }
+    ],
+    "pass": true,
+    "elapsed_s": 0.318
+  },
+  {
+    "event": "matrix_case",
+    "case": "interlock_natural",
+    "repeat": 2,
+    "query": "Atlas-R7 进料闸门全闭位置阈值和联锁延时分别是多少？",
+    "expected": [
+      "atlas-r7-interlock.md"
+    ],
+    "retained": [
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 1,
+        "score": 0.9997690320014954
+      }
+    ],
+    "scores": [
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 1,
+        "score": 0.9997690320014954
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 0,
+        "score": 0.04159756749868393
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 2,
+        "score": 0.0054083638824522495
+      },
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.0030398317612707615
+      },
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.0012033472303301096
+      },
+      {
+        "source": "atlas-r7-parts.md",
+        "chunk_id": 0,
+        "score": 0.00006584642687812448
+      }
+    ],
+    "pass": true,
+    "elapsed_s": 0.311
+  },
+  {
+    "event": "matrix_case",
+    "case": "cross_document",
+    "repeat": 2,
+    "query": "Atlas-R7 校准用什么标准块，送料轴承又是什么型号？",
+    "expected": [
+      "atlas-r7-operations.md",
+      "atlas-r7-parts.md"
+    ],
+    "retained": [
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.9969894289970398
+      },
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.6539740562438965
+      }
+    ],
+    "scores": [
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.9969894289970398
+      },
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.6539740562438965
+      },
+      {
+        "source": "atlas-r7-parts.md",
+        "chunk_id": 0,
+        "score": 0.09216904640197754
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 0,
+        "score": 0.04473716393113136
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 1,
+        "score": 0.0061817835085093975
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 2,
+        "score": 0.0015404974110424519
+      }
+    ],
+    "pass": false,
+    "elapsed_s": 0.315
+  },
+  {
+    "event": "matrix_case",
+    "case": "split_calibration",
+    "repeat": 2,
+    "query": "Atlas-R7 校准用什么标准块？",
+    "expected": [
+      "atlas-r7-operations.md"
+    ],
+    "retained": [
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.999779999256134
+      },
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.9783404469490051
+      }
+    ],
+    "scores": [
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.999779999256134
+      },
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.9783404469490051
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 0,
+        "score": 0.29765868186950684
+      },
+      {
+        "source": "atlas-r7-parts.md",
+        "chunk_id": 0,
+        "score": 0.07151597738265991
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 1,
+        "score": 0.030846327543258667
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 2,
+        "score": 0.0029356691520661116
+      }
+    ],
+    "pass": true,
+    "elapsed_s": 0.316
+  },
+  {
+    "event": "matrix_case",
+    "case": "split_bearing",
+    "repeat": 2,
+    "query": "Atlas-R7 送料轴承是什么型号？",
+    "expected": [
+      "atlas-r7-parts.md"
+    ],
+    "retained": [
+      {
+        "source": "atlas-r7-parts.md",
+        "chunk_id": 0,
+        "score": 0.9987106323242188
+      }
+    ],
+    "scores": [
+      {
+        "source": "atlas-r7-parts.md",
+        "chunk_id": 0,
+        "score": 0.9987106323242188
+      },
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.460991770029068
+      },
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.24065890908241272
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 1,
+        "score": 0.22663773596286774
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 0,
+        "score": 0.1927376389503479
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 2,
+        "score": 0.038705360144376755
+      }
+    ],
+    "pass": true,
+    "elapsed_s": 0.317
+  },
+  {
+    "event": "matrix_case",
+    "case": "absent_device",
+    "repeat": 2,
+    "query": "Luma-X9 水泵叶轮直径是多少毫米？",
+    "expected": [],
+    "retained": [],
+    "scores": [
+      {
+        "source": "atlas-r7-parts.md",
+        "chunk_id": 0,
+        "score": 0.0006727826548740268
+      },
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.0004817511944565922
+      },
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.0001689750060904771
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 1,
+        "score": 0.00012888490164186805
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 0,
+        "score": 0.000024243439838755876
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 2,
+        "score": 0.0000014468886320173624
+      }
+    ],
+    "pass": true,
+    "elapsed_s": 0.332
+  },
+  {
+    "event": "matrix_case",
+    "case": "absent_fact",
+    "repeat": 2,
+    "query": "Atlas-R7 主控芯片的时钟频率是多少 MHz？",
+    "expected": [],
+    "retained": [],
+    "scores": [
+      {
+        "source": "atlas-r7-operations.md",
+        "chunk_id": 0,
+        "score": 0.011967511847615242
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 0,
+        "score": 0.006314998958259821
+      },
+      {
+        "source": "boreal-t2-handbook.md",
+        "chunk_id": 0,
+        "score": 0.001302821096032858
+      },
+      {
+        "source": "atlas-r7-parts.md",
+        "chunk_id": 0,
+        "score": 0.0012595922453328967
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 1,
+        "score": 0.0012574093416333199
+      },
+      {
+        "source": "atlas-r7-interlock.md",
+        "chunk_id": 2,
+        "score": 0.0002470052568241954
+      }
+    ],
+    "pass": true,
+    "elapsed_s": 0.325
+  },
+  {
+    "event": "matrix_summary",
+    "positive_runs": 28,
+    "all_expected_sources_retained": 26,
+    "negative_runs": 4,
+    "negative_empty": 4
+  }
+]

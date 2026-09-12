@@ -1,10 +1,10 @@
 document.addEventListener('DOMContentLoaded', async () => {
   let attachedImage = null;
   let currentChatId = '';
-  // 轻量聊天的多轮历史(user/assistant 交替);带给后端做上下文 + 记忆抽取。
-  // 只保留最近若干轮,防无限增长(图片消息不入历史,避免 base64 累积撑爆请求)。
+  // 仅兼容直连模式使用前端历史；本项目后端由服务端管理上下文。
   let chatMessages = [];
-  const MAX_CHAT_HISTORY_MESSAGES = 20;
+  const serverContextBases = new Set();
+  const sessionSequences = new Map();
   const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
   const MAX_IMAGE_PIXELS = 20_000_000;
   const MAX_URL_LENGTH = 2048;
@@ -547,7 +547,11 @@ document.addEventListener('DOMContentLoaded', async () => {
         (response) => {
           const runtimeError = chrome.runtime.lastError;
           if (runtimeError) { reject(new Error(runtimeError.message || '后台请求失败')); return; }
-          if (!response?.ok) { reject(new Error(response?.error || '后台请求失败')); return; }
+          if (!response?.ok) {
+            const error = new Error(response?.error || '后台请求失败');
+            error.status = response?.status;
+            reject(error); return;
+          }
           resolve(response.body);
         }
       );
@@ -1245,6 +1249,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
     if (!(await ensurePrivacyNoticeAccepted())) return;
 
+    if (await supportsServerContext(safeApiUrl)) {
+      await runServerChat(text, image, search_query, { apiKey, modelName, safeApiUrl });
+      return;
+    }
+
     const safeModelName = String(modelName || '').trim() || 'gpt-4o';
 
     // 用户气泡
@@ -1353,6 +1362,137 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
 
+  async function supportsServerContext(base) {
+    if (serverContextBases.has(base)) return true;
+    try {
+      const data = await callBackendApi(buildBackendEndpointUrl(base, '/v1/sessions/capabilities'));
+      if (data?.server_context === true && data.protocol_version === 1) {
+        serverContextBases.add(base);
+        return true;
+      }
+    } catch {}
+    return false;
+  }
+
+  function addRequestRecovery(container, base, chatId, requestId, originalBody = null) {
+    const button = document.createElement('button');
+    button.type = 'button'; button.className = 'tool-btn';
+    button.textContent = '检查状态 / 重试';
+    button.addEventListener('click', async () => {
+      if (_sendingLock) return;
+      if (currentChatId !== chatId) { alert('请先打开此请求所属的会话。'); return; }
+      _sendingLock = true;
+      button.disabled = true;
+      try {
+        let state;
+        try {
+          state = await callBackendApi(buildBackendEndpointUrl(base,
+            `/v1/sessions/${encodeURIComponent(chatId)}/requests/${encodeURIComponent(requestId)}`));
+        } catch (error) {
+          if (error.status !== 404 || !originalBody) throw error;
+          state = { can_retry: true, last_seq: originalBody.expected_last_seq };
+        }
+        sessionSequences.set(`${base}|${chatId}`, state.last_seq);
+        if (state.status === 'completed') {
+          await resumeSession(chatId);
+        } else if (state.status === 'running') {
+          alert('后端仍在处理此请求，暂不重复提交，请稍后检查。');
+        } else if (state.can_retry) {
+          const body = originalBody || state.retry_request;
+          if (!body) { alert('此请求包含未保存的图片，请重新提供图片后发送。'); return; }
+          const settings = await resolveApiRequestConfig();
+          if (settings.safeApiUrl !== base) { alert('后端地址已改变，请切回原地址后重试。'); return; }
+          if (currentChatId !== chatId) { alert('当前会话已改变，请回到原会话后重试。'); return; }
+          await runServerChat('', null, '', settings, body);
+        } else {
+          alert('此失败请求后已有其他消息，请作为新问题重新发送。');
+        }
+      } catch (error) {
+        alert('无法确认请求状态: ' + (error.message || error));
+      } finally { button.disabled = false; _sendingLock = false; }
+    });
+    container.appendChild(button);
+  }
+
+  async function runServerChat(text, image, searchQuery, settings, retryBody = null) {
+    const { apiKey, modelName, safeApiUrl: base } = settings;
+    const chatId = retryBody?.chat_id || await getOrCreateCurrentChatId();
+    const key = `${base}|${chatId}`;
+    let body;
+    try {
+      if (!sessionSequences.has(key)) {
+        const state = await callBackendApi(buildBackendEndpointUrl(base, `/v1/sessions/${encodeURIComponent(chatId)}/messages?limit=1`));
+        sessionSequences.set(key, state.last_seq);
+      }
+      body = retryBody || {
+        context_mode: 'server', chat_id: chatId, request_id: createMessageId(),
+        expected_last_seq: sessionSequences.get(key), model: String(modelName).trim(), stream: true,
+        kb_id: window._kbBoundId || '', search_query: searchQuery,
+        messages: [{ role: 'user', content: image ? [
+          { type: 'text', text: text || '请分析这张图片' }, { type: 'image_url', image_url: { url: image } }
+        ] : text }],
+      };
+    } catch (error) {
+      document.getElementById('chatInput').value = text;
+      if (image) applyAttachedImage({ dataUrl: image, name: '待发送图片' });
+      alert('无法同步会话，尚未提交: ' + error.message);
+      return;
+    }
+    if (!retryBody) {
+      const user = createMessageNode('user');
+      user.dataset.requestId = body.request_id;
+      const label = document.createElement('div'); label.textContent = text;
+      user.appendChild(label);
+      if (image) {
+        const preview = document.createElement('img'); preview.className = 'user-upload-preview';
+        preview.src = image; preview.alt = '本轮图片'; user.appendChild(preview);
+      }
+    }
+    const bubble = createMessageNode('ai');
+    bubble.dataset.requestId = body.request_id;
+    const content = document.createElement('div'); content.className = 'markdown-body'; bubble.appendChild(content);
+    const streamer = createMarkdownStreamer(content);
+    const msgId = createMessageId();
+    let reply = ''; let meta = null; let sources = []; let done = false;
+    await new Promise(resolve => {
+      const finish = (error = '') => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        chrome.runtime.onMessage.removeListener(listener);
+        if (reply) streamer.finalize(reply); else streamer.cancel();
+        if (meta?.persisted && !error) {
+          sessionSequences.set(key, meta.last_seq);
+          if (sources.length) renderSearchCitations(bubble, sources);
+        } else {
+          const status = document.createElement('div'); status.className = 'error-text';
+          status.textContent = `未确认保存：${error || '连接已结束，但没有收到保存确认'}`;
+          bubble.appendChild(status);
+          addRequestRecovery(bubble, base, chatId, body.request_id, body);
+        }
+        resolve();
+      };
+      const listener = msg => {
+        if (msg.msgId !== msgId) return;
+        if (msg.type === 'LLM_CHUNK') { reply += msg.chunk; streamer.update(reply); scrollToBottom(); }
+        else if (msg.type === 'LLM_SESSION_META') meta = msg.session_meta;
+        else if (msg.type === 'LLM_ENHANCEMENT_STEP') {
+          updateEnhancementCard(bubble, msg.step);
+          if (msg.step.status === 'done') sources.push(...(msg.step.sources || []));
+        } else if (msg.type === 'LLM_ERROR') finish(msg.error);
+        else if (msg.type === 'LLM_DONE') finish();
+      };
+      const timer = setTimeout(() => finish('等待超时，请检查后端状态'), 605000);
+      chrome.runtime.onMessage.addListener(listener);
+      const headers = { 'Content-Type': 'application/json' };
+      if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+      chrome.runtime.sendMessage({ type: 'CALL_LLM_STREAM', msgId, url: `${base}/chat/completions`,
+        options: { method: 'POST', headers, body: JSON.stringify(body) } }, () => {
+          if (chrome.runtime.lastError) finish(chrome.runtime.lastError.message);
+        });
+    });
+  }
+
   // ── 会话历史(抽屉:列表 / 续谈 / 重命名 / 删除)──
 
   async function backendBase() {
@@ -1419,12 +1559,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
-  async function resumeSession(chatId) {
+  async function resumeSession(chatId, beforeSeq = null) {
     let base;
     try { base = await backendBase(); } catch { return; }
     let data;
     try {
-      data = await callBackendApi(buildBackendEndpointUrl(base, `/v1/sessions/${encodeURIComponent(chatId)}/messages`), 'GET');
+      const managed = await supportsServerContext(base);
+      const query = managed ? `?limit=100${beforeSeq ? `&before_seq=${beforeSeq}` : ''}` : '';
+      data = await callBackendApi(buildBackendEndpointUrl(base, `/v1/sessions/${encodeURIComponent(chatId)}/messages${query}`), 'GET');
     } catch (e) {
       alert('载入会话失败: ' + (e?.message || ''));
       return;
@@ -1437,22 +1579,37 @@ document.addEventListener('DOMContentLoaded', async () => {
     await chrome.storage.session.set({ [CURRENT_CHAT_ID_KEY]: chatId });
     // chatMessages 用于发给 LLM:摘要 + tail 原文
     chatMessages = [];
-    if (summary) {
+    const managed = serverContextBases.has(base);
+    if (managed) sessionSequences.set(`${base}|${chatId}`, data.last_seq);
+    if (summary && !managed) {
       chatMessages.push({ role: 'system', content: '## 本会话此前摘要\n' + summary });
     }
-    const tail = summaryMsgCount > 0 ? messages.slice(summaryMsgCount) : messages;
+    const tail = managed ? [] : summaryMsgCount > 0 ? messages.slice(summaryMsgCount) : messages;
     for (const m of tail) {
       chatMessages.push({ role: m.role, content: m.content });
     }
     // DOM 全量渲染(用户看得到完整历史)
     const historyEl = document.getElementById('chatHistory');
+    const oldNodes = beforeSeq ? Array.from(historyEl.children).filter(node => node.id !== 'loadOlderMessages') : [];
     historyEl.replaceChildren();
+    if (data.has_more) {
+      const more = document.createElement('button'); more.id = 'loadOlderMessages'; more.type = 'button';
+      more.className = 'tool-btn'; more.textContent = '加载更早消息';
+      more.addEventListener('click', () => resumeSession(chatId, data.before_seq));
+      historyEl.appendChild(more);
+    }
     for (const m of messages) {
       const bubble = createMessageNode(m.role === 'user' ? 'user' : 'ai');
+      if (m.request_id) bubble.dataset.requestId = m.request_id;
       if (m.role === 'user') {
         const node = document.createElement('div');
         node.textContent = m.content;
         bubble.appendChild(node);
+        if (managed && m.request_id && m.status !== 'completed') {
+          const state = document.createElement('div'); state.textContent = `请求状态：${m.status}`;
+          bubble.appendChild(state);
+          addRequestRecovery(bubble, base, chatId, m.request_id);
+        }
       } else {
         // AI 消息:先渲染工具调用步骤(如果有),再渲染正文 + 引用面板
         let toolSteps = [];
@@ -1480,7 +1637,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
       }
     }
-    scrollToBottom();
+    for (const node of oldNodes) historyEl.appendChild(node);
+    if (!beforeSeq) scrollToBottom();
     closeDrawer();
   }
 
@@ -2927,10 +3085,13 @@ document.addEventListener('DOMContentLoaded', async () => {
   async function loadKBs() {
     try {
       const res = await fetch(`${API_BASE}/v1/kb`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       kbs = await res.json();
       renderKBList();
+      return true;
     } catch (err) {
       console.error('加载知识库失败:', err);
+      return false;
     }
   }
 
@@ -2949,6 +3110,18 @@ document.addEventListener('DOMContentLoaded', async () => {
       </div>`;
     }).join('');
   }
+
+  document.getElementById('kbRefreshBtn')?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    btn.textContent = '刷新中…';
+    try {
+      const loaded = viewMode === 'trash' ? await loadTrash() : await loadKBs();
+      btn.textContent = loaded ? '↻ 刷新' : '刷新失败，重试';
+    } finally {
+      btn.disabled = false;
+    }
+  });
 
   document.getElementById('createKbBtn')?.addEventListener('click', async () => {
     const name = prompt('知识库名称:');
@@ -3121,10 +3294,13 @@ document.addEventListener('DOMContentLoaded', async () => {
   async function loadTrash() {
     try {
       const res = await fetch(`${API_BASE}/v1/kb/trash`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       trashKbs = await res.json();
       renderTrashList();
+      return true;
     } catch (err) {
       console.error('加载回收站失败:', err);
+      return false;
     }
   }
 

@@ -25,13 +25,13 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Optional, Sequence, Literal
 
 from dotenv import load_dotenv
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse, JSONResponse
 from openai import OpenAI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from observability.logger import get_logger
 
@@ -70,6 +70,9 @@ class ChatRequest(BaseModel):
     chat_id: str = ""          # 前端会话标识(可选,用于日志关联)
     search_query: str = ""     # 手动搜索:非空时直接搜→注入→LLM(不走 function calling)
     kb_id: str = ""            # 当前绑定的知识库 id(前端 chip 选中后传入)
+    context_mode: Literal['client', 'server'] = 'client'
+    request_id: str = ''
+    expected_last_seq: int | None = Field(default=None, ge=0)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -673,6 +676,14 @@ def sync_chat(model: str, messages: list[dict[str, Any]],
 @router.post("/chat/completions")
 def chat_completions(item: ChatRequest):
     """OpenAI 兼容对话端点 + 长期记忆注入 + 上下文压缩 + 联网搜索 + KB 检索。"""
+    if item.context_mode == 'server':
+        from api.server_chat import handle
+        return handle(item)
+    if item.chat_id:
+        from storage import chat_store
+        session = chat_store.get_session(item.chat_id)
+        if session and session['context_mode'] == 'server':
+            return JSONResponse(status_code=409, content={'error': {'code': 'server_context_required'}})
     messages = _prepare_messages(item)
     user_text = _extract_last_user_text(item.messages)
     _chat_log.info("chat_request", data={

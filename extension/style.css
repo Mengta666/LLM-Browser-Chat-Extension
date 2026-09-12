@@ -797,7 +797,7 @@ input { width: 100%; padding: 8px; margin-top: 5px; box-sizing: border-box; bord
 .search-source-num { font-weight: 600; margin-right: 4px; }
 
 /* ── 知识库(批次 G)── */
-.kb-header { display: flex; align-items: center; justify-content: space-between; padding: 12px 16px; border-bottom: 1px solid var(--app-border, #dce3ea); }
+.kb-header { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; padding: 12px 16px; border-bottom: 1px solid var(--app-border, #dce3ea); }
 .kb-header h3 { font-size: 15px; font-weight: 600; margin: 0; }
 .kb-cards { display: flex; flex-wrap: wrap; gap: 8px; padding: 12px 16px; }
 .kb-card { border: 1px solid var(--app-border, #dce3ea); border-radius: 6px; padding: 10px 12px; cursor: pointer; min-width: 140px; transition: all 0.2s; }
@@ -824,7 +824,8 @@ input { width: 100%; padding: 8px; margin-top: 5px; box-sizing: border-box; bord
 .doc-delete:hover { text-decoration: underline; }
 
 /* 回收站 */
-.kb-header-actions { display: flex; gap: 8px; }
+.kb-header-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.kb-header-actions .tool-btn:disabled { opacity: 0.65; cursor: not-allowed; }
 .tool-btn.kb-trash-btn { color: #C0392B; border-color: #C0392B; background: none; }
 .tool-btn.kb-trash-btn:hover { background: #C0392B; color: #fff; }
 .kb-card.trash { border-color: #d0d5da; background: #fafafa; opacity: 0.85; }

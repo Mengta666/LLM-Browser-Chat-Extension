@@ -157,8 +157,9 @@ async function handleCallLlmStream(request) {
     sendLlmMessage(msgId, 'LLM_ERROR', { error: 'API 请求体为空或过大' });
     return;
   }
+  let parsedBody;
   try {
-    JSON.parse(body);
+    parsedBody = JSON.parse(body);
   } catch {
     sendLlmMessage(msgId, 'LLM_ERROR', { error: 'API 请求体不是有效 JSON' });
     return;
@@ -173,7 +174,7 @@ async function handleCallLlmStream(request) {
     redirect: 'error',
     headers: requestHeaders,
     body,
-    signal: AbortSignal.timeout(120000)
+    signal: AbortSignal.timeout(parsedBody.context_mode === 'server' ? 600000 : 120000)
   });
 
   if (!response.ok) {
@@ -185,6 +186,10 @@ async function handleCallLlmStream(request) {
   const contentType = response.headers.get('content-type') || '';
   if (!/text\/event-stream|text\/plain/i.test(contentType)) {
     const dataObj = await response.json();
+    if (dataObj.session_meta) sendLlmMessage(msgId, 'LLM_SESSION_META', { session_meta: dataObj.session_meta });
+    for (const step of dataObj.enhancement_steps || []) {
+      sendLlmMessage(msgId, 'LLM_ENHANCEMENT_STEP', { step });
+    }
     const content = extractChunkText(dataObj);
     if (content) {
       sendLlmMessage(msgId, 'LLM_CHUNK', { chunk: content });
@@ -217,6 +222,12 @@ async function handleCallLlmStream(request) {
       }
       try {
         const parsed = JSON.parse(dataStr);
+        if (parsed.session_meta) sendLlmMessage(msgId, 'LLM_SESSION_META', { session_meta: parsed.session_meta });
+        if (parsed.error || parsed.choices?.some(choice => choice.finish_reason === 'error')) {
+          sendLlmMessage(msgId, 'LLM_ERROR', { error: parsed.error?.code || '后端处理失败，请检查会话状态后重试' });
+          await reader.cancel();
+          return;
+        }
         // 联网搜索:识别 search_results 自定义字段,转发给前端渲染引用面板
         if (parsed.search_results) {
           sendLlmMessage(msgId, 'LLM_SEARCH_RESULTS', { search_results: parsed.search_results });
@@ -252,6 +263,7 @@ async function getResponseErrorMessage(response) {
   try {
     const parsed = JSON.parse(trimmedText);
     return parsed?.error?.message
+      || parsed?.error?.code
       || parsed?.message
       || parsed?.detail
       || trimmedText
@@ -365,7 +377,9 @@ async function handleCallBackendApi(request) {
   const response = await fetch(url, fetchOptions);
   if (!response.ok) {
     const errorMessage = await getResponseErrorMessage(response);
-    throw new Error(`请求失败 (${response.status})：${errorMessage}`);
+    const error = new Error(`请求失败 (${response.status})：${errorMessage}`);
+    error.status = response.status;
+    throw error;
   }
   return response.json();
 }
@@ -388,7 +402,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === 'CALL_BACKEND_API') {
     handleCallBackendApi(request)
       .then((body) => sendResponse({ ok: true, body }))
-      .catch((error) => sendResponse({ ok: false, error: error?.message || '未知错误' }));
+      .catch((error) => sendResponse({ ok: false, error: error?.message || '未知错误', status: error?.status }));
     return true;
   }
 

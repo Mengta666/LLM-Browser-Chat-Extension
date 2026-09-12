@@ -23,7 +23,9 @@ def run_agentic_loop(
     *,
     max_rounds: int = None,
     chat_id: str = "",
-    stream: bool = False
+    stream: bool = False,
+    enforce_budget: bool = False,
+    start_index: int = 1,
 ) -> Generator[dict, None, None]:
     """
     Agentic loop: 循环调用 LLM 直到不再请求工具（对齐 Anthropic）。
@@ -45,7 +47,7 @@ def run_agentic_loop(
         max_rounds = AGENTIC_MAX_ROUNDS
 
     working_messages = list(messages)
-    citation_index = 1
+    citation_index = start_index
     all_steps = []  # 收集所有工具调用步骤(供持久化)
 
     for round_idx in range(max_rounds):
@@ -69,12 +71,18 @@ def run_agentic_loop(
 
         # 3. 调用 LLM（非流式，中间轮需判断 tool_calls）
         try:
+            extra = {}
+            if enforce_budget:
+                from agent.memory import chat_context, config
+                chat_context.check_budget(working_messages, call_tools)
+                extra['max_tokens'] = config.CHAT_MAX_OUTPUT_TOKENS
             resp = _llm_client.chat.completions.create(
                 model=model,
                 messages=working_messages,
                 tools=call_tools,
                 stream=False,
-                timeout=CHAT_LLM_TIMEOUT
+                timeout=CHAT_LLM_TIMEOUT,
+                **extra,
             )
         except Exception as exc:
             _chat_log.error("agentic_llm_failed", session_id=chat_id, data={
@@ -85,6 +93,9 @@ def run_agentic_loop(
             return
 
         msg = resp.choices[0].message
+        if enforce_budget and resp.choices[0].finish_reason == 'length':
+            yield {'type': 'error', 'content': 'model_output_truncated'}
+            return
         has_tool_calls = bool(msg.tool_calls)
 
         # 4. 无 tool_call → 最终回答，结束循环

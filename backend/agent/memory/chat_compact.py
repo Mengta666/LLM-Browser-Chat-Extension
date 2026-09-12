@@ -20,6 +20,7 @@ from openai import OpenAI
 from agent.memory.config import (
     CHAT_COMPACT_KEEP_PAIRS,
     CHAT_COMPACT_SUMMARY_MAX_TOKENS,
+    CHAT_COMPACT_MAX_OUTPUT_TOKENS,
     CHAT_CONTEXT_LENGTH,
     CHAT_COMPACT_TRIGGER_RATIO,
     CHAT_COMPACT_HARD_RATIO,
@@ -91,7 +92,10 @@ def _summarize_llm(system_prompt: str, user_prompt: str) -> str:
                 {"role": "user", "content": user_prompt},
             ],
             timeout=90,
+            max_tokens=CHAT_COMPACT_MAX_OUTPUT_TOKENS,
         )
+        if resp.choices[0].finish_reason == 'length':
+            return ''
         return (resp.choices[0].message.content or "").strip()
     except Exception as exc:
         _log.error("compact_llm_failed", data={"error": str(exc)[:200]})
@@ -111,7 +115,7 @@ def _build_compact_user_prompt(prev_summary: str, evicted_msgs: list[dict]) -> s
         role = "用户" if m.get("role") == "user" else "助手"
         content = str(m.get("content", "")).strip()
         if content:
-            parts.append(f"{role}:{content[:2000]}")
+            parts.append(f"{role}:{content}")
 
     parts.append("")
     parts.append("请输出 5 段结构化摘要。")
@@ -151,7 +155,7 @@ def compact_chat(chat_id: str, *, force: bool = False) -> dict[str, Any]:
 
     t0 = time.time()
     try:
-        all_msgs = chat_store.get_messages(chat_id, limit=5000)
+        all_msgs = chat_store.get_messages(chat_id)
         prev = chat_store.get_summary(chat_id)
         n = len(all_msgs)
 

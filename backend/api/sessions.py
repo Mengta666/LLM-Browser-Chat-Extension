@@ -6,7 +6,7 @@
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from storage import chat_store as CS
@@ -31,11 +31,36 @@ def list_sessions() -> dict[str, Any]:
     return {"sessions": sessions, "count": len(sessions)}
 
 
+@router.get('/capabilities')
+def capabilities():
+    return {'server_context': True, 'protocol_version': 1}
+
+
+@router.get('/{chat_id}/requests/{request_id}')
+def get_request(chat_id: str, request_id: str):
+    try:
+        session = CS.get_session(chat_id)
+        result = CS.get_request(chat_id, request_id) if session and not session['deleted_at'] else None
+    except Exception:
+        raise HTTPException(503, 'history_unavailable')
+    if not session or session['deleted_at']:
+        raise HTTPException(404, 'session_not_found')
+    if not result:
+        raise HTTPException(404, 'request_not_found')
+    return result
+
+
 @router.get("/{chat_id}/messages")
-def get_session_messages(chat_id: str) -> dict[str, Any]:
+def get_session_messages(chat_id: str, before_seq: int | None = Query(None, ge=1),
+                         limit: int | None = Query(None, ge=1, le=200)) -> dict[str, Any]:
     """载入某会话的消息(时间正序,供续谈重建对话)。含会话摘要(如有)供前端恢复上下文。"""
     try:
+        session = CS.get_session(chat_id)
+        if limit is not None or before_seq is not None or (session and session['context_mode'] == 'server'):
+            return CS.message_page(chat_id, before_seq, limit or 100)
         messages = CS.get_messages(chat_id)
+    except CS.SessionError as exc:
+        raise HTTPException(exc.status, exc.code)
     except Exception as exc:
         raise HTTPException(503, f"会话历史不可用: {str(exc)[:160]}")
     # 会话摘要(上下文压缩产物)
@@ -49,6 +74,10 @@ def get_session_messages(chat_id: str) -> dict[str, Any]:
         "count": len(messages),
         "summary": summary_info.get("summary", ""),
         "summary_msg_count": summary_info.get("msg_count", 0),
+        'last_seq': session['last_seq'] if session else 0,
+        'context_mode': session['context_mode'] if session else 'client',
+        'active_request_id': session['active_request_id'] if session else '',
+        'has_more': False,
     }
 
 
@@ -70,6 +99,8 @@ def delete_session(chat_id: str) -> dict[str, Any]:
     """软删会话(消息保留可回溯)。"""
     try:
         ok = CS.soft_delete(chat_id)
+    except CS.SessionError as exc:
+        raise HTTPException(exc.status, exc.code)
     except Exception as exc:
         raise HTTPException(503, f"删除失败: {str(exc)[:160]}")
     if not ok:

@@ -718,7 +718,8 @@ async function cdpGatherTrees(target) {
     const css = m.cssVisualViewport && (m.cssVisualViewport.clientWidth);
     if (css && dev && css > 0) dpr = dev / css;
   }
-  return { snapshot: snap.value, domTree: dom.value, devicePixelRatio: dpr };
+  return { snapshot: snap.value, domTree: dom.value, devicePixelRatio: dpr,
+    metrics: metrics.status === 'fulfilled' ? metrics.value : null };
 }
 
 function settleOne(p) {
@@ -726,7 +727,7 @@ function settleOne(p) {
                 (e) => ({ status: 'rejected', reason: e }));
 }
 
-// 建 snapshot lookup：{ backendNodeId -> { bounds(÷DPR), clientRects, scrollRects,
+// 建 snapshot lookup：{ backendNodeId -> { bounds(÷DPR), clientRects,
 //   computedStyles, paintOrder, isClickable } }（enhanced_snapshot.py build_snapshot_lookup）。
 function buildSnapshotLookup(snapshot, dpr) {
   const lookup = new Map();
@@ -752,23 +753,23 @@ function buildSnapshotLookup(snapshot, dpr) {
     const stylesArr = layout.styles || [];
     const paintOrders = layout.paintOrders || [];
     const clientRects = layout.clientRects || [];
-    const scrollRects = layout.scrollRects || [];
 
     for (const [backendId, snapIdx] of backendToSnapIdx.entries()) {
       const isClickable = clickableSet.has(snapIdx);
       const li = layoutIndexMap.get(snapIdx);
-      const entry = { isClickable, bounds: null, clientRects: null, scrollRects: null,
+      const entry = { isClickable, bounds: null, clientRects: null,
+                      frameId: strings[doc.frameId] || null,
+                      scrollX: (doc.scrollOffsetX || 0) / dpr,
+                      scrollY: (doc.scrollOffsetY || 0) / dpr,
                       computedStyles: {}, paintOrder: null };
       if (li !== undefined) {
-        // ★ 陷阱②：bounds ÷ DPR 转 CSS；client/scroll rects 不除。
+        // 快照 bounds 与文档滚动同尺度；clientRects 已是 CSS 客户区数据。
         const b = bounds[li];
         if (Array.isArray(b) && b.length >= 4) {
           entry.bounds = { x: b[0] / dpr, y: b[1] / dpr, width: b[2] / dpr, height: b[3] / dpr };
         }
         const cr = clientRects[li];
         if (Array.isArray(cr) && cr.length >= 4) entry.clientRects = { x: cr[0], y: cr[1], width: cr[2], height: cr[3] };
-        const sr = scrollRects[li];
-        if (Array.isArray(sr) && sr.length >= 4) entry.scrollRects = { x: sr[0], y: sr[1], width: sr[2], height: sr[3] };
         // ★ 陷阱④：layout.styles[li] 是字符串索引数组，按 REQUIRED_COMPUTED_STYLES 顺序映射。
         const st = stylesArr[li];
         if (Array.isArray(st)) {
@@ -799,17 +800,19 @@ function constructEnhancedTree(domRoot, snapshotLookup, opts) {
   const allNodes = [];                     // 扁平列表，供 serialize 遍历
   const pendingCrossOrigin = [];           // 跨源 iframe 待处理：{ hostNode, frameId, offset }
 
-  function build(cdpNode, totalFrameOffset) {
+  function build(cdpNode, totalFrameOffset, frameViewport) {
     if (cdpNode == null) return null;
     if (nodeByNodeId.has(cdpNode.nodeId)) return nodeByNodeId.get(cdpNode.nodeId);
 
     const attributes = parseFlatAttributes(cdpNode.attributes);
     const snap = snapshotLookup.get(cdpNode.backendNodeId) || null;
-    let absolutePosition = null;
+    let absolutePosition = null, viewportRect = null;
     if (snap && snap.bounds) {
+      viewportRect = { x: snap.bounds.x - snap.scrollX, y: snap.bounds.y - snap.scrollY,
+        width: snap.bounds.width, height: snap.bounds.height };
       absolutePosition = {
-        x: snap.bounds.x + totalFrameOffset.x,
-        y: snap.bounds.y + totalFrameOffset.y,
+        x: viewportRect.x + totalFrameOffset.x,
+        y: viewportRect.y + totalFrameOffset.y,
         width: snap.bounds.width, height: snap.bounds.height,
       };
     }
@@ -820,10 +823,11 @@ function constructEnhancedTree(domRoot, snapshotLookup, opts) {
       nodeName: cdpNode.nodeName || '',
       nodeValue: cdpNode.nodeValue || '',
       attributes,
-      frameId: cdpNode.frameId || null,
+      frameId: cdpNode.frameId || (snap && snap.frameId) || null,
       snapshot: snap,
       ax: axByBackend ? (axByBackend.get(cdpNode.backendNodeId) || null) : null,
       absolutePosition,
+      viewportRect,
       isVisible: false,
       isInteractive: false,
       hasJsClickListener: jsClickIds.has(cdpNode.backendNodeId),
@@ -832,25 +836,25 @@ function constructEnhancedTree(domRoot, snapshotLookup, opts) {
       parent: null,
       children: [],
       selectorIndex: null,
-      _viewport: viewport,
+      _viewport: frameViewport,
+      _frameOffset: totalFrameOffset,
       sessionId: ctxSessionId,             // Phase 4：本节点所属 CDP session（OOPIF 定位用）
       targetId: ctxTargetId,
     };
     nodeByNodeId.set(cdpNode.nodeId, node);
     allNodes.push(node);
 
-    // 可见性 + 可交互（依赖 hasJsClickListener / ax / _viewport，均已在上方设好）。
-    node.isVisible = isVisibleCss(node);
-    node.isInteractive = isInteractive(node);
-
-    // 帧偏移累加（service.py:878）：进入本节点的子树时的偏移。
-    // HTML frame（有 frameId）→ 减 scrollRects；IFRAME/FRAME（有 bounds）→ 加 bounds。
+    // 文档滚动已在 viewportRect 中扣除；进入 iframe 时只累加内容区原点。
     let childOffset = totalFrameOffset;
+    let childViewport = frameViewport;
     const nm = (cdpNode.nodeName || '').toUpperCase();
-    if (nm === 'HTML' && cdpNode.frameId && snap && snap.scrollRects) {
-      childOffset = { x: totalFrameOffset.x - snap.scrollRects.x, y: totalFrameOffset.y - snap.scrollRects.y };
-    } else if ((nm === 'IFRAME' || nm === 'FRAME') && snap && snap.bounds) {
-      childOffset = { x: totalFrameOffset.x + snap.bounds.x, y: totalFrameOffset.y + snap.bounds.y };
+    if ((nm === 'IFRAME' || nm === 'FRAME') && absolutePosition) {
+      const client = snap.clientRects;
+      childOffset = { x: absolutePosition.x + (client ? client.x : 0),
+        y: absolutePosition.y + (client ? client.y : 0) };
+      if (client && client.width > 0 && client.height > 0) {
+        childViewport = { width: client.width, height: client.height };
+      }
     }
 
     // 跨源 iframe：无 contentDocument（同进程拿不到内容）→ 记为待处理，交 handleAgentObserve
@@ -866,13 +870,17 @@ function constructEnhancedTree(domRoot, snapshotLookup, opts) {
     if (cdpNode.contentDocument) kids.push(cdpNode.contentDocument);
     if (Array.isArray(cdpNode.shadowRoots)) kids.push(...cdpNode.shadowRoots);
     for (const child of kids) {
-      const childNode = build(child, childOffset);
+      const childNode = build(child, childOffset, childViewport);
       if (childNode) { childNode.parent = node; node.children.push(childNode); }
     }
     return node;
   }
 
-  const root = build(domRoot, initialOffset);
+  const root = build(domRoot, initialOffset, viewport);
+  for (const node of allNodes) {
+    node.isVisible = isVisibleCss(node);
+    node.isInteractive = isInteractive(node);
+  }
   return { root, allNodes, pendingCrossOrigin };
 }
 
@@ -940,6 +948,7 @@ function bboxExempt(node) {
   if (KEEP_TAGS.has(tag)) return true;
   if (isPropagating(node)) return true;
   const attrs = node.attributes || {};
+  if (hasExplicitClick(node)) return true;
   if (attrs.onclick !== undefined) return true;
   if (attrs['aria-label'] && attrs['aria-label'].trim()) return true;
   const role = attrs.role || (node.ax && node.ax.role) || '';
@@ -951,7 +960,9 @@ function isPropagating(node) {
   const tag = (node.nodeName || '').toLowerCase();
   if (PROPAGATING_TAGS.has(tag)) return true;
   const role = (node.attributes && node.attributes.role) || (node.ax && node.ax.role) || '';
-  return PROPAGATING_ROLES.has(role);
+  const attrs = node.attributes || {};
+  return PROPAGATING_ROLES.has(role) ||
+    (hasExplicitClick(node) && !!(attrs.title || attrs['aria-label'] || (node.ax && node.ax.name)));
 }
 
 // 后代 box 被祖先 box 覆盖的面积占比（后代面积为分母）。
@@ -978,7 +989,9 @@ function applyBoundingBoxFilter(allNodes) {
       for (const c of d.children) stack.push(c);
       if (d === node || !d.isInteractive || !d.isVisible || d.excludedByParent) continue;
       if (bboxExempt(d)) continue;               // 5 条豁免:表单控件/传播容器/onclick/aria-label/交互role
-      if (d.absolutePosition && containmentRatio(d.absolutePosition, pbox) >= CONTAINMENT_THRESHOLD) {
+      // 行内包装元素的行框可能比内部 SVG 矮；纯装饰 SVG 不要求 99% 几何包含。
+      const decorativeSvg = (d.nodeName || '').toLowerCase() === 'svg';
+      if (d.absolutePosition && (decorativeSvg || containmentRatio(d.absolutePosition, pbox) >= CONTAINMENT_THRESHOLD)) {
         d.excludedByParent = true;               // 被父按钮几乎完全包含 → 不单独编号
       }
     }
@@ -1079,18 +1092,19 @@ function hasFormControlDescendant(node, maxDepth) {
   return false;
 }
 
-// 可见性（is_element_visible_according_to_all_parents 简化：Phase 2 同文档视口求交；
-// 跨 frame 偏移累减留 Phase 3）。CSS 检查 + clientRects 视口相交（上下放宽 1000px）。
+// clientRects 是客户区尺寸/边框，不是视口位置；只用规范化后的 CSS 视口矩形。
 function isVisibleCss(node) {
   const snap = node.snapshot;
   if (!snap) return false;
   const cs = snap.computedStyles || {};
-  if (cs.display === 'none' || cs.visibility === 'hidden') return false;
+  if (cs.display === 'none' || cs.visibility === 'hidden' || cs.visibility === 'collapse') return false;
   if (cs.opacity !== undefined && cs.opacity !== '' && parseFloat(cs.opacity) <= 0) return false;
-  if (!snap.bounds) return false;
-  if (snap.bounds.width <= 0 || snap.bounds.height <= 0) return false;
-  // 视口求交（用 clientRects 视口坐标；无则回退 bounds 不做视口过滤）。
-  const r = snap.clientRects;
+  for (let p = node.parent; p; p = p.parent) {
+    const style = p.snapshot && p.snapshot.computedStyles;
+    if (style && (style.display === 'none' || parseFloat(style.opacity) === 0)) return false;
+  }
+  const r = node.viewportRect;
+  if (!r || r.width <= 0 || r.height <= 0) return false;
   if (r && node._viewport) {
     const vw = node._viewport.width, vh = node._viewport.height;
     if (!(r.x < vw && r.x + r.width > 0 && r.y < vh + VIEWPORT_THRESHOLD && r.y + r.height > -VIEWPORT_THRESHOLD)) return false;
@@ -1098,12 +1112,37 @@ function isVisibleCss(node) {
   return true;
 }
 
+function hasExplicitClick(node) {
+  const attrs = node.attributes || {};
+  return node.hasJsClickListener || node.snapshot?.isClickable === true ||
+    ['onclick', 'onmousedown', 'onmouseup', 'onpointerdown', 'onpointerup'].some(key => key in attrs);
+}
+
+function isDisabled(node) {
+  const attrs = node.attributes || {};
+  const tag = (node.nodeName || '').toLowerCase();
+  if (node.ax?.properties?.disabled === true || attrs['aria-disabled'] === 'true') return true;
+  if (['button', 'input', 'select', 'textarea', 'option', 'optgroup', 'fieldset'].includes(tag) && 'disabled' in attrs) return true;
+  for (let p = node; p; p = p.parent) {
+    const pa = p.attributes || {};
+    if ('inert' in pa || pa['aria-disabled'] === 'true') return true;
+    if (p !== node && (p.nodeName || '').toLowerCase() === 'button' && 'disabled' in pa) return true;
+    if ((p.nodeName || '').toLowerCase() === 'fieldset' && 'disabled' in pa &&
+        ['button', 'input', 'select', 'textarea'].includes(tag)) {
+      const legend = p.children.find(c => (c.nodeName || '').toLowerCase() === 'legend');
+      if (!legend || !isAncestorOrSelf(legend, node)) return true;
+    }
+  }
+  return false;
+}
+
 // 可交互判定（完整判定顺序 + 常量集，clickable_elements.py）。命中即返回。
 function isInteractive(node) {
   if (node.nodeType !== NODE_TYPE.ELEMENT) return false;
   const tag = (node.nodeName || '').toLowerCase();
   if (tag === 'html' || tag === 'body') return false;
-  if (node.hasJsClickListener) return true;
+  if (isDisabled(node) || node.ax?.properties?.hidden === true) return false;
+  if (hasExplicitClick(node)) return true;
   // IFRAME/FRAME 且 >100×100
   if ((tag === 'iframe' || tag === 'frame') && node.snapshot && node.snapshot.bounds) {
     if (node.snapshot.bounds.width > 100 && node.snapshot.bounds.height > 100) return true;
@@ -1161,6 +1200,23 @@ function extractText(node) {
   const attrs = node.attributes || {};
   if (attrs['aria-label']) return attrs['aria-label'].replace(/\s+/g, ' ').trim().slice(0, 100);
   if (attrs.title) return attrs.title.replace(/\s+/g, ' ').trim().slice(0, 100);
+  for (let p = node.parent; p && p.nodeType === NODE_TYPE.ELEMENT; p = p.parent) {
+    const style = p.snapshot?.computedStyles || {};
+    if (isDisabled(p) || style.display === 'none' || style.visibility === 'hidden' ||
+        style.visibility === 'collapse' || parseFloat(style.opacity) === 0) break;
+    const siblings = [...p.children];
+    let independent = false;
+    while (siblings.length) {
+      const child = siblings.pop();
+      if (child === node) continue;
+      if (child.isInteractive && !isAncestorOrSelf(child, node)) { independent = true; break; }
+      siblings.push(...child.children);
+    }
+    if (independent) break;
+    const label = p.attributes['aria-label'] || p.attributes.title;
+    if (label) return label.replace(/\s+/g, ' ').trim().slice(0, 100);
+    if (p.isInteractive) break;
+  }
   const iconName = findSvgIconName(node);
   if (iconName) return iconName.slice(0, 100);
   return '';
@@ -1242,19 +1298,39 @@ function serializeInteractive(allNodes, ctx) {
       haspopup: attrs.haspopup || attrs['aria-haspopup'] || '',
       date_format: attrs['data-date-format'] || attrs['format'] || attrs['expected_format'] || '',
       component: attrs['data-component-name'] || '',
-      enabled: !(node.ax && node.ax.properties && node.ax.properties.disabled),
+      enabled: !isDisabled(node),
       occluded: !!node.ignoredByPaintOrder,
       in_popup: false,                       // Phase 2/3 补弹层归属
       backend_node_id: node.backendNodeId,   // 附加键：后端忽略，前端/execute 用
       bounding_box: box ? { x: Math.round(box.x), y: Math.round(box.y), width: Math.round(box.width), height: Math.round(box.height) } : {},
     };
     elements.push(el);
+    const framePath = [];
+    const independentDescendants = [];
+    const descendants = [...node.children];
+    while (descendants.length) {
+      const child = descendants.pop();
+      if (child.nodeType === NODE_TYPE.DOCUMENT) continue;
+      if (child.isInteractive && child.isVisible && bboxExempt(child)) {
+        independentDescendants.push(child.backendNodeId);
+      } else {
+        descendants.push(...child.children);
+      }
+    }
+    for (let p = node.parent; p; p = p.parent) {
+      if (!['iframe', 'frame'].includes((p.nodeName || '').toLowerCase())) continue;
+      const document = p.children.find(c => c.nodeType === NODE_TYPE.DOCUMENT);
+      framePath.unshift({ backendNodeId: p.backendNodeId, sessionId: p.sessionId || null,
+        childSessionId: document?.sessionId || null });
+    }
     // OOPIF：用节点自己的 session/target（跨源子树节点带子 session），主 target 节点为 null。
     indexMap[id] = {
       backendNodeId: node.backendNodeId,
       sessionId: node.sessionId || null,
       frameId: node.frameId || null,
       targetId: node.targetId || null,
+      framePath,
+      independentDescendants,
     };
   }
   return { elements, indexMap };
@@ -1340,15 +1416,28 @@ async function gatherAndConstructTarget(target, ctx, offset) {
   const jsClickIds = await detectClickListeners(target);
   const axNodes = await axTreeForAllFrames(target);
   const axByBackend = buildAxLookup(axNodes);
-  const metrics = await cdpSend(target, 'Page.getLayoutMetrics', {}).catch(() => null);
-  const viewport = metrics && metrics.layoutViewport
-    ? { width: metrics.layoutViewport.clientWidth, height: metrics.layoutViewport.clientHeight }
+  const metrics = trees.metrics;
+  const viewport = metrics && metrics.cssLayoutViewport
+    ? { width: metrics.cssLayoutViewport.clientWidth, height: metrics.cssLayoutViewport.clientHeight }
     : null;
   const snapshotLookup = buildSnapshotLookup(trees.snapshot, trees.devicePixelRatio);
   const built = constructEnhancedTree(trees.domTree.root, snapshotLookup, {
     viewport, jsClickIds, axByBackend,
     sessionId: ctx.sessionId, targetId: ctx.targetId, initialOffset: offset,
   });
+  const uncertain = built.allNodes.filter(node => node.isInteractive &&
+    (!node.viewportRect || node.viewportRect.width <= 0 || node.viewportRect.height <= 0) &&
+    node.snapshot?.computedStyles?.display !== 'none');
+  for (let i = 0; i < uncertain.length; i += 20) {
+    await Promise.all(uncertain.slice(i, i + 20).map(async node => {
+      const rect = await readElementRect(target, node.backendNodeId).catch(() => null);
+      if (!rect || rect.width <= 0 || rect.height <= 0) return;
+      node.viewportRect = { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+      node.absolutePosition = { ...node.viewportRect, x: rect.x + node._frameOffset.x,
+        y: rect.y + node._frameOffset.y };
+      node.isVisible = isVisibleCss(node);
+    }));
+  }
   return { built, dpr: trees.devicePixelRatio, jsClickCount: jsClickIds.size };
 }
 
@@ -1400,6 +1489,10 @@ async function handleAgentObserve(tabId) {
     pending = nextPending;
   }
 
+  for (const node of allNodes) {
+    node.isVisible = isVisibleCss(node);
+    node.isInteractive = isInteractive(node);
+  }
   applyBoundingBoxFilter(allNodes);   // 先剔除被父按钮包含的冗余后代
   applyPaintOrderFilter(allNodes);
   const { elements, indexMap } = serializeInteractive(allNodes, { sessionId: null, targetId: null });
@@ -1443,8 +1536,26 @@ async function resolveIndex(tabId, index) {
   return { entry };
 }
 
-// 坐标降级链：getContentQuads → getBoxModel → resolveNode+getBoundingClientRect → JS click 兜底。
-// 返回 { rect } 或 { objectId, jsClickOnly:true }（无几何,只能 JS 点）。session.py get_element_coordinates。
+function runtimeValue(result) {
+  if (result && result.exceptionDetails) throw new Error('页面脚本执行异常（Runtime）');
+  return result && result.result && result.result.value;
+}
+
+async function readElementRect(target, backendNodeId) {
+  const rn = await cdpSend(target, 'DOM.resolveNode', { backendNodeId });
+  const objectId = rn?.object?.objectId;
+  if (!objectId) throw new Error('目标节点已失效，请重新观察');
+  try {
+    return runtimeValue(await cdpSend(target, 'Runtime.callFunctionOn', {
+      objectId, functionDeclaration: `function(){const r=this.getBoundingClientRect();
+        return {x:r.x,y:r.y,width:r.width,height:r.height,
+          topLevel:this.ownerDocument.defaultView===this.ownerDocument.defaultView.top};}`,
+      returnByValue: true,
+    }));
+  } finally { await cdpSend(target, 'Runtime.releaseObject', { objectId }).catch(() => {}); }
+}
+
+// 无几何时不执行 JS 点击；后备矩形需转换到当前 CDP target 的视口。
 async function getElementCoordinates(target, backendNodeId) {
   // Method 1: getContentQuads
   try {
@@ -1457,66 +1568,85 @@ async function getElementCoordinates(target, backendNodeId) {
     const c = r && r.model && r.model.content;
     if (Array.isArray(c) && c.length >= 8) return { quads: [c.slice(0, 8)] };
   } catch { /* 下沉 */ }
-  // Method 3: resolveNode + getBoundingClientRect
-  try {
-    const rn = await cdpSend(target, 'DOM.resolveNode', { backendNodeId });
-    const objectId = rn && rn.object && rn.object.objectId;
-    if (objectId) {
-      const js = await cdpSend(target, 'Runtime.callFunctionOn', {
-        objectId,
-        functionDeclaration: 'function(){const r=this.getBoundingClientRect();return {x:r.x,y:r.y,width:r.width,height:r.height};}',
-        returnByValue: true,
-      });
-      const rect = js && js.result && js.result.value;
-      if (rect && rect.width > 0 && rect.height > 0) {
-        const q = [rect.x, rect.y, rect.x + rect.width, rect.y, rect.x + rect.width, rect.y + rect.height, rect.x, rect.y + rect.height];
-        return { quads: [q] };
-      }
-      return { objectId, jsClickOnly: true };   // 有节点无几何 → 只能 JS 点
-    }
-  } catch { /* 下沉 */ }
+  // 只有顶层矩形能直接当作当前 target 坐标；子页面无法确认几何时停止。
+  const rect = await readElementRect(target, backendNodeId);
+  if (rect && rect.topLevel && rect.width > 0 && rect.height > 0) {
+    return { quads: [[rect.x, rect.y, rect.x + rect.width, rect.y,
+      rect.x + rect.width, rect.y + rect.height, rect.x, rect.y + rect.height]] };
+  }
   return null;
 }
 
-// 从 quads 选与视口交集面积最大者 → 中心点（4 点均值）→ 夹取视口内。daw.py:830。
-function quadsToClickPoint(quads, vw, vh) {
-  let best = null, bestArea = 0;
+function clickPointsFromQuads(quads, vw, vh) {
+  const regions = [];
   for (const q of quads) {
     if (!q || q.length < 8) continue;
     const xs = [q[0], q[2], q[4], q[6]], ys = [q[1], q[3], q[5], q[7]];
     const minX = Math.min(...xs), maxX = Math.max(...xs), minY = Math.min(...ys), maxY = Math.max(...ys);
-    if (maxX < 0 || maxY < 0 || minX > vw || minY > vh) continue;
-    const area = (Math.min(vw, maxX) - Math.max(0, minX)) * (Math.min(vh, maxY) - Math.max(0, minY));
-    if (area > bestArea) { bestArea = area; best = q; }
+    const left = Math.max(0, minX), top = Math.max(0, minY);
+    const width = Math.min(vw, maxX) - left, height = Math.min(vh, maxY) - top;
+    if (width > 0 && height > 0) regions.push({ left, top, width, height });
   }
-  if (!best) best = quads[0];
-  let cx = (best[0] + best[2] + best[4] + best[6]) / 4;
-  let cy = (best[1] + best[3] + best[5] + best[7]) / 4;
-  cx = Math.max(0, Math.min(vw - 1, cx));
-  cy = Math.max(0, Math.min(vh - 1, cy));
-  return { x: cx, y: cy };
+  regions.sort((a, b) => b.width * b.height - a.width * a.height);
+  return regions.slice(0, 8).flatMap(r => [[.5, .5], [.1, .1], [.9, .1], [.1, .9], [.9, .9]]
+    .map(([x, y]) => ({ x: r.left + x * r.width, y: r.top + y * r.height })));
 }
 
-async function jsClickBackend(target, backendNodeId) {
-  const rn = await cdpSend(target, 'DOM.resolveNode', { backendNodeId });
-  const objectId = rn && rn.object && rn.object.objectId;
-  if (!objectId) throw new Error('resolveNode 无 objectId');
-  await cdpSend(target, 'Runtime.callFunctionOn', {
-    objectId, functionDeclaration: 'function(){ this.click(); }',
-  });
+function quadsToClickPoint(quads, vw, vh) {
+  return clickPointsFromQuads(quads, vw, vh)[0] || null;
+}
+
+async function getActionGeometry(target, backendNodeId, entry) {
+  const offsets = new Map([[null, { x: 0, y: 0, sx: 1, sy: 1 }]]);
+  const frames = [];
+  for (const frame of entry?.framePath || []) {
+    const frameTarget = frame.sessionId ? { tabId: target.tabId, sessionId: frame.sessionId } : { tabId: target.tabId };
+    const offset = offsets.get(frame.sessionId);
+    if (!offset) throw new Error('子页面定位信息失效，请重新观察');
+    const box = await cdpSend(frameTarget, 'DOM.getBoxModel', { backendNodeId: frame.backendNodeId });
+    const q = box?.model?.content;
+    if (!q || q.length !== 8) throw new Error('无法定位 iframe 内容区');
+    frames.push({ target: frameTarget, backendNodeId: frame.backendNodeId, offset });
+    if (frame.childSessionId !== frame.sessionId) {
+      if (Math.abs(q[1] - q[3]) > .1 || Math.abs(q[0] - q[6]) > .1 || q[2] <= q[0] || q[7] <= q[1]) {
+        throw new Error('当前不支持旋转或翻转的跨进程 iframe 点击');
+      }
+      const rn = await cdpSend(frameTarget, 'DOM.resolveNode', { backendNodeId: frame.backendNodeId });
+      const objectId = rn?.object?.objectId;
+      if (!objectId) throw new Error('iframe 已失效，请重新观察');
+      let size;
+      try {
+        size = runtimeValue(await cdpSend(frameTarget, 'Runtime.callFunctionOn', {
+          objectId, functionDeclaration: `function(){const s=getComputedStyle(this);return {
+            width:this.clientWidth-parseFloat(s.paddingLeft)-parseFloat(s.paddingRight),
+            height:this.clientHeight-parseFloat(s.paddingTop)-parseFloat(s.paddingBottom)};}`, returnByValue: true,
+        }));
+      } finally { await cdpSend(frameTarget, 'Runtime.releaseObject', { objectId }).catch(() => {}); }
+      if (!size || size.width <= 0 || size.height <= 0) throw new Error('iframe 没有可点击区域');
+      offsets.set(frame.childSessionId, { x: offset.x + q[0] * offset.sx, y: offset.y + q[1] * offset.sy,
+        sx: offset.sx * (q[2] - q[0]) / size.width, sy: offset.sy * (q[7] - q[1]) / size.height });
+    }
+  }
+  const offset = offsets.get(target.sessionId || null);
+  if (!offset) throw new Error('子页面定位信息失效，请重新观察');
+  const coords = await getElementCoordinates(target, backendNodeId);
+  return coords ? { frames, offset, quads: coords.quads.map(q => q.map((v, i) =>
+    i % 2 === 0 ? offset.x + v * offset.sx : offset.y + v * offset.sy)) } : null;
 }
 
 // 真实点击三连：mouseMoved → mousePressed(wait3s) → mouseReleased(wait5s)。daw.py:903。
 async function dispatchRealClick(target, x, y) {
   await cdpSend(target, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
   await sleep(50);
+  let failure = null;
   try {
     await cdpSend(target, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 }, CDP_TIMEOUTS.mousePressed);
     await sleep(80);
-  } catch { /* 超时不 sleep,继续 release */ }
+  } catch (e) { failure = e; }
   try {
     await cdpSend(target, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 }, CDP_TIMEOUTS.mouseReleased);
-  } catch { /* 超时忽略 */ }
+  } catch (e) { failure = failure || e; }
+  if (failure) throw new Error('鼠标点击未能完整确认，可能已部分执行；请先观察结果，不要直接重试');
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -1584,34 +1714,53 @@ async function typeChars(target, text) {
   }
 }
 
-// 遮挡检测（daw.py:573）：elementFromPoint 命中目标本身/后代/祖先 + label/input 三关联救援。
-// 拿不到→视为遮挡（走 JS click）；异常→视为不遮挡（继续真实点击）。
-async function checkOcclusion(target, backendNodeId, x, y) {
+// 命中目标本身或非独立的后代才可点击；检测异常交给动作层报告，不绕过遮挡。
+async function checkOcclusion(target, backendNodeId, x, y, independentDescendants = []) {
+  const rn = await cdpSend(target, 'DOM.resolveNode', { backendNodeId });
+  const objectId = rn?.object?.objectId;
+  if (!objectId) throw new Error('点击目标已失效，请重新观察');
+  const childObjects = [];
   try {
-    const rn = await cdpSend(target, 'DOM.resolveNode', { backendNodeId });
-    const objectId = rn && rn.object && rn.object.objectId;
-    if (!objectId) return true;   // 拿不到 → 视为遮挡
-    const fn = `function(){
-      const at=document.elementFromPoint(arguments[0],arguments[1]);
-      if(!at) return {ok:false,noPoint:true};
-      let ok = this===at || this.contains(at) || at.contains(this);
-      if(!ok){
-        const t=this;
-        if(t.tagName==='INPUT'&&t.id){const l=document.querySelector('label[for="'+CSS.escape(t.id)+'"]');if(l&&(l===at||l.contains(at)))ok=true;}
-        if(!ok&&t.tagName==='INPUT'){let a=at;for(let i=0;i<3&&a;i++){if(a.tagName==='LABEL'&&a.contains(t)){ok=true;break;}a=a.parentElement;}}
-        if(!ok&&t.tagName==='LABEL'){if(t.htmlFor&&at.tagName==='INPUT'&&at.id===t.htmlFor)ok=true;if(!ok&&at.tagName==='INPUT'&&t.contains(at))ok=true;}
+    for (const childId of independentDescendants) {
+      const child = await cdpSend(target, 'DOM.resolveNode', { backendNodeId: childId });
+      if (!child?.object?.objectId) throw new Error('子控件已变化，请重新观察');
+      childObjects.push(child.object.objectId);
+    }
+    const box = await cdpSend(target, 'DOM.getBoxModel', { backendNodeId });
+    const q = box?.model?.border;
+    if (!q || q.length !== 8) throw new Error('无法确认点击目标的命中区域');
+    const fn = `function(x,y,q,...independent){
+      if(!this.isConnected || this.matches(':disabled') || this.closest('button:disabled,[inert],[aria-disabled="true"]')) return false;
+      const r=this.getBoundingClientRect();
+      const left=Math.min(q[0],q[2],q[4],q[6]), top=Math.min(q[1],q[3],q[5],q[7]);
+      const width=Math.max(q[0],q[2],q[4],q[6])-left, height=Math.max(q[1],q[3],q[5],q[7])-top;
+      if(width<=0||height<=0||r.width<=0||r.height<=0) return false;
+      const lx=r.x+(x-left)*r.width/width, ly=r.y+(y-top)*r.height/height;
+      const doc=this.ownerDocument;
+      let at=doc.elementFromPoint(lx,ly);
+      while(at && at.shadowRoot){
+        const inner=at.shadowRoot.elementFromPoint(lx,ly);
+        if(!inner || inner===at) break;
+        at=inner;
       }
-      return {ok:ok};
+      if(!at) return false;
+      if(independent.some(child=>child===at||child.contains(at))) return false;
+      if(this===at || this.contains(at)) return true;
+      if(this.tagName==='INPUT' && this.labels){
+        return Array.from(this.labels).some(label=>label===at||label.contains(at));
+      }
+      return this.tagName==='LABEL' && this.control===at;
     }`;
-    const res = await cdpSend(target, 'Runtime.callFunctionOn', {
+    const value = runtimeValue(await cdpSend(target, 'Runtime.callFunctionOn', {
       objectId, functionDeclaration: fn,
-      arguments: [{ value: x }, { value: y }], returnByValue: true,
-    });
-    const v = res && res.result && res.result.value;
-    if (!v) return true;
-    if (v.noPoint) return true;   // 命中不到任何元素 → 视为遮挡
-    return !v.ok;                 // ok=可点 → 不遮挡
-  } catch { return false; }       // 异常 → 视为不遮挡，继续真实点击
+      arguments: [{ value: x }, { value: y }, { value: q }, ...childObjects.map(objectId => ({ objectId }))], returnByValue: true,
+    }));
+    if (typeof value !== 'boolean') throw new Error('无法确认点击目标是否被遮挡');
+    return !value;
+  } finally {
+    await Promise.all([objectId, ...childObjects].map(objectId =>
+      cdpSend(target, 'Runtime.releaseObject', { objectId }).catch(() => {})));
+  }
 }
 
 // finally 重聚焦顶层（防点击开了新 tab/dialog 卡住）。daw.py:1026。
@@ -1631,11 +1780,13 @@ async function handleAgentExecute(tabId, action) {
   const optElActions = ['press_key'];   // press_key 可带 index 也可不带（对当前 focus）
   const needsEl = !noElActions.includes(type) && !optElActions.includes(type);
   let backendNodeId = null;
+  let elementEntry = null;
   let domTarget = { tabId };               // DOM 命令（resolveNode/focus/getContentQuads）用；OOPIF 节点走子 session
   if (needsEl || (optElActions.includes(type) && action.index != null)) {
     const r = await resolveIndex(tabId, action.index);
     if (needsEl && r.stale) return { __via: 'cdp', success: false, stale: true, action_type: type, error: `编号 ${action.index} 已失效（需重新观察）` };
     if (!r.stale) {
+      elementEntry = r.entry;
       backendNodeId = r.entry.backendNodeId;
       // OOPIF：跨源节点的 backendNodeId 只在其子 session 有效（cdp_client_for_node 4级定位）。
       if (r.entry.sessionId) domTarget = { tabId, sessionId: r.entry.sessionId };
@@ -1644,16 +1795,16 @@ async function handleAgentExecute(tabId, action) {
 
   // 视口取根 target（顶层坐标系）。
   const metrics = await cdpSend(rootTarget, 'Page.getLayoutMetrics', {}).catch(() => null);
-  const vw = (metrics && metrics.layoutViewport && metrics.layoutViewport.clientWidth) || 1920;
-  const vh = (metrics && metrics.layoutViewport && metrics.layoutViewport.clientHeight) || 1080;
+  const vw = (metrics && metrics.cssLayoutViewport && metrics.cssLayoutViewport.clientWidth) || 1920;
+  const vh = (metrics && metrics.cssLayoutViewport && metrics.cssLayoutViewport.clientHeight) || 1080;
 
   try {
-    // DOM 命令走 domTarget（OOPIF 子 session）；鼠标/键盘走 rootTarget（顶层坐标）。
-    if (type === 'click') return { __via: 'cdp', ...(await doClick(domTarget, rootTarget, backendNodeId, action.index, vw, vh)) };
+    // 元素点击/悬停走目标 session；页面级动作仍走根 session。
+    if (type === 'click') return { __via: 'cdp', ...(await doClick(domTarget, rootTarget, backendNodeId, action.index, vw, vh, elementEntry)) };
     if (type === 'type') return { __via: 'cdp', ...(await doType(domTarget, rootTarget, backendNodeId, action)) };
     if (type === 'clear') return { __via: 'cdp', ...(await doClear(domTarget, backendNodeId, action.index)) };
-    if (type === 'select') return { __via: 'cdp', ...(await doSelect(domTarget, rootTarget, backendNodeId, action, vw, vh)) };
-    if (type === 'hover') return { __via: 'cdp', ...(await doHover(domTarget, rootTarget, backendNodeId, vw, vh)) };
+    if (type === 'select') return { __via: 'cdp', ...(await doSelect(domTarget, rootTarget, backendNodeId, action, vw, vh, elementEntry)) };
+    if (type === 'hover') return { __via: 'cdp', ...(await doHover(domTarget, rootTarget, backendNodeId, vw, vh, elementEntry)) };
     if (type === 'focus') { await cdpSend(domTarget, 'DOM.focus', { backendNodeId }).catch(() => {}); return { __via: 'cdp', success: true, action_type: type, details: `聚焦[${action.index}]` }; }
     if (type === 'press_key') {
       const key = (action.params && action.params.key) || 'Enter';
@@ -1687,47 +1838,45 @@ async function handleAgentExecute(tabId, action) {
   }
 }
 
-// 点击：滚动→取坐标→遮挡检测→(遮挡)JS click /(不遮挡)三连派发；checkbox 回读兜底。daw.py:702。
-// DOM 命令走 domTarget（OOPIF 子 session），真实鼠标派发走 rootTarget（顶层坐标）。
-async function doClick(domTarget, rootTarget, backendNodeId, index, vw, vh) {
-  const target = domTarget;
-  // checkbox/radio 预读 checked
-  let checkboxObjId = null, preChecked = null;
-  try {
-    const rn = await cdpSend(target, 'DOM.resolveNode', { backendNodeId });
-    const oid = rn && rn.object && rn.object.objectId;
-    if (oid) {
-      const info = await cdpSend(target, 'Runtime.callFunctionOn', {
-        objectId: oid, functionDeclaration: 'function(){return (this.tagName==="INPUT"&&(this.type==="checkbox"||this.type==="radio"))?this.checked:null;}', returnByValue: true,
-      });
-      const v = info && info.result && info.result.value;
-      if (v !== null && v !== undefined) { checkboxObjId = oid; preChecked = v; }
-    }
-  } catch { /* 非 toggle，忽略 */ }
-
-  await cdpSend(target, 'DOM.scrollIntoViewIfNeeded', { backendNodeId }).catch(() => {});
+// 定位与命中检查完成后只派发一次真实点击；没有几何或被遮挡时不穿透、不补点。
+async function doClick(domTarget, rootTarget, backendNodeId, index, vw, vh, entry) {
+  for (const frame of entry?.framePath || []) {
+    const target = frame.sessionId ? { tabId: rootTarget.tabId, sessionId: frame.sessionId } : rootTarget;
+    await cdpSend(target, 'DOM.scrollIntoViewIfNeeded', { backendNodeId: frame.backendNodeId });
+  }
+  await cdpSend(domTarget, 'DOM.scrollIntoViewIfNeeded', { backendNodeId });
   await sleep(50);
-  const coords = await getElementCoordinates(target, backendNodeId);
-  if (!coords) return { success: false, stale: true, action_type: 'click', error: '无法定位元素坐标' };
-  if (coords.jsClickOnly) { await jsClickBackend(target, backendNodeId); return { success: true, action_type: 'click', details: `点击[${index}]（JS兜底）` }; }
-  const pt = quadsToClickPoint(coords.quads, vw, vh);
-  const occluded = await checkOcclusion(target, backendNodeId, pt.x, pt.y);
-  if (occluded) {
-    await jsClickBackend(target, backendNodeId);
-    return { success: true, action_type: 'click', details: `点击[${index}]（遮挡,JS绕过）` };
-  }
-  await dispatchRealClick(rootTarget, pt.x, pt.y);   // 真实鼠标走根 target
-  // checkbox 回读：状态没变 → JS click 兜底
-  if (checkboxObjId && preChecked !== null) {
-    await sleep(50);
-    try {
-      const post = await cdpSend(target, 'Runtime.callFunctionOn', { objectId: checkboxObjId, functionDeclaration: 'function(){return this.checked;}', returnByValue: true });
-      if (post && post.result && post.result.value === preChecked) {
-        await cdpSend(target, 'Runtime.callFunctionOn', { objectId: checkboxObjId, functionDeclaration: 'function(){this.click();}' });
+  const geometry = await getActionGeometry(domTarget, backendNodeId, entry);
+  if (!geometry) return { success: false, action_type: 'click', error: '目标没有有效几何，未执行点击' };
+  const checks = [...geometry.frames, { target: domTarget, backendNodeId, offset: geometry.offset,
+    independentDescendants: entry?.independentDescendants }];
+  for (const pt of clickPointsFromQuads(geometry.quads, vw, vh)) {
+    let blocked = false;
+    // 移动鼠标可能触发菜单或遮罩，移动后再确认一次命中。
+    for (let round = 0; round < 2; round++) {
+      for (const check of checks) {
+        if (await checkOcclusion(check.target, check.backendNodeId,
+          (pt.x - check.offset.x) / check.offset.sx, (pt.y - check.offset.y) / check.offset.sy,
+          check.independentDescendants)) {
+          blocked = true;
+          break;
+        }
       }
-    } catch { /* noop */ }
+      if (blocked) break;
+      if (round === 0) {
+        await cdpSend(domTarget, 'Input.dispatchMouseEvent', { type: 'mouseMoved',
+          x: (pt.x - geometry.offset.x) / geometry.offset.sx,
+          y: (pt.y - geometry.offset.y) / geometry.offset.sy });
+        await sleep(50);
+      }
+    }
+    if (blocked) continue;
+    // OOPIF 由自己的会话投递真实事件；顶层坐标只用于视口与各级遮挡检查。
+    await dispatchRealClick(domTarget, (pt.x - geometry.offset.x) / geometry.offset.sx,
+      (pt.y - geometry.offset.y) / geometry.offset.sy);
+    return { success: true, action_type: 'click', details: `已向[${index}]派发一次真实点击，请结合后续页面状态确认结果` };
   }
-  return { success: true, action_type: 'click', details: `点击了[${index}]` };
+  return { success: false, action_type: 'click', error: '目标被遮挡、不可操作或不在可点击视口内；未执行点击，请重新观察' };
 }
 
 // 输入:focus→(需直接赋值的类型)setter/(否则)clear+逐字符→回读。daw.py:1756。
@@ -1791,7 +1940,7 @@ async function doClear(target, backendNodeId, index) {
 }
 
 // 选择:原生<select>直接设value;自定义下拉→点触发器→在弹层找精确文本选项点击。
-async function doSelect(domTarget, rootTarget, backendNodeId, action, vw, vh) {
+async function doSelect(domTarget, rootTarget, backendNodeId, action, vw, vh, entry) {
   const target = domTarget;
   const optText = (action.params && action.params.option_text) || '';
   const rn = await cdpSend(target, 'DOM.resolveNode', { backendNodeId }).catch(() => null);
@@ -1808,8 +1957,9 @@ async function doSelect(domTarget, rootTarget, backendNodeId, action, vw, vh) {
     }
   }
   // 自定义下拉:点触发器展开,等,再在弹层里精确文本匹配点击(不用子串,防 wrong-click)
-  const coords = await getElementCoordinates(target, backendNodeId);
-  if (coords && coords.quads) { const pt = quadsToClickPoint(coords.quads, vw, vh); await dispatchRealClick(rootTarget, pt.x, pt.y); await sleep(500); }
+  const opened = await doClick(target, rootTarget, backendNodeId, action.index, vw, vh, entry);
+  if (!opened.success) return { ...opened, action_type: 'select' };
+  await sleep(500);
   const found = await cdpSend(target, 'Runtime.evaluate', {
     expression: `(()=>{const t=${JSON.stringify(optText.toLowerCase().trim())};const items=document.querySelectorAll('[role="option"],[role="listbox"] li,.ant-select-item,.el-select-dropdown__item,[class*="option"],[class*="menu-item"],[class*="dropdown"] li');for(const it of items){if((it.textContent||'').toLowerCase().trim()===t){const r=it.getBoundingClientRect();it.click();return {x:r.x+r.width/2,y:r.y+r.height/2};}}return null;})()`,
     returnByValue: true,
@@ -1819,13 +1969,15 @@ async function doSelect(domTarget, rootTarget, backendNodeId, action, vw, vh) {
 }
 
 // 悬停:取坐标→真实鼠标移动(触发 CSS :hover / JS mouseenter)。
-async function doHover(domTarget, rootTarget, backendNodeId, vw, vh) {
+async function doHover(domTarget, rootTarget, backendNodeId, vw, vh, entry) {
   await cdpSend(domTarget, 'DOM.scrollIntoViewIfNeeded', { backendNodeId }).catch(() => {});
   await sleep(50);
-  const coords = await getElementCoordinates(domTarget, backendNodeId);
+  const coords = await getActionGeometry(domTarget, backendNodeId, entry);
   if (!coords || !coords.quads) return { success: false, action_type: 'hover', error: '无法定位坐标' };
   const pt = quadsToClickPoint(coords.quads, vw, vh);
-  await cdpSend(rootTarget, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: pt.x, y: pt.y });   // 鼠标走根 target
+  if (!pt) return { success: false, action_type: 'hover', error: '目标不在视口内' };
+  await cdpSend(domTarget, 'Input.dispatchMouseEvent', { type: 'mouseMoved',
+    x: (pt.x - coords.offset.x) / coords.offset.sx, y: (pt.y - coords.offset.y) / coords.offset.sy });
   return { success: true, action_type: 'hover', details: '悬停' };
 }
 

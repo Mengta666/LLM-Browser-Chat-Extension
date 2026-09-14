@@ -1,3 +1,5 @@
+# 最新分支在agent-slim，暂不考虑合并代码
+
 # Browser Agent
 
 Browser Agent 是一个浏览器侧边栏 AI 助手项目，目前包含 Chrome 扩展前端和 FastAPI 后端。前端负责聊天、页面读取、截图/图片输入和交互状态；后端负责 OpenAI-compatible 聊天接口、当前网页 RAG、页面快照索引、Qdrant 向量检索和 SQLite 元数据管理。

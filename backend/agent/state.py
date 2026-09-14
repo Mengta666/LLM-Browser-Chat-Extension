@@ -56,6 +56,8 @@ class PageState(BaseModel):
     text_content_summary: str = ""
     forms: list[dict[str, Any]] = []
     screenshot: str = ""        # data:image/... base64（多模态截图 ground truth；不进 history，仅当步用）
+    screenshot_marked: bool = False
+    screenshot_mark_ids: list[int] = []
 
 
 @dataclass

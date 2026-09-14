@@ -2332,17 +2332,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     const tab = await getActiveBrowserTab();
     if (!tab?.id) throw new Error('无法获取当前标签页');
 
-    // CDP 三源观察：background 融合返回 pageState；截图裸传给 LLM(不叠 SoM 标注),
-    // LLM 靠文本 [N] 列表 + 视觉位置自行对齐(对齐 browser-use)。
-    const resp = await chrome.runtime.sendMessage({ type: 'AGENT_OBSERVE', tabId: tab.id });
+    const resp = await chrome.runtime.sendMessage({ type: 'AGENT_OBSERVE', tabId: tab.id, includeScreenshot: true });
     if (!resp || !resp.ok) throw new Error(resp?.error || 'CDP 观察失败');
-    const pageState = resp.pageState;
-    try {
-      pageState.screenshot = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'jpeg', quality: 60 });
-    } catch (e) {
-      pageState.screenshot = '';
-    }
-    return pageState;
+    return AgentObservation.annotate(resp.pageState);
   }
 
   async function executePageAction(action) {

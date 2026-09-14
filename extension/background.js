@@ -422,7 +422,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   // CDP 观察/执行（Phase 1+，对齐 browser-use）
   if (request.type === 'AGENT_OBSERVE') {
-    handleAgentObserve(request.tabId)
+    handleAgentObserve(request.tabId, !!request.includeScreenshot)
       .then((r) => sendResponse({ ok: true, pageState: r.pageState }))
       .catch((error) => sendResponse({ ok: false, error: error?.message || '观察失败' }));
     return true;
@@ -933,7 +933,7 @@ async function detectClickListeners(target) {
 // 传播容器（a/button/summary/label/role=button|combobox）把自己的 box 传给后代，
 // 后代若被父 box ≥99% 包含则标 excludedByParent（不给编号）——避免一个可点按钮连同它内部的
 // 图标/文字 span 各拿一个编号（冗余编号 + 视觉密集的主因）。5 条豁免（见 bboxExempt）保证
-// 真正独立可点的后代（onclick/aria-label/交互 role/表单控件/传播容器）仍保留编号，不被误伤。
+// 真正独立可点的后代（监听/交互 role/表单控件/传播容器）仍保留编号，不被误伤。
 const PROPAGATING_TAGS = new Set(['a', 'button', 'summary', 'label']);
 const PROPAGATING_ROLES = new Set(['button', 'combobox']);
 const CONTAINMENT_THRESHOLD = 0.99;
@@ -942,7 +942,7 @@ const KEEP_TAGS = new Set(['input', 'select', 'textarea', 'label']);
 const KEEP_ROLES = new Set(['button', 'link', 'checkbox', 'radio', 'tab', 'menuitem', 'option']);
 
 // 后代是否应豁免（保留独立编号）：对齐 browser-use 5 条豁免——真表单控件/label、自身传播容器、
-// 有 onclick、有非空 aria-label、交互 role。漏这几条会过度排除、误伤真正独立的可点子元素。
+// 有点击证据或交互 role；名称属性自身不证明后代是独立操作。
 function bboxExempt(node) {
   const tag = (node.nodeName || '').toLowerCase();
   if (KEEP_TAGS.has(tag)) return true;
@@ -950,7 +950,6 @@ function bboxExempt(node) {
   const attrs = node.attributes || {};
   if (hasExplicitClick(node)) return true;
   if (attrs.onclick !== undefined) return true;
-  if (attrs['aria-label'] && attrs['aria-label'].trim()) return true;
   const role = attrs.role || (node.ax && node.ax.role) || '';
   if (KEEP_ROLES.has(role)) return true;
   return false;
@@ -988,7 +987,7 @@ function applyBoundingBoxFilter(allNodes) {
       if (!d) continue;
       for (const c of d.children) stack.push(c);
       if (d === node || !d.isInteractive || !d.isVisible || d.excludedByParent) continue;
-      if (bboxExempt(d)) continue;               // 5 条豁免:表单控件/传播容器/onclick/aria-label/交互role
+      if (bboxExempt(d)) continue;
       // 行内包装元素的行框可能比内部 SVG 矮；纯装饰 SVG 不要求 99% 几何包含。
       const decorativeSvg = (d.nodeName || '').toLowerCase() === 'svg';
       if (d.absolutePosition && (decorativeSvg || containmentRatio(d.absolutePosition, pbox) >= CONTAINMENT_THRESHOLD)) {
@@ -1078,7 +1077,6 @@ const INTERACTIVE_ROLES = new Set(['button', 'link', 'menuitem', 'option', 'radi
 // AX role 集比 html role 多 listbox。
 const INTERACTIVE_AX_ROLES = new Set(['button', 'link', 'menuitem', 'option', 'radio', 'checkbox', 'tab', 'textbox',
   'combobox', 'slider', 'spinbutton', 'listbox', 'search', 'searchbox', 'row', 'cell', 'gridcell']);
-const SEARCH_INDICATORS = ['search', 'magnify', 'glass', 'lookup', 'find', 'query', 'search-icon', 'search-btn', 'search-button', 'searchbox'];
 const FORM_CONTROL_TAGS = new Set(['input', 'select', 'textarea']);
 const VIEWPORT_THRESHOLD = 1000;   // 视口上下各放宽 1000px 缓冲（service.py）。
 
@@ -1136,70 +1134,71 @@ function isDisabled(node) {
   return false;
 }
 
-// 可交互判定（完整判定顺序 + 常量集，clickable_elements.py）。命中即返回。
-function isInteractive(node) {
-  if (node.nodeType !== NODE_TYPE.ELEMENT) return false;
+// 候选来源用于筛选与诊断；名称、class 和尺寸都不是独立点击证据。
+function interactionSource(node) {
+  if (node.nodeType !== NODE_TYPE.ELEMENT) return '';
   const tag = (node.nodeName || '').toLowerCase();
-  if (tag === 'html' || tag === 'body') return false;
-  if (isDisabled(node) || node.ax?.properties?.hidden === true) return false;
-  if (hasExplicitClick(node)) return true;
+  if (tag === 'html' || tag === 'body') return '';
+  if (isDisabled(node) || node.ax?.properties?.hidden === true) return '';
+  if (hasExplicitClick(node)) return 'click';
   // IFRAME/FRAME 且 >100×100
   if ((tag === 'iframe' || tag === 'frame') && node.snapshot && node.snapshot.bounds) {
-    if (node.snapshot.bounds.width > 100 && node.snapshot.bounds.height > 100) return true;
+    if (node.snapshot.bounds.width > 100 && node.snapshot.bounds.height > 100) return 'frame';
   }
   const attrs = node.attributes || {};
   // label：有 for → F（避免双触发）；否则含表单控件后代 → T
   if (tag === 'label') {
-    if (attrs.for !== undefined) return false;
-    if (hasFormControlDescendant(node, 2)) return true;
+    if (attrs.for !== undefined) return '';
+    if (hasFormControlDescendant(node, 2)) return 'form-wrapper';
   }
   // span 含表单控件后代 → T
-  if (tag === 'span' && hasFormControlDescendant(node, 2)) return true;
-  // search 指示词：class / id / 任意 data-* 值
-  const cls = (attrs.class || '').toLowerCase();
-  const id = (attrs.id || '').toLowerCase();
-  let searchHit = SEARCH_INDICATORS.some(s => cls.includes(s) || id.includes(s));
-  if (!searchHit) {
-    for (const [k, v] of Object.entries(attrs)) {
-      if (k.startsWith('data-') && SEARCH_INDICATORS.some(s => String(v).toLowerCase().includes(s))) { searchHit = true; break; }
-    }
-  }
-  if (searchHit) return true;
+  if (tag === 'span' && hasFormControlDescendant(node, 2)) return 'form-wrapper';
   // AX properties：disabled/hidden → F；focusable/editable/settable/checked/expanded/pressed/selected/required/keyshortcuts → T
   const axp = (node.ax && node.ax.properties) || {};
-  if (axp.disabled === true || axp.hidden === true) return false;
+  if (axp.disabled === true || axp.hidden === true) return '';
   for (const p of ['focusable', 'editable', 'settable', 'checked', 'expanded', 'pressed', 'selected', 'required', 'keyshortcuts']) {
-    if (axp[p] === true || (axp[p] !== undefined && axp[p] !== false && p in axp)) return true;
+    if (axp[p] === true || (axp[p] !== undefined && axp[p] !== false && p in axp)) return 'ax';
   }
-  if (INTERACTIVE_TAGS.has(tag)) return true;
-  for (const a of Object.keys(attrs)) { if (INTERACTIVE_ATTRS.has(a)) return true; }
-  if (attrs.contenteditable === 'true' || attrs.contenteditable === '') return true;
-  if (attrs.role && INTERACTIVE_ROLES.has(attrs.role)) return true;
-  if (node.ax && node.ax.role && INTERACTIVE_AX_ROLES.has(node.ax.role)) return true;
-  // 图标小元素：10~50px 带 class/role/onclick/data-action/aria-label
-  const b = node.snapshot && node.snapshot.bounds;
-  if (b && b.width >= 10 && b.width <= 50 && b.height >= 10 && b.height <= 50) {
-    if (attrs.class || attrs.role || attrs.onclick || attrs['data-action'] || attrs['aria-label']) return true;
+  if (INTERACTIVE_TAGS.has(tag)) return 'native';
+  for (const a of Object.keys(attrs)) { if (INTERACTIVE_ATTRS.has(a)) return 'keyboard'; }
+  if (attrs.contenteditable === 'true' || attrs.contenteditable === '') return 'editable';
+  if (attrs.role && INTERACTIVE_ROLES.has(attrs.role)) return 'role';
+  if (node.ax && node.ax.role && INTERACTIVE_AX_ROLES.has(node.ax.role)) return 'ax-role';
+  // display:contents 的监听包装层没有点击几何，使用其首层可见子控件承接冒泡。
+  for (let p = node.parent; p && p.nodeType !== NODE_TYPE.DOCUMENT; p = p.parent) {
+    if (p.viewportRect?.width > 0 && p.viewportRect?.height > 0) break;
+    if (hasExplicitClick(p) && !isDisabled(p)) return 'layoutless-parent';
   }
-  // cursor:pointer 兜底
-  if (node.snapshot && node.snapshot.computedStyles && node.snapshot.computedStyles.cursor === 'pointer') return true;
-  return false;
+  // pointer 会被后代继承；没有独立交互证据的后代交给祖先控件。
+  if (node.snapshot?.computedStyles?.cursor === 'pointer') {
+    for (let p = node.parent; p; p = p.parent) {
+      if (p.nodeType === NODE_TYPE.DOCUMENT) break;
+      if (interactionSource(p)) return '';
+    }
+    return 'cursor';
+  }
+  return '';
+}
+
+function isInteractive(node) {
+  return !!interactionSource(node);
 }
 
 // 取元素文本：AX name 优先（Phase 3），否则拼直接 TEXT 子节点。
-function extractText(node) {
-  if (node.ax && node.ax.name) return node.ax.name.replace(/\s+/g, ' ').trim().slice(0, 100);
+function extractLabel(node) {
+  const label = (text, source) => ({ text: text.replace(/\s+/g, ' ').trim().slice(0, 100), source });
+  if (node.ax && node.ax.name) return label(node.ax.name, 'ax');
   let t = '';
   for (const c of node.children) {
     if (c.nodeType === NODE_TYPE.TEXT && c.nodeValue) t += c.nodeValue;
   }
   t = t.replace(/\s+/g, ' ').trim();
-  if (t) return t.slice(0, 100);
+  if (t) return label(t, 'text');
   // 纯图标按钮兜底:文本子节点为空时,依次退回 aria-label → title → svg use 的 href 图标名
   // (如 <use href="#logout"> → "logout")。否则 LLM 看到一排 `<a/>` 空壳,无法分辨,不会选。
   const attrs = node.attributes || {};
-  if (attrs['aria-label']) return attrs['aria-label'].replace(/\s+/g, ' ').trim().slice(0, 100);
-  if (attrs.title) return attrs.title.replace(/\s+/g, ' ').trim().slice(0, 100);
+  if (attrs['aria-label']) return label(attrs['aria-label'], 'aria-label');
+  if (attrs.title) return label(attrs.title, 'title');
   for (let p = node.parent; p && p.nodeType === NODE_TYPE.ELEMENT; p = p.parent) {
     const style = p.snapshot?.computedStyles || {};
     if (isDisabled(p) || style.display === 'none' || style.visibility === 'hidden' ||
@@ -1213,13 +1212,36 @@ function extractText(node) {
       siblings.push(...child.children);
     }
     if (independent) break;
-    const label = p.attributes['aria-label'] || p.attributes.title;
-    if (label) return label.replace(/\s+/g, ' ').trim().slice(0, 100);
+    const parentLabel = p.attributes['aria-label'] || p.attributes.title;
+    if (parentLabel) return label(parentLabel, 'ancestor');
     if (p.isInteractive) break;
   }
   const iconName = findSvgIconName(node);
-  if (iconName) return iconName.slice(0, 100);
-  return '';
+  if (iconName) return label(iconName, 'svg-icon');
+  return { text: '', source: 'none' };
+}
+
+function extractText(node) {
+  return extractLabel(node).text;
+}
+
+function safeLinkHint(href) {
+  if (!href) return '';
+  try {
+    const url = new URL(href, 'https://observation.invalid/');
+    if (!['http:', 'https:'].includes(url.protocol)) return '';
+    // 不透传 URL：仅保留短路由名与动作枚举，所有其他参数、账号和 fragment 丢弃。
+    const parts = [];
+    const route = url.pathname.split('/').pop();
+    if (/^[a-z][a-z_-]{0,31}(?:\.(?:php|html?|aspx?))?$/.test(route)) parts.push(route);
+    for (const key of ['action', 'operation', 'mod']) {
+      const value = url.searchParams.get(key) || '';
+      if (/^[a-z][a-z_-]{0,31}$/.test(value)) parts.push(`${key}=${value}`);
+    }
+    const module = url.searchParams.get('id') || '';
+    if (/^[a-z][a-z_-]{0,23}:[a-z][a-z_-]{0,23}$/.test(module)) parts.push(`id=${module}`);
+    return parts.join('; ');
+  } catch { return ''; }
 }
 
 // 递归找后代 svg <use> 的 href/xlink:href 图标名(去 # 前缀)。剪枝已把 svg 内部整组丢弃,
@@ -1268,7 +1290,7 @@ function serializeInteractive(allNodes, ctx) {
     usedIds.add(id);
     const attrs = node.attributes || {};
     const tag = (node.nodeName || '').toLowerCase();
-    const text = extractText(node);
+    const label = extractLabel(node);
     const box = node.absolutePosition || (node.snapshot && node.snapshot.bounds) || null;
     const el = {
       id,
@@ -1278,7 +1300,10 @@ function serializeInteractive(allNodes, ctx) {
       name: attrs.name || '',
       placeholder: attrs.placeholder || '',
       value: tag === 'input' && attrs.type === 'password' ? '' : (attrs.value || ''),  // 剔 password
-      text: text.slice(0, 100),
+      text: label.text,
+      label_source: label.source,
+      interaction_source: interactionSource(node),
+      target_hint: tag === 'a' ? safeLinkHint(attrs.href) : '',
       aria_label: attrs['aria-label'] || '',
       // 对齐 browser-use DEFAULT_INCLUDE_ATTRIBUTES 的高价值属性:
       title: attrs.title || '',
@@ -1457,10 +1482,18 @@ async function resolveChildTarget(tabId, frameId) {
 
 
 const MAX_IFRAME_DEPTH = 5, MAX_IFRAMES = 100;
-async function handleAgentObserve(tabId) {
+async function observationPosition(target) {
+  return runtimeValue(await cdpSend(target, 'Runtime.evaluate', {
+    expression: 'JSON.stringify([location.href,scrollX,scrollY,innerWidth,innerHeight,devicePixelRatio])',
+    returnByValue: true,
+  }));
+}
+
+async function handleAgentObserve(tabId, includeScreenshot = false, retry = 0) {
   await debuggerEnsureAttached(tabId);
   const target = { tabId };
   const epoch = await getSessionEpoch(tabId);
+  const position = includeScreenshot ? await observationPosition(target) : null;
 
   // 主 target。
   const { built, dpr, jsClickCount } = await gatherAndConstructTarget(target, { sessionId: null, targetId: null }, { x: 0, y: 0 });
@@ -1497,6 +1530,20 @@ async function handleAgentObserve(tabId) {
   applyPaintOrderFilter(allNodes);
   const { elements, indexMap } = serializeInteractive(allNodes, { sessionId: null, targetId: null });
   const extras = await pageExtrasProbe(target);
+  let screenshot = '';
+  if (includeScreenshot) {
+    try {
+      const capture = await cdpSend(target, 'Page.captureScreenshot', {
+        format: 'jpeg', quality: 75, captureBeyondViewport: false,
+      });
+      if (capture?.data) screenshot = 'data:image/jpeg;base64,' + capture.data;
+    } catch { /* 截图不可用时仍可使用本轮文字观察。 */ }
+    if (position !== await observationPosition(target)) {
+      await saveTabState(STATE_KEYS.indexMap, tabId, null);
+      if (retry === 0) return handleAgentObserve(tabId, true, 1);
+      throw new Error('页面在观察期间发生导航或滚动，请重新观察');
+    }
+  }
 
   // indexMap 持久化（含 epoch）：SW 重启后 execute 侧比对 epoch，不符即 stale。
   await saveTabState(STATE_KEYS.indexMap, tabId, { epoch, map: indexMap });
@@ -1505,6 +1552,7 @@ async function handleAgentObserve(tabId) {
   console.log(`[CDP观察] elems=${elements.length} jsClick=${jsClickCount} iframes=${iframeCount} dpr=${dpr.toFixed(2)} url=${(extras.url || '').slice(0, 60)}`);
 
   const pageState = {
+    screenshot,
     url: extras.url || '',
     title: extras.title || '',
     viewport: extras.viewport || {},

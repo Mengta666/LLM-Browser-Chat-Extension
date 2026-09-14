@@ -334,6 +334,10 @@ def run_step(session: AgentSession, page_state: PageState,
         "target": target, "url": page_state.url, "title": (page_state.title or "")[:60],
         "elements": len(page_state.interactive_elements or []),
     }
+    selected = next((el for el in page_state.interactive_elements if el.get('id') == action.index), None)
+    if selected:
+        log_data['target_evidence'] = {key: selected.get(key) for key in (
+            'tag', 'role', 'label_source', 'interaction_source', 'bounding_box', 'target_hint')}
     if func_name == "type":
         log_data["text"] = (action.params.get("text", "") or "")[:60]
     elif func_name == "select":

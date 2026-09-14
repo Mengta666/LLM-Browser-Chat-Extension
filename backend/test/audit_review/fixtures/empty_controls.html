@@ -1,0 +1,29 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>合成控件测试</title>
+<style>
+body{margin:24px;font:16px sans-serif;min-height:1600px} .actions{display:flex;gap:16px;flex-wrap:wrap}
+.btn{display:block;width:180px;height:65px;background:#258650} .stats{display:flex;gap:20px;margin:30px 0}
+.pics,.pics span{display:inline-block;width:23px;height:23px;background:#ddd}.search-icon{display:inline-block;width:24px;height:24px}
+.generated::before{content:'帮助';color:white}.titled{margin-top:25px} iframe{display:block;margin:25px 0;width:380px;height:160px;border:3px solid #333}
+</style>
+<h2>操作中心</h2><div class="actions">
+<a id="control-a" class="btn J_chkitot" href="plugin.php?id=k_misign:sign&amp;operation=qiandao&amp;formhash=TEST_CREDENTIAL&amp;token=TEST_CREDENTIAL"></a>
+<a id="control-b" class="btn" href="plugin.php?operation=redeem&amp;signature=TEST_CREDENTIAL"></a>
+<a id="control-c" class="btn" href="/go?nonce=TEST_CREDENTIAL"></a>
+</div>
+<div class="stats"><div>连续签到 <b id="decor-digit" class="pics J_numpic"><span class="one"></span></b> 天</div><span id="decor-search" class="search-icon"></span></div>
+<a id="titled" class="btn titled" href="#help" title="查看帮助"></a><a id="generated" class="btn generated" href="#help-css"></a>
+<p id="result">尚未操作</p><iframe id="same-frame" src="/frame"></iframe><iframe id="cross-frame" src="http://empty-child.test/frame"></iframe>
+<script>
+window.auditEvents=[];
+const labels=['签到','兑换','导出'];
+const ids=['control-a','control-b','control-c'];
+ids.forEach((id,i)=>{
+  const svg='<svg xmlns="http://www.w3.org/2000/svg" width="180" height="65"><rect width="180" height="65" fill="'+['#258650','#316ba1','#765291'][i]+'"/><text x="90" y="43" font-family="sans-serif" font-size="28" fill="white" text-anchor="middle">'+labels[i]+'</text></svg>';
+  document.getElementById(id).style.backgroundImage='url("data:image/svg+xml,'+encodeURIComponent(svg)+'")';
+});
+document.addEventListener('click',event=>{
+  event.preventDefault(); const id=event.target.closest('[id]')?.id;
+  auditEvents.push({id,trusted:event.isTrusted});
+  if(ids.includes(id))document.getElementById('result').textContent=labels[ids.indexOf(id)]+'已完成';
+});
+</script></html>

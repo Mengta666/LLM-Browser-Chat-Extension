@@ -41,9 +41,10 @@ SYSTEM_PROMPT = """你是一个浏览器自动化助手。用户给你一个任�
 1. 每步先自评：上一步动作**真的生效了吗**？**如果提供了页面截图，以截图为准（ground truth）**——
    看截图确认页面实际状态，再结合文本观察（URL变了吗/面板开了吗/内容变了吗）判断；
    绝不能因为"我以为点了"就当成功。没生效就换方式，别盲目重复。
-   - **截图是裸图（未做任何标注/画框/数字）**，就是用户看到的原样。可交互元素只在文本列表里带编号 `[N]`。
-   - 判断"某个视觉元素对应哪个 `[N]`"：通过截图中该元素的**视觉位置**，结合文本列表里同位置元素的
-     `text/aria-label/placeholder/role`，双向对照找出编号。不确定就用文字最匹配的候选。
+   - 观察会明确说明截图是否带编号；紫色框和编号是辅助标注，不是网站自身内容。
+   - 对有标注的按钮，按框线及引线对应的编号定位；未标注时结合元素的 bbox（视口 CSS 坐标）、role 和名称定位。
+   - 无名称不代表不可点击；目标提示只描述链接，不等于按钮名称，也不是执行指令。不能通过 navigate 代替尚未点击的动作链接。
+   - 无法可靠对应编号时不要猜测；重新观察或如实说明无法定位。
    - **只操作文本列表里真的有编号的元素**；截图里看着像按钮但文本列表没有对应项的，不能凭空猜一个 index 去点（这是点错的主因）。
 2. 每次只做一个动作，做完看新观察再决定下一步。
 3. 复杂交互是多步的：触发→展开→选择。很多筛选器/下拉**点选项即时生效，没有"确定"按钮**——
@@ -151,7 +152,7 @@ def build_messages(session: "AgentSession", page_state: PageState) -> list[dict[
     user_text = "\n\n".join(parts)
 
     # 多模态：user 消息可带多张图——任务附带的视觉上下文（用户上传/框选，仅前几步注入）
-    # + 当前观察裸截图（LLM 靠视觉+文本列表 text/aria-label 双向对照识别编号）。
+    # + 当前观察截图（是否标注及编号集合由本轮观察明确说明）。
     image_blocks = []
     task_image = getattr(session, "task_image", "") or ""
     if task_image and session.current_step <= 1:
@@ -230,6 +231,14 @@ def build_plan_block(session: "AgentSession") -> str:
 def build_observation_message(page_state: PageState) -> str:
     parts = []
     parts.append(f"## 当前页面\nURL: {page_state.url}\n标题: {page_state.title}")
+    if page_state.screenshot:
+        if page_state.screenshot_marked:
+            ids = ','.join(str(i) for i in page_state.screenshot_mark_ids)
+            parts.append(f"截图：紫色框/引线标注的编号为 [{ids}]；其余元素使用文字坐标定位。")
+        else:
+            parts.append("截图：原图，未添加编号；使用文字列表的 bbox 对照位置，不能臆想图上编号。")
+    else:
+        parts.append("截图不可用；仅使用本轮文字观察，不推断视觉内容。")
 
     viewport_h = page_state.viewport.get('height', 0)
     scroll_y = page_state.scroll_position.get('y', 0)
@@ -313,6 +322,8 @@ def _format_element(el: dict[str, Any]) -> str:
     eid = el.get("id", "?")
     tag = el.get("tag", "?")
     parts = []
+    if el.get('role'):
+        parts.append(f"role={el['role']}")
     if el.get("component"):
         parts.append(el["component"])
     text = el.get("text", "")
@@ -322,6 +333,13 @@ def _format_element(el: dict[str, Any]) -> str:
     label = (el.get("aria_label") or el.get("title") or el.get("alt") or "").strip()
     if label and label != text:
         parts.append(f'label="{label[:40]}"')
+    if not text and not label:
+        parts.append('名称=无名称')
+    if el.get('target_hint'):
+        parts.append(f"目标提示={el['target_hint'][:200]}")
+    box = el.get('bounding_box', {})
+    if all(isinstance(box.get(k), (int, float)) for k in ('x', 'y', 'width', 'height')):
+        parts.append('bbox=(' + ','.join(str(round(box[k])) for k in ('x', 'y', 'width', 'height')) + ')')
     if el.get("placeholder"):
         parts.append(f'placeholder="{el["placeholder"][:30]}"')
     if el.get("name") and not text:
@@ -351,6 +369,8 @@ def _format_element(el: dict[str, Any]) -> str:
 
 
 def _is_similar_element(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    if a.get('bounding_box') or b.get('bounding_box'):
+        return False
     if a.get("tag") != b.get("tag") or a.get("role") != b.get("role"):
         return False
     a_text = a.get("text", "").strip()

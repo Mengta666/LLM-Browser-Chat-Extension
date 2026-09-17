@@ -8,10 +8,12 @@ LLM 必须先自评上一步是否成功（对照观察），再决定下一个�
 """
 
 import json
+import copy
 import os
 import re
 import time
 import threading
+from uuid import uuid4
 from pathlib import Path
 from typing import Any, Optional
 
@@ -41,10 +43,10 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 _DEBUG_SCREENSHOT = os.getenv("AGENT_DEBUG_SCREENSHOT", "").strip() in ("1", "true", "True", "yes")
 _SHOT_DIR = Path(__file__).resolve().parents[1] / "logs" / "screenshots"
 
-_llm_client = OpenAI(base_url=MODEL_BASE_URL, api_key=OPENAI_API_KEY)
+_llm_client = OpenAI(base_url=MODEL_BASE_URL, api_key=OPENAI_API_KEY, max_retries=0)
 
 _sessions: dict[str, AgentSession] = {}
-_sessions_lock = threading.Lock()
+_sessions_lock = threading.RLock()
 # 空闲 TTL：基于 last_activity（每步 /step 刷新）。活跃任务不断刷新→永不误清；
 # 只回收真正卡死/被遗弃（很久无 /step）的会话。取代旧的"绝对创建时间 TTL"（会误杀长任务）。
 _SESSION_IDLE_TTL = 1800         # 30min 无任何活动 = 死会话，回收（须 ≥ 最慢单步耗时；配合 max_steps=200 长任务，留足单步余量）
@@ -79,8 +81,8 @@ def _cleanup_expired_sessions():
     done_states = (AgentStatus.COMPLETED, AgentStatus.ERROR, AgentStatus.CANCELLED)
     expired = [
         sid for sid, s in _sessions.items()
-        if (now - s.last_activity > _SESSION_DONE_IDLE_TTL and s.status in done_states)
-        or (now - s.last_activity > _SESSION_IDLE_TTL)
+        if not s.in_flight and ((now - s.last_activity > _SESSION_DONE_IDLE_TTL and s.status in done_states)
+        or (now - s.last_activity > _SESSION_IDLE_TTL))
     ]
     for sid in expired:
         del _sessions[sid]
@@ -95,7 +97,7 @@ def _evict_if_full():
     if len(_sessions) < MAX_SESSIONS:
         return None
     done_states = (AgentStatus.COMPLETED, AgentStatus.ERROR, AgentStatus.CANCELLED)
-    victims = [(s.last_activity, sid) for sid, s in _sessions.items() if s.status in done_states]
+    victims = [(s.last_activity, sid) for sid, s in _sessions.items() if s.status in done_states and not s.in_flight]
     if not victims:
         return None                        # 全在跑：不牺牲活跃会话，交由 create_session 决定拒绝
     victims.sort()                         # 最久未活动的排前
@@ -134,6 +136,8 @@ def create_session(session_id: str, task: str, model: str,
                    llm_params: Optional[dict[str, Any]] = None) -> AgentSession:
     with _sessions_lock:
         _cleanup_expired_sessions()
+        if session_id in _sessions:
+            raise RuntimeError("会话已存在")
         _evict_if_full()
         # 容量仍到顶（全是活跃会话，无可淘汰）→ 拒绝新建，避免无上限撑爆内存
         if len(_sessions) >= MAX_SESSIONS:
@@ -157,32 +161,16 @@ def cancel_session(session_id: str) -> bool:
     with _sessions_lock:
         session = _sessions.get(session_id)
         if not session:
-            return False
+            session = create_session(session_id, "", "")
+        if session.status in (AgentStatus.COMPLETED, AgentStatus.ERROR):
+            return True
+        session.cancel_event.set()
         session.status = AgentStatus.CANCELLED
+        session.pending_action = None
+        session.success = False
+        session.last_activity = time.time()
     _agent_log.info("session_cancel", session_id=session_id, data={"step": session.current_step})
     return True
-
-
-def acquire_session(session_id: str) -> tuple[Optional[AgentSession], bool]:
-    """原子地取会话并占用忙标志（check-and-set 在锁内，杜绝同会话并发 /step 竞态）。
-
-    返回 (session, acquired)：
-      (None, False)  会话不存在
-      (session, False)  会话存在但正忙 → 调用方应回 409，且不要 release
-      (session, True)   已成功占用 → 调用方处理完必须 release_session
-    """
-    with _sessions_lock:
-        session = _sessions.get(session_id)
-        if not session:
-            return None, False
-        if session.in_flight:
-            return session, False
-        session.in_flight = True
-        return session, True
-
-
-def release_session(session: AgentSession) -> None:
-    session.in_flight = False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -192,6 +180,31 @@ def release_session(session: AgentSession) -> None:
 def run_step(session: AgentSession, page_state: PageState,
              action_result: Optional[ActionResult] = None,
              force_done: bool = False) -> dict[str, Any]:
+    # 模型调用不持锁；只在发布结果时检查取消，防止迟到结果改写终态。
+    with _sessions_lock:
+        if session.cancel_event.is_set() or session.status in (AgentStatus.COMPLETED, AgentStatus.ERROR):
+            return _build_response(session)
+        work = copy.copy(session)
+        for name, value in vars(session).items():
+            if isinstance(value, (dict, list)) and name not in ('request_digests', 'request_results'):
+                setattr(work, name, copy.deepcopy(value))
+    _run_step(work, page_state, action_result, force_done)
+    with _sessions_lock:
+        if not session.cancel_event.is_set():
+            if session.decision_deadline and time.monotonic() >= session.decision_deadline:
+                work.status = AgentStatus.ERROR
+                work.pending_action = None
+                work.success = False
+                work.error = '模型决策超过时间预算，未发布迟到动作'
+            for name, value in vars(work).items():
+                if name not in ('cancel_event', 'in_flight', 'active_request_id', 'request_digests', 'request_results'):
+                    setattr(session, name, value)
+        return _build_response(session)
+
+
+def _run_step(session: AgentSession, page_state: PageState,
+              action_result: Optional[ActionResult] = None,
+              force_done: bool = False) -> dict[str, Any]:
     """记录上一步结果 + 调 LLM 出下一个动作。stale 由前端处理（重新观察后再调本函数）。
 
     force_done=True（前端整轮超时触发）：强制本步只接受 task_complete，给用户一个交代。
@@ -255,6 +268,8 @@ def run_step(session: AgentSession, page_state: PageState,
         # 3. compaction（对齐 browser-use maybe_compact_messages）：步数很多时把中间段 LLM 总结成一条摘要，
         #    保留 首项 + <摘要> + 最近若干项。超长任务防止滑动窗口丢失中间进展。
         _maybe_compact_history(session)
+        if session.cancel_event.is_set():
+            return _build_response(session)
 
         # 4. 每步重建 messages（system + 任务 + 历史块 + 计划 + 当前观察）
         session.messages = build_messages(session, page_state)
@@ -264,7 +279,7 @@ def run_step(session: AgentSession, page_state: PageState,
         _dump_screenshot(session, page_state)   # 调试通道：AGENT_DEBUG_SCREENSHOT=1 时落盘截图
         _log_exec_tokens(session)
         parsed = _call_llm(session)
-        if parsed is None:
+        if parsed is None or session.cancel_event.is_set():
             return _build_response(session)
 
         # 5. 消化结构化输出：自评/记忆/意图/计划
@@ -325,11 +340,15 @@ def run_step(session: AgentSession, page_state: PageState,
         break  # 页面动作：跳出循环，走下发前端流程
 
     action = _parse_action(func_name, action_obj)
+    action.action_id = uuid4().hex
+    action.observation_id = page_state.observation_id
     session.pending_action = action
     session.current_step += 1
 
     target = _describe_target(action.index, page_state)
     log_data = {
+        "request_id": session.active_request_id, "action_id": action.action_id,
+        "observation_id": action.observation_id,
         "step": session.current_step, "action": func_name, "index": action.index,
         "target": target, "url": page_state.url, "title": (page_state.title or "")[:60],
         "elements": len(page_state.interactive_elements or []),
@@ -395,9 +414,11 @@ def _maybe_compact_history(session: AgentSession) -> None:
     prompt += f"\n【要压缩的步骤】\n{mid_text}\n\n只输出摘要文本，不要其他。"
 
     try:
+        compact_session = copy.copy(session)
+        compact_session.llm_params = {}
         resp = _create_with_retry(
             _llm_client, session.model,
-            [{"role": "user", "content": prompt}], session=None)
+            [{"role": "user", "content": prompt}], session=compact_session)
         summary = (resp.choices[0].message.content or "").strip() if resp else ""
         summary = _strip_think_tags(summary)
     except Exception:
@@ -426,8 +447,10 @@ def _call_llm(session: AgentSession) -> Optional[dict]:
     """
     last_raw = ""
     for attempt in range(MAX_PARSE_RETRIES):
+        if session.cancel_event.is_set():
+            return None
         response = _create_with_retry(_llm_client, session.model, session.messages, session=session)
-        if response is None:
+        if response is None or session.cancel_event.is_set():
             return None            # 网络层重试已耗尽 / 认证等硬错误：session.error 已置
         raw = response.choices[0].message.content or ""
         last_raw = raw
@@ -476,6 +499,15 @@ def _create_with_retry(client: OpenAI, model: str, messages: list, session: Opti
     create_kwargs = _build_create_kwargs(model, messages, llm_params)
     last_error = None
     for attempt in range(MAX_LLM_RETRIES):
+        if session and session.cancel_event.is_set():
+            return None
+        if session and session.decision_deadline:
+            remaining = session.decision_deadline - time.monotonic()
+            if remaining <= 0:
+                session.status = AgentStatus.ERROR
+                session.error = '模型决策超过时间预算'
+                return None
+            create_kwargs['timeout'] = min(LLM_CALL_TIMEOUT, remaining)
         try:
             return client.chat.completions.create(**create_kwargs)
         except RateLimitError as e:
@@ -506,7 +538,11 @@ def _create_with_retry(client: OpenAI, model: str, messages: list, session: Opti
         except Exception as e:
             last_error = f"未知错误: {type(e).__name__}: {str(e)[:100]}"
         if attempt < MAX_LLM_RETRIES - 1:
-            time.sleep(RETRY_DELAYS[attempt])
+            if session:
+                if session.cancel_event.wait(RETRY_DELAYS[attempt]):
+                    return None
+            else:
+                time.sleep(RETRY_DELAYS[attempt])
     if session:
         session.status = AgentStatus.ERROR
         session.error = f"LLM 调用失败（重试{MAX_LLM_RETRIES}次）: {last_error}"
@@ -678,6 +714,8 @@ def _log_observation(session: AgentSession, page_state: PageState) -> None:
     popup = page_state.active_popup or {}
     _agent_log.info("observation", session_id=session.session_id,
                     data={"step": session.current_step, "url": page_state.url,
+                          "request_id": session.active_request_id,
+                          "observation_id": page_state.observation_id, "tab_id": page_state.tab_id,
                           "title": (page_state.title or "")[:60], "elements": len(els),
                           "popup": popup.get("type", "") if popup else "",
                           "text_len": len(txt), "text_head": txt[:160],
@@ -719,6 +757,7 @@ def _log_exec_tokens(session: AgentSession) -> None:
 
 def _build_response(session: AgentSession, thought: str = "") -> dict[str, Any]:
     resp: dict[str, Any] = {
+        "protocol_version": 2,
         "session_id": session.session_id,
         "status": session.status.value,
         "step": session.current_step,

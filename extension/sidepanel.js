@@ -527,7 +527,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           }
 
           if (!response?.ok) {
-            reject(new Error(response?.error || '后台请求失败'));
+            reject(Object.assign(new Error(response?.error || '后台请求失败'), { status: response?.status }));
             return;
           }
 
@@ -2261,9 +2261,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   ];
   const AGENT_COMMAND = '/browser-operation ';
   const AGENT_SETTLE_TIMEOUT_MS = 3000;
-  const AGENT_ACTION_TIMEOUT_MS = 10000;
-  const AGENT_STEP_TIMEOUT_MS = 120000;   // 单个 step（执行+等稳+观察）总超时；对齐 browser-use step_timeout（它 180s），防非 LLM 环节卡死拖到整轮墙钟
-  const AGENT_TOTAL_TIMEOUT_MS = 3600000;   // 1小时：整轮墙钟仅作"防真死"极粗兜底（browser-use 无整轮墙钟，只靠步数+单步超时）；到点走 force_done 收尾。配合 max_steps=200 长任务放宽
 
   const agentState = {
     active: false,
@@ -2328,62 +2325,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   // 没有这层标注，多模态反而有害：模型看得见按钮却猜不准编号，会反复点错。
   // ═══════════════════════════════════════════════════════════════════════════
 
-  async function observePageState() {
-    const tab = await getActiveBrowserTab();
-    if (!tab?.id) throw new Error('无法获取当前标签页');
-
-    const resp = await chrome.runtime.sendMessage({ type: 'AGENT_OBSERVE', tabId: tab.id, includeScreenshot: true });
-    if (!resp || !resp.ok) throw new Error(resp?.error || 'CDP 观察失败');
-    return AgentObservation.annotate(resp.pageState);
-  }
-
-  async function executePageAction(action) {
-    if (action.type === 'wait') {
-      const ms = Math.min(action.params?.ms || 1000, 5000);
-      await new Promise(resolve => setTimeout(resolve, ms));
-      return { success: true, action_type: 'wait', details: `等待了 ${ms}ms`, timestamp: Date.now() };
-    }
-
-    if (action.type === 'navigate') {
-      const url = action.params?.url;
-      if (!url) return { success: false, action_type: 'navigate', error: '缺少 URL', timestamp: Date.now() };
-      // 安全校验：只允许 http/https 协议
-      try {
-        const parsed = new URL(url);
-        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-          return { success: false, action_type: 'navigate', error: `不允许的 URL 协议: ${parsed.protocol}`, timestamp: Date.now() };
-        }
-      } catch {
-        return { success: false, action_type: 'navigate', error: `无效的 URL: ${url}`, timestamp: Date.now() };
-      }
-      const tab = await getActiveBrowserTab();
-      if (!tab?.id) return { success: false, action_type: 'navigate', error: '无法获取标签页', timestamp: Date.now() };
-      await chrome.tabs.update(tab.id, { url });
-      // 等待页面加载完成
-      await new Promise((resolve) => {
-        const listener = (tabId, info) => {
-          if (tabId === tab.id && info.status === 'complete') {
-            chrome.tabs.onUpdated.removeListener(listener);
-            clearTimeout(timeout);
-            resolve();
-          }
-        };
-        const timeout = setTimeout(() => {
-          chrome.tabs.onUpdated.removeListener(listener);
-          resolve();
-        }, 10000);
-        chrome.tabs.onUpdated.addListener(listener);
-      });
-      return { success: true, action_type: 'navigate', details: `导航到 ${url}`, timestamp: Date.now() };
-    }
-
-    // CDP 执行：元素动作（click/type/scroll/...）下沉 background（navigate/wait 已在上方本地处理）。
-    const tab = await getActiveBrowserTab();
-    if (!tab?.id) throw new Error('无法获取当前标签页');
-    const resp = await chrome.runtime.sendMessage({ type: 'AGENT_EXECUTE', tabId: tab.id, action });
-    if (!resp || !resp.ok) return { success: false, action_type: action.type, error: resp?.error || 'CDP 执行失败', timestamp: Date.now() };
-    return { ...resp.result, timestamp: Date.now() };
-  }
 
   function buildAgentApiUrl(safeApiUrl, path) {
     return buildBackendEndpointUrl(safeApiUrl, path);
@@ -2619,40 +2560,8 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   async function runAgentTask(task, taskImage = '') {
     const sessionId = `agent_${createMessageId()}`;
-    agentState.active = true;
-    agentState.sessionId = sessionId;
-    agentState.task = task;
-    agentState.status = 'running';
-    agentState.currentStep = 0;
-
-    // Port keepalive：任务全程持有，活跃 Port 在则 background service worker 不被 terminate，
-    // 覆盖单步 settle + LLM 90s 的长间隙（MV3 SW 空闲 30s 会被杀）。finally 里断开。
-    let keepalivePort = null;
-    try {
-      keepalivePort = chrome.runtime.connect({ name: 'agent-keepalive' });
-      keepalivePort.onDisconnect.addListener(() => { /* SW 重启会断开，无需动作 */ });
-    } catch { keepalivePort = null; }
-
-    let apiKey, modelName, safeApiUrl;
-    try {
-      ({ apiKey, modelName, safeApiUrl } = await resolveApiRequestConfig());
-    } catch (err) {
-      alert(err.message || 'API 配置无效');
-      agentState.active = false;
-      agentState.status = 'idle';
-      return;
-    }
-
-    // 自动化专属:读取用户在设置面板配的 LLM 参数(JSON 字符串)。空/非法都当没配,execute 里默认不传。
-    let agentLlmParamsObj = null;
-    try {
-      const stored = await chrome.storage.local.get(['agentLlmParams']);
-      const raw = (stored.agentLlmParams || '').trim();
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) agentLlmParamsObj = parsed;
-      }
-    } catch { agentLlmParamsObj = null; }  // 保存时已校验过,这里出错静默降级
+    Object.assign(agentState, { active: true, sessionId, task, status: 'running', currentStep: 0 });
+    const ownsUI = () => agentState.sessionId === sessionId;
 
     const userBubble = createMessageNode('user');
     const userText = document.createElement('div');
@@ -2665,201 +2574,136 @@ document.addEventListener('DOMContentLoaded', async () => {
       previewImage.alt = '任务参考图';
       userBubble.appendChild(previewImage);
     }
-
     const aiBubble = createMessageNode('ai');
-    showTypingIndicator(aiBubble);
+    const header = document.createElement('div');
+    header.className = 'agent-header';
+    const statusText = document.createElement('span');
+    statusText.textContent = '🤖 正在准备自动化任务…';
+    header.appendChild(statusText);
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'agent-btn-cancel';
+    cancelBtn.textContent = '⏹ 停止';
+    header.appendChild(cancelBtn);
+    aiBubble.appendChild(header);
     scrollToBottom();
 
-    let cancelBtn = null;
+    let run = null;
+    let keepalivePort = null;
+    let stopRequested = false;
+    let backendTerminal = false;
+    cancelBtn.onclick = () => {
+      stopRequested = true;
+      cancelBtn.disabled = true;
+      cancelBtn.textContent = '正在停止…';
+      statusText.textContent = '正在停止后续动作并释放输入…';
+      if (ownsUI()) agentState.status = 'stopping';
+      if (run) run.stop().catch(() => {});
+    };
 
     try {
-      let pageState = await observePageState();
-      aiBubble.textContent = '';
+      keepalivePort = chrome.runtime.connect({ name: 'agent-keepalive' });
+      keepalivePort.onDisconnect.addListener(() => {});
+      const tab = await getActiveBrowserTab();
+      if (!tab?.id) throw new Error('无法获取当前标签页');
+      const { apiKey, modelName, safeApiUrl } = await resolveApiRequestConfig();
+      let llmParams = {};
+      try {
+        const stored = await chrome.storage.local.get(['agentLlmParams']);
+        const parsed = JSON.parse(stored.agentLlmParams || '{}');
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) llmParams = parsed;
+      } catch { /* 保持已有默认参数 */ }
 
-      const headerEl = document.createElement('div');
-      headerEl.className = 'agent-header';
-      headerEl.textContent = '🤖 Agent 自动化执行中...';
-      aiBubble.appendChild(headerEl);
-
-      cancelBtn = document.createElement('button');
-      cancelBtn.className = 'agent-btn-cancel';
-      cancelBtn.textContent = '⏹ 停止';
-      cancelBtn.onclick = async () => {
-        agentState.active = false;
-        cancelBtn.disabled = true;
-        cancelBtn.textContent = '已停止';
-        await callAgentApi(safeApiUrl, '/v1/agent/cancel', { session_id: sessionId }, apiKey).catch(() => {});
-        cancelBtn.remove();
-      };
-      headerEl.appendChild(cancelBtn);
-
-      let response = await callAgentApi(safeApiUrl, '/v1/agent/execute', {
-        task,
-        page_state: pageState,
-        session_id: sessionId,
-        model: modelName || 'gpt-4o',
-        require_confirmation: [],
-        task_image: taskImage || '',
-        llm_params: agentLlmParamsObj || {},   // 自定义 LLM 参数(思考模式开关等),后端仅自动化 loop 使用
-      }, apiKey);
-
-      const agentStartTime = Date.now();
-      while (response.status === 'action_required' || response.status === 'confirm_required') {
-        if (!agentState.active) break;
-        if (Date.now() - agentStartTime > AGENT_TOTAL_TIMEOUT_MS) {
-          // 整轮超时：不硬杀，让后端 force_done 逼 LLM 出 task_complete 给交代（对齐 browser-use 收尾）
-          try {
-            const freshState = await observePageState().catch(() => pageState);
-            const finalResp = await callAgentApi(safeApiUrl, '/v1/agent/step', {
-              session_id: sessionId,
-              action_result: { success: true, action_type: 'timeout_finish', details: '整轮超时，强制收尾' },
-              page_state: freshState,
-              force_done: true
-            }, apiKey);
-            if (finalResp.status === 'completed') {
-              renderAgentComplete(aiBubble, finalResp.summary, false);
-            } else {
-              renderAgentError(aiBubble, '执行超时，未能生成收尾总结');
-            }
-          } catch (e) {
-            renderAgentError(aiBubble, '执行超时');
-          }
-          break;
+      run = new AgentRunner.Run(sessionId, tab.id, {
+        message: message => chrome.runtime.sendMessage(message),
+        api: (path, body) => callAgentApi(safeApiUrl, path, body, apiKey),
+        annotate: page => AgentObservation.annotate(page),
+        status: (state, text) => {
+          if (!ownsUI()) return;
+          agentState.status = state;
+          statusText.textContent = text;
         }
+      });
+      if (stopRequested) { await run.stop(); run.check(); }
+      await run.start();
+      let pageState = await run.observe();
+      let response = await run.decide('/v1/agent/execute', {
+        task, page_state: pageState, model: modelName || 'gpt-4o',
+        require_confirmation: [], task_image: taskImage || '', llm_params: llmParams
+      });
 
+      while (response.status === 'action_required' || response.status === 'confirm_required') {
+        run.check();
+        if (!ownsUI()) throw new Error('任务已被替换');
         agentState.currentStep = response.step;
         const action = response.action;
-        if (!action) break;  // 无动作但非终态，异常，退出
-
+        if (!action?.action_id || action.observation_id !== pageState.observation_id) {
+          throw new Error('动作与当前观察版本不匹配，未执行');
+        }
         if (response.status === 'confirm_required') {
-          const confirmed = await showAgentConfirmDialog(aiBubble, action, response.thought);
-          if (!confirmed) {
-            await callAgentApi(safeApiUrl, '/v1/agent/cancel', { session_id: sessionId }, apiKey).catch(() => {});
-            renderAgentError(aiBubble, '用户取消了操作');
-            break;
-          }
+          const confirmed = await run.wait(showAgentConfirmDialog(aiBubble, action, response.thought), run.deadline - Date.now());
+          if (!confirmed) { await run.stop(); run.check(); }
         }
-
         renderAgentStepInBubble(aiBubble, response.step, response.thought, action, null);
+        const result = await run.execute(action);
+        run.check();
+        renderAgentStepInBubble(aiBubble, response.step, null, null, result);
 
-        // 记录操作前状态
-        const preUrl = pageState?.url || '';
-        const prePopup = pageState?.active_popup || null;
-        const preElementCount = (pageState?.interactive_elements || []).length;
-
-        const actionResult = await Promise.race([
-          executePageAction(action),
-          new Promise((resolve) => setTimeout(
-            () => resolve({ success: false, action_type: action.type, details: 'step 超时（执行未在时限内返回）', _stepTimeout: true }),
-            AGENT_STEP_TIMEOUT_MS))
-        ]);
-        renderAgentStepInBubble(aiBubble, response.step, null, null, actionResult);
-
-        // 编号失效（stale）：页面已重渲染，重新观察后让 LLM 用新编号，不计失败
-        if (actionResult.stale) {
-          const freshState = await observePageState();
-          pageState = freshState;
-          response = await callAgentApi(safeApiUrl, '/v1/agent/step', {
-            session_id: sessionId,
-            action_result: { success: false, stale: true, action_type: action.type, details: actionResult.error || '编号失效' },
-            page_state: freshState
-          }, apiKey);
-          continue;
-        }
-
-        // step 超时：执行卡住未在时限内返回，重新观察后把失败反馈给 LLM 换策略，不拖到整轮墙钟
-        if (actionResult._stepTimeout) {
-          const freshState = await observePageState().catch(() => pageState);
-          pageState = freshState;
-          response = await callAgentApi(safeApiUrl, '/v1/agent/step', {
-            session_id: sessionId,
-            action_result: { success: false, action_type: action.type, details: '本步超时，请换一种方式' },
-            page_state: freshState
-          }, apiKey);
-          continue;
-        }
-
-        // 智能等待页面稳定（导航期间 executeScript 可能永远不返回,外层超时兜底）
-        const activeTab = await getActiveBrowserTab().catch(() => null);
-        if (activeTab?.id) {
-          await Promise.race([
-            waitForPageSettle(activeTab.id),
-            new Promise(r => setTimeout(r, 5000))   // 5s 硬上限,防导航中 executeScript 挂死
-          ]);
-        }
-
-        // 导航后移鼠标到中性位收残留浮层，再观察
-        const preObserveTab = await getActiveBrowserTab().catch(() => null);
-        if (preObserveTab?.id) {
-          try {
-            const curUrl = await chrome.scripting.executeScript({
-              target: { tabId: preObserveTab.id, allFrames: false },
-              func: () => location.href
-            }).then(r => r?.[0]?.result).catch(() => null);
-            if (curUrl && curUrl !== preUrl) {
-              await chrome.runtime.sendMessage({ type: 'DEBUGGER_HOVER', tabId: preObserveTab.id, x: 2, y: 2 });
-              await new Promise(r => setTimeout(r, 250));
-            }
-          } catch (e) { /* ignore */ }
-        }
-
-        const newPageState = await Promise.race([
-          observePageState(),
-          new Promise((_, reject) => setTimeout(() => reject(new Error('observe 超时')), 30000))
-        ]).catch(() => pageState);  // 观察超时时沿用上一步状态,不卡死循环
-
-        // inline 组兜底：成簇新增 → 合成 active_popup，让 popup_appeared 成立、格式化置顶
-        if (!newPageState.active_popup) {
-          const inlineGroup = detectInlineGroup(
-            pageState?.interactive_elements || [],
-            newPageState.interactive_elements || []
-          );
+        // 等稳仅帮助减少瞬时变化；只有后续成功的新观察才允许推进。
+        await run.wait(waitForPageSettle(tab.id), 5000).catch(error => {
+          if (error.code !== 'timeout') throw error;
+        });
+        run.check();
+        const nextPage = await run.observe();
+        if (!nextPage.active_popup) {
+          const inlineGroup = detectInlineGroup(pageState.interactive_elements || [], nextPage.interactive_elements || []);
           if (inlineGroup) {
-            newPageState.active_popup = inlineGroup;
-            const sig = (e) => `${e.tag}|${e.role}|${(e.text || '').slice(0, 20)}|${e.name}`;
-            const prevSet = new Set((pageState?.interactive_elements || []).map(sig));
-            for (const e of newPageState.interactive_elements) {
-              if (!prevSet.has(sig(e))) e.in_popup = true;
+            nextPage.active_popup = inlineGroup;
+            const sig = e => `${e.tag}|${e.role}|${(e.text || '').slice(0, 20)}|${e.name}`;
+            const previous = new Set((pageState.interactive_elements || []).map(sig));
+            for (const element of nextPage.interactive_elements) {
+              if (!previous.has(sig(element))) element.in_popup = true;
             }
           }
         }
-
-        actionResult.state_changes = {
-          url_changed: newPageState.url !== preUrl,
-          popup_appeared: !prePopup && !!newPageState.active_popup,
-          popup_disappeared: !!prePopup && !newPageState.active_popup,
-          element_count_delta: newPageState.interactive_elements.length - preElementCount
+        result.state_changes = {
+          url_changed: nextPage.url !== pageState.url,
+          popup_appeared: !pageState.active_popup && !!nextPage.active_popup,
+          popup_disappeared: !!pageState.active_popup && !nextPage.active_popup,
+          element_count_delta: (nextPage.interactive_elements || []).length - (pageState.interactive_elements || []).length
         };
-        pageState = newPageState;
-
-        // 单次调用：传上一步结果 + 新观察 → 下一个动作
-        response = await callAgentApi(safeApiUrl, '/v1/agent/step', {
-          session_id: sessionId,
-          action_result: actionResult,
-          page_state: newPageState
-        }, apiKey);
+        pageState = nextPage;
+        response = await run.decide('/v1/agent/step', { page_state: pageState, action_result: result });
       }
-
+      run.check();
+      backendTerminal = ['completed', 'cancelled', 'error'].includes(response.status);
       if (response.status === 'completed') {
+        statusText.textContent = response.success === false ? '任务未完成' : '任务完成';
         renderAgentComplete(aiBubble, response.summary, response.success !== false);
-      } else if (response.status === 'error') {
-        renderAgentError(aiBubble, response.error || '未知错误');
+      } else if (response.status === 'cancelled') {
+        statusText.textContent = '任务已取消';
+      } else {
+        throw new Error(response.error || '后端未返回有效动作或终态');
       }
-
-    } catch (err) {
-      aiBubble.textContent = '';
-      renderAgentError(aiBubble, err.message || '执行失败');
+    } catch (error) {
+      if (error.code === 'cancelled' || stopRequested) {
+        statusText.textContent = '正在确认停止状态…';
+      } else {
+        statusText.textContent = '任务未完成';
+        renderAgentError(aiBubble, error.message || '执行失败');
+      }
     } finally {
-      agentState.active = false;
-      agentState.status = 'idle';
-      if (cancelBtn && cancelBtn.parentNode) cancelBtn.remove();
-      // 释放 debugger 连接
-      const activeTab = await getActiveBrowserTab().catch(() => null);
-      if (activeTab?.id) {
-        chrome.runtime.sendMessage({ type: 'DEBUGGER_DETACH', tabId: activeTab.id }).catch(() => {});
+      if (run && !backendTerminal) await run.stop();
+      const cleanup = run ? await run.finish() : { safe: true };
+      if (cleanup.safe === false) {
+        statusText.textContent = '旧动作状态未确认，已阻止后续输入';
+        renderAgentError(aiBubble, '请检查页面；当前标签页仍被保护锁定，不会自动重放动作。');
+      } else if (stopRequested || run?.abort.signal.aborted && !backendTerminal) {
+        statusText.textContent = stopRequested ? '已停止；已发出的操作不会回滚' : '任务已结束';
       }
-      // 断开 keepalive：任务结束后允许 SW 正常回收
-      if (keepalivePort) { try { keepalivePort.disconnect(); } catch { /* noop */ } }
+      if (ownsUI()) Object.assign(agentState, { active: false, status: 'idle' });
+      aiBubble.querySelectorAll('.agent-confirm').forEach(element => element.remove());
+      cancelBtn.remove();
+      if (keepalivePort) { try { keepalivePort.disconnect(); } catch { /* 已断开 */ } }
     }
   }
 

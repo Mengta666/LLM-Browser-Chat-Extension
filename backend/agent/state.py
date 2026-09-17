@@ -10,6 +10,7 @@
 from dataclasses import dataclass, field
 from enum import Enum
 import time
+import threading
 from typing import Any, Optional
 
 from pydantic import BaseModel
@@ -25,12 +26,16 @@ class AgentStatus(str, Enum):
 
 
 class PageAction(BaseModel):
+    action_id: str = ""
+    observation_id: str = ""
     type: str  # click, type, select, scroll, hover, focus, clear, press_key, wait, navigate, task_complete
     index: Optional[int] = None          # 目标元素编号（data-agent-id）；无需元素的动作为 None
     params: dict[str, Any] = {}
 
 
 class ActionResult(BaseModel):
+    action_id: str = ""
+    execution_state: str = ""
     success: bool
     action_type: str
     details: str = ""
@@ -41,6 +46,9 @@ class ActionResult(BaseModel):
 
 
 class PageState(BaseModel):
+    tab_id: Optional[int] = None
+    observation_id: str = ""
+    document_epoch: str = ""
     url: str = ""
     title: str = ""
     viewport: dict[str, int] = {}
@@ -133,6 +141,12 @@ class AgentSession:
     created_at: float = field(default_factory=time.time)
     last_activity: float = field(default_factory=time.time)  # 每次 /step 刷新；空闲 TTL 依据（活跃任务不被误清）
     in_flight: bool = False              # 忙标志：该会话有请求正在 run_step 处理中，拒绝同会话并发（防 current_step 竞态）
+    cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    decision_deadline: float = 0
+    bound_tab_id: Optional[int] = None
+    active_request_id: str = ""
+    request_digests: dict = field(default_factory=dict)
+    request_results: dict = field(default_factory=dict)
 
     # 步数与超时防护
     max_steps: int = 200                 # 单任务最大步数（第 199 步自动 force_done 收尾，第 200 步硬兜底 ERROR）

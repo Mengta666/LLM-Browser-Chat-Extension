@@ -1,10 +1,15 @@
-importScripts('shared.js');
+importScripts('shared.js', 'agent_execution.js');
+
+const agentExecution = new AgentExecution.Controller({
+  read: async tabId => (await chrome.storage.session.get(`agentExecution:${tabId}`))[`agentExecution:${tabId}`],
+  write: (tabId, state) => chrome.storage.session.set({ [`agentExecution:${tabId}`]: state }),
+});
 
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(console.error);
 
 const MAX_LLM_BODY_BYTES = 25 * 1024 * 1024;
 const PAGE_REFRESH_ENDPOINT_PATH = '/api/pages/refresh_snapshot';
-const AGENT_ENDPOINT_PATHS = ['/v1/agent/execute', '/v1/agent/step', '/v1/agent/cancel'];
+const AGENT_ENDPOINT_PATHS = ['/v1/agent/execute', '/v1/agent/step', '/v1/agent/cancel', '/v1/agent/status'];
 
 // 会话历史 + 记忆管理 CRUD 的路径前缀(支持 GET/POST/PATCH/DELETE，仅本地/自定义后端）
 const BACKEND_API_PREFIXES = ['/v1/sessions', '/v1/memory'];
@@ -320,7 +325,7 @@ async function handleCallApiJson(request) {
 
   if (!response.ok) {
     const errorMessage = await getResponseErrorMessage(response);
-    throw new Error(`请求失败 (${response.status})：${errorMessage}`);
+    throw Object.assign(new Error(`请求失败 (${response.status})：${errorMessage}`), { status: response.status });
   }
 
   return response.json();
@@ -395,7 +400,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === 'CALL_API_JSON') {
     handleCallApiJson(request)
       .then((body) => sendResponse({ ok: true, body }))
-      .catch((error) => sendResponse({ ok: false, error: error?.message || '未知错误' }));
+      .catch((error) => sendResponse({ ok: false, error: error?.message || '未知错误', status: error?.status }));
     return true;
   }
 
@@ -406,42 +411,49 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
 
-  if (request.type === 'DEBUGGER_HOVER') {
-    handleDebuggerHover(request.tabId, request.x, request.y)
-      .then(() => sendResponse({ ok: true }))
-      .catch((error) => sendResponse({ ok: false, error: error?.message || '未知错误' }));
-    return true;
-  }
-
-  if (request.type === 'DEBUGGER_DETACH') {
-    debuggerDetach(request.tabId)
-      .then(() => sendResponse({ ok: true }))
-      .catch(() => sendResponse({ ok: true }));
-    return true;
-  }
-
   // CDP 观察/执行（Phase 1+，对齐 browser-use）
   if (request.type === 'AGENT_OBSERVE') {
-    handleAgentObserve(request.tabId, !!request.includeScreenshot)
+    managedAgentObserve(request)
       .then((r) => sendResponse({ ok: true, pageState: r.pageState }))
-      .catch((error) => sendResponse({ ok: false, error: error?.message || '观察失败' }));
+      .catch((error) => sendResponse({ ok: false, error: error?.message || '观察失败', code: error?.code }));
     return true;
   }
 
   if (request.type === 'AGENT_EXECUTE') {
-    handleAgentExecute(request.tabId, request.action)
+    agentExecution.execute(request.tabId, request.sessionId, request.action,
+      ctx => handleAgentExecute(request.tabId, request.action, ctx), request.timeoutMs)
       .then((result) => sendResponse({ ok: true, result }))
-      .catch((error) => sendResponse({ ok: false, error: error?.message || '执行失败' }));
+      .catch((error) => sendResponse({ ok: false, error: error?.message || '执行失败', code: error?.code }));
     return true;
   }
+});
+
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request.type !== 'AGENT_CONTROL') return;
+  Promise.resolve().then(async () => {
+    const { tabId, sessionId, command } = request;
+    if (command === 'start') return agentExecution.start(tabId, sessionId);
+    if (command === 'cancel') return agentExecution.cancel(tabId, sessionId);
+    if (command === 'status') return agentExecution.status(tabId, sessionId, request.actionId);
+    if (command === 'abort_action') return agentExecution.abortAction(tabId, sessionId, request.actionId);
+    if (command === 'invalidate_observation') return agentExecution.invalidateObservation(tabId, sessionId, request.observationId);
+    if (command === 'end') return agentExecution.end(tabId, sessionId, () => debuggerDetach(tabId));
+    throw new Error('未知自动化控制请求');
+  }).then(result => sendResponse({ ok: true, result }))
+    .catch(error => sendResponse({ ok: false, error: error.message, code: error.code }));
+  return true;
 });
 
 // Debugger 会话管理：保持 attach 状态复用，避免每次 attach/detach 的开销
 const _debuggerAttached = new Set();
 
-chrome.debugger.onDetach.addListener((source) => {
+chrome.debugger.onDetach.addListener((source, reason) => {
   _debuggerAttached.delete(source.tabId);
   if (source.tabId != null) {
+    if (reason === 'canceled_by_user') {
+      const run = agentExecution.tabs.get(source.tabId);
+      if (run) agentExecution.cancel(source.tabId, run.sessionId).catch(() => {});
+    }
     // 标记未挂载（如用户点了横幅"取消"）；下次 ensureAttached 会重连并 bump epoch → execute 侧转 stale。
     saveTabState(STATE_KEYS.attach, source.tabId, { attached: false, sessionEpoch: _sessionEpoch.get(source.tabId) || 0 });
   }
@@ -525,15 +537,6 @@ async function debuggerDetach(tabId) {
   await saveTabState(STATE_KEYS.oopif, tabId, null);
 }
 
-// 真实鼠标移动，触发 hover 浮层（CSS :hover 和 JS mouseenter 都生效）
-// 导航后移鼠标到中性位收残留浮层（sidepanel runAgentTask 用）；元素级 hover 走 AGENT_EXECUTE。
-async function handleDebuggerHover(tabId, x, y) {
-  await debuggerEnsureAttached(tabId);
-  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
-    type: 'mouseMoved', x, y
-  });
-}
-
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CDP 观察/执行层基座（Phase 0，对齐 browser-use 0.13.8）
@@ -570,18 +573,29 @@ const REQUIRED_COMPUTED_STYLES = [
 // target = {tabId} 走根会话；{tabId, sessionId} 路由到子 protocol session（OOPIF flatten）。
 // chrome.debugger.sendCommand 官方支持 sessionId（Chromium debugger.json: DebuggerSession.sessionId）。
 function cdpSend(target, method, params, timeoutMs) {
+  const { _agentAction: ctx, _agentCleanup: cleanup, _agentEffect: effect, ...debugTarget } = target;
+  const releasing = cleanup || method === 'Runtime.releaseObject';
+  try { if (ctx && !releasing) ctx.check(); } catch (error) { return Promise.reject(error); }
+  const isEffect = effect || method.startsWith('Input.') || ['DOM.focus', 'DOM.scrollIntoViewIfNeeded', 'Page.navigate', 'Page.bringToFront'].includes(method);
+  if (ctx && !releasing && isEffect) ctx.dispatched = true;
   const cmdPromise = new Promise((resolve, reject) => {
-    chrome.debugger.sendCommand(target, method, params || {}, (result) => {
+    chrome.debugger.sendCommand(debugTarget, method, params || {}, (result) => {
       const err = chrome.runtime.lastError;
       if (err) { reject(new Error(`${method}: ${err.message}`)); return; }
+      if (ctx && isEffect && result?.exceptionDetails) { reject(new Error(`${method}: 页面输入脚本执行异常`)); return; }
       resolve(result);
     });
   });
+  if (ctx) ctx.track(cmdPromise, effect || method.startsWith('Input.') || method === 'Page.navigate');
+  if (ctx && !timeoutMs) timeoutMs = releasing ? 5000 : Math.max(1, Math.min(10000, ctx.deadline - Date.now()));
   if (!timeoutMs) return cmdPromise;
-  return withTimeout(cmdPromise, timeoutMs, method);
+  return withTimeout(cmdPromise, timeoutMs, method).catch(error => {
+    if (ctx?.pending.has(cmdPromise)) ctx.cancelled = true;
+    throw error;
+  });
 }
 
-// Promise 墙钟超时：超时 reject（调用方决定降级/吞掉），复现 browser-use asyncio.wait_for 语义。
+// 只限制等待，不取消底层命令；动作占用必须等原始 CDP 回调结束才释放。
 function withTimeout(promise, ms, label) {
   let timer = null;
   const timeout = new Promise((_, reject) => {
@@ -602,13 +616,13 @@ async function loadTabState(key, tabId) {
   } catch { return null; }
 }
 
-async function saveTabState(key, tabId, value) {
+async function saveTabState(key, tabId, value, required = false) {
   try {
     const all = await chrome.storage.session.get([key]);
     const map = all[key] || {};
     if (value === null) delete map[tabId]; else map[tabId] = value;
     await chrome.storage.session.set({ [key]: map });
-  } catch { /* storage 不可用则退化为纯内存，SW 存活期间仍可用 */ }
+  } catch (error) { if (required) throw error; }
 }
 
 // attach 成功即递增 sessionEpoch：新 CDP session 里旧 backendNodeId 语义可能失效，
@@ -1489,14 +1503,31 @@ async function observationPosition(target) {
   }));
 }
 
-async function handleAgentObserve(tabId, includeScreenshot = false, retry = 0) {
+async function managedAgentObserve(request) {
+  if (!request.observationId) throw new Error('缺少观察版本，请重新加载扩展');
+  const token = agentExecution.observeToken(request.tabId, request.sessionId, request.observationId);
+  return handleAgentObserve(request.tabId, !!request.includeScreenshot, 0, token);
+}
+
+async function documentIdentity(target) {
+  const tree = await cdpSend(target, 'Page.getFrameTree', {});
+  const frame = tree?.frameTree?.frame;
+  if (!frame?.id || !frame.loaderId) throw new Error('页面文档身份暂不可用');
+  return `${frame.id}:${frame.loaderId}`;
+}
+
+async function handleAgentObserve(tabId, includeScreenshot = false, retry = 0, token = null) {
+  token?.check();
   await debuggerEnsureAttached(tabId);
+  token?.check();
   const target = { tabId };
+  const documentEpoch = token ? await documentIdentity(target) : '';
   const epoch = await getSessionEpoch(tabId);
   const position = includeScreenshot ? await observationPosition(target) : null;
 
   // 主 target。
   const { built, dpr, jsClickCount } = await gatherAndConstructTarget(target, { sessionId: null, targetId: null }, { x: 0, y: 0 });
+  token?.check();
   const allNodes = built.allNodes;
   let pending = built.pendingCrossOrigin;
   let iframeCount = 0;
@@ -1506,6 +1537,7 @@ async function handleAgentObserve(tabId, includeScreenshot = false, retry = 0) {
   for (let depth = 0; depth < MAX_IFRAME_DEPTH && pending.length && iframeCount < MAX_IFRAMES; depth++) {
     const nextPending = [];
     for (const pc of pending) {
+      token?.check();
       if (iframeCount >= MAX_IFRAMES) break;
       const child = await resolveChildTarget(tabId, pc.frameId);
       if (!child) continue;
@@ -1530,6 +1562,8 @@ async function handleAgentObserve(tabId, includeScreenshot = false, retry = 0) {
   applyPaintOrderFilter(allNodes);
   const { elements, indexMap } = serializeInteractive(allNodes, { sessionId: null, targetId: null });
   const extras = await pageExtrasProbe(target);
+  token?.check();
+  if (token && (!extras.url || !extras.viewport)) throw new Error('页面基本信息暂不可用，请重新观察');
   let screenshot = '';
   if (includeScreenshot) {
     try {
@@ -1539,19 +1573,30 @@ async function handleAgentObserve(tabId, includeScreenshot = false, retry = 0) {
       if (capture?.data) screenshot = 'data:image/jpeg;base64,' + capture.data;
     } catch { /* 截图不可用时仍可使用本轮文字观察。 */ }
     if (position !== await observationPosition(target)) {
-      await saveTabState(STATE_KEYS.indexMap, tabId, null);
-      if (retry === 0) return handleAgentObserve(tabId, true, 1);
+      token?.check();
+      if (!token) await saveTabState(STATE_KEYS.indexMap, tabId, null);
+      if (retry === 0) return handleAgentObserve(tabId, true, 1, token);
       throw new Error('页面在观察期间发生导航或滚动，请重新观察');
     }
   }
 
   // indexMap 持久化（含 epoch）：SW 重启后 execute 侧比对 epoch，不符即 stale。
-  await saveTabState(STATE_KEYS.indexMap, tabId, { epoch, map: indexMap });
+  if (token) {
+    token.check();
+    if (documentEpoch !== await documentIdentity(target)) throw new Error('页面已重载，请重新观察');
+    await agentExecution.publishObservation(token, () => saveTabState(STATE_KEYS.indexMap, tabId,
+      { epoch, map: indexMap, observationId: token.id, documentEpoch }, true));
+  } else {
+    await saveTabState(STATE_KEYS.indexMap, tabId, { epoch, map: indexMap });
+  }
 
   // 路径铁证：在 SW 控制台打印，确认走的是 CDP 观察（区分新旧路径）。
   console.log(`[CDP观察] elems=${elements.length} jsClick=${jsClickCount} iframes=${iframeCount} dpr=${dpr.toFixed(2)} url=${(extras.url || '').slice(0, 60)}`);
 
   const pageState = {
+    tab_id: tabId,
+    observation_id: token?.id || '',
+    document_epoch: documentEpoch,
     screenshot,
     url: extras.url || '',
     title: extras.title || '',
@@ -1648,7 +1693,8 @@ async function getActionGeometry(target, backendNodeId, entry) {
   const offsets = new Map([[null, { x: 0, y: 0, sx: 1, sy: 1 }]]);
   const frames = [];
   for (const frame of entry?.framePath || []) {
-    const frameTarget = frame.sessionId ? { tabId: target.tabId, sessionId: frame.sessionId } : { tabId: target.tabId };
+    const frameTarget = { tabId: target.tabId, ...(frame.sessionId ? { sessionId: frame.sessionId } : {}),
+      ...(target._agentAction ? { _agentAction: target._agentAction } : {}) };
     const offset = offsets.get(frame.sessionId);
     if (!offset) throw new Error('子页面定位信息失效，请重新观察');
     const box = await cdpSend(frameTarget, 'DOM.getBoxModel', { backendNodeId: frame.backendNodeId });
@@ -1686,13 +1732,14 @@ async function getActionGeometry(target, backendNodeId, entry) {
 async function dispatchRealClick(target, x, y) {
   await cdpSend(target, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
   await sleep(50);
+  target._agentAction?.check();
   let failure = null;
   try {
     await cdpSend(target, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 }, CDP_TIMEOUTS.mousePressed);
     await sleep(80);
   } catch (e) { failure = e; }
   try {
-    await cdpSend(target, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 }, CDP_TIMEOUTS.mouseReleased);
+    await cdpSend({ ...target, ...(target._agentAction ? { _agentCleanup: true } : {}) }, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 }, CDP_TIMEOUTS.mouseReleased);
   } catch (e) { failure = failure || e; }
   if (failure) throw new Error('鼠标点击未能完整确认，可能已部分执行；请先观察结果，不要直接重试');
 }
@@ -1743,21 +1790,29 @@ async function dispatchSpecialKey(target, key, modifiers) {
   let mod = 0;
   for (const m of (modifiers || [])) mod |= (KEY_MODIFIERS[String(m).toLowerCase()] || 0);
   const base = { key, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk, modifiers: mod };
-  await cdpSend(target, 'Input.dispatchKeyEvent', { type: 'keyDown', ...base });
-  if (key === 'Enter') await cdpSend(target, 'Input.dispatchKeyEvent', { type: 'char', text: '\r', key, modifiers: mod });
-  await cdpSend(target, 'Input.dispatchKeyEvent', { type: 'keyUp', ...base });
+  target._agentAction?.check();
+  try {
+    await cdpSend(target, 'Input.dispatchKeyEvent', { type: 'keyDown', ...base });
+    if (key === 'Enter') await cdpSend(target, 'Input.dispatchKeyEvent', { type: 'char', text: '\r', key, modifiers: mod });
+  } finally {
+    await cdpSend({ ...target, ...(target._agentAction ? { _agentCleanup: true } : {}) }, 'Input.dispatchKeyEvent', { type: 'keyUp', ...base });
+  }
 }
 
 // 逐字符输入（三段式 keyDown 无 text → char 有 text → keyUp 无 text，含 VK 映射）。daw.py:1874。
 async function typeChars(target, text) {
   for (const ch of text) {
+    target._agentAction?.check();
     if (ch === '\n') { await dispatchSpecialKey(target, 'Enter', []); await sleep(1); continue; }
     const { mod, vk, base } = charModifiersAndVk(ch);
     const code = keyCodeForChar(base);
-    await cdpSend(target, 'Input.dispatchKeyEvent', { type: 'keyDown', key: base, code, modifiers: mod, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk });
-    await sleep(5);
-    await cdpSend(target, 'Input.dispatchKeyEvent', { type: 'char', text: ch, key: ch });
-    await cdpSend(target, 'Input.dispatchKeyEvent', { type: 'keyUp', key: base, code, modifiers: mod, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk });
+    try {
+      await cdpSend(target, 'Input.dispatchKeyEvent', { type: 'keyDown', key: base, code, modifiers: mod, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk });
+      await sleep(5);
+      await cdpSend(target, 'Input.dispatchKeyEvent', { type: 'char', text: ch, key: ch });
+    } finally {
+      await cdpSend({ ...target, ...(target._agentAction ? { _agentCleanup: true } : {}) }, 'Input.dispatchKeyEvent', { type: 'keyUp', key: base, code, modifiers: mod, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk });
+    }
     await sleep(1);
   }
 }
@@ -1818,10 +1873,27 @@ async function refocusTop(target) {
 
 // AGENT_EXECUTE：按 action.type 分发。Phase 2 完整支持 click/type/scroll/wait/press_key/clear/select/hover/focus/scroll_to_element。
 // 返回 ActionResult 形状。__via:'cdp' 是路径铁证标记（区分新旧路径，验证用）。
-async function handleAgentExecute(tabId, action) {
+async function handleAgentExecute(tabId, action, ctx = null) {
+  ctx?.check();
   await debuggerEnsureAttached(tabId);
-  const rootTarget = { tabId };            // 鼠标/键盘派发用根 target（坐标是顶层视口）
+  ctx?.check();
+  const rootTarget = { tabId, ...(ctx ? { _agentAction: ctx } : {}) };
   const type = action.type;
+  if (ctx) {
+    const map = await loadTabState(STATE_KEYS.indexMap, tabId);
+    if (!map || map.observationId !== action.observation_id || map.epoch !== await getSessionEpoch(tabId)
+        || map.documentEpoch !== await documentIdentity(rootTarget)) {
+      return { success: false, stale: true, action_type: type, error: '观察版本或页面文档已失效' };
+    }
+    ctx.check();
+  }
+  if (type === 'navigate') {
+    const url = new URL(action.params?.url);
+    if (!['http:', 'https:'].includes(url.protocol)) throw new Error('不允许的导航协议');
+    const result = await cdpSend(rootTarget, 'Page.navigate', { url: url.href });
+    if (result?.errorText) throw new Error('导航失败');
+    return { success: true, action_type: type, details: '已派发导航，请以新观察确认页面' };
+  }
 
   // 需要元素的动作先解析 index → { backendNodeId, sessionId }（epoch 不符即 stale）。
   const noElActions = ['scroll', 'wait', 'navigate'];
@@ -1829,15 +1901,15 @@ async function handleAgentExecute(tabId, action) {
   const needsEl = !noElActions.includes(type) && !optElActions.includes(type);
   let backendNodeId = null;
   let elementEntry = null;
-  let domTarget = { tabId };               // DOM 命令（resolveNode/focus/getContentQuads）用；OOPIF 节点走子 session
+  let domTarget = rootTarget;
   if (needsEl || (optElActions.includes(type) && action.index != null)) {
     const r = await resolveIndex(tabId, action.index);
-    if (needsEl && r.stale) return { __via: 'cdp', success: false, stale: true, action_type: type, error: `编号 ${action.index} 已失效（需重新观察）` };
+    if (r.stale) return { __via: 'cdp', success: false, stale: true, action_type: type, error: `编号 ${action.index} 已失效（需重新观察）` };
     if (!r.stale) {
       elementEntry = r.entry;
       backendNodeId = r.entry.backendNodeId;
       // OOPIF：跨源节点的 backendNodeId 只在其子 session 有效（cdp_client_for_node 4级定位）。
-      if (r.entry.sessionId) domTarget = { tabId, sessionId: r.entry.sessionId };
+      if (r.entry.sessionId) domTarget = { ...rootTarget, sessionId: r.entry.sessionId };
     }
   }
 
@@ -1853,12 +1925,12 @@ async function handleAgentExecute(tabId, action) {
     if (type === 'clear') return { __via: 'cdp', ...(await doClear(domTarget, backendNodeId, action.index)) };
     if (type === 'select') return { __via: 'cdp', ...(await doSelect(domTarget, rootTarget, backendNodeId, action, vw, vh, elementEntry)) };
     if (type === 'hover') return { __via: 'cdp', ...(await doHover(domTarget, rootTarget, backendNodeId, vw, vh, elementEntry)) };
-    if (type === 'focus') { await cdpSend(domTarget, 'DOM.focus', { backendNodeId }).catch(() => {}); return { __via: 'cdp', success: true, action_type: type, details: `聚焦[${action.index}]` }; }
+    if (type === 'focus') { await cdpSend(domTarget, 'DOM.focus', { backendNodeId }); return { __via: 'cdp', success: true, action_type: type, details: `聚焦[${action.index}]` }; }
     if (type === 'press_key') {
       const key = (action.params && action.params.key) || 'Enter';
       const mods = (action.params && action.params.modifiers) || [];
-      if (backendNodeId != null) await cdpSend(domTarget, 'DOM.focus', { backendNodeId }).catch(() => {});
-      await dispatchSpecialKey(rootTarget, key, mods);
+      if (backendNodeId != null) await cdpSend(domTarget, 'DOM.focus', { backendNodeId });
+      await dispatchSpecialKey(domTarget, key, mods);
       return { __via: 'cdp', success: true, action_type: type, details: `按下 ${key}` };
     }
     if (type === 'scroll_to_element') {
@@ -1875,6 +1947,7 @@ async function handleAgentExecute(tabId, action) {
     if (type === 'wait') {
       const ms = Math.min((action.params && action.params.ms) || 1000, 5000);
       await sleep(ms);
+      ctx?.check();
       return { __via: 'cdp', success: true, action_type: type, details: `等待 ${ms}ms` };
     }
     return { __via: 'cdp', success: false, action_type: type, error: `不支持的动作: ${type}` };
@@ -1889,7 +1962,7 @@ async function handleAgentExecute(tabId, action) {
 // 定位与命中检查完成后只派发一次真实点击；没有几何或被遮挡时不穿透、不补点。
 async function doClick(domTarget, rootTarget, backendNodeId, index, vw, vh, entry) {
   for (const frame of entry?.framePath || []) {
-    const target = frame.sessionId ? { tabId: rootTarget.tabId, sessionId: frame.sessionId } : rootTarget;
+    const target = frame.sessionId ? { ...rootTarget, sessionId: frame.sessionId } : rootTarget;
     await cdpSend(target, 'DOM.scrollIntoViewIfNeeded', { backendNodeId: frame.backendNodeId });
   }
   await cdpSend(domTarget, 'DOM.scrollIntoViewIfNeeded', { backendNodeId });
@@ -1935,7 +2008,7 @@ async function doType(domTarget, rootTarget, backendNodeId, action) {
   const doClear = action.params && action.params.clear !== false;
   await cdpSend(target, 'DOM.scrollIntoViewIfNeeded', { backendNodeId }).catch(() => {});
   await sleep(10);
-  await cdpSend(target, 'DOM.focus', { backendNodeId }).catch(() => {});
+  await cdpSend(target, 'DOM.focus', { backendNodeId });
   const rn = await cdpSend(target, 'DOM.resolveNode', { backendNodeId }).catch(() => null);
   const objectId = rn && rn.object && rn.object.objectId;
 
@@ -1946,7 +2019,7 @@ async function doType(domTarget, rootTarget, backendNodeId, action) {
       returnByValue: true,
     }).then(r => r && r.result && r.result.value).catch(() => false);
     if (needDirect) {
-      await cdpSend(target, 'Runtime.callFunctionOn', {
+      await cdpSend({ ...target, _agentEffect: true }, 'Runtime.callFunctionOn', {
         objectId, arguments: [{ value: text }],
         functionDeclaration: `function(v){const p=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value');p&&p.set&&p.set.call(this,v);this.dispatchEvent(new Event('focus',{bubbles:true}));this.dispatchEvent(new Event('input',{bubbles:true}));this.dispatchEvent(new Event('change',{bubbles:true}));this.dispatchEvent(new Event('blur',{bubbles:true}));}`,
       });
@@ -1962,7 +2035,7 @@ async function doType(domTarget, rootTarget, backendNodeId, action) {
       const rv = await cdpSend(target, 'Runtime.callFunctionOn', { objectId, functionDeclaration: 'function(){return this.value!==undefined?this.value:this.textContent;}', returnByValue: true });
       const actual = (rv && rv.result && rv.result.value) || '';
       if (doClear && actual !== text && actual.length > text.length && (actual.endsWith(text) || actual.startsWith(text))) {
-        await cdpSend(target, 'Runtime.callFunctionOn', {
+        await cdpSend({ ...target, _agentEffect: true }, 'Runtime.callFunctionOn', {
           objectId, arguments: [{ value: text }],
           functionDeclaration: `function(v){const P=this.tagName==='TEXTAREA'?window.HTMLTextAreaElement.prototype:window.HTMLInputElement.prototype;const p=Object.getOwnPropertyDescriptor(P,'value');if(p&&p.set){p.set.call(this,v);}else{this.value=v;}this.dispatchEvent(new Event('input',{bubbles:true}));this.dispatchEvent(new Event('change',{bubbles:true}));}`,
         });
@@ -1976,7 +2049,7 @@ async function doType(domTarget, rootTarget, backendNodeId, action) {
 async function clearField(target, backendNodeId, objectId) {
   const oid = objectId || (await cdpSend(target, 'DOM.resolveNode', { backendNodeId }).then(r => r && r.object && r.object.objectId).catch(() => null));
   if (!oid) return;
-  await cdpSend(target, 'Runtime.callFunctionOn', {
+  await cdpSend({ ...target, _agentEffect: true }, 'Runtime.callFunctionOn', {
     objectId: oid,
     functionDeclaration: `function(){const ce=this.getAttribute('contenteditable');if(ce==='true'||ce===''||this.isContentEditable){while(this.firstChild)this.removeChild(this.firstChild);}else{try{this.select();}catch(e){}this.value='';}this.dispatchEvent(new Event('input',{bubbles:true}));this.dispatchEvent(new Event('change',{bubbles:true}));}`,
   }).catch(() => {});
@@ -1996,7 +2069,7 @@ async function doSelect(domTarget, rootTarget, backendNodeId, action, vw, vh, en
   if (objectId) {
     const isNative = await cdpSend(target, 'Runtime.callFunctionOn', { objectId, functionDeclaration: 'function(){return this.tagName==="SELECT";}', returnByValue: true }).then(r => r && r.result && r.result.value).catch(() => false);
     if (isNative) {
-      await cdpSend(target, 'Runtime.callFunctionOn', {
+      await cdpSend({ ...target, _agentEffect: true }, 'Runtime.callFunctionOn', {
         objectId, arguments: [{ value: optText }],
         functionDeclaration: `function(t){const o=Array.from(this.options).find(o=>o.textContent.trim().toLowerCase()===t.toLowerCase());if(o){this.value=o.value;this.dispatchEvent(new Event('change',{bubbles:true}));return true;}return false;}`,
         returnByValue: true,
@@ -2008,7 +2081,7 @@ async function doSelect(domTarget, rootTarget, backendNodeId, action, vw, vh, en
   const opened = await doClick(target, rootTarget, backendNodeId, action.index, vw, vh, entry);
   if (!opened.success) return { ...opened, action_type: 'select' };
   await sleep(500);
-  const found = await cdpSend(target, 'Runtime.evaluate', {
+  const found = await cdpSend({ ...target, _agentEffect: true }, 'Runtime.evaluate', {
     expression: `(()=>{const t=${JSON.stringify(optText.toLowerCase().trim())};const items=document.querySelectorAll('[role="option"],[role="listbox"] li,.ant-select-item,.el-select-dropdown__item,[class*="option"],[class*="menu-item"],[class*="dropdown"] li');for(const it of items){if((it.textContent||'').toLowerCase().trim()===t){const r=it.getBoundingClientRect();it.click();return {x:r.x+r.width/2,y:r.y+r.height/2};}}return null;})()`,
     returnByValue: true,
   }).then(r => r && r.result && r.result.value).catch(() => null);

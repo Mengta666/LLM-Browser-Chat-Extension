@@ -1,116 +1,155 @@
-"""Agent 自动化 API 端点（单 LLM 反应式）。
-
-/execute 启动会话并返回首个动作；/step 传入上一步结果+新观察，返回下一个动作；
-/cancel 取消。（旧的 /plan /action 双端点已合并进 /step。）
-"""
-
+"""自动化协议 v2：步骤幂等、决策状态查询、取消终态保护。"""
+import hashlib
+import json
+import time
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
-from agent.loop import (
-    create_session, get_session, run_step, cancel_session,
-    acquire_session, release_session,
-)
-from agent.state import PageState, ActionResult
+from agent import loop
+from agent.state import PageState, ActionResult, AgentStatus
 
-
-router = APIRouter(prefix="/v1/agent", tags=["Agent 自动化"])
+router = APIRouter(prefix='/v1/agent', tags=['Agent 自动化'])
 
 
 class AgentExecuteRequest(BaseModel):
-    task: str
+    protocol_version: int = 0
+    request_id: str = Field(min_length=1, max_length=128)
+    session_id: str = Field(min_length=1, max_length=128)
     page_state: dict[str, Any]
-    session_id: str
-    model: str = "gpt-4o"
+    budget_ms: int = Field(default=180000, gt=0, le=3600000)
+    task: str
+    model: str = 'gpt-4o'
     require_confirmation: list[str] = []
-    task_image: str = ""   # 可选：任务附带的视觉上下文（上传图/框选截图 data URL）
-    llm_params: dict[str, Any] = {}   # 用户在设置面板配的自定义 LLM 参数(如关思考模式);仅自动化 loop 使用,chat 不受影响
+    task_image: str = ''
+    llm_params: dict[str, Any] = {}
 
 
 class AgentStepRequest(BaseModel):
-    session_id: str
-    action_result: dict[str, Any] = {}
+    protocol_version: int = 0
+    request_id: str = Field(min_length=1, max_length=128)
+    session_id: str = Field(min_length=1, max_length=128)
     page_state: dict[str, Any]
-    user_confirmed: bool = False
-    force_done: bool = False   # 前端整轮超时触发：强制本步只出 task_complete 收尾
+    budget_ms: int = Field(default=180000, gt=0, le=3600000)
+    action_result: dict[str, Any]
+    force_done: bool = False
 
 
 class AgentCancelRequest(BaseModel):
-    session_id: str
+    session_id: str = Field(min_length=1, max_length=128)
 
 
-def _parse_result(raw: dict[str, Any]) -> ActionResult:
-    raw = raw or {}
-    return ActionResult(
-        success=raw.get("success", False),
-        action_type=raw.get("action_type", "unknown"),
-        details=raw.get("details", ""),
-        error=raw.get("error"),
-        timestamp=raw.get("timestamp", 0),
-        stale=raw.get("stale", False),
-        state_changes=raw.get("state_changes"),
-    )
+class AgentStatusRequest(AgentCancelRequest):
+    request_id: str = Field(min_length=1, max_length=128)
 
 
-@router.post("/execute")
-def agent_execute(item: AgentExecuteRequest) -> dict[str, Any]:
-    """启动新会话，返回第一个动作。"""
-    if not item.task.strip():
-        raise HTTPException(400, "task 不能为空")
-    if not item.session_id.strip():
-        raise HTTPException(400, "session_id 不能为空")
-    if get_session(item.session_id):
-        raise HTTPException(409, f"会话 {item.session_id} 已存在")
+def _processing(session, request_id):
+    return {'protocol_version': 2, 'session_id': session.session_id,
+            'request_id': request_id, 'status': 'processing', 'action': None}
 
+
+def _decide(item, initial=False):
+    if item.protocol_version != 2:
+        raise HTTPException(409, '自动化协议不匹配，请同时更新后端和扩展')
     try:
-        session = create_session(
-            session_id=item.session_id, task=item.task, model=item.model,
-            require_confirmation=item.require_confirmation,
-            task_image=item.task_image,
-            llm_params=item.llm_params or {},
-        )
-    except RuntimeError as e:                       # 活跃会话到达容量上限
-        raise HTTPException(503, str(e)) from e
+        page = PageState(**item.page_state)
+        result = None if initial else ActionResult(**item.action_result)
+    except (ValidationError, TypeError) as exc:
+        raise HTTPException(400, '页面观察或动作结果格式错误') from exc
+    if page.tab_id is None or not page.observation_id or not page.document_epoch:
+        raise HTTPException(400, '缺少有效观察版本或目标标签页')
+    if initial and not item.task.strip():
+        raise HTTPException(400, 'task 不能为空')
+    digest = hashlib.sha256(json.dumps(item.model_dump(), sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    with loop._sessions_lock:
+        session = loop.get_session(item.session_id)
+        if not session:
+            if not initial:
+                raise HTTPException(404, '自动化会话不存在，不能续接旧动作')
+            try:
+                session = loop.create_session(item.session_id, item.task, item.model,
+                    item.require_confirmation, item.task_image, item.llm_params)
+            except RuntimeError as exc:
+                raise HTTPException(503, str(exc)) from exc
+            session.bound_tab_id = page.tab_id
+        if session.cancel_event.is_set():
+            return loop._build_response(session)
+        previous = session.request_digests.get(item.request_id)
+        if previous:
+            if previous != digest:
+                raise HTTPException(409, '同一请求标识不能用于不同内容')
+            session.last_activity = time.time()
+            return session.request_results.get(item.request_id) or _processing(session, item.request_id)
+        if session.in_flight:
+            raise HTTPException(409, '已有决策正在处理，请查询原请求状态')
+        if session.status in (AgentStatus.COMPLETED, AgentStatus.ERROR):
+            return loop._build_response(session)
+        if session.bound_tab_id != page.tab_id:
+            raise HTTPException(409, '观察不属于本任务标签页')
+        if initial and session.request_digests:
+            raise HTTPException(409, '会话已经启动')
+        if not initial:
+            if not session.pending_action or result.action_id != session.pending_action.action_id:
+                raise HTTPException(409, '动作结果已过期或不属于当前步骤')
+            if result.execution_state not in ('completed', 'not_dispatched', 'partial'):
+                raise HTTPException(409, '旧动作尚未结束，不能推进下一步')
+            if page.observation_id == session.pending_action.observation_id:
+                raise HTTPException(409, '必须提交动作后的新观察')
+        session.in_flight = True
+        session.active_request_id = item.request_id
+        session.request_digests[item.request_id] = digest
+        session.decision_deadline = time.monotonic() + min(item.budget_ms / 1000, 180)
     try:
-        page_state = PageState(**item.page_state)
-    except (ValidationError, TypeError) as e:
-        raise HTTPException(400, f"page_state 格式错误: {str(e)[:200]}")
-    try:
-        return run_step(session, page_state)
+        response = loop.run_step(session, page, result, getattr(item, 'force_done', False))
     except Exception as exc:
-        raise HTTPException(502, f"Agent 执行出错: {exc}") from exc
+        with loop._sessions_lock:
+            if not session.cancel_event.is_set():
+                session.status = AgentStatus.ERROR
+                session.pending_action = None
+                session.success = False
+                session.error = f'自动化决策失败（{type(exc).__name__}）'
+            response = loop._build_response(session)
+    with loop._sessions_lock:
+        if session.cancel_event.is_set():
+            response = loop._build_response(session)
+        session.request_results[item.request_id] = response
+        session.in_flight = False
+        session.last_activity = time.time()
+        return response
 
 
-@router.post("/step")
-def agent_step(item: AgentStepRequest) -> dict[str, Any]:
-    """继续会话：传入上一步执行结果 + 新页面观察，返回下一个动作。"""
-    # 原子取会话 + 占用忙标志：拒绝同会话并发 /step（防 current_step 读-改-写竞态）
-    session, acquired = acquire_session(item.session_id)
-    if session is None:
-        raise HTTPException(404, f"会话 {item.session_id} 不存在")
-    if not acquired:
-        raise HTTPException(409, f"会话 {item.session_id} 有请求正在处理中")
+@router.post('/execute')
+def agent_execute(item: AgentExecuteRequest):
+    return _decide(item, initial=True)
+
+
+@router.post('/step')
+def agent_step(item: AgentStepRequest):
+    return _decide(item)
+
+
+@router.post('/status')
+def agent_status(item: AgentStatusRequest):
+    with loop._sessions_lock:
+        session = loop.get_session(item.session_id)
+        if not session:
+            raise HTTPException(404, '自动化会话不存在')
+        session.last_activity = time.time()
+        if session.cancel_event.is_set():
+            return loop._build_response(session)
+        if item.request_id in session.request_results:
+            return session.request_results[item.request_id]
+        if item.request_id in session.request_digests:
+            return _processing(session, item.request_id)
+        raise HTTPException(404, '决策请求尚未接收')
+
+
+@router.post('/cancel')
+def agent_cancel(item: AgentCancelRequest):
     try:
-        action_result = _parse_result(item.action_result)
-        try:
-            page_state = PageState(**item.page_state)
-        except (ValidationError, TypeError) as e:
-            raise HTTPException(400, f"page_state 格式错误: {str(e)[:200]}")
-        try:
-            return run_step(session, page_state, action_result, force_done=item.force_done)
-        except HTTPException:
-            raise
-        except Exception as exc:
-            raise HTTPException(502, f"Agent 执行出错: {exc}") from exc
-    finally:
-        release_session(session)               # 无论成功/异常/校验失败都释放忙标志
-
-
-@router.post("/cancel")
-def agent_cancel(item: AgentCancelRequest) -> dict[str, Any]:
-    success = cancel_session(item.session_id)
-    if not success:
-        raise HTTPException(404, f"会话 {item.session_id} 不存在")
-    return {"session_id": item.session_id, "status": "cancelled"}
+        loop.cancel_session(item.session_id)
+    except RuntimeError as exc:
+        raise HTTPException(503, '取消记录暂时无法保存') from exc
+    with loop._sessions_lock:
+        return loop._build_response(loop.get_session(item.session_id))

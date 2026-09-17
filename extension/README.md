@@ -17,6 +17,8 @@
 
 扩展不需要 npm 构建，生产运行通过 Chrome 的 CDP 接口执行自动化，不需要安装 Playwright。修改扩展文件后，要在扩展管理页重新加载，再关闭并重新打开侧边栏；只刷新目标网页不够。
 
+自动化协议已升级到 v2，需要同时重启新版后端并重新加载扩展。观察失败自动恢复、不沿用旧状态；停止会阻止后续输入，无法确认是否完成的旧动作不会自动重放。任务始终绑定启动时的标签页，具体预算与限制见项目 README。
+
 ## 主要操作
 
 - **普通聊天**：关闭自动化，发送文本或图片；支持 Markdown、公式和流式响应。具体图片 / 工具能力由模型服务决定。
@@ -35,6 +37,8 @@
 | [manifest.json](manifest.json) | 扩展入口、权限及资源声明 |
 | [background.js](background.js) | CDP 连接、页面观察、浏览器输入及导航 |
 | [agent_observation.js](agent_observation.js) | 自动化观察辅助与截图标注 |
+| [agent_execution.js](agent_execution.js) | 标签页执行占用、动作去重、取消与执行记录 |
+| [agent_runner.js](agent_runner.js) | 自动观察恢复、决策状态查询和时间预算 |
 | [sidepanel.html](sidepanel.html) | 侧边栏页面 |
 | [sidepanel.js](sidepanel.js) | 聊天、自动化循环、历史恢复及知识库界面 |
 
@@ -65,11 +69,16 @@ API 地址、模型等设置使用 `chrome.storage.local`，API Key 使用 `chro
 node --check extension/background.js
 node --check extension/sidepanel.js
 node --check extension/agent_observation.js
+node --check extension/agent_execution.js
+node --check extension/agent_runner.js
 
 node backend/test/audit_review/server_frontend.test.cjs
 node backend/test/audit_review/kb_refresh.test.cjs
 node backend/test/audit_review/svg_controls.test.cjs
 node backend/test/audit_review/empty_controls.test.cjs
+node backend/test/audit_review/agent_execution.test.cjs
+node backend/test/audit_review/agent_runner.test.cjs
+node backend/test/audit_review/agent_panel.test.cjs
 ```
 
 这些是语法与离线回归检查，不替代真实浏览器、模型、Qdrant 和 reranker 的端到端验收。更多测试边界和历史报告见 [项目 README](../README.md#开发检查与回归)。

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Annotated
 
@@ -16,8 +17,21 @@ from pydantic import BaseModel
 
 from agent.memory.config import KB_MAX_FILE_BYTES
 from rag import kb as KB
+from storage import kb_store as KS
 
 router = APIRouter(prefix="/v1/kb", tags=["kb"])
+
+
+@contextmanager
+def _kb_errors():
+    try:
+        yield
+    except KS.KBNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except KS.KBConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except KB.KBSyncUnavailable as exc:
+        raise HTTPException(503, str(exc)) from exc
 
 
 # ─── Models ───────────────────────────────────────────────────────
@@ -53,6 +67,8 @@ class DocListItem(BaseModel):
     error_msg: str
     created_at: str
     indexed_at: str
+    sync_pending: bool = False
+    sync_error: str = ""
 
 
 class DocStatusResponse(BaseModel):
@@ -60,6 +76,8 @@ class DocStatusResponse(BaseModel):
     error_msg: str = ""
     chunk_count: int = 0
     indexed_at: str = ""
+    sync_pending: bool = False
+    sync_error: str = ""
 
 
 class UploadDocResponse(BaseModel):
@@ -75,6 +93,8 @@ class TrashKBItem(BaseModel):
     created_at: str
     deleted_at: str
     doc_count: int
+    sync_action: str = ""
+    sync_error: str = ""
 
 
 class HardDeleteResponse(BaseModel):
@@ -107,28 +127,22 @@ def list_trash():
 @router.post("/{kb_id}/restore")
 def restore_kb(kb_id: str):
     """还原 KB + 级联恢复文档 + 恢复 chunks。"""
-    try:
-        KB.restore_kb(kb_id)
-        return {"ok": True}
-    except ValueError as e:
-        raise HTTPException(400, str(e))
+    with _kb_errors():
+        return KB.restore_kb(kb_id)
 
 
 @router.delete("/{kb_id}/hard", response_model=HardDeleteResponse)
 def hard_delete_kb(kb_id: str):
     """彻底删除 KB:物删 chunks + docs + KB 行。"""
-    try:
-        result = KB.hard_delete_kb(kb_id)
-        return {"ok": True, **result}
-    except ValueError as e:
-        raise HTTPException(400, str(e))
+    with _kb_errors():
+        return KB.hard_delete_kb(kb_id)
 
 
 @router.delete("/{kb_id}")
 def delete_kb(kb_id: str):
     """软删 KB + 级联失效所有 doc chunks。"""
-    KB.delete_kb(kb_id)
-    return {"ok": True}
+    with _kb_errors():
+        return KB.delete_kb(kb_id)
 
 
 @router.post("/{kb_id}/docs", response_model=UploadDocResponse)
@@ -157,17 +171,13 @@ async def upload_doc(
         raise HTTPException(400, "文件内容为空")
 
     # 3. KB 存在性校验
-    from storage import kb_store as KS
     kb = KS.get_kb(kb_id)
-    if not kb or kb.get("deleted_at"):
+    if not kb or kb["user_id"] != KB.CHAT_USER_ID or kb.get("deleted_at") or kb.get("sync_action"):
         raise HTTPException(404, f"知识库不存在: {kb_id}")
 
     # 4. 文件 hash 去重
     import hashlib
     file_hash = hashlib.md5(content).hexdigest()
-    dup = KS.find_duplicate_doc(kb_id, file_hash)
-    if dup:
-        raise HTTPException(409, f"该知识库已存在相同内容的文档: {dup['filename']} (状态: {dup['status']})")
 
     # 5. 存临时文件
     with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as tmp:
@@ -176,9 +186,11 @@ async def upload_doc(
 
     # 6. 交给 rag.kb 后台处理(daemon 线程)
     try:
-        result = KB.add_doc(kb_id, tmp_path, filename, ext, content_hash=file_hash)
-    finally:
-        pass
+        with _kb_errors():
+            result = KB.add_doc(kb_id, tmp_path, filename, ext, content_hash=file_hash)
+    except Exception:
+        Path(tmp_path).unlink(missing_ok=True)
+        raise
 
     return result
 
@@ -186,14 +198,15 @@ async def upload_doc(
 @router.get("/{kb_id}/docs", response_model=list[DocListItem])
 def list_docs(kb_id: str):
     """列该 KB 下所有 doc(不含软删)。"""
-    return KB.list_docs(kb_id)
+    with _kb_errors():
+        return KB.list_docs(kb_id)
 
 
 @router.delete("/{kb_id}/docs/{doc_id}")
 def delete_doc(kb_id: str, doc_id: str):
     """软删 doc + 失效该 doc 所有 chunks。"""
-    KB.delete_doc(kb_id, doc_id)
-    return {"ok": True}
+    with _kb_errors():
+        return KB.delete_doc(kb_id, doc_id)
 
 
 @router.get("/{kb_id}/docs/{doc_id}/status", response_model=DocStatusResponse)

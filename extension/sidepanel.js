@@ -3074,6 +3074,15 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   const API_BASE = 'http://localhost:8000';
 
+  async function kbRequest(path, options) {
+    const response = await fetch(`${API_BASE}${path}`, options);
+    const data = await response.json();
+    if (!response.ok || data?.ok === false) {
+      throw new Error(typeof data?.detail === 'string' ? data.detail : `HTTP ${response.status}`);
+    }
+    return data;
+  }
+
   async function loadKBs() {
     try {
       const res = await fetch(`${API_BASE}/v1/kb`);
@@ -3122,7 +3131,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const btn = document.getElementById('createKbBtn');
     btn.disabled = true; btn.textContent = '创建中...';
     try {
-      await fetch(`${API_BASE}/v1/kb`, {
+      await kbRequest('/v1/kb', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({name: name.trim(), description: description.trim()})
@@ -3146,13 +3155,13 @@ document.addEventListener('DOMContentLoaded', async () => {
       _busy.set('kb-del-' + kb_id, {text: '删除中...'});
       renderKBList();
       try {
-        await fetch(`${API_BASE}/v1/kb/${kb_id}`, {method: 'DELETE'});
+        const result = await kbRequest(`/v1/kb/${kb_id}`, {method: 'DELETE'});
         if (currentKbId === kb_id) {
           currentKbId = '';
           sessionStorage.removeItem('kb_id');
           document.getElementById('kbDocsSection').style.display = 'none';
         }
-        _busy.set('kb-del-' + kb_id, {text: '✓ 已删除'});
+        _busy.set('kb-del-' + kb_id, {text: result.sync_pending ? '已删除，待同步' : '✓ 已删除'});
         renderKBList();
         setTimeout(() => { _busy.delete('kb-del-' + kb_id); loadKBs(); }, 800);
       } catch (err) {
@@ -3188,15 +3197,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
     const formData = new FormData();
     formData.append('file', file);
+    const uploadKbId = currentKbId;
+    if (!uploadKbId) return;
     try {
-      const res = await fetch(`${API_BASE}/v1/kb/${currentKbId}/docs`, {
+      const data = await kbRequest(`/v1/kb/${uploadKbId}/docs`, {
         method: 'POST',
         body: formData
       });
-      const data = await res.json();
       e.target.value = '';
-      await loadDocs(currentKbId);
-      pollDocStatus(currentKbId, data.doc_id);
+      await loadDocs(uploadKbId);
+      pollDocStatus(uploadKbId, data.doc_id);
     } catch (err) {
       alert('上传失败: ' + err.message);
     }
@@ -3204,8 +3214,9 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   async function loadDocs(kb_id) {
     try {
-      const res = await fetch(`${API_BASE}/v1/kb/${kb_id}/docs`);
-      docs = await res.json();
+      const loaded = await kbRequest(`/v1/kb/${kb_id}/docs`);
+      if (currentKbId !== kb_id) return;
+      docs = loaded;
       renderDocList();
     } catch (err) {
       console.error('加载文档失败:', err);
@@ -3222,7 +3233,8 @@ document.addEventListener('DOMContentLoaded', async () => {
       return `
       <div class="doc-item" data-doc-id="${doc.doc_id}">
         <span class="doc-name">${escapeHtml(doc.filename)}</span>
-        <span class="doc-status ${doc.status}">${statusIcon(doc.status)}</span>
+        <span class="doc-status ${doc.status}">${doc.status === 'pending' ? '⏳ 索引中' : doc.sync_pending ? (doc.status === 'failed' ? '❌ 索引失败，待清理' : '待同步') : statusIcon(doc.status)}</span>
+        <span class="doc-error">${escapeHtml(doc.sync_error || doc.error_msg || '')}</span>
         <span class="doc-size">${(doc.file_bytes / 1024).toFixed(1)} KB</span>
         <button class="doc-delete" data-doc-id="${doc.doc_id}" ${btnDis}>${btnText}</button>
       </div>`;
@@ -3241,9 +3253,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     for (let i = 0; i < maxRetries; i++) {
       await new Promise(r => setTimeout(r, 2000));
       try {
-        const res = await fetch(`${API_BASE}/v1/kb/${kb_id}/docs/${doc_id}/status`);
-        const data = await res.json();
-        if (data.status === 'indexed' || data.status === 'failed') {
+        const data = await kbRequest(`/v1/kb/${kb_id}/docs/${doc_id}/status`);
+        if (data.status === 'not_found') {
+          await loadDocs(kb_id);
+          break;
+        }
+        if (currentKbId === kb_id) {
+          docs = docs.map(doc => doc.doc_id === doc_id ? {...doc, ...data} : doc);
+          renderDocList();
+        }
+        if ((data.status === 'indexed' || data.status === 'failed') && !data.sync_pending) {
           await loadDocs(kb_id);
           break;
         }
@@ -3259,14 +3278,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (delBtn) {
       e.stopPropagation();
       const doc_id = delBtn.dataset.docId;
+      const kb_id = currentKbId;
       if (!confirm('确定删除此文档?')) return;
       _busy.set('doc-del-' + doc_id, {text: '删除中...'});
       renderDocList();
       try {
-        await fetch(`${API_BASE}/v1/kb/${currentKbId}/docs/${doc_id}`, {method: 'DELETE'});
-        _busy.set('doc-del-' + doc_id, {text: '✓ 已删除'});
+        const result = await kbRequest(`/v1/kb/${kb_id}/docs/${doc_id}`, {method: 'DELETE'});
+        _busy.set('doc-del-' + doc_id, {text: result.sync_pending ? '已删除，待同步' : '✓ 已删除'});
         renderDocList();
-        setTimeout(() => { _busy.delete('doc-del-' + doc_id); loadDocs(currentKbId); }, 800);
+        setTimeout(() => { _busy.delete('doc-del-' + doc_id); loadDocs(kb_id); }, 800);
       } catch (err) {
         _busy.set('doc-del-' + doc_id, {text: '删除失败'});
         renderDocList();
@@ -3320,6 +3340,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         <div class="kb-card-name">${escapeHtml(kb.name)}</div>
         <div class="kb-card-desc">${escapeHtml(kb.description || '')}</div>
         <div class="kb-trash-meta">${kb.doc_count} 篇文档 · 删除于 ${kb.deleted_at.slice(0, 10)}</div>
+        <div class="kb-sync-state">${escapeHtml(kb.sync_action ? '待同步：' + kb.sync_action : '')} ${escapeHtml(kb.sync_error || '')}</div>
         <div class="kb-card-actions">
           <button class="kb-card-restore" data-kb-id="${kb.kb_id}" data-kb-name="${escapeHtml(kb.name)}" ${restDis}>${restText}</button>
           <button class="kb-card-hard-delete" data-kb-id="${kb.kb_id}" data-kb-name="${escapeHtml(kb.name)}" ${hardDis}>${hardText}</button>
@@ -3365,14 +3386,15 @@ document.addEventListener('DOMContentLoaded', async () => {
       _busy.set('kb-restore-' + kb_id, {text: '还原中...'});
       renderTrashList();
       try {
-        await fetch(`${API_BASE}/v1/kb/${kb_id}/restore`, {method: 'POST'});
+        const result = await kbRequest(`/v1/kb/${kb_id}/restore`, {method: 'POST'});
+        if (result.sync_pending) throw new Error('恢复仍在同步中');
         _busy.set('kb-restore-' + kb_id, {text: '✓ 已还原'});
         renderTrashList();
         setTimeout(() => { _busy.delete('kb-restore-' + kb_id); loadTrash(); }, 800);
       } catch (err) {
-        _busy.set('kb-restore-' + kb_id, {text: '还原失败'});
+        _busy.set('kb-restore-' + kb_id, {text: '还原未完成，重试'});
         renderTrashList();
-        setTimeout(() => { _busy.delete('kb-restore-' + kb_id); renderTrashList(); }, 1500);
+        setTimeout(() => { _busy.delete('kb-restore-' + kb_id); loadTrash(); }, 1500);
       }
       return;
     }
@@ -3390,7 +3412,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       _busy.set('kb-hard-' + kb_id, {text: '删除中...'});
       renderTrashList();
       try {
-        await fetch(`${API_BASE}/v1/kb/${kb_id}/hard`, {method: 'DELETE'});
+        await kbRequest(`/v1/kb/${kb_id}/hard`, {method: 'DELETE'});
         _busy.set('kb-hard-' + kb_id, {text: '✓ 已删除'});
         renderTrashList();
         setTimeout(() => { _busy.delete('kb-hard-' + kb_id); loadTrash(); }, 800);

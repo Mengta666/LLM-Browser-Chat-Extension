@@ -2,6 +2,8 @@
 
 本文保留第一轮的环境与结果；后续真实服务测试见 [LIVE_RERANK_RESULTS.md](LIVE_RERANK_RESULTS.md)，第二轮 44 项累计用例及新增结论见 [DEEP_AUDIT_RESULTS.md](DEEP_AUDIT_RESULTS.md)。不要将下方第一轮的空知识库、配置和测试数量当成当前状态。
 
+2026-09-16：F2 / F11 / F12 / F13 和关联 F4 已完成修复及回归，最新范围、测试数量和真实流程见 [KB_LIFECYCLE_RESULTS.md](KB_LIFECYCLE_RESULTS.md)；下方保留原始审计证据。
+
 审计基线：`agent-slim@c23f882`。只新增测试，未修复业务代码，未修改真实 `.env`。
 
 ## 运行

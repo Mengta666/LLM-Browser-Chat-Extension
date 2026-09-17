@@ -10,7 +10,7 @@ SQLite/Qdrant 两库同步问题。point.id 由业务 memory_id 幂等派生(uui
 
 import hashlib
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from qdrant_client import QdrantClient, models
@@ -73,7 +73,7 @@ def _ensure_payload_indexes() -> None:
     重复建同名同型索引是 no-op;异常静默(索引缺失只影响性能不影响正确性)。
     """
     client = get_client()
-    keyword_fields = ["user_id", "memory_type", "chat_id", "scope", "subject", "kb_id", "doc_id"]
+    keyword_fields = ["user_id", "memory_type", "chat_id", "scope", "subject", "kb_id", "doc_id", "index_run_id"]
     for field in keyword_fields:
         try:
             client.create_payload_index(
@@ -152,6 +152,7 @@ def _build_payload(memory_id: str, content: str, *,
                    superseded_by: str = "",
                    kb_id: str = "",
                    doc_id: str = "",
+                   index_run_id: str = "",
                    source: str = "",
                    chunk_idx: int = 0,
                    chunk_id: Optional[int] = None,
@@ -211,6 +212,7 @@ def _build_payload(memory_id: str, content: str, *,
         "superseded_by": superseded_by or "",
         "kb_id": kb_id or "",
         "doc_id": doc_id or "",
+        "index_run_id": index_run_id or "",
         "source": source or "",
         "chunk_idx": int(chunk_idx),
         "chunk_id": chunk_id,
@@ -277,7 +279,8 @@ def insert_memory(content: str, *, vector: list[float],
     return payload
 
 
-def batch_insert_memories(items: list[dict[str, Any]], *, batch_size: int = 64) -> list[dict[str, Any]]:
+def batch_insert_memories(items: list[dict[str, Any]], *, batch_size: int = 64,
+                          before_batch: Optional[Callable[[], None]] = None) -> list[dict[str, Any]]:
     """批量写入记忆(KB chunk 专用),返回所有 payload。
 
     每条 item 需包含:content, vector, 以及 _build_payload 的关键字参数。
@@ -287,10 +290,16 @@ def batch_insert_memories(items: list[dict[str, Any]], *, batch_size: int = 64) 
     all_payloads: list[dict[str, Any]] = []
 
     for start in range(0, len(items), batch_size):
+        if before_batch:
+            before_batch()
         batch = items[start:start + batch_size]
         points = []
         for item in batch:
             memory_id = make_memory_id()
+            if item.get("memory_type") == MEMORY_TYPE_KB_CHUNK and item.get("index_run_id"):
+                identity = ":".join(str(item[key]) for key in
+                                    ("user_id", "kb_id", "doc_id", "index_run_id", "chunk_idx"))
+                memory_id = str(uuid5(NAMESPACE_URL, "kb-index:" + identity))
             now = _now_iso()
             content = item["content"]
             vector = item["vector"]
@@ -319,6 +328,72 @@ def batch_insert_memories(items: list[dict[str, Any]], *, batch_size: int = 64) 
     except Exception:
         pass
     return all_payloads
+
+
+def _kb_index_filter(user_id: str, kb_id: str, doc_id: Optional[str] = None,
+                     index_run_id: Optional[str] = None, *, valid_only: bool = False):
+    flt = _build_filter(user_id=user_id, memory_type=MEMORY_TYPE_KB_CHUNK,
+                        scope=None, domain=None, kb_id=kb_id, doc_id=doc_id,
+                        include_invalid=not valid_only)
+    if index_run_id == "":
+        flt.must.append(models.Filter(should=[
+            models.FieldCondition(key="index_run_id", match=models.MatchValue(value="")),
+            models.IsEmptyCondition(is_empty=models.PayloadField(key="index_run_id")),
+        ]))
+    elif index_run_id is not None:
+        flt.must.append(models.FieldCondition(key="index_run_id", match=models.MatchValue(value=index_run_id)))
+    return flt
+
+
+def set_kb_chunks_valid(*, user_id: str, kb_id: str, valid: bool,
+                        doc_id: Optional[str] = None, index_run_id: Optional[str] = None) -> None:
+    if valid and (not doc_id or index_run_id is None):
+        raise ValueError("恢复必须指定文档及已发布索引版本")
+    ensure_collection()
+    get_client().set_payload(
+        collection_name=MEMORY_COLLECTION,
+        payload={"valid": valid, "invalid_at": "" if valid else _now_iso()},
+        points=models.FilterSelector(filter=_kb_index_filter(user_id, kb_id, doc_id, index_run_id)),
+        wait=True)
+
+
+def kb_index_complete(*, user_id: str, kb_id: str, doc_id: str, index_run_id: str,
+                       expected: int) -> bool:
+    if expected <= 0:
+        return False
+    ensure_collection()
+    flt = _kb_index_filter(user_id, kb_id, doc_id, index_run_id)
+    seen = set()
+    offset = None
+    while True:
+        points, offset = get_client().scroll(collection_name=MEMORY_COLLECTION, scroll_filter=flt,
+                                            limit=256, offset=offset, with_payload=["chunk_idx"],
+                                            with_vectors=False)
+        for point in points:
+            index = (point.payload or {}).get("chunk_idx")
+            if type(index) is not int or not 0 <= index < expected or index in seen:
+                return False
+            seen.add(index)
+        if offset is None:
+            return len(seen) == expected
+
+
+def get_kb_chunk(*, user_id: str, kb_id: str, doc_id: str, index_run_id: str, chunk_idx: int):
+    ensure_collection()
+    flt = _kb_index_filter(user_id, kb_id, doc_id, index_run_id, valid_only=True)
+    flt.must.append(models.FieldCondition(key="chunk_idx", match=models.MatchValue(value=chunk_idx)))
+    points, _ = get_client().scroll(collection_name=MEMORY_COLLECTION, scroll_filter=flt,
+                                   limit=2, with_payload=True, with_vectors=False)
+    return dict(points[0].payload or {}) if len(points) == 1 else None
+
+
+def purge_kb_chunks(*, user_id: str, kb_id: str) -> int:
+    ensure_collection()
+    flt = _kb_index_filter(user_id, kb_id)
+    count = get_client().count(collection_name=MEMORY_COLLECTION, count_filter=flt, exact=True).count
+    get_client().delete(collection_name=MEMORY_COLLECTION,
+                        points_selector=models.FilterSelector(filter=flt), wait=True)
+    return count
 
 
 def update_memory(memory_id: str, content: str, *, vector: list[float]) -> Optional[dict[str, Any]]:

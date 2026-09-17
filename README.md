@@ -152,6 +152,9 @@ if (-not (Test-Path -LiteralPath 'config/.env')) {
 
 - 支持 `.pdf`、`.md`、`.markdown`、`.txt`。扫描 PDF 暂不提供 OCR，正文过少时可能拒绝索引；文本文件应使用 UTF-8。
 - 上传后通过文档状态确认索引完成：`pending` → `indexed` / `failed`。上传成功不等于可检索。
+- 新文档分批写入不可检索的暂存版本，完整校验后发布；检索还会核对 SQLite 中的库、文档和已发布版本，失败或已删除文档不能仅凭向量的 `valid=true` 被返回。
+- 删除先逻辑隐藏，向量同步失败时返回 `sync_pending=true`，后台每 30 秒尝试收敛。恢复必须完成向量校验和同步后才重新开放；暂时失败返回 503，可重试，不表示已还原。单独删除的文档不会随整库还原。
+- 首次升级会在元数据数据库旁生成 `*.kb-lifecycle-*.sqlite3` 备份，并以事务添加生命周期字段；旧索引先核对完整性再开放，不清空向量。重启中断的索引标为失败，需要重新上传；缺片的旧索引保持隔离，需人工核验。
 - `KB_MAX_FILE_BYTES` 后端默认 50 MiB，前端也有 50 MiB 限制；单改后端配置不会提高前端上限。
 - `KB_CHUNK_SIZE=512`、`KB_CHUNK_OVERLAP=0` 控制文档 token 分块；不应拿旧网页快照分块字段配置它。
 - 精排需设置 `KB_RERANK_ENABLED=true`，并填写 `KB_RERANK_API_URL`、`KB_RERANK_API_KEY`、`KB_RERANK_MODEL`。URL 必须是完整调用路径（例如服务实际提供的 `/rerank`），代码不会自动补路径。
@@ -227,6 +230,7 @@ browser-agent/
 
 node backend/test/audit_review/server_frontend.test.cjs
 node backend/test/audit_review/kb_refresh.test.cjs
+node backend/test/audit_review/kb_lifecycle.test.cjs
 node backend/test/audit_review/svg_controls.test.cjs
 node backend/test/audit_review/empty_controls.test.cjs
 
@@ -245,6 +249,7 @@ node --check extension/agent_observation.js
 - [SVG 控件](backend/test/audit_review/SVG_CONTROLS_RESULTS.md)
 - [无文本控件](backend/test/audit_review/EMPTY_CONTROLS_RESULTS.md)
 - [真实 reranker 测试](backend/test/audit_review/LIVE_RERANK_RESULTS.md)
+- [知识库一致性修复与真实流程验收](backend/test/audit_review/KB_LIFECYCLE_RESULTS.md)
 - [详细审计结果](backend/test/audit_review/DEEP_AUDIT_RESULTS.md)
 
 历史报告描述的是各自测试时的环境和结果，不代替当前版本的重新验收。

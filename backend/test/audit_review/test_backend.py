@@ -165,6 +165,7 @@ def insert_chunks(runtime, count=3, vector=None):
             "next_chunk_id": i + 1 if i + 1 < count else None,
         } for i in range(count)
     ])
+    assert runtime.store.publish_index(kb_id, doc_id, "", count, "2026-01-01", runtime.config.CHAT_USER_ID)
     return kb_id, doc_id
 
 
@@ -177,14 +178,12 @@ def test_vector_roundtrip_control(runtime):
     assert sorted(r["chunk_id"] for r in rows) == [0, 1, 2]
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="F4: sibling lookup omits query_vector")
 def test_existing_neighbor_is_returned(runtime):
     kb_id, doc_id = insert_chunks(runtime)
     neighbor = runtime.kb._get_sibling_chunk(kb_id, doc_id, 1)
     assert neighbor is not None, "Chunk 1 exists in actual Qdrant but sibling lookup returns None"
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="F4: search window misses existing neighbors")
 def test_search_expands_existing_neighbor(runtime):
     kb_id, _ = insert_chunks(runtime)
     runtime.monkeypatch.setattr(runtime.kb, "embed_query", lambda *a: [1.0, 0.0])
@@ -203,18 +202,19 @@ def test_delete_indexed_doc_control(runtime):
     )
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="F2: pending deletion races with index upsert")
 def test_delete_during_embedding_leaves_no_active_chunks(runtime):
     kb_id = runtime.kb.create_kb("Audit race KB")["kb_id"]
     entered = threading.Event()
     resume = threading.Event()
     finished = threading.Event()
     doc_ids = []
-    original_update = runtime.store.update_doc_status
+    original_process = runtime.kb._process_doc
 
-    def update_status(doc_id, *args, **kwargs):
-        original_update(doc_id, *args, **kwargs)
-        finished.set()
+    def process(*args, **kwargs):
+        try:
+            return original_process(*args, **kwargs)
+        finally:
+            finished.set()
 
     def controlled_embedding(texts, **kwargs):
         entered.set()
@@ -224,7 +224,7 @@ def test_delete_during_embedding_leaves_no_active_chunks(runtime):
     # The splitter package is optional in this checkout; keep that boundary deterministic.
     runtime.monkeypatch.setattr(runtime.kb.chunker, "chunk_document", lambda text, *a: [{"text": text, "chunk_id": 0}])
     runtime.monkeypatch.setattr(runtime.kb, "embed_texts", controlled_embedding)
-    runtime.monkeypatch.setattr(runtime.store, "update_doc_status", update_status)
+    runtime.monkeypatch.setattr(runtime.kb, "_process_doc", process)
     try:
         response = runtime.api.post(f"/v1/kb/{kb_id}/docs", files={"file": ("audit.txt", b"synthetic audit text", "text/plain")})
         assert response.status_code == 200, response.text

@@ -1,300 +1,311 @@
-"""KB 元数据存储:SQLite 存 kb_kbs / kb_docs 两表。
-
-与 chat_store 共用 chat_history.sqlite3,但表名独立、不互相依赖。
-删 KB / doc 是软删(deleted_at),不物删。
-"""
+"""知识库元数据与发布状态；SQLite 是知识库可检索性的依据。"""
 
 from __future__ import annotations
 
 import sqlite3
 import threading
+from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any, Optional
+from uuid import uuid4
 
-from agent.memory.config import MEMORY_DB_PATH
+from agent.memory.config import CHAT_USER_ID, MEMORY_DB_PATH
 
 _lock = threading.Lock()
 
 
+class KBNotFound(LookupError):
+    pass
+
+
+class KBConflict(ValueError):
+    pass
+
+
 def _get_conn() -> sqlite3.Connection:
-    """复用 chat_history.sqlite3(与 chat_store 共库不共表)。"""
     path = Path(MEMORY_DB_PATH)
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path), check_same_thread=False)
+    conn = sqlite3.connect(str(path), timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
 
 
+@contextmanager
+def _transaction():
+    with _lock, closing(_get_conn()) as conn, conn:
+        yield conn
+
+
 def _ensure_tables() -> None:
-    """建表(幂等):kb_kbs / kb_docs。"""
-    with _lock, _get_conn() as conn:
+    with _transaction() as conn:
+        old_columns = {r["name"] for r in conn.execute("PRAGMA table_info(kb_docs)")}
+        if old_columns and "index_run_id" not in old_columns:
+            backup = Path(MEMORY_DB_PATH).with_name(
+                f"{Path(MEMORY_DB_PATH).stem}.kb-lifecycle-{uuid4().hex[:8]}.sqlite3")
+            with closing(sqlite3.connect(str(backup))) as target:
+                conn.backup(target)
+        # sqlite3 默认不为 DDL 自动开启事务，迁移必须整体提交或回滚。
+        conn.execute("BEGIN")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS kb_kbs (
-                kb_id       TEXT PRIMARY KEY,
-                user_id     TEXT NOT NULL,
-                name        TEXT NOT NULL,
-                description TEXT NOT NULL DEFAULT '',
-                created_at  TEXT NOT NULL,
-                updated_at  TEXT NOT NULL,
-                deleted_at  TEXT NOT NULL DEFAULT ''
-            )
-        """)
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_kb_kbs_user
-            ON kb_kbs(user_id, deleted_at)
-        """)
+                kb_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL, deleted_at TEXT NOT NULL DEFAULT ''
+            )""")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS kb_docs (
-                doc_id       TEXT PRIMARY KEY,
-                kb_id        TEXT NOT NULL,
-                filename     TEXT NOT NULL,
-                file_type    TEXT NOT NULL,
-                file_bytes   INTEGER NOT NULL,
-                chunk_count  INTEGER NOT NULL DEFAULT 0,
-                status       TEXT NOT NULL DEFAULT 'pending',
-                error_msg    TEXT NOT NULL DEFAULT '',
-                created_at   TEXT NOT NULL,
-                indexed_at   TEXT NOT NULL DEFAULT '',
-                deleted_at   TEXT NOT NULL DEFAULT ''
-            )
-        """)
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_kb_docs_kb
-            ON kb_docs(kb_id, deleted_at)
-        """)
-        # 兼容迁移:存量库补 content_hash 列
-        try:
-            conn.execute("ALTER TABLE kb_docs ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''")
-        except Exception:
-            pass
-        # 兼容迁移:存量库补 deleted_reason 列(区分级联删 vs 独立删)
-        try:
-            conn.execute("ALTER TABLE kb_docs ADD COLUMN deleted_reason TEXT NOT NULL DEFAULT ''")
-        except Exception:
-            pass
-        conn.commit()
+                doc_id TEXT PRIMARY KEY, kb_id TEXT NOT NULL, filename TEXT NOT NULL,
+                file_type TEXT NOT NULL, file_bytes INTEGER NOT NULL,
+                chunk_count INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'pending', error_msg TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL, indexed_at TEXT NOT NULL DEFAULT '',
+                deleted_at TEXT NOT NULL DEFAULT ''
+            )""")
+        additions = {
+            "kb_kbs": {"delete_batch_id": "TEXT NOT NULL DEFAULT ''",
+                       "sync_action": "TEXT NOT NULL DEFAULT ''",
+                       "sync_error": "TEXT NOT NULL DEFAULT ''"},
+            "kb_docs": {"content_hash": "TEXT NOT NULL DEFAULT ''",
+                        "deleted_reason": "TEXT NOT NULL DEFAULT ''",
+                        "delete_batch_id": "TEXT NOT NULL DEFAULT ''",
+                        "index_run_id": "TEXT NOT NULL DEFAULT ''",
+                        "published_run_id": "TEXT NOT NULL DEFAULT ''",
+                        "sync_pending": "INTEGER NOT NULL DEFAULT 0",
+                        "sync_error": "TEXT NOT NULL DEFAULT ''"},
+        }
+        for table, columns in additions.items():
+            existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+            for column, definition in columns.items():
+                if column not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        if old_columns and "index_run_id" not in old_columns:
+            # 旧索引先隔离，后台核对完整性后再开放；不重建或清空向量。
+            conn.execute("UPDATE kb_docs SET sync_pending=1")
+            conn.execute("UPDATE kb_kbs SET delete_batch_id=deleted_at WHERE deleted_at!=''")
+            conn.execute("""
+                UPDATE kb_docs SET delete_batch_id=(
+                    SELECT delete_batch_id FROM kb_kbs WHERE kb_kbs.kb_id=kb_docs.kb_id)
+                WHERE deleted_reason='cascade_from_kb' AND deleted_at!=''
+                  AND EXISTS (SELECT 1 FROM kb_kbs WHERE kb_kbs.kb_id=kb_docs.kb_id
+                              AND kb_kbs.deleted_at!='')""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_kb_kbs_user ON kb_kbs(user_id,deleted_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_kb_docs_kb ON kb_docs(kb_id,deleted_at)")
 
 
 _ensure_tables()
 
 
-# ─── KB ───────────────────────────────────────────────────────────
+def _owned_kb(conn, kb_id, user_id, *, active=False):
+    row = conn.execute("SELECT * FROM kb_kbs WHERE kb_id=? AND user_id=?",
+                       (kb_id, user_id)).fetchone()
+    if not row or (active and (row["deleted_at"] or row["sync_action"])):
+        raise KBNotFound("知识库不存在或不可用")
+    return row
 
 
 def create_kb(kb_id: str, user_id: str, name: str, description: str, created_at: str) -> None:
-    """建 KB(user_id 是 CHAT_USER_ID)。"""
-    with _lock, _get_conn() as conn:
-        conn.execute(
-            """
-            INSERT INTO kb_kbs (kb_id, user_id, name, description, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (kb_id, user_id, name, description, created_at, created_at),
-        )
-        conn.commit()
-
-
-def list_kbs(user_id: str) -> list[dict[str, Any]]:
-    """列出该用户的所有 KB(不含软删)。"""
-    with _lock, _get_conn() as conn:
-        rows = conn.execute(
-            """
-            SELECT kb_id, name, description, created_at, updated_at
-            FROM kb_kbs
-            WHERE user_id = ? AND deleted_at = ''
-            ORDER BY created_at DESC
-            """,
-            (user_id,),
-        ).fetchall()
-    return [dict(r) for r in rows]
+    with _transaction() as conn:
+        conn.execute("""INSERT INTO kb_kbs(kb_id,user_id,name,description,created_at,updated_at)
+                        VALUES(?,?,?,?,?,?)""", (kb_id,user_id,name,description,created_at,created_at))
 
 
 def get_kb(kb_id: str) -> Optional[dict[str, Any]]:
-    """查单个 KB(含软删)。"""
-    with _lock, _get_conn() as conn:
-        row = conn.execute(
-            "SELECT * FROM kb_kbs WHERE kb_id = ?",
-            (kb_id,),
-        ).fetchone()
+    with _transaction() as conn:
+        row = conn.execute("SELECT * FROM kb_kbs WHERE kb_id=?", (kb_id,)).fetchone()
     return dict(row) if row else None
 
 
-def delete_kb(kb_id: str, deleted_at: str) -> None:
-    """软删 KB。"""
-    with _lock, _get_conn() as conn:
-        conn.execute(
-            "UPDATE kb_kbs SET deleted_at = ? WHERE kb_id = ?",
-            (deleted_at, kb_id),
-        )
-        conn.commit()
-
-
-# ─── Doc ──────────────────────────────────────────────────────────
+def list_kbs(user_id: str) -> list[dict[str, Any]]:
+    with _transaction() as conn:
+        rows = conn.execute("SELECT * FROM kb_kbs WHERE user_id=? AND deleted_at='' ORDER BY created_at DESC",
+                            (user_id,)).fetchall()
+    return [dict(r) for r in rows]
 
 
 def create_doc(doc_id: str, kb_id: str, filename: str, file_type: str,
-               file_bytes: int, created_at: str, content_hash: str = "") -> None:
-    """建 doc(status 默认 pending)。"""
-    with _lock, _get_conn() as conn:
-        conn.execute(
-            """
-            INSERT INTO kb_docs (doc_id, kb_id, filename, file_type, file_bytes, created_at, status, content_hash)
-            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
-            """,
-            (doc_id, kb_id, filename, file_type, file_bytes, created_at, content_hash),
-        )
-        conn.commit()
+               file_bytes: int, created_at: str, content_hash: str = "", *,
+               index_run_id: str = "", user_id: str = CHAT_USER_ID) -> None:
+    with _transaction() as conn:
+        _owned_kb(conn, kb_id, user_id, active=True)
+        if content_hash and conn.execute("""
+            SELECT 1 FROM kb_docs WHERE kb_id=? AND content_hash=? AND deleted_at=''
+            AND status IN ('pending','indexed')""", (kb_id, content_hash)).fetchone():
+            raise KBConflict("该知识库已存在相同内容的待处理或已索引文档")
+        conn.execute("""
+            INSERT INTO kb_docs(doc_id,kb_id,filename,file_type,file_bytes,created_at,
+                                content_hash,index_run_id,sync_pending)
+            VALUES(?,?,?,?,?,?,?,?,1)""",
+            (doc_id,kb_id,filename,file_type,file_bytes,created_at,content_hash,index_run_id))
 
 
-def find_duplicate_doc(kb_id: str, content_hash: str) -> Optional[dict[str, Any]]:
-    """查同 KB 下是否已有相同 hash 的未删除文档。"""
-    if not content_hash:
-        return None
-    with _lock, _get_conn() as conn:
-        row = conn.execute(
-            "SELECT doc_id, filename, status FROM kb_docs WHERE kb_id = ? AND content_hash = ? AND deleted_at = ''",
-            (kb_id, content_hash),
-        ).fetchone()
+def get_doc(doc_id: str) -> Optional[dict[str, Any]]:
+    with _transaction() as conn:
+        row = conn.execute("SELECT * FROM kb_docs WHERE doc_id=?", (doc_id,)).fetchone()
     return dict(row) if row else None
 
 
 def list_docs(kb_id: str) -> list[dict[str, Any]]:
-    """列出该 KB 下所有 doc(不含软删)。"""
-    with _lock, _get_conn() as conn:
-        rows = conn.execute(
-            """
-            SELECT doc_id, filename, file_type, file_bytes, chunk_count, status, error_msg, created_at, indexed_at
-            FROM kb_docs
-            WHERE kb_id = ? AND deleted_at = ''
-            ORDER BY created_at DESC
-            """,
-            (kb_id,),
-        ).fetchall()
+    with _transaction() as conn:
+        rows = conn.execute("SELECT * FROM kb_docs WHERE kb_id=? AND deleted_at='' ORDER BY created_at DESC",
+                            (kb_id,)).fetchall()
     return [dict(r) for r in rows]
 
 
-def get_doc(doc_id: str) -> Optional[dict[str, Any]]:
-    """查单个 doc(含软删)。"""
-    with _lock, _get_conn() as conn:
-        row = conn.execute(
-            "SELECT * FROM kb_docs WHERE doc_id = ?",
-            (doc_id,),
-        ).fetchone()
-    return dict(row) if row else None
-
-
-def update_doc_status(doc_id: str, status: str, error_msg: str = "",
-                      chunk_count: int = 0, indexed_at: str = "") -> None:
-    """更新 doc 状态(pending / indexed / failed)。"""
-    with _lock, _get_conn() as conn:
-        conn.execute(
-            """
-            UPDATE kb_docs
-            SET status = ?, error_msg = ?, chunk_count = ?, indexed_at = ?
-            WHERE doc_id = ?
-            """,
-            (status, error_msg, chunk_count, indexed_at, doc_id),
-        )
-        conn.commit()
-
-
-def delete_doc(doc_id: str, deleted_at: str, reason: str = "") -> None:
-    """软删 doc。reason='cascade_from_kb' 表级联删,空串表用户独立删。"""
-    with _lock, _get_conn() as conn:
-        conn.execute(
-            "UPDATE kb_docs SET deleted_at = ?, deleted_reason = ? WHERE doc_id = ?",
-            (deleted_at, reason, doc_id),
-        )
-        conn.commit()
-
-
-def list_docs_by_kb(kb_id: str, include_deleted: bool = False) -> list[dict[str, Any]]:
-    """列该 KB 下所有 doc_id(供级联软删)。"""
-    with _lock, _get_conn() as conn:
-        if include_deleted:
-            rows = conn.execute(
-                "SELECT doc_id FROM kb_docs WHERE kb_id = ?",
-                (kb_id,),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT doc_id FROM kb_docs WHERE kb_id = ? AND deleted_at = ''",
-                (kb_id,),
-            ).fetchall()
+def all_docs(kb_id: str) -> list[dict[str, Any]]:
+    with _transaction() as conn:
+        rows = conn.execute("SELECT * FROM kb_docs WHERE kb_id=?", (kb_id,)).fetchall()
     return [dict(r) for r in rows]
 
 
-# ─── 回收站(trash) ──────────────────────────────────────────────
+def index_is_current(kb_id: str, doc_id: str, run_id: str, user_id: str) -> bool:
+    with _transaction() as conn:
+        return bool(conn.execute("""
+            SELECT 1 FROM kb_docs d JOIN kb_kbs k ON k.kb_id=d.kb_id
+            WHERE d.kb_id=? AND d.doc_id=? AND d.index_run_id=? AND d.status='pending'
+              AND d.deleted_at='' AND k.deleted_at='' AND k.sync_action='' AND k.user_id=?""",
+            (kb_id,doc_id,run_id,user_id)).fetchone())
+
+
+def publish_index(kb_id: str, doc_id: str, run_id: str, count: int, now: str, user_id: str) -> bool:
+    with _transaction() as conn:
+        cursor = conn.execute("""
+            UPDATE kb_docs SET status='indexed',published_run_id=?,chunk_count=?,indexed_at=?,
+                               error_msg='',sync_pending=0,sync_error=''
+            WHERE kb_id=? AND doc_id=? AND index_run_id=? AND status='pending' AND deleted_at=''
+              AND EXISTS (SELECT 1 FROM kb_kbs k WHERE k.kb_id=kb_docs.kb_id
+                          AND k.user_id=? AND k.deleted_at='' AND k.sync_action='')""",
+            (run_id,count,now,kb_id,doc_id,run_id,user_id))
+    return cursor.rowcount == 1
+
+
+def fail_index(kb_id: str, doc_id: str, run_id: str, error: str) -> None:
+    with _transaction() as conn:
+        conn.execute("""UPDATE kb_docs SET status='failed',error_msg=?,sync_pending=1
+                        WHERE kb_id=? AND doc_id=? AND index_run_id=? AND status='pending'""",
+                     (error,kb_id,doc_id,run_id))
+
+
+def mark_doc_deleted(kb_id: str, doc_id: str, now: str, user_id: str) -> None:
+    with _transaction() as conn:
+        _owned_kb(conn, kb_id, user_id, active=True)
+        row = conn.execute("SELECT * FROM kb_docs WHERE kb_id=? AND doc_id=?", (kb_id,doc_id)).fetchone()
+        if not row:
+            raise KBNotFound("文档不存在于该知识库")
+        conn.execute("""
+            UPDATE kb_docs SET deleted_at=CASE WHEN deleted_at='' THEN ? ELSE deleted_at END,
+                status=CASE WHEN status='pending' THEN 'failed' ELSE status END,
+                error_msg=CASE WHEN status='pending' THEN '索引已取消，请重新上传' ELSE error_msg END,
+                sync_pending=1 WHERE kb_id=? AND doc_id=?""", (now,kb_id,doc_id))
+
+
+def mark_kb_deleted(kb_id: str, now: str, user_id: str) -> None:
+    with _transaction() as conn:
+        kb = _owned_kb(conn, kb_id, user_id)
+        if kb["sync_action"] == "purge":
+            raise KBConflict("知识库正在彻底删除")
+        batch = kb["delete_batch_id"] if kb["deleted_at"] else uuid4().hex
+        conn.execute("""
+            UPDATE kb_docs SET deleted_at=?,deleted_reason='cascade_from_kb',delete_batch_id=?,
+                status=CASE WHEN status='pending' THEN 'failed' ELSE status END,
+                error_msg=CASE WHEN status='pending' THEN '索引已取消，请重新上传' ELSE error_msg END,
+                sync_pending=1 WHERE kb_id=? AND deleted_at=''""", (now,batch,kb_id))
+        conn.execute("""UPDATE kb_kbs SET deleted_at=?,delete_batch_id=?,sync_action='delete',sync_error=''
+                        WHERE kb_id=? AND user_id=?""", (kb["deleted_at"] or now,batch,kb_id,user_id))
+
+
+def request_restore(kb_id: str, user_id: str) -> None:
+    with _transaction() as conn:
+        kb = _owned_kb(conn, kb_id, user_id)
+        if kb["sync_action"] == "purge":
+            raise KBConflict("知识库正在彻底删除，不能还原")
+        if kb["deleted_at"]:
+            conn.execute("UPDATE kb_kbs SET sync_action='restore',sync_error='' WHERE kb_id=?", (kb_id,))
+
+
+def finish_restore(kb_id: str, batch: str) -> bool:
+    with _transaction() as conn:
+        cursor = conn.execute("""
+            UPDATE kb_kbs SET deleted_at='',sync_action='',sync_error=''
+            WHERE kb_id=? AND delete_batch_id=? AND sync_action='restore'""", (kb_id,batch))
+        if cursor.rowcount != 1:
+            return False
+        conn.execute("""
+            UPDATE kb_docs SET deleted_at='',deleted_reason='',delete_batch_id='',
+                sync_pending=CASE WHEN status='indexed' THEN 0 ELSE sync_pending END,sync_error=''
+            WHERE kb_id=? AND deleted_reason='cascade_from_kb' AND delete_batch_id=?""", (kb_id,batch))
+    return True
+
+
+def finish_delete_sync(kb_id: str, batch: str) -> None:
+    with _transaction() as conn:
+        cursor = conn.execute("""
+            UPDATE kb_kbs SET sync_action='',sync_error=''
+            WHERE kb_id=? AND delete_batch_id=? AND sync_action='delete'""", (kb_id,batch))
+        if cursor.rowcount:
+            conn.execute("UPDATE kb_docs SET sync_pending=0,sync_error='' WHERE kb_id=?", (kb_id,))
+
+
+def set_doc_sync(doc_id: str, run_id: str, pending: bool, error: str = "") -> None:
+    with _transaction() as conn:
+        conn.execute("UPDATE kb_docs SET sync_pending=?,sync_error=? WHERE doc_id=? AND index_run_id=?",
+                     (int(pending),error,doc_id,run_id))
+
+
+def set_kb_sync_error(kb_id: str, error: str) -> None:
+    with _transaction() as conn:
+        conn.execute("UPDATE kb_kbs SET sync_error=? WHERE kb_id=?", (error,kb_id))
+
+
+def request_purge(kb_id: str, user_id: str) -> None:
+    with _transaction() as conn:
+        kb = _owned_kb(conn, kb_id, user_id)
+        if not kb["deleted_at"]:
+            raise KBConflict("必须先软删，再从回收站彻底删除")
+        conn.execute("UPDATE kb_kbs SET sync_action='purge',sync_error='' WHERE kb_id=?", (kb_id,))
+
+
+def finish_purge(kb_id: str) -> int:
+    with _transaction() as conn:
+        kb = conn.execute("SELECT * FROM kb_kbs WHERE kb_id=?", (kb_id,)).fetchone()
+        if not kb or kb["sync_action"] != "purge" or not kb["deleted_at"]:
+            raise KBConflict("彻底删除状态已改变")
+        cursor = conn.execute("DELETE FROM kb_docs WHERE kb_id=?", (kb_id,))
+        conn.execute("DELETE FROM kb_kbs WHERE kb_id=?", (kb_id,))
+    return cursor.rowcount
+
+
+def searchable_docs(kb_id: str, user_id: str, doc_ids: list[str]) -> dict[str, dict]:
+    if not doc_ids:
+        return {}
+    with _transaction() as conn:
+        placeholders = ",".join("?" for _ in doc_ids)
+        rows = conn.execute(f"""
+            SELECT d.* FROM kb_docs d JOIN kb_kbs k ON k.kb_id=d.kb_id
+            WHERE d.kb_id=? AND k.user_id=? AND k.deleted_at='' AND k.sync_action=''
+              AND d.deleted_at='' AND d.status='indexed' AND d.sync_pending=0 AND d.chunk_count>0
+              AND d.doc_id IN ({placeholders})""", (kb_id,user_id,*doc_ids)).fetchall()
+    return {row["doc_id"]: dict(row) for row in rows}
 
 
 def list_deleted_kbs(user_id: str) -> list[dict[str, Any]]:
-    """列已软删的 KB(回收站列表)。"""
-    with _lock, _get_conn() as conn:
-        rows = conn.execute(
-            """
-            SELECT kb_id, name, description, created_at, updated_at, deleted_at
-            FROM kb_kbs
-            WHERE user_id = ? AND deleted_at != ''
-            ORDER BY deleted_at DESC
-            """,
-            (user_id,),
-        ).fetchall()
+    with _transaction() as conn:
+        rows = conn.execute("""
+            SELECT k.*,(SELECT count(*) FROM kb_docs d WHERE d.kb_id=k.kb_id) AS doc_count
+            FROM kb_kbs k WHERE user_id=? AND deleted_at!='' ORDER BY deleted_at DESC""", (user_id,)).fetchall()
     return [dict(r) for r in rows]
 
 
-def count_docs_by_kb(kb_id: str) -> int:
-    """统计该 KB 下文档总数(含软删)。"""
-    with _lock, _get_conn() as conn:
-        row = conn.execute(
-            "SELECT COUNT(*) as cnt FROM kb_docs WHERE kb_id = ?",
-            (kb_id,),
-        ).fetchone()
-    return row["cnt"] if row else 0
+def recover_interrupted(user_id: str) -> None:
+    with _transaction() as conn:
+        conn.execute("""
+            UPDATE kb_docs SET status='failed',sync_pending=1,error_msg='后端重启中断索引，请重新上传'
+            WHERE status='pending' AND kb_id IN (SELECT kb_id FROM kb_kbs WHERE user_id=?)""", (user_id,))
 
 
-def restore_kb(kb_id: str) -> None:
-    """还原 KB(清 deleted_at)。"""
-    with _lock, _get_conn() as conn:
-        conn.execute(
-            "UPDATE kb_kbs SET deleted_at = '' WHERE kb_id = ?",
-            (kb_id,),
-        )
-        conn.commit()
-
-
-def restore_docs_by_kb_cascade(kb_id: str) -> list[str]:
-    """还原该 KB 下所有级联软删的 doc,返回被还原的 doc_id 列表。"""
-    with _lock, _get_conn() as conn:
-        rows = conn.execute(
-            "SELECT doc_id FROM kb_docs WHERE kb_id = ? AND deleted_reason = 'cascade_from_kb' AND deleted_at != ''",
-            (kb_id,),
-        ).fetchall()
-        doc_ids = [r["doc_id"] for r in rows]
-        if doc_ids:
-            conn.execute(
-                "UPDATE kb_docs SET deleted_at = '', deleted_reason = '' WHERE kb_id = ? AND deleted_reason = 'cascade_from_kb'",
-                (kb_id,),
-            )
-            conn.commit()
-    return doc_ids
-
-
-def hard_delete_docs_by_kb(kb_id: str) -> int:
-    """物删该 KB 下所有 doc 行(含已软删)。"""
-    with _lock, _get_conn() as conn:
-        cur = conn.execute(
-            "DELETE FROM kb_docs WHERE kb_id = ?",
-            (kb_id,),
-        )
-        conn.commit()
-    return cur.rowcount
-
-
-def hard_delete_kb(kb_id: str) -> None:
-    """物删 KB 行。"""
-    with _lock, _get_conn() as conn:
-        conn.execute(
-            "DELETE FROM kb_kbs WHERE kb_id = ?",
-            (kb_id,),
-        )
-        conn.commit()
+def pending_kbs(user_id: str) -> list[str]:
+    with _transaction() as conn:
+        rows = conn.execute("""
+            SELECT k.kb_id FROM kb_kbs k WHERE user_id=? AND
+                (sync_action!='' OR EXISTS(SELECT 1 FROM kb_docs d
+                 WHERE d.kb_id=k.kb_id AND d.sync_pending=1))""", (user_id,)).fetchall()
+    return [r["kb_id"] for r in rows]

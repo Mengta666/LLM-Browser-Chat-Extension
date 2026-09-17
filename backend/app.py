@@ -71,6 +71,9 @@ if _modules_failed:
 
 @app.on_event("shutdown")
 async def _on_shutdown():
+    if "kb" in _modules_loaded:
+        from rag import kb
+        kb.stop_recovery()
     uptime = int((time.monotonic() - _start_ts))
     _log.info("app_shutdown", data={"uptime_seconds": uptime, "pid": os.getpid()})
 
@@ -79,6 +82,9 @@ async def _on_shutdown():
 def _init_chat_sessions():
     from storage import chat_store
     chat_store._get_conn()
+    if "kb" in _modules_loaded:
+        from rag import kb
+        kb.start_recovery()
 
 
 if __name__ == "__main__":

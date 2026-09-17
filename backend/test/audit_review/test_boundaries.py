@@ -61,7 +61,6 @@ def test_cross_kb_doc_status_is_hidden_control(runtime):
     assert runtime.store.get_doc(doc_id)["deleted_at"] == ""
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="F11: delete ignores document's owning KB in SQLite")
 @pytest.mark.parametrize("existing_parent", [True, False])
 def test_cross_kb_delete_cannot_modify_other_doc(runtime, existing_parent):
     kb_id, doc_id = insert_chunks(runtime)
@@ -95,7 +94,6 @@ def test_kb_restore_preserves_independently_deleted_doc_control(runtime):
     assert not runtime.vector.scroll_memories(user_id=runtime.config.CHAT_USER_ID, kb_id=kb_id, limit=20)
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="F12: failed vector restore commits metadata and cannot be retried")
 def test_restore_after_transient_vector_failure_can_retry(runtime):
     kb_id, doc_id = insert_chunks(runtime)
     assert runtime.api.delete(f"/v1/kb/{kb_id}").status_code == 200
@@ -115,7 +113,7 @@ def test_restore_after_transient_vector_failure_can_retry(runtime):
         first = api.post(f"/v1/kb/{kb_id}/restore")
         second = api.post(f"/v1/kb/{kb_id}/restore")
     active = runtime.vector.scroll_memories(user_id=runtime.config.CHAT_USER_ID, kb_id=kb_id, limit=20)
-    assert first.status_code == 500
+    assert first.status_code == 503
     assert second.status_code == 200 and len(active) == 3, {
         "first_status": first.status_code, "retry_status": second.status_code,
         "kb_active": not runtime.store.get_kb(kb_id)["deleted_at"],
@@ -125,20 +123,20 @@ def test_restore_after_transient_vector_failure_can_retry(runtime):
 
 
 @pytest.mark.parametrize("chunk_count,fail_batch", [
-    (64, None), (65, None), (65, 1),
-    pytest.param(65, 2, marks=pytest.mark.xfail(strict=True, raises=AssertionError,
-        reason="F13: failed later batch leaves searchable fragments of failed document")),
+    (64, None), (65, None), (65, 1), (65, 2),
 ])
 def test_upload_batch_failure_leaves_no_active_partial_doc(runtime, chunk_count, fail_batch):
     kb_id = runtime.kb.create_kb("Synthetic upload boundary KB")["kb_id"]
     finished = threading.Event()
-    update_status = runtime.store.update_doc_status
+    original_process = runtime.kb._process_doc
 
-    def finished_status(*args, **kwargs):
-        update_status(*args, **kwargs)
-        finished.set()
+    def process(*args, **kwargs):
+        try:
+            return original_process(*args, **kwargs)
+        finally:
+            finished.set()
 
-    runtime.monkeypatch.setattr(runtime.store, "update_doc_status", finished_status)
+    runtime.monkeypatch.setattr(runtime.kb, "_process_doc", process)
     runtime.monkeypatch.setattr(runtime.kb.chunker, "chunk_document", lambda text, *args: [
         {"text": f"synthetic part {i}", "chunk_id": i} for i in range(chunk_count)
     ])

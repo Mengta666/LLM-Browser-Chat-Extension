@@ -1,6 +1,10 @@
 # 文档暂不进入仓库
 docs/
 
+# 本地测试代码、用例及验收报告
+/test/
+/pytest-cache-files-*/
+
 # Python 本地环境与缓存
 .venv/
 __pycache__/
@@ -37,7 +41,6 @@ backend/config/.env
 backend/logs/
 *.log
 *.jsonl
-!backend/test/eval/cases/*.jsonl
 backend/knowledge/records/operations.json
 
 # 本地临时/脚本产物

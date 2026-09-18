@@ -3,7 +3,7 @@
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 
 from observability.logger import get_logger, get_all_loggers, LOG_DIR
 
@@ -17,7 +17,7 @@ def query_logs(
     session_id: str = "",
     level: str = "",
     event: str = "",
-    limit: int = 100,
+    limit: int = Query(default=100, ge=1, le=1000),
 ) -> list[dict[str, Any]]:
     """从内存缓存查询日志。"""
     logger = get_logger(channel)

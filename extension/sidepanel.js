@@ -181,7 +181,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
     if (code.length) {
       const re = new RegExp(`${PH_CODE}(\\d+)${PH_CODE}`, 'g');
-      out = out.replace(re, (_m, i) => code[Number(i)] || '');
+      out = out.replace(re, (_m, i) => {
+        const raw = code[Number(i)];
+        if (!raw) return '';
+        const node = document.createElement('code');
+        node.textContent = raw.slice(1, -1);
+        return node.outerHTML;
+      });
     }
     return out;
   }
@@ -2033,7 +2039,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const card = getOrCreateEnhancementCard(bubbleEl);
     const esc = (t) => String(t || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
-    const stepId = `${step.type}_${step.query || ''}`;
+    const stepId = step.tool_call_id || `${step.type}_${step.query || ''}`;
     let stepEl = card.querySelector(`[data-step-id="${CSS.escape(stepId)}"]`);
 
     const icon = step.type === 'web_search' ? '🔍' : '📚';
@@ -2041,12 +2047,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (step.status === 'running') {
       if (!stepEl) {
         stepEl = document.createElement('div');
-        stepEl.className = 'enhancement-step running';
         stepEl.setAttribute('data-step-id', stepId);
         card.appendChild(stepEl);
       }
-      const label = step.type === 'web_search' ? '正在搜索' : '正在检索知识库';
-      stepEl.innerHTML = `<span class="step-icon">${icon}</span><span class="step-text">${label} “${esc(step.query)}”</span>`;
+      stepEl.className = 'enhancement-step running';
+      const label = step.type === 'web_search' ? '正在搜索' : step.type === 'kb_list_documents' ? '正在读取知识库目录' : '正在检索知识库';
+      stepEl.innerHTML = `<span class="step-icon">${icon}</span><span class="step-text">${label}${step.query ? ` “${esc(step.query)}”` : ''}</span>`;
     } else if (step.status === 'done') {
       if (!stepEl) {
         stepEl = document.createElement('div');
@@ -2054,10 +2060,59 @@ document.addEventListener('DOMContentLoaded', async () => {
         card.appendChild(stepEl);
       }
       stepEl.className = 'enhancement-step done';
+      if (step.type === 'evidence_check') {
+        stepEl.classList.add('kb-result');
+        stepEl.textContent = step.outcome === 'reviewed'
+          ? '📎 已完成引用格式与模型证据复核（不代表人工核实）'
+          : '⚠ 证据核对未完成，未通过的结论已收起';
+        return;
+      }
+      stepEl.classList.toggle('kb-result', step.type === 'kb_search' || step.type === 'kb_list_documents');
+      if (step.type === 'kb_list_documents' && step.catalog) {
+        const catalog = step.catalog;
+        const counts = catalog.counts;
+        stepEl.replaceChildren();
+        const heading = document.createElement('span');
+        heading.className = 'step-text';
+        heading.textContent = `📚 目录统计：共 ${counts.total} 份，已索引 ${counts.indexed} 份（可检索 ${counts.searchable} 份），处理中 ${counts.pending} 份，失败 ${counts.failed} 份`;
+        const details = document.createElement('details');
+        details.className = 'kb-catalog';
+        const summary = document.createElement('summary');
+        summary.textContent = `第 ${catalog.page} 页 · 本页 ${catalog.documents.length} 份 · ${catalog.has_more ? '还有下一页，未列全' : catalog.page === 1 ? '已到末页' : '已到末页，仅展示本页'}（目录不含正文）`;
+        details.append(summary);
+        const list = document.createElement('ul');
+        for (const doc of catalog.documents) {
+          const row = document.createElement('li');
+          const status = doc.searchable ? '可检索' : doc.status === 'failed' ? '索引失败' : doc.status === 'pending' ? '处理中' : '已索引，暂不可检索';
+          row.textContent = `${doc.filename} · ${status} · ${doc.chunk_count} 个片段`;
+          list.append(row);
+        }
+        details.append(list);
+        stepEl.append(heading, details);
+        return;
+      }
       const label = step.type === 'web_search' ? '已搜索' : '已检索知识库';
       const count = step.result_count || 0;
-      const countText = count > 0 ? ` · ${count} 项` : '';
-      stepEl.innerHTML = `<span class="step-icon">${icon}</span><span class="step-text">${label} “${esc(step.query)}”${countText}</span>`;
+      const outcomeText = {
+        empty_kb: '知识库没有文档',
+        no_searchable_documents: '文档存在，暂无可检索文档',
+        no_match: '检索完成，0 条匹配',
+      }[step.outcome];
+      const countText = ` · ${count} 项`;
+      const counts = step.counts;
+      const stateText = step.outcome === 'no_searchable_documents' && counts
+        ? `（共 ${counts.total} 份，已索引 ${counts.indexed} 份，处理中 ${counts.pending} 份，失败 ${counts.failed} 份）` : '';
+      stepEl.innerHTML = `<span class="step-icon">${icon}</span><span class="step-text">${esc(outcomeText || label)} “${esc(step.query)}”${outcomeText ? esc(stateText) : countText}</span>`;
+    } else if (step.status === 'error') {
+      if (!stepEl) {
+        stepEl = document.createElement('div');
+        stepEl.setAttribute('data-step-id', stepId);
+        card.appendChild(stepEl);
+      }
+      stepEl.className = 'enhancement-step error';
+      const failed = step.outcome === 'error';
+      stepEl.innerHTML = `<span class="step-icon">⚠</span><span class="step-text">${failed ? '知识库查询失败' : '工具未执行'}：${esc(step.error || '工具参数无效')}</span>`;
+      stepEl.title = step.error || '工具参数无效';
     }
   }
 
@@ -2065,54 +2120,105 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   function renderSearchCitations(bubbleEl, sources) {
     if (!sources || !sources.length) return;
-    // 把回答里的 [1] [2] 渲染为可点击引用链接
-    const contentEl = bubbleEl.querySelector('.markdown-body') || bubbleEl;
-    if (contentEl.innerHTML) {
-      contentEl.innerHTML = contentEl.innerHTML.replace(/\[(\d+)\]/g, (match, num) => {
-        const idx = parseInt(num) - 1;
-        const src = sources[idx];
-        if (!src) return match;
-        const isKb = src.url && src.url.startsWith('kb://');
-        const safeTitle = (src.title || '').replace(/"/g, '&quot;');
-        if (isKb) {
-          // KB 引用：不跳转，仅 tooltip 提示
-          return `<span class="search-citation kb-citation-inline" title="${safeTitle}">[${num}]</span>`;
-        }
-        return `<a class="search-citation" href="${src.url}" target="_blank" rel="noopener" title="${safeTitle}">[${num}]</a>`;
+    const entries = [...new Map(sources.map((source, i) => {
+      const url = typeof source.url === 'string' ? source.url : '';
+      let href = '';
+      try {
+        const parsed = new URL(url);
+        if (parsed.protocol === 'https:' || parsed.protocol === 'http:') href = parsed.href;
+      } catch (_) { /* 非法来源仅显示文本。 */ }
+      const index = Number.isInteger(source.index) && source.index > 0 ? source.index : i + 1;
+      return [index, {
+        index,
+        title: String(source.title || ''), snippet: String(source.snippet || ''),
+        isKb: url.startsWith('kb://'), href,
+        hasDocumentId: Boolean(source.doc_id),
+        docKey: source.doc_id ? `${source.kb_id}/${source.doc_id}` : (url || `legacy-${index}`),
+      }];
+    })).values()];
+    const byIndex = new Map(entries.map(source => [source.index, source]));
+    const contentEl = bubbleEl.querySelector('.markdown-body');
+    if (contentEl) {
+      const walker = document.createTreeWalker(contentEl, NodeFilter.SHOW_TEXT, {
+        acceptNode(node) {
+          return node.parentElement.closest('a, code, pre, script, style, textarea, button, .katex, math, .search-citation')
+            ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
+        },
       });
+      const nodes = [];
+      while (walker.nextNode()) nodes.push(walker.currentNode);
+      for (const node of nodes) {
+        const fragment = document.createDocumentFragment();
+        let offset = 0;
+        for (const match of node.textContent.matchAll(/\[(\d+)\]/g)) {
+          const source = byIndex.get(Number(match[1]));
+          if (!source) continue;
+          fragment.append(document.createTextNode(node.textContent.slice(offset, match.index)));
+          const citation = document.createElement(source.href ? 'a' : 'span');
+          citation.className = 'search-citation' + (source.isKb ? ' kb-citation-inline' : '');
+          citation.title = source.title;
+          citation.textContent = match[0];
+          if (source.href) {
+            citation.href = source.href;
+            citation.target = '_blank';
+            citation.rel = 'noopener';
+          }
+          fragment.append(citation);
+          offset = match.index + match[0].length;
+        }
+        if (offset) {
+          fragment.append(document.createTextNode(node.textContent.slice(offset)));
+          node.replaceWith(fragment);
+        }
+      }
     }
-    // 来源面板
+    const previousPanel = bubbleEl.querySelector(':scope > .search-sources-panel');
     const panel = document.createElement('div');
     panel.className = 'search-sources-panel';
     const toggle = document.createElement('div');
     toggle.className = 'search-sources-toggle';
-    toggle.textContent = `📎 来源 (${sources.length})`;
+    const cited = new Set([...(contentEl?.querySelectorAll('.search-citation') || [])]
+      .map(node => Number(node.textContent.slice(1, -1))).filter(index => byIndex.has(index)));
+    const docCount = new Set(entries.map(source => source.docKey)).size;
+    const documentLabel = entries.some(source => source.isKb && !source.hasDocumentId)
+      ? '文档数未知（旧记录）' : `${docCount} 份文档/网页`;
+    toggle.textContent = `📎 检索来源：${documentLabel} · ${entries.length} 个片段 · 正文引用 ${cited.size} 个`;
     const list = document.createElement('div');
     list.className = 'search-sources-list';
-    list.style.display = 'none';
-    for (let i = 0; i < sources.length; i++) {
-      const s = sources[i];
-      const isKb = s.url && s.url.startsWith('kb://');
+    list.style.display = previousPanel?.querySelector('.search-sources-list')?.style.display || 'none';
+    for (const source of entries) {
       const item = document.createElement('div');
-      item.className = 'search-source-item' + (isKb ? ' kb-source-item' : '');
-
-      if (isKb) {
-        // KB 来源：不可点击，显示文档名 + snippet
-        item.innerHTML = `
-          <span class="search-source-num">[${i + 1}]</span>
-          <span class="kb-source-icon">📚</span>
-          <div class="kb-source-detail">
-            <div class="kb-source-title">${(s.title || '').replace(/</g, '&lt;')}</div>
-            ${s.snippet ? `<div class="kb-source-snippet">${s.snippet.replace(/</g, '&lt;')}</div>` : ''}
-          </div>`;
+      item.className = 'search-source-item' + (source.isKb ? ' kb-source-item' : '');
+      const number = document.createElement('span');
+      number.className = 'search-source-num';
+      number.textContent = `[${source.index}]`;
+      item.title = cited.has(source.index) ? '正文已引用；不代表事实已经人工核实' : '已检索，正文未引用';
+      if (source.isKb) {
+        const icon = document.createElement('span');
+        icon.className = 'kb-source-icon';
+        icon.textContent = '📚';
+        const detail = document.createElement('div');
+        detail.className = 'kb-source-detail';
+        const title = document.createElement('div');
+        title.className = 'kb-source-title';
+        title.textContent = source.title;
+        detail.append(title);
+        if (source.snippet) {
+          const snippet = document.createElement('div');
+          snippet.className = 'kb-source-snippet';
+          snippet.textContent = source.snippet;
+          detail.append(snippet);
+        }
+        item.append(number, icon, detail);
       } else {
-        // Web 来源：可点击链接
-        const a = document.createElement('a');
+        const a = document.createElement(source.href ? 'a' : 'span');
         a.className = 'search-source-link';
-        a.href = s.url;
-        a.target = '_blank';
-        a.rel = 'noopener';
-        a.innerHTML = `<span class="search-source-num">[${i + 1}]</span> ${(s.title || '').replace(/</g, '&lt;')}`;
+        if (source.href) {
+          a.href = source.href;
+          a.target = '_blank';
+          a.rel = 'noopener';
+        }
+        a.append(number, document.createTextNode(` ${source.title}`));
         item.appendChild(a);
       }
       list.appendChild(item);
@@ -2122,7 +2228,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
     panel.appendChild(toggle);
     panel.appendChild(list);
-    bubbleEl.appendChild(panel);
+    if (previousPanel) previousPanel.replaceWith(panel);
+    else bubbleEl.appendChild(panel);
   }
 
   // 5. 绑定各种交互事件

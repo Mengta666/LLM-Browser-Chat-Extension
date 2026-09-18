@@ -42,12 +42,12 @@ def handle(item):
                     yield {'enhancement_step': step}
                 yield {'choices': [{'delta': {'content': answer['content']}, 'index': 0}]}
             else:
-                from search.tools import WEB_SEARCH_TOOL, KB_SEARCH_TOOL
+                from search.tools import WEB_SEARCH_TOOL, KB_SEARCH_TOOL, KB_LIST_DOCUMENTS_TOOL, KB_TOOL_GUIDANCE
                 tools = []
                 if chat._SEARCH_ON and not item.search_query.strip():
                     tools.append(WEB_SEARCH_TOOL)
                 if item.kb_id:
-                    tools.append(KB_SEARCH_TOOL)
+                    tools.extend([KB_SEARCH_TOOL, KB_LIST_DOCUMENTS_TOOL])
                 parts = [chat._CHAT_BASE_SYSTEM]
                 memory = chat._build_memory_system(user_text, chat_id=item.chat_id)
                 if memory:
@@ -55,12 +55,13 @@ def handle(item):
                 if item.kb_id:
                     from storage import kb_store
                     kb = kb_store.get_kb(item.kb_id)
-                    if not kb or kb.get('deleted_at'):
+                    if not kb or kb['user_id'] != C.CHAT_USER_ID or kb.get('deleted_at') or kb.get('sync_action'):
                         raise store.SessionError('kb_not_found', 404)
-                    parts.append(f'当前绑定知识库「{kb["name"]}」(id: {item.kb_id})。优先使用 kb_search 查询该库，不混用其他知识库。')
+                    parts.append(f'当前绑定知识库「{kb["name"]}」(id: {item.kb_id})。只能查询该库。' + KB_TOOL_GUIDANCE)
                 messages = context.prepare(item.chat_id, current, parts, tools)
                 full_text = ''
                 steps = []
+                initial_sources = []
                 if item.search_query.strip():
                     from search.tools import format_search_results
                     yield {'enhancement_step': {'type': 'web_search', 'status': 'running', 'query': item.search_query}}
@@ -73,6 +74,8 @@ def handle(item):
                                 {'index': i + 1, 'title': result.title, 'url': result.url,
                                  'snippet': (result.snippet or '')[:200]} for i, result in enumerate(results)]}
                     steps.append(step)
+                    initial_sources = [{**s, 'content': results[i].snippet or '', 'questions': [item.search_query]}
+                                       for i, s in enumerate(step['sources'])]
                     yield {'enhancement_step': step}
                     messages.append({'role': 'assistant', 'content': None, 'tool_calls': [{
                         'id': 'manual_search', 'type': 'function', 'function': {
@@ -83,6 +86,8 @@ def handle(item):
                     from api.agentic import run_agentic_loop
                     for event in run_agentic_loop(item.model, messages, tools, chat_id=item.chat_id,
                                                   stream=item.stream, enforce_budget=True,
+                                                  bound_kb_id=item.kb_id,
+                                                  initial_sources=initial_sources,
                                                   start_index=1 + sum(len(step.get('sources', [])) for step in steps)):
                         if event['type'] == 'enhancement_step':
                             yield {'enhancement_step': event['step']}

@@ -68,7 +68,9 @@ class StructuredLogger:
         limit: int = 100,
     ) -> list[dict[str, Any]]:
         """从内存缓存中查询日志条目。"""
-        results = self._memory
+        if not 1 <= limit <= 1000:
+            raise ValueError("limit 必须在 1 到 1000 之间")
+        results = list(self._memory)
         if session_id:
             results = [e for e in results if e["session_id"] == session_id]
         if level:

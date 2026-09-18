@@ -286,6 +286,11 @@ def _get_sibling_chunk(kb_id: str, doc_id: str, chunk_id: int,
     return admitted[0] if admitted else None
 
 
+def _recall_score(chunk: dict) -> float:
+    score = chunk.get("rerank_score")
+    return chunk.get("score", 0) if score is None else score
+
+
 def search_kb(kb_id: str, query: str, top_k: int = KB_SEARCH_TOP_K) -> list[dict[str, Any]]:
     """检索 KB,返回 top-K chunks(带 doc/source/chunk_idx)。
 
@@ -316,12 +321,15 @@ def search_kb(kb_id: str, query: str, top_k: int = KB_SEARCH_TOP_K) -> list[dict
             break
 
     # Rerank（如果启用）
-    results = rerank_chunks(query, results)
+    admitted_count = len(results)
+    diagnostics = {}
+    results = rerank_chunks(query, results, diagnostics=diagnostics)
+    scores = [_recall_score(chunk) for chunk in results]
 
     # 相关性过滤
     filtered = []
     for chunk in results:
-        score = chunk.get("rerank_score") or chunk.get("score", 0)
+        score = _recall_score(chunk)
         if score >= KB_RECALL_MIN_SCORE:
             filtered.append(chunk)
 
@@ -351,6 +359,7 @@ def search_kb(kb_id: str, query: str, top_k: int = KB_SEARCH_TOP_K) -> list[dict
         expanded_chunk = chunk.copy()
         expanded_chunk["content"] = expanded_content
         expanded_chunk["window_size"] = len(context_chunks)  # 标记扩展了几个 chunk
+        expanded_chunk["window_chunk_ids"] = [c.get("chunk_idx", c.get("chunk_id")) for c in context_chunks]
         expanded.append(expanded_chunk)
 
     expanded = _admit_chunks(kb_id, expanded)
@@ -362,11 +371,17 @@ def search_kb(kb_id: str, query: str, top_k: int = KB_SEARCH_TOP_K) -> list[dict
             "kb_id": kb_id,
             "query_head": query[:60],
             "raw_count": raw_count,
+            "admitted_count": admitted_count,
             "reranked_count": len(results),
             "filtered_count": len(filtered),
             "expanded_count": len(expanded),
             "rerank_enabled": KB_RERANK_ENABLED,
-            "top_score": filtered[0].get("rerank_score") or filtered[0].get("score", 0) if filtered else 0,
+            "top_score": max(scores) if scores else None,
+            "min_score": min(scores) if scores else None,
+            "score_threshold": KB_RECALL_MIN_SCORE,
+            "filtered_top_score": max((_recall_score(c) for c in filtered), default=None),
+            **diagnostics,
+            "score_source": ("rerank" if results[0].get("rerank_score") is not None else "recall") if results else "none",
             "avg_window": sum(c.get("window_size", 1) for c in expanded) / len(expanded) if expanded else 0,
             "elapsed_ms": int((time.time() - start) * 1000)
         })

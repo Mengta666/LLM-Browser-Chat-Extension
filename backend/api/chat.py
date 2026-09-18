@@ -233,12 +233,15 @@ def _prepare_messages(item: ChatRequest) -> list[dict[str, Any]]:
     # 若绑定 KB,拼 system 提示(供 LLM 自主决定是否 tool_call kb_search)
     if item.kb_id.strip():
         from storage import kb_store as _KS
+        from agent.memory.config import CHAT_USER_ID
+        from search.tools import KB_TOOL_GUIDANCE
         _kb_info = _KS.get_kb(item.kb_id)
-        _kb_name = _kb_info["name"] if _kb_info else item.kb_id
+        _kb_name = _kb_info["name"] if (_kb_info and _kb_info["user_id"] == CHAT_USER_ID
+                   and not _kb_info["deleted_at"] and not _kb_info["sync_action"]) else "不可用"
         kb_hint = (
             f"当前已绑定知识库「{_kb_name}」(id: {item.kb_id})。\n"
             f"用户绑定知识库通常希望优先从中查找答案。\n"
-            f"除非用户明确只要联网信息，否则应优先或同时调用 kb_search 工具。\n"
+            f"只能查询当前绑定的库。{KB_TOOL_GUIDANCE}\n"
             f"你可以同时调用多个工具（web_search + kb_search）。"
         )
         insert_pos = 1 if messages and messages[0].get("role") == "system" else 0
@@ -486,7 +489,7 @@ def stream_chat(model: str, messages: list[dict[str, Any]],
                 user_text: str, chat_id: str,
                 use_tools: bool = False,
                 search_results: list = None,
-                tools_list: list[str] = None) -> StreamingResponse:
+                tools_list: list[str] = None, bound_kb_id: str = "") -> StreamingResponse:
     """SSE 流式转发。use_tools=True 时走 function calling 链路。
 
     tools_list: ["web_search", "kb_search"] 显式指定启用哪些 tool。
@@ -522,7 +525,7 @@ def stream_chat(model: str, messages: list[dict[str, Any]],
                 yield _sse(chunk.model_dump())
         else:
             # 有工具：走 agentic loop
-            from search.tools import WEB_SEARCH_TOOL, KB_SEARCH_TOOL, SEARCH_ENABLED
+            from search.tools import WEB_SEARCH_TOOL, KB_SEARCH_TOOL, KB_LIST_DOCUMENTS_TOOL, SEARCH_ENABLED
             from api.agentic import run_agentic_loop
 
             tools = []
@@ -533,7 +536,7 @@ def stream_chat(model: str, messages: list[dict[str, Any]],
                 if "web_search" in tools_list and SEARCH_ENABLED:
                     tools.append(WEB_SEARCH_TOOL)
                 if "kb_search" in tools_list:
-                    tools.append(KB_SEARCH_TOOL)
+                    tools.extend([KB_SEARCH_TOOL, KB_LIST_DOCUMENTS_TOOL])
 
             if not tools:
                 # 无可用工具，降级普通流式
@@ -552,7 +555,7 @@ def stream_chat(model: str, messages: list[dict[str, Any]],
             else:
                 # 走 agentic loop
                 try:
-                    for event in run_agentic_loop(model, messages, tools, chat_id=chat_id, stream=True):
+                    for event in run_agentic_loop(model, messages, tools, chat_id=chat_id, stream=True, bound_kb_id=bound_kb_id):
                         if event["type"] == "enhancement_step":
                             yield _sse({
                                 "choices": [{"delta": {"content": ""}, "finish_reason": None, "index": 0}],
@@ -597,7 +600,7 @@ def sync_chat(model: str, messages: list[dict[str, Any]],
               user_text: str, chat_id: str,
               use_tools: bool = False,
               search_results: list = None,
-              tools_list: list[str] = None) -> JSONResponse:
+              tools_list: list[str] = None, bound_kb_id: str = "") -> JSONResponse:
     """非流式同步调用。use_tools=True 时走 agentic loop。"""
     t0 = time.monotonic()
     search_used = bool(search_results)
@@ -618,7 +621,7 @@ def sync_chat(model: str, messages: list[dict[str, Any]],
             return JSONResponse(status_code=502, content={"error": f"对话失败: {str(exc)[:100]}"})
     else:
         # 有工具：走 agentic loop
-        from search.tools import WEB_SEARCH_TOOL, KB_SEARCH_TOOL, SEARCH_ENABLED
+        from search.tools import WEB_SEARCH_TOOL, KB_SEARCH_TOOL, KB_LIST_DOCUMENTS_TOOL, SEARCH_ENABLED
         from api.agentic import run_agentic_loop
 
         tools = []
@@ -629,7 +632,7 @@ def sync_chat(model: str, messages: list[dict[str, Any]],
             if "web_search" in tools_list and SEARCH_ENABLED:
                 tools.append(WEB_SEARCH_TOOL)
             if "kb_search" in tools_list:
-                tools.append(KB_SEARCH_TOOL)
+                tools.extend([KB_SEARCH_TOOL, KB_LIST_DOCUMENTS_TOOL])
 
         if not tools:
             # 无可用工具，降级普通调用
@@ -643,7 +646,7 @@ def sync_chat(model: str, messages: list[dict[str, Any]],
             # 走 agentic loop
             text = ""
             try:
-                for event in run_agentic_loop(model, messages, tools, chat_id=chat_id, stream=False):
+                for event in run_agentic_loop(model, messages, tools, chat_id=chat_id, stream=False, bound_kb_id=bound_kb_id):
                     if event["type"] == "enhancement_step":
                         if event["step"]["status"] == "done" and event["step"].get("result_count", 0) > 0:
                             search_used = True
@@ -730,6 +733,6 @@ def chat_completions(item: ChatRequest):
 
     if item.stream:
         return stream_chat(item.model, messages, user_text, item.chat_id,
-                           use_tools=bool(use_tools_list), tools_list=use_tools_list)
+                           use_tools=bool(use_tools_list), tools_list=use_tools_list, bound_kb_id=item.kb_id)
     return sync_chat(item.model, messages, user_text, item.chat_id,
-                     use_tools=bool(use_tools_list), tools_list=use_tools_list)
+                     use_tools=bool(use_tools_list), tools_list=use_tools_list, bound_kb_id=item.kb_id)

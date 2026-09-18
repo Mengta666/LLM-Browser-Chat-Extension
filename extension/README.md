@@ -72,13 +72,13 @@ node --check extension/agent_observation.js
 node --check extension/agent_execution.js
 node --check extension/agent_runner.js
 
-node backend/test/audit_review/server_frontend.test.cjs
-node backend/test/audit_review/kb_refresh.test.cjs
-node backend/test/audit_review/svg_controls.test.cjs
-node backend/test/audit_review/empty_controls.test.cjs
-node backend/test/audit_review/agent_execution.test.cjs
-node backend/test/audit_review/agent_runner.test.cjs
-node backend/test/audit_review/agent_panel.test.cjs
+node test/audit_review/server_frontend.test.cjs
+node test/audit_review/kb_refresh.test.cjs
+node test/audit_review/svg_controls.test.cjs
+node test/audit_review/empty_controls.test.cjs
+node test/audit_review/agent_execution.test.cjs
+node test/audit_review/agent_runner.test.cjs
+node test/audit_review/agent_panel.test.cjs
 ```
 
 这些是语法与离线回归检查，不替代真实浏览器、模型、Qdrant 和 reranker 的端到端验收。更多测试边界和历史报告见 [项目 README](../README.md#开发检查与回归)。

@@ -25,8 +25,8 @@ python -m venv .venv
 .\.venv\Scripts\python.exe app.py
 
 # Backend self-tests (RAG side)
-.\.venv\Scripts\python.exe -B test\test_page_identity.py
-.\.venv\Scripts\python.exe -B test\test_rag_refresh_flow.py
+.\.venv\Scripts\python.exe -B ..\test\test_page_identity.py
+.\.venv\Scripts\python.exe -B ..\test\test_rag_refresh_flow.py
 
 # Frontend syntax check (no build step — plain JS)
 node --check extension\background.js

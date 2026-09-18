@@ -197,7 +197,7 @@ if (-not (Test-Path -LiteralPath 'config/.env')) {
 | `/v1/memory/*` | 长期记忆查询、管理及 rethink |
 | `GET /v1/logs/query`、`GET /v1/logs/sessions`、`GET /v1/logs/files` | 日志查询 |
 
-服务端聊天需设置 `context_mode: "server"`，携带会话 / 请求标识和预期序号，`messages` 只包含本轮一条用户消息。幂等重试应复用原请求 ID，不要每次生成新 ID；完整行为见 [服务端上下文回归说明](backend/test/audit_review/SERVER_CONTEXT_RESULTS.md)。
+服务端聊天需设置 `context_mode: "server"`，携带会话 / 请求标识和预期序号，`messages` 只包含本轮一条用户消息。幂等重试应复用原请求 ID，不要每次生成新 ID；完整行为见 [服务端上下文回归说明](test/audit_review/SERVER_CONTEXT_RESULTS.md)。
 
 当前应用没有旧的 `/api/pages/refresh_snapshot`、独立 `/search` 路由，也没有通用 `/v1/models` 代理。兼容聊天入口不等于实现了全部 OpenAI API。
 
@@ -216,8 +216,7 @@ browser-agent/
 │  ├─ tools/                  自动化动作白名单等工具代码
 │  ├─ config/                 .env 与模板
 │  ├─ data/                   聊天 SQLite 等运行数据
-│  ├─ logs/                   分频道 JSONL 日志及可选调试截图
-│  └─ test/audit_review/      审计、离线回归与真实服务验证材料
+│  └─ logs/                   分频道 JSONL 日志及可选调试截图
 ├─ extension/
 │  ├─ manifest.json           扩展声明与权限
 │  ├─ background.js           CDP 连接、页面观察、浏览器动作执行
@@ -227,23 +226,27 @@ browser-agent/
 │  ├─ agent_runner.js         决策查询、观察恢复与停止协调
 │  ├─ sidepanel.html          侧边栏入口
 │  └─ sidepanel.js            聊天、自动化循环、知识库与历史交互
+├─ test/                      本地测试、用例与验收报告（Git 忽略）
+│  ├─ audit_review/           审计、隔离回归与真实服务验证材料
+│  ├─ eval/                   长期记忆评测
+│  └─ chat_eval/              聊天链路回归脚本
 └─ docs/                      本地文档目录（Git 忽略）
    └─ TODO.md                 待办、已知问题与暂缓设计
 ```
 
 ## 开发检查与回归
 
-以下命令从**仓库根目录**执行。测试依赖与前端检查所需的 Node.js 需另行安装。
+以下命令从**仓库根目录**执行。`test/` 是本地保留并被 Git 忽略的目录，新克隆的仓库不包含这些测试及下方验收报告；需已有本地测试副本才能运行。测试依赖与前端检查所需的 Node.js 需另行安装。
 
 ```powershell
 .\backend\.venv\Scripts\python.exe -m pip install pytest httpx lxml
-.\backend\.venv\Scripts\python.exe -X utf8 -B -m pytest backend/test/audit_review -q -p no:cacheprovider
+.\backend\.venv\Scripts\python.exe -X utf8 -B -m pytest test/audit_review -q -p no:cacheprovider
 
-node backend/test/audit_review/server_frontend.test.cjs
-node backend/test/audit_review/kb_refresh.test.cjs
-node backend/test/audit_review/kb_lifecycle.test.cjs
-node backend/test/audit_review/svg_controls.test.cjs
-node backend/test/audit_review/empty_controls.test.cjs
+node test/audit_review/server_frontend.test.cjs
+node test/audit_review/kb_refresh.test.cjs
+node test/audit_review/kb_lifecycle.test.cjs
+node test/audit_review/svg_controls.test.cjs
+node test/audit_review/empty_controls.test.cjs
 
 node --check extension/background.js
 node --check extension/sidepanel.js
@@ -252,17 +255,17 @@ node --check extension/agent_observation.js
 
 上述 Python 审计回归使用隔离配置、临时 SQLite / 内存 Qdrant，并阻断外部网络，不应读写真实知识库。已知缺陷可能标记为 `xfail`，不表示已经修复。当前本地核对的 qdrant-client 版本为 1.18.0。
 
-不要直接把整个 `backend/test` 目录当成安全的离线套件：其中有旧架构脚本和真实服务测试，部分会调用模型、写入或清理集合。`live_*.py` 也需要明确的测试数据范围及服务准备，不应仅为检查文档随意运行。
+不要直接把整个 `test` 目录当成安全的离线套件：其中有旧架构脚本和真实服务测试，部分会调用模型、写入或清理集合。`live_*.py` 也需要明确的测试数据范围及服务准备，不应仅为检查文档随意运行。
 
 验收记录：
 
-- [长会话与恢复](backend/test/audit_review/SERVER_CONTEXT_RESULTS.md)
-- [SVG 控件](backend/test/audit_review/SVG_CONTROLS_RESULTS.md)
-- [无文本控件](backend/test/audit_review/EMPTY_CONTROLS_RESULTS.md)
-- [编辑器输入与按键](backend/test/audit_review/EDITOR_INPUT_RESULTS.md)
-- [真实 reranker 测试](backend/test/audit_review/LIVE_RERANK_RESULTS.md)
-- [知识库一致性修复与真实流程验收](backend/test/audit_review/KB_LIFECYCLE_RESULTS.md)
-- [详细审计结果](backend/test/audit_review/DEEP_AUDIT_RESULTS.md)
+- [长会话与恢复](test/audit_review/SERVER_CONTEXT_RESULTS.md)
+- [SVG 控件](test/audit_review/SVG_CONTROLS_RESULTS.md)
+- [无文本控件](test/audit_review/EMPTY_CONTROLS_RESULTS.md)
+- [编辑器输入与按键](test/audit_review/EDITOR_INPUT_RESULTS.md)
+- [真实 reranker 测试](test/audit_review/LIVE_RERANK_RESULTS.md)
+- [知识库一致性修复与真实流程验收](test/audit_review/KB_LIFECYCLE_RESULTS.md)
+- [详细审计结果](test/audit_review/DEEP_AUDIT_RESULTS.md)
 
 历史报告描述的是各自测试时的环境和结果，不代替当前版本的重新验收。
 

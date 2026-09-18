@@ -151,6 +151,35 @@ def list_docs(kb_id: str) -> list[dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+def document_catalog(kb_id: str, user_id: str, *, page: int = 1, limit: int = 20) -> dict:
+    if type(page) is not int or not 1 <= page <= 1_000_000:
+        raise ValueError("page 必须是 1～1000000 的整数")
+    if type(limit) is not int or not 1 <= limit <= 50:
+        raise ValueError("limit 必须是 1～50 的整数")
+    with _transaction() as conn:
+        # 数量和当前页使用同一读取快照；不同页之间仍可能发生文档变更。
+        conn.execute("BEGIN")
+        kb = _owned_kb(conn, kb_id, user_id, active=True)
+        counts = dict(conn.execute("""
+            SELECT COUNT(*) AS total,
+                   COALESCE(SUM(status='indexed'),0) AS indexed,
+                   COALESCE(SUM(status='pending'),0) AS pending,
+                   COALESCE(SUM(status='failed'),0) AS failed,
+                   COALESCE(SUM(status='indexed' AND sync_pending=0 AND chunk_count>0),0) AS searchable
+            FROM kb_docs WHERE kb_id=? AND deleted_at=''
+        """, (kb_id,)).fetchone())
+        rows = conn.execute("""
+            SELECT doc_id,filename,status,chunk_count,sync_pending,
+                   (status='indexed' AND sync_pending=0 AND chunk_count>0) AS searchable
+            FROM kb_docs WHERE kb_id=? AND deleted_at=''
+            ORDER BY created_at DESC,doc_id DESC LIMIT ? OFFSET ?
+        """, (kb_id, limit, (page - 1) * limit)).fetchall()
+    return {"kb_id": kb_id, "name": kb["name"], "counts": counts,
+            "documents": [{**dict(row), "searchable": bool(row["searchable"]),
+                           "sync_pending": bool(row["sync_pending"])} for row in rows],
+            "page": page, "limit": limit, "has_more": page * limit < counts["total"]}
+
+
 def all_docs(kb_id: str) -> list[dict[str, Any]]:
     with _transaction() as conn:
         rows = conn.execute("SELECT * FROM kb_docs WHERE kb_id=?", (kb_id,)).fetchall()

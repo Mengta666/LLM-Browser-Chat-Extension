@@ -45,6 +45,7 @@ function setup() {
         try {
           if (m.type === 'AGENT_CONTROL') {
             let result;
+            if (command === 'probe') result = { protocol_version: 2 };
             if (command === 'start') result = await control.start(tabId, sessionId);
             if (command === 'cancel') result = await control.cancel(tabId, sessionId);
             if (command === 'end') result = await control.end(tabId, sessionId, async () => {});
@@ -139,4 +140,15 @@ test('old panel cleanup cannot clear a replacement task state', async () => {
   await context.runAgentTask('synthetic');
   assert.equal(context.agentState.active, true);
   assert.equal(context.agentState.status, 'running');
+});
+
+test('startup communication failure never renders a fictitious locked action', async () => {
+  const { context, stats, nodes } = setup();
+  context.chrome.runtime.sendMessage = async () => undefined;
+  await context.runAgentTask('synthetic');
+  assert.equal(stats.inputs, 0);
+  assert.equal(stats.apiCalls.length, 0);
+  assert.equal(stats.errors.some(e => /重新加载扩展/.test(e)), true);
+  assert.equal(stats.errors.some(e => /锁定|旧动作/.test(e)), false);
+  assert.equal(nodes.some(n => n.textContent === '任务未完成'), true);
 });

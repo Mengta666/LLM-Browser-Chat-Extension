@@ -19,9 +19,16 @@
         if (this.cancelledSessions.has(sessionId)) throw new ControlError('cancelled', '任务已停止');
         const old = this.tabs.get(tabId);
         if (old?.sessionId === sessionId) { this.assertRun(old); return { protocol_version: 2 }; }
+        if (old?.closeRequested && !old.current && !old.ended) {
+          const closed = await this.closeRun(old);
+          if (!closed.safe) throw new ControlError('cleanup_failed', '上个任务的资源清理尚未完成，请稍后重试');
+        }
         if (old && (!old.ended || old.current)) throw new ControlError('tab_busy', '该标签页仍有任务或未确认的动作');
         const saved = await this.store.read(tabId);
         if (this.cancelledSessions.has(sessionId)) throw new ControlError('cancelled', '任务已停止');
+        if (saved?.state === 'closing') {
+          throw new ControlError('cleanup_unconfirmed', '后台在任务收尾时中断，资源释放状态未确认；请检查页面后重新打开测试标签页');
+        }
         if (saved && ['running', 'unknown'].includes(saved.state)) {
           throw new ControlError('execution_unknown', '后台曾中断，旧动作结果未知；请检查页面，不能自动重放');
         }
@@ -167,19 +174,38 @@
         record.settled = true;
         if (record.run.current === record) record.run.current = null;
         record.resolve(result);
+        if (record.run.closeRequested) await this.closeRun(record.run);
       }).catch(() => {});
+    }
+
+    // 仅从标签页串行队列内部调用，避免收尾重入队列后等待自身。
+    async closeRun(run) {
+      if (this.tabs.get(run.tabId) !== run) return { state: 'superseded', safe: true };
+      if (run.current) return { state: run.current.unknown ? 'unknown' : 'stopping', safe: false,
+        reason: run.current.unknown ? 'execution_unknown' : 'action_pending' };
+      if (run.ended) return { state: 'stopped', safe: true };
+      try {
+        if (!run.cleaned) {
+          await this.store.write(run.tabId, { sessionId: run.sessionId, state: 'closing' });
+          await run.cleanup();
+          run.cleaned = true;
+        }
+        await this.store.write(run.tabId, { sessionId: run.sessionId, state: 'finished' });
+        run.ended = true;
+        return { state: 'stopped', safe: true };
+      } catch {
+        return { state: 'cleanup_failed', safe: false, reason: 'cleanup_failed' };
+      }
     }
 
     async end(tabId, sessionId, cleanup) {
       await this.cancel(tabId, sessionId);
       return this.serial(tabId, async () => {
         const run = this.tabs.get(tabId);
-        if (!run || run.sessionId !== sessionId) return { state: 'superseded' };
-        if (run.current) return { state: 'unknown', safe: false };
-        await cleanup();
-        run.ended = true;
-        await this.store.write(tabId, { sessionId, state: 'finished' });
-        return { state: 'stopped', safe: true };
+        if (!run || run.sessionId !== sessionId) return { state: 'superseded', safe: true };
+        run.closeRequested = true;
+        run.cleanup ||= cleanup;
+        return this.closeRun(run);
       });
     }
   }

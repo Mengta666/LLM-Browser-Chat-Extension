@@ -1,4 +1,4 @@
-importScripts('shared.js', 'agent_execution.js');
+importScripts('shared.js', 'agent_execution.js', 'agent_editing.js');
 
 const agentExecution = new AgentExecution.Controller({
   read: async tabId => (await chrome.storage.session.get(`agentExecution:${tabId}`))[`agentExecution:${tabId}`],
@@ -432,6 +432,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type !== 'AGENT_CONTROL') return;
   Promise.resolve().then(async () => {
     const { tabId, sessionId, command } = request;
+    if (command === 'probe') return { protocol_version: 2 };
     if (command === 'start') return agentExecution.start(tabId, sessionId);
     if (command === 'cancel') return agentExecution.cancel(tabId, sessionId);
     if (command === 'status') return agentExecution.status(tabId, sessionId, request.actionId);
@@ -526,15 +527,17 @@ async function handleTargetAttached(tabId, params) {
 }
 
 async function debuggerDetach(tabId) {
-  if (!_debuggerAttached.has(tabId)) return;
-  await chrome.debugger.detach({ tabId }).catch(() => {});
+  if (_debuggerAttached.has(tabId)) {
+    try { await chrome.debugger.detach({ tabId }); }
+    catch (error) { if (_debuggerAttached.has(tabId)) throw error; }
+  }
   _debuggerAttached.delete(tabId);
   // 会话结束：清持久化状态，避免 storage.session 无限累积（tab 关闭/新任务不复用旧编号）。
   _sessionEpoch.delete(tabId);
   _oopif.delete(tabId);
-  await saveTabState(STATE_KEYS.attach, tabId, null);
-  await saveTabState(STATE_KEYS.indexMap, tabId, null);
-  await saveTabState(STATE_KEYS.oopif, tabId, null);
+  await saveTabState(STATE_KEYS.attach, tabId, null, true);
+  await saveTabState(STATE_KEYS.indexMap, tabId, null, true);
+  await saveTabState(STATE_KEYS.oopif, tabId, null, true);
 }
 
 
@@ -959,6 +962,7 @@ const KEEP_ROLES = new Set(['button', 'link', 'checkbox', 'radio', 'tab', 'menui
 // 有点击证据或交互 role；名称属性自身不证明后代是独立操作。
 function bboxExempt(node) {
   const tag = (node.nodeName || '').toLowerCase();
+  if (node.editing?.kind === 'codemirror5') return true;
   if (KEEP_TAGS.has(tag)) return true;
   if (isPropagating(node)) return true;
   const attrs = node.attributes || {};
@@ -1154,6 +1158,8 @@ function interactionSource(node) {
   const tag = (node.nodeName || '').toLowerCase();
   if (tag === 'html' || tag === 'body') return '';
   if (isDisabled(node) || node.ax?.properties?.hidden === true) return '';
+  if (node.editing?.proxy) return '';
+  if (node.editing?.kind === 'codemirror5') return 'editor';
   if (hasExplicitClick(node)) return 'click';
   // IFRAME/FRAME 且 >100×100
   if ((tag === 'iframe' || tag === 'frame') && node.snapshot && node.snapshot.bounds) {
@@ -1175,7 +1181,7 @@ function interactionSource(node) {
   }
   if (INTERACTIVE_TAGS.has(tag)) return 'native';
   for (const a of Object.keys(attrs)) { if (INTERACTIVE_ATTRS.has(a)) return 'keyboard'; }
-  if (attrs.contenteditable === 'true' || attrs.contenteditable === '') return 'editable';
+  if (['true', '', 'plaintext-only'].includes(attrs.contenteditable)) return 'editable';
   if (attrs.role && INTERACTIVE_ROLES.has(attrs.role)) return 'role';
   if (node.ax && node.ax.role && INTERACTIVE_AX_ROLES.has(node.ax.role)) return 'ax-role';
   // display:contents 的监听包装层没有点击几何，使用其首层可见子控件承接冒泡。
@@ -1291,6 +1297,7 @@ function serializeInteractive(allNodes, ctx) {
   const usedIds = new Set();
   for (const node of allNodes) {
     if (!node.isInteractive || !node.isVisible) continue;
+    if (node.editing?.proxy) continue;
     if (node.ignoredByPaintOrder) continue;
     if (node.excludedByParent) continue;       // 被父按钮包含的冗余后代:不单独编号
     // selector_index 分配：首选 backend_node_id;冲突走合成号。
@@ -1313,7 +1320,7 @@ function serializeInteractive(allNodes, ctx) {
       role: attrs.role || (node.ax && node.ax.role) || '',
       name: attrs.name || '',
       placeholder: attrs.placeholder || '',
-      value: tag === 'input' && attrs.type === 'password' ? '' : (attrs.value || ''),  // 剔 password
+      value: tag === 'input' && attrs.type === 'password' ? '' : (node.editing?.preview ?? attrs.value ?? ''),
       text: label.text,
       label_source: label.source,
       interaction_source: interactionSource(node),
@@ -1338,6 +1345,9 @@ function serializeInteractive(allNodes, ctx) {
       date_format: attrs['data-date-format'] || attrs['format'] || attrs['expected_format'] || '',
       component: attrs['data-component-name'] || '',
       enabled: !isDisabled(node),
+      ...(node.editing ? { editable: node.editing.editable, read_only: node.editing.readOnly,
+        editor_type: node.editing.kind, focused: node.editing.focused } : {}),
+      frame_id: node.frameId || '',
       occluded: !!node.ignoredByPaintOrder,
       in_popup: false,                       // Phase 2/3 补弹层归属
       backend_node_id: node.backendNodeId,   // 附加键：后端忽略，前端/execute 用
@@ -1412,7 +1422,11 @@ const PAGE_EXTRAS_FN = `(() => {
     scroll_position: { x: Math.round(window.scrollX), y: Math.round(window.scrollY) },
     document_height: (document.documentElement && document.documentElement.scrollHeight) || 0,
     is_loading: document.readyState !== 'complete',
-    focused_element: (document.activeElement && document.activeElement.id) ? ('#' + document.activeElement.id) : null,
+    focused_element: (() => {
+      let e = document.activeElement;
+      while (e?.shadowRoot?.activeElement) e = e.shadowRoot.activeElement;
+      return e && !['BODY','HTML'].includes(e.tagName) ? (e.id ? '#' + e.id : e.tagName.toLowerCase()) : null;
+    })(),
     text_content_summary: textSummary,
     forms: forms,
     active_popup: (() => {
@@ -1475,6 +1489,25 @@ async function gatherAndConstructTarget(target, ctx, offset) {
       node.absolutePosition = { ...node.viewportRect, x: rect.x + node._frameOffset.x,
         y: rect.y + node._frameOffset.y };
       node.isVisible = isVisibleCss(node);
+    }));
+  }
+  const candidates = built.allNodes.filter(node => node.nodeType === NODE_TYPE.ELEMENT &&
+    (['INPUT', 'TEXTAREA'].includes(node.nodeName) ||
+     ['true', '', 'plaintext-only'].includes(node.attributes.contenteditable) ||
+     (node.attributes.class || '').split(/\s+/).includes('CodeMirror')));
+  for (let i = 0; i < candidates.length; i += 20) {
+    await Promise.all(candidates.slice(i, i + 20).map(async node => {
+      let objectId;
+      try {
+        objectId = (await cdpSend(target, 'DOM.resolveNode', { backendNodeId: node.backendNodeId })).object?.objectId;
+        if (!objectId) return;
+        const info = runtimeValue(await cdpSend(target, 'Runtime.callFunctionOn', {
+          objectId, functionDeclaration: AgentEditing.describeEditingTarget.toString(),
+          arguments: [{ value: true }], returnByValue: true,
+        }));
+        if (info?.success) node.editing = info;
+      } catch { /* 探测失败不猜测能力；实际动作会再次解析和校验。 */ }
+      finally { if (objectId) await cdpSend(target, 'Runtime.releaseObject', { objectId }).catch(() => {}); }
     }));
   }
   return { built, dpr: trees.devicePixelRatio, jsClickCount: jsClickIds.size };
@@ -1604,7 +1637,8 @@ async function handleAgentObserve(tabId, includeScreenshot = false, retry = 0, t
     scroll_position: extras.scroll_position || {},
     document_height: extras.document_height || 0,
     is_loading: !!extras.is_loading,
-    focused_element: extras.focused_element || null,
+    focused_element: elements.filter(e => e.focused).map(e =>
+      `[${e.id}] ${e.editor_type}${e.frame_id ? ' frame=' + e.frame_id : ''}`).join('; ') || extras.focused_element || null,
     interactive_elements: elements,
     element_count_truncated: false,
     text_content_summary: extras.text_content_summary || '',
@@ -1785,33 +1819,58 @@ function keyCodeForChar(base) {
 }
 
 // 派发一个专用键（Enter/Escape/Arrow...），含 modifiers 位掩码。
-async function dispatchSpecialKey(target, key, modifiers) {
-  const [code, vk] = SPECIAL_KEYS[key] || [key, 0];
+async function dispatchSpecialKey(target, key, modifiers, guard = null) {
   let mod = 0;
-  for (const m of (modifiers || [])) mod |= (KEY_MODIFIERS[String(m).toLowerCase()] || 0);
+  if (!Array.isArray(modifiers)) throw new Error('modifiers 必须是数组');
+  for (const m of modifiers) {
+    const flag = KEY_MODIFIERS[String(m).toLowerCase()];
+    if (!flag) throw new Error('不支持的修饰键');
+    mod |= flag;
+  }
+  let code, vk, text = '';
+  if (SPECIAL_KEYS[key]) {
+    [code, vk] = SPECIAL_KEYS[key];
+    if (!(mod & 7)) text = key === 'Enter' ? '\r' : key === 'Space' ? ' ' : '';
+  } else if (typeof key === 'string' && /^[\x20-\x7e]$/.test(key)) {
+    const info = charModifiersAndVk(key);
+    code = keyCodeForChar(info.base); vk = info.vk;
+    if (!(mod & 7)) {
+      mod |= info.mod;
+      if (mod & 8) key = Object.keys(SHIFT_CHARS).find(k => SHIFT_CHARS[k][0] === info.base) || key.toUpperCase();
+      text = key;
+    }
+  } else throw new Error('不支持的按键；文字请使用 type，组合键请使用 modifiers');
   const base = { key, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk, modifiers: mod };
   target._agentAction?.check();
   try {
     await cdpSend(target, 'Input.dispatchKeyEvent', { type: 'keyDown', ...base });
-    if (key === 'Enter') await cdpSend(target, 'Input.dispatchKeyEvent', { type: 'char', text: '\r', key, modifiers: mod });
+    if (text) {
+      if (guard) await guard();
+      await cdpSend(target, 'Input.dispatchKeyEvent', { type: 'char', text, key, modifiers: mod });
+    }
   } finally {
     await cdpSend({ ...target, ...(target._agentAction ? { _agentCleanup: true } : {}) }, 'Input.dispatchKeyEvent', { type: 'keyUp', ...base });
   }
 }
 
 // 逐字符输入（三段式 keyDown 无 text → char 有 text → keyUp 无 text，含 VK 映射）。daw.py:1874。
-async function typeChars(target, text) {
+async function typeChars(target, text, guard = null) {
   for (const ch of text) {
     target._agentAction?.check();
-    if (ch === '\n') { await dispatchSpecialKey(target, 'Enter', []); await sleep(1); continue; }
+    if (guard) await guard();
+    if (!/^[\x20-\x7e]$/.test(ch)) {
+      await cdpSend(target, 'Input.insertText', { text: ch });
+      continue;
+    }
     const { mod, vk, base } = charModifiersAndVk(ch);
     const code = keyCodeForChar(base);
     try {
-      await cdpSend(target, 'Input.dispatchKeyEvent', { type: 'keyDown', key: base, code, modifiers: mod, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk });
+      await cdpSend(target, 'Input.dispatchKeyEvent', { type: 'keyDown', key: ch, code, modifiers: mod, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk });
       await sleep(5);
-      await cdpSend(target, 'Input.dispatchKeyEvent', { type: 'char', text: ch, key: ch });
+      if (guard) await guard();
+      await cdpSend(target, 'Input.dispatchKeyEvent', { type: 'char', text: ch, key: ch, modifiers: mod });
     } finally {
-      await cdpSend({ ...target, ...(target._agentAction ? { _agentCleanup: true } : {}) }, 'Input.dispatchKeyEvent', { type: 'keyUp', key: base, code, modifiers: mod, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk });
+      await cdpSend({ ...target, ...(target._agentAction ? { _agentCleanup: true } : {}) }, 'Input.dispatchKeyEvent', { type: 'keyUp', key: ch, code, modifiers: mod, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk });
     }
     await sleep(1);
   }
@@ -1920,18 +1979,28 @@ async function handleAgentExecute(tabId, action, ctx = null) {
 
   try {
     // 元素点击/悬停走目标 session；页面级动作仍走根 session。
+    if (['type', 'clear', 'focus', 'press_key'].includes(type)) await refocusTop(rootTarget);
     if (type === 'click') return { __via: 'cdp', ...(await doClick(domTarget, rootTarget, backendNodeId, action.index, vw, vh, elementEntry)) };
     if (type === 'type') return { __via: 'cdp', ...(await doType(domTarget, rootTarget, backendNodeId, action)) };
     if (type === 'clear') return { __via: 'cdp', ...(await doClear(domTarget, backendNodeId, action.index)) };
     if (type === 'select') return { __via: 'cdp', ...(await doSelect(domTarget, rootTarget, backendNodeId, action, vw, vh, elementEntry)) };
     if (type === 'hover') return { __via: 'cdp', ...(await doHover(domTarget, rootTarget, backendNodeId, vw, vh, elementEntry)) };
-    if (type === 'focus') { await cdpSend(domTarget, 'DOM.focus', { backendNodeId }); return { __via: 'cdp', success: true, action_type: type, details: `聚焦[${action.index}]` }; }
+    if (type === 'focus') return { __via: 'cdp', ...(await withEditingTarget(domTarget, backendNodeId, type, async editor => {
+      await editor.call('focus');
+      return { success: true, action_type: type, details: `已确认[${action.index}]获得焦点` };
+    })) };
     if (type === 'press_key') {
       const key = (action.params && action.params.key) || 'Enter';
       const mods = (action.params && action.params.modifiers) || [];
-      if (backendNodeId != null) await cdpSend(domTarget, 'DOM.focus', { backendNodeId });
-      await dispatchSpecialKey(domTarget, key, mods);
-      return { __via: 'cdp', success: true, action_type: type, details: `按下 ${key}` };
+      return { __via: 'cdp', ...(await withEditingTarget(domTarget, backendNodeId, type, async editor => {
+        const state = await editor.call(backendNodeId == null ? 'state' : 'focus');
+        if (!state.focused) throw new Error('未能确认按键目标焦点');
+        if (/^[\x20-\x7e]$/.test(key) || key === 'Space' || ['Backspace', 'Delete'].includes(key)) await editor.call('guard');
+        await dispatchSpecialKey(domTarget, key, mods, async () => {
+          if (!(await editor.call('state')).focused) throw new Error('按键期间焦点转移，未继续派发字符');
+        });
+        return { success: true, action_type: type, details: `已派发按键 ${key}，请结合新观察确认结果` };
+      })) };
     }
     if (type === 'scroll_to_element') {
       await cdpSend(domTarget, 'DOM.scrollIntoViewIfNeeded', { backendNodeId }).catch(() => {});
@@ -2000,82 +2069,131 @@ async function doClick(domTarget, rootTarget, backendNodeId, index, vw, vh, entr
   return { success: false, action_type: 'click', error: '目标被遮挡、不可操作或不在可点击视口内；未执行点击，请重新观察' };
 }
 
-// 输入:focus→(需直接赋值的类型)setter/(否则)clear+逐字符→回读。daw.py:1756。
-// DOM 命令 + 键盘走 domTarget（focus 后按键留在该 frame）；rootTarget 备用。
-async function doType(domTarget, rootTarget, backendNodeId, action) {
-  const target = domTarget;
-  const text = (action.params && action.params.text) || '';
-  const doClear = action.params && action.params.clear !== false;
-  await cdpSend(target, 'DOM.scrollIntoViewIfNeeded', { backendNodeId }).catch(() => {});
-  await sleep(10);
-  await cdpSend(target, 'DOM.focus', { backendNodeId });
-  const rn = await cdpSend(target, 'DOM.resolveNode', { backendNodeId }).catch(() => null);
-  const objectId = rn && rn.object && rn.object.objectId;
-
-  // 日期/color/range/datepicker 类：直接赋值（原生 setter + 派发事件）。
-  if (objectId) {
-    const needDirect = await cdpSend(target, 'Runtime.callFunctionOn', {
-      objectId, functionDeclaration: `function(){const t=(this.getAttribute('type')||'').toLowerCase();const dp=['date','time','datetime-local','month','week','color','range'];const cls=(this.className||'')+' '+(this.getAttribute('data-provide')||'');return this.tagName==='INPUT'&&(dp.includes(t)||/datepicker|data-date/i.test(cls));}`,
-      returnByValue: true,
-    }).then(r => r && r.result && r.result.value).catch(() => false);
-    if (needDirect) {
-      await cdpSend({ ...target, _agentEffect: true }, 'Runtime.callFunctionOn', {
-        objectId, arguments: [{ value: text }],
-        functionDeclaration: `function(v){const p=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value');p&&p.set&&p.set.call(this,v);this.dispatchEvent(new Event('focus',{bubbles:true}));this.dispatchEvent(new Event('input',{bubbles:true}));this.dispatchEvent(new Event('change',{bubbles:true}));this.dispatchEvent(new Event('blur',{bubbles:true}));}`,
-      });
-      return { success: true, action_type: 'type', details: `直接赋值"${text.slice(0, 20)}"` };
-    }
+async function withEditingTarget(target, backendNodeId, actionType, perform) {
+  let nodeId, descriptorId;
+  try {
+    const resolved = backendNodeId != null
+      ? (await cdpSend(target, 'DOM.resolveNode', { backendNodeId })).object
+      : (await cdpSend(target, 'Runtime.evaluate', { expression: `(()=>{let e=document.activeElement;
+          while(e?.shadowRoot?.activeElement)e=e.shadowRoot.activeElement;
+          return e&& !['IFRAME','FRAME'].includes(e.tagName)?e:null;})()` })).result;
+    nodeId = resolved?.objectId;
+    if (!nodeId) throw Object.assign(new Error('编辑目标或焦点已失效，请重新观察并指定编号'), { stale: true });
+    const descriptor = await cdpSend(target, 'Runtime.callFunctionOn', {
+      objectId: nodeId, functionDeclaration: AgentEditing.describeEditingTarget.toString(), returnByValue: false,
+    });
+    runtimeValue(descriptor);
+    descriptorId = descriptor.result?.objectId;
+    if (!descriptorId) throw new Error('无法解析编辑目标');
+    const editor = { call: async (operation, value = null) => {
+      const effect = ['focus', 'select_all', 'set_native', 'insert_cm'].includes(operation);
+      const result = runtimeValue(await cdpSend({ ...target, _agentEffect: effect }, 'Runtime.callFunctionOn', {
+        objectId: descriptorId, functionDeclaration: 'function(op,arg){return this.call(op,arg);}',
+        arguments: [{ value: operation }, { value }], returnByValue: true,
+      }));
+      if (!result?.success) throw Object.assign(new Error(result?.error || '编辑操作未确认'), { stale: !!result?.stale });
+      return result;
+    } };
+    return await perform(editor);
+  } catch (error) {
+    return { success: false, action_type: actionType, stale: !!error.stale, error: error.message };
+  } finally {
+    for (const objectId of [descriptorId, nodeId].filter(Boolean))
+      await cdpSend(target, 'Runtime.releaseObject', { objectId }).catch(() => {});
   }
-  if (doClear) await clearField(target, backendNodeId, objectId);
-  await typeChars(target, text);
-  // 回读校验 + 拼接错误重设
-  if (objectId) {
-    await sleep(50);
-    try {
-      const rv = await cdpSend(target, 'Runtime.callFunctionOn', { objectId, functionDeclaration: 'function(){return this.value!==undefined?this.value:this.textContent;}', returnByValue: true });
-      const actual = (rv && rv.result && rv.result.value) || '';
-      if (doClear && actual !== text && actual.length > text.length && (actual.endsWith(text) || actual.startsWith(text))) {
-        await cdpSend({ ...target, _agentEffect: true }, 'Runtime.callFunctionOn', {
-          objectId, arguments: [{ value: text }],
-          functionDeclaration: `function(v){const P=this.tagName==='TEXTAREA'?window.HTMLTextAreaElement.prototype:window.HTMLInputElement.prototype;const p=Object.getOwnPropertyDescriptor(P,'value');if(p&&p.set){p.set.call(this,v);}else{this.value=v;}this.dispatchEvent(new Event('input',{bubbles:true}));this.dispatchEvent(new Event('change',{bubbles:true}));}`,
-        });
-      }
-    } catch { /* noop */ }
-  }
-  return { success: true, action_type: 'type', details: `输入了"${text.slice(0, 20)}"` };
 }
 
-// 清空:JS 赋空(contenteditable removeChild / 普通 select+value="")→ 三击+Delete 兜底。daw.py:1344。
-async function clearField(target, backendNodeId, objectId) {
-  const oid = objectId || (await cdpSend(target, 'DOM.resolveNode', { backendNodeId }).then(r => r && r.object && r.object.objectId).catch(() => null));
-  if (!oid) return;
-  await cdpSend({ ...target, _agentEffect: true }, 'Runtime.callFunctionOn', {
-    objectId: oid,
-    functionDeclaration: `function(){const ce=this.getAttribute('contenteditable');if(ce==='true'||ce===''||this.isContentEditable){while(this.firstChild)this.removeChild(this.firstChild);}else{try{this.select();}catch(e){}this.value='';}this.dispatchEvent(new Event('input',{bubbles:true}));this.dispatchEvent(new Event('change',{bubbles:true}));}`,
-  }).catch(() => {});
+async function verifyEditorValue(editor, expected) {
+  // 只等待编辑器处理 input，不重写内容，也不把代理 textarea 当作完整文档。
+  for (let i = 0; i < 6; i++) {
+    const result = await editor.call('read');
+    if (result.value === (result.kind === 'contenteditable' ? expected.replace(/\u00a0/g, ' ') : expected)) return;
+    if (i < 5) await sleep(50);
+  }
+  throw new Error('回读内容与预期不符，未重放输入；请依据新观察确认已写入的内容');
+}
+
+async function clearEditor(target, editor) {
+  const state = await editor.call('guard');
+  if ((await editor.call('read')).value === '') return;
+  if (state.kind === 'native') await editor.call('set_native', '');
+  else {
+    await editor.call('select_all');
+    await editor.call('guard');
+    await dispatchSpecialKey(target, 'Backspace', []);
+  }
+  await verifyEditorValue(editor, '');
+}
+
+async function doType(domTarget, rootTarget, backendNodeId, action) {
+  return withEditingTarget(domTarget, backendNodeId, 'type', async editor => {
+    const text = String(action.params?.text ?? '').replace(/\r\n?/g, '\n');
+    const state = await editor.call('state');
+    if (!state.editable) throw new Error('目标不是可编辑区域或处于只读状态，请选择可输入的元素');
+    if (!state.multiline && /[\r\n]/.test(text)) throw new Error('单行控件不支持多行文本，未修改内容或发送 Enter');
+    if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(text)) throw new Error('文本包含不支持的控制字符');
+    await editor.call('focus');
+    const replace = action.params?.clear !== false;
+    let expected = text;
+    if (state.direct) {
+      if (!replace) throw new Error('日期/数值选择控件只支持完整替换');
+      await editor.call('set_native', text);
+    } else {
+      if (replace) await clearEditor(domTarget, editor);
+      else expected = (await editor.call('expected', text)).value;
+      if (state.kind === 'codemirror5') await editor.call('insert_cm', text);
+      else if (state.kind === 'contenteditable') {
+        await editor.call('guard');
+        await cdpSend(domTarget, 'Input.insertText', { text });
+      }
+      else await typeChars(domTarget, text, () => editor.call('guard'));
+    }
+    await verifyEditorValue(editor, expected);
+    return { success: true, action_type: 'type', details: '已回读确认输入内容；未执行提交操作' };
+  });
 }
 
 async function doClear(target, backendNodeId, index) {
-  await clearField(target, backendNodeId, null);
-  return { success: true, action_type: 'clear', details: `清空[${index}]` };
+  return withEditingTarget(target, backendNodeId, 'clear', async editor => {
+    await editor.call('focus');
+    await clearEditor(target, editor);
+    return { success: true, action_type: 'clear', details: `已确认[${index}]内容为空` };
+  });
 }
 
 // 选择:原生<select>直接设value;自定义下拉→点触发器→在弹层找精确文本选项点击。
 async function doSelect(domTarget, rootTarget, backendNodeId, action, vw, vh, entry) {
   const target = domTarget;
   const optText = (action.params && action.params.option_text) || '';
-  const rn = await cdpSend(target, 'DOM.resolveNode', { backendNodeId }).catch(() => null);
+  const rn = await cdpSend(target, 'DOM.resolveNode', { backendNodeId });
   const objectId = rn && rn.object && rn.object.objectId;
-  if (objectId) {
-    const isNative = await cdpSend(target, 'Runtime.callFunctionOn', { objectId, functionDeclaration: 'function(){return this.tagName==="SELECT";}', returnByValue: true }).then(r => r && r.result && r.result.value).catch(() => false);
+  if (!objectId) return { success: false, stale: true, action_type: 'select', error: '选择目标已失效，请重新观察' };
+  try {
+    const isNative = await cdpSend(target, 'Runtime.callFunctionOn', { objectId, functionDeclaration: 'function(){return this.tagName==="SELECT";}', returnByValue: true }).then(r => r?.result?.value);
+    if (typeof isNative !== 'boolean') return { success: false, action_type: 'select', error: '无法确认下拉控件类型' };
     if (isNative) {
-      await cdpSend({ ...target, _agentEffect: true }, 'Runtime.callFunctionOn', {
+      const response = await cdpSend({ ...target, _agentEffect: true }, 'Runtime.callFunctionOn', {
         objectId, arguments: [{ value: optText }],
-        functionDeclaration: `function(t){const o=Array.from(this.options).find(o=>o.textContent.trim().toLowerCase()===t.toLowerCase());if(o){this.value=o.value;this.dispatchEvent(new Event('change',{bubbles:true}));return true;}return false;}`,
+        functionDeclaration: `function(t){
+          if(!this.isConnected)return {success:false,stale:true,error:'选择目标已脱离页面'};
+          if(this.matches(':disabled'))return {success:false,error:'下拉框已禁用'};
+          const o=Array.from(this.options).find(o=>o.textContent.trim().toLowerCase()===t.trim().toLowerCase());
+          if(!o)return {success:false,error:'目标选项不存在'};
+          if(o.disabled||(o.parentElement.tagName==='OPTGROUP'&&o.parentElement.disabled))return {success:false,error:'目标选项已禁用'};
+          this.selectedIndex=o.index;
+          this.dispatchEvent(new Event('input',{bubbles:true}));
+          this.dispatchEvent(new Event('change',{bubbles:true}));
+          if(!this.isConnected||!this.contains(o))return {success:false,stale:true,error:'选择后目标被替换，请重新观察'};
+          return o.selected&&this.value===o.value?{success:true}:{success:false,error:'回读选中项不符，选择未生效'};
+        }`,
         returnByValue: true,
       });
-      return { success: true, action_type: 'select', details: `选择"${optText}"` };
+      const result = response?.result?.value;
+      if (typeof result?.success !== 'boolean') return { success: false, action_type: 'select', error: '无法确认选择结果' };
+      return { ...result, action_type: 'select', ...(result.success ? { details: `已确认选择"${optText}"` } : {}) };
     }
+  } finally {
+    await cdpSend(target, 'Runtime.releaseObject', { objectId }).catch(() => {});
   }
   // 自定义下拉:点触发器展开,等,再在弹层里精确文本匹配点击(不用子串,防 wrong-click)
   const opened = await doClick(target, rootTarget, backendNodeId, action.index, vw, vh, entry);
@@ -2085,7 +2203,7 @@ async function doSelect(domTarget, rootTarget, backendNodeId, action, vw, vh, en
     expression: `(()=>{const t=${JSON.stringify(optText.toLowerCase().trim())};const items=document.querySelectorAll('[role="option"],[role="listbox"] li,.ant-select-item,.el-select-dropdown__item,[class*="option"],[class*="menu-item"],[class*="dropdown"] li');for(const it of items){if((it.textContent||'').toLowerCase().trim()===t){const r=it.getBoundingClientRect();it.click();return {x:r.x+r.width/2,y:r.y+r.height/2};}}return null;})()`,
     returnByValue: true,
   }).then(r => r && r.result && r.result.value).catch(() => null);
-  if (found) return { success: true, action_type: 'select', details: `选择"${optText}"` };
+  if (found) return { success: true, action_type: 'select', details: `已向选项"${optText}"派发点击，请结合新观察确认选择结果` };
   return { success: false, action_type: 'select', error: `下拉项未找到:"${optText}"` };
 }
 

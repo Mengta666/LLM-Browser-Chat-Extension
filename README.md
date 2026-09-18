@@ -32,7 +32,11 @@
 
 当前注册的动作：`click`、`type`、`select`、`scroll`、`scroll_to_element`、`hover`、`focus`、`clear`、`press_key`、`wait`、`navigate`。
 
-模型通过结构化 JSON 描述动作，不依赖聊天的 Function Calling 开关。点击路径使用浏览器输入事件；页面脚本用于观察等辅助工作，不应把“脚本返回成功”视为业务成功。
+输入支持原生 input / textarea、普通 contenteditable，以及已确认实例的 CodeMirror 5。`type` 默认替换全文，`clear=false` 在当前光标 / 选区插入；`press_key` 的组合键使用独立 `modifiers` 数组，例如 `key="a", modifiers=["Control"]`。观察提供编辑器类型、可输入 / 只读状态和焦点；写入后回读确认，失败或部分执行不会自动重放。文本中的换行不模拟 Enter；单行框拒绝多行文本。
+
+CodeMirror 5 通过其公开接口更新文档，不把代理 textarea 的值当作全文，也不直接清除展示 DOM。普通富文本使用浏览器文本插入并按纯文本语义回读；不保证任意富文本框架的内部模型同步。CodeMirror 6 / Monaco 等尚未单独适配，多光标插入及无法可靠映射的富文本选区会明确拒绝。更新后需重新加载扩展、关闭重开侧边栏，并重启后端加载输入规则。
+
+模型通过结构化 JSON 描述动作，不依赖聊天的 Function Calling 开关。点击路径使用浏览器输入事件；页面脚本用于观察、焦点和已支持的编辑器适配，不应把“脚本返回成功”视为业务成功。
 
 目前没有通用拖拽动作、任意截图坐标操作工具、操作系统桌面鼠标控制或验证码自动处理流程。人工完成验证后页面出现“成功”，也不代表自动化具备了验证能力。
 
@@ -218,6 +222,7 @@ browser-agent/
 │  ├─ manifest.json           扩展声明与权限
 │  ├─ background.js           CDP 连接、页面观察、浏览器动作执行
 │  ├─ agent_observation.js    自动化观察辅助及截图标注
+│  ├─ agent_editing.js        编辑目标识别、焦点确认与编辑器文档回读
 │  ├─ agent_execution.js      按标签页管理动作占用、去重与执行记录
 │  ├─ agent_runner.js         决策查询、观察恢复与停止协调
 │  ├─ sidepanel.html          侧边栏入口
@@ -254,6 +259,7 @@ node --check extension/agent_observation.js
 - [长会话与恢复](backend/test/audit_review/SERVER_CONTEXT_RESULTS.md)
 - [SVG 控件](backend/test/audit_review/SVG_CONTROLS_RESULTS.md)
 - [无文本控件](backend/test/audit_review/EMPTY_CONTROLS_RESULTS.md)
+- [编辑器输入与按键](backend/test/audit_review/EDITOR_INPUT_RESULTS.md)
 - [真实 reranker 测试](backend/test/audit_review/LIVE_RERANK_RESULTS.md)
 - [知识库一致性修复与真实流程验收](backend/test/audit_review/KB_LIFECYCLE_RESULTS.md)
 - [详细审计结果](backend/test/audit_review/DEEP_AUDIT_RESULTS.md)

@@ -31,9 +31,9 @@ SYSTEM_PROMPT = """你是一个浏览器自动化助手。用户给你一个任�
 - 编号每轮重新分配，**只用当前这轮观察里的编号**，不要臆想不存在的元素
 
 ## 可用动作（action.type）
-- click(index) / type(index,text) / select(index,option_text)
+- click(index) / type(index,text,clear=true) / select(index,option_text)
 - scroll(direction,amount) / scroll_to_element(index) / hover(index)
-- focus(index) / clear(index) / press_key(key,index?)
+- focus(index) / clear(index) / press_key(key,index?,modifiers=[])
 - navigate(url) / wait(ms)
 - task_complete(summary,success): 任务结束时必须调用
 
@@ -50,9 +50,18 @@ SYSTEM_PROMPT = """你是一个浏览器自动化助手。用户给你一个任�
 3. 复杂交互是多步的：触发→展开→选择。很多筛选器/下拉**点选项即时生效，没有"确定"按钮**——
    选中后找不到"确定"就是已生效，直接下一步，不要臆想确定按钮。
 4. 面板已展开时（观察提示"活跃弹出层"），直接点面板内目标编号；**不要**再点展开它的触发器（会关掉面板）。
-5. 修改已有值：先 clear 或点关闭图标，再输入。
+5. type 默认替换已有值；clear=false 在当前光标/选区插入，不代表自动追加到末尾。不必先单独 clear。
 6. 目标不在列表 → scroll 或 hover，不要瞎猜编号。
 7. 最大化理解任务意图：查看类任务要真正看到内容（进详情页/看到 diff），不是看到标题就算完。
+
+## 编辑与按键
+- 输入应选择观察中标记“可输入”的编号；CodeMirror 编辑器使用 editor=codemirror5 的整体编号，不选外壳装饰、显示行或内部代理 textarea。
+- type 会确认焦点、写入并回读内容；clear 只清空支持的编辑区域；只读或不可输入时不要用多次 click / press_key 强行绕过。
+- 文本（包括中文、表情、多行）使用 type。文本换行不是 Enter，不会因此触发表单提交；单行控件拒绝多行文本。
+- press_key 用于明确的按键/快捷键，如 key="a", modifiers=["Control"]，不要写成 key="Control+A"。省略 index 时只操作已确认的焦点；跨 iframe 优先指定当前编号。
+- focus 成功只代表焦点已确认，不代表输入已完成；press_key 成功只代表按键已派发，需要结合新观察验证。
+- 回读失败、焦点转移或部分执行时，已写内容可能保留。先检查新观察，禁止盲目重放整段输入或再次清空。
+- 用户要求“只填写/不发送”时，完成输入即可；不得追加 Enter、提交按钮或发送快捷键。
 
 ## 每步对照原始任务（重要：防走错大方向）
 - 每一步都把【当前所在位置】和【原始任务真正要的东西】对比一次：现在这个页面/入口，是通往任务目标的路吗？
@@ -105,8 +114,10 @@ SYSTEM_PROMPT = """你是一个浏览器自动化助手。用户给你一个任�
 - action 示例：
   - 点击：`{"type":"click","index":7}`
   - 输入：`{"type":"type","index":2,"text":"关键词"}`
+  - 在当前选区插入：`{"type":"type","index":2,"text":"补充内容","clear":false}`
   - 滚动：`{"type":"scroll","direction":"down","amount":300}`
   - 按键：`{"type":"press_key","key":"Enter","index":2}`
+  - 全选：`{"type":"press_key","key":"a","modifiers":["Control"],"index":2}`
   - 跳转：`{"type":"navigate","url":"https://..."}`
   - 完成：`{"type":"task_complete","summary":"...","success":true}`
 - 只输出这个 JSON，不要 markdown 之外的解释文字（可以放进 memory）。
@@ -261,6 +272,8 @@ def build_observation_message(page_state: PageState) -> str:
 
     if page_state.is_loading:
         parts.append("\n⏳ 页面加载中，建议 wait。")
+    if page_state.focused_element:
+        parts.append(f"当前焦点: {page_state.focused_element}")
 
     active_popup = getattr(page_state, 'active_popup', None)
     if isinstance(active_popup, dict) and active_popup:
@@ -348,6 +361,14 @@ def _format_element(el: dict[str, Any]) -> str:
         parts.append(f'当前值="{el["value"][:20]}"')
     if el.get("type") and tag == "input":
         parts.append(el["type"])
+    if el.get("editor_type") and el["editor_type"] != "none":
+        parts.append(f"editor={el['editor_type']}")
+    if "editable" in el:
+        parts.append("可输入" if el["editable"] else "不可输入")
+    if el.get("read_only"):
+        parts.append("只读")
+    if el.get("focused"):
+        parts.append("已聚焦")
     # 状态属性(勾选/展开/富文本/有弹出层/日期格式)——对 LLM 决策直接有用
     checked = el.get("checked") or el.get("aria_checked")
     if checked and checked not in ("false", "False", ""):

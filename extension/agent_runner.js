@@ -18,6 +18,8 @@
         settleAction: 30000, decision: 180000, poll: 1000, ...limits };
       this.deadline = Date.now() + this.limits.total;
       this.abort = new AbortController(); this.sequence = 0;
+      this.startSubmitted = false; this.startAcknowledged = false;
+      this.pendingActionId = null; this.backendSubmitted = false;
     }
     check() {
       if (this.abort.signal.aborted) throw Object.assign(new Error('任务已停止'), { code: 'cancelled' });
@@ -40,14 +42,24 @@
       return (await this.message('AGENT_CONTROL', { command, ...data }, 5000, stopping)).result;
     }
     async start() {
+      try {
+        const probe = await this.control('probe');
+        if (probe?.protocol_version !== 2) throw new Error('协议不匹配');
+      } catch (error) {
+        if (error.code === 'cancelled') throw error;
+        throw Object.assign(new Error('无法确认扩展后台通信或协议版本，请在扩展管理页重新加载扩展，并关闭后重新打开侧边栏'), { code: 'protocol_mismatch' });
+      }
+      this.check();
+      this.startSubmitted = true;
       const response = await this.control('start');
       if (response?.protocol_version !== 2) throw new Error('请重新加载扩展以启用自动化协议 v2');
+      this.startAcknowledged = true;
     }
     async stop() {
       this.abort.abort();
       const results = await Promise.allSettled([
-        this.control('cancel', {}, true),
-        bounded(this.io.api('/v1/agent/cancel', { session_id: this.sessionId }), 5000),
+        ...(this.startSubmitted ? [this.control('cancel', {}, true)] : []),
+        ...(this.backendSubmitted ? [bounded(this.io.api('/v1/agent/cancel', { session_id: this.sessionId }), 5000)] : []),
       ]);
       return results;
     }
@@ -89,6 +101,7 @@
       while (Date.now() < deadline) {
         this.check();
         try {
+          if (submit) this.backendSubmitted = true;
           const result = await this.wait(this.io.api(submit ? path : '/v1/agent/status', submit ? request :
             { session_id: this.sessionId, request_id: request.request_id }), Math.min(30000, deadline - Date.now()));
           if (result?.protocol_version !== 2 || result.session_id !== this.sessionId) throw Object.assign(new Error('自动化协议不匹配，请更新后端'), { status: 409 });
@@ -107,10 +120,13 @@
 
     async execute(action) {
       this.check();
+      // 先记可能已送达；回复丢失不能被当成没有执行。
+      this.pendingActionId = action.action_id;
       try {
         const response = await this.message('AGENT_EXECUTE', { action,
           timeoutMs: Math.min(this.limits.action, this.deadline - Date.now()) }, this.limits.action);
-        if (response.result?.execution_state === 'unknown') throw new Error('动作结果未知，禁止自动重试');
+        if (!['completed', 'partial', 'not_dispatched'].includes(response.result?.execution_state)) throw new Error('动作结果未知，禁止自动重试');
+        this.pendingActionId = null;
         return response.result;
       } catch (error) {
         this.check();
@@ -120,7 +136,7 @@
         const deadline = Math.min(this.deadline, Date.now() + this.limits.settleAction);
         while (Date.now() < deadline) {
           const state = await this.control('status', { actionId: action.action_id });
-          if (state.state === 'finished') return state.result;
+          if (state.state === 'finished') { this.pendingActionId = null; return state.result; }
           if (state.state === 'not_received') throw new Error('动作是否被接收无法确认，任务结束且不重放');
           if (state.state === 'unknown') break;
           await this.sleep(Math.min(this.limits.poll, Math.max(1, deadline - Date.now())));
@@ -131,14 +147,23 @@
 
     async finish() {
       this.abort.abort();
-      await this.control('cancel', {}, true).catch(() => {});
-      const deadline = Date.now() + 5000;
-      while (Date.now() < deadline) {
-        const state = await this.control('status', {}, true).catch(() => ({ state: 'unknown' }));
-        if (state.safe || state.state === 'unknown') break;
-        await new Promise(resolve => setTimeout(resolve, 100));
+      if (!this.startSubmitted) return { state: 'not_started', safe: true };
+      try {
+        // 先登记关闭意图，即使侧边栏结束等待，迟到动作也会继续收尾。
+        let closed = await this.control('end', {}, true);
+        const deadline = Date.now() + 5000;
+        while (closed?.reason === 'action_pending' && Date.now() < deadline) {
+          await new Promise(resolve => setTimeout(resolve, 100));
+          const state = await this.control('status', {}, true);
+          if (state.safe || state.state === 'unknown') break;
+        }
+        if (closed?.reason === 'action_pending') closed = await this.control('end', {}, true);
+        if (typeof closed?.safe !== 'boolean') throw new Error('收尾响应无效');
+        return closed;
+      } catch {
+        return { state: 'unconfirmed', safe: false, reason: this.pendingActionId ? 'execution_unknown' :
+          this.startAcknowledged ? 'cleanup_unconfirmed' : 'startup_unconfirmed' };
       }
-      return this.control('end', {}, true).catch(() => ({ state: 'unknown', safe: false }));
     }
   }
   globalThis.AgentRunner = { Run, bounded };

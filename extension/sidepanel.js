@@ -2591,6 +2591,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     let keepalivePort = null;
     let stopRequested = false;
     let backendTerminal = false;
+    let taskFailed = false;
     cancelBtn.onclick = () => {
       stopRequested = true;
       cancelBtn.disabled = true;
@@ -2688,6 +2689,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (error.code === 'cancelled' || stopRequested) {
         statusText.textContent = '正在确认停止状态…';
       } else {
+        taskFailed = true;
         statusText.textContent = '任务未完成';
         renderAgentError(aiBubble, error.message || '执行失败');
       }
@@ -2695,9 +2697,18 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (run && !backendTerminal) await run.stop();
       const cleanup = run ? await run.finish() : { safe: true };
       if (cleanup.safe === false) {
-        statusText.textContent = '旧动作状态未确认，已阻止后续输入';
-        renderAgentError(aiBubble, '请检查页面；当前标签页仍被保护锁定，不会自动重放动作。');
-      } else if (stopRequested || run?.abort.signal.aborted && !backendTerminal) {
+        if (['execution_unknown', 'action_pending'].includes(cleanup.reason)) {
+          statusText.textContent = '旧动作尚未确认结束，已阻止后续输入';
+          renderAgentError(aiBubble, cleanup.reason === 'action_pending'
+            ? '后台会在旧动作确认结束后继续收尾；不会自动重放动作。'
+            : '请检查页面；旧动作执行状态未知，不会自动重放动作。');
+        } else {
+          statusText.textContent = cleanup.reason === 'startup_unconfirmed' ? '启动状态未确认' : '任务收尾未完成';
+          renderAgentError(aiBubble, cleanup.reason === 'cleanup_failed'
+            ? '动作执行链已结束，但资源清理未完成；再次发起任务时会先重试清理。'
+            : '未能确认扩展后台的收尾状态，请检查扩展通信；这不代表存在未结束的页面动作。');
+        }
+      } else if (!taskFailed && (stopRequested || run?.abort.signal.aborted && !backendTerminal)) {
         statusText.textContent = stopRequested ? '已停止；已发出的操作不会回滚' : '任务已结束';
       }
       if (ownsUI()) Object.assign(agentState, { active: false, status: 'idle' });

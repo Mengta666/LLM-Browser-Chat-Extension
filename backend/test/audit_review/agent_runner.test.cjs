@@ -114,3 +114,56 @@ test('cancel during model decision discards late completed result', async () => 
   release({ protocol_version: 2, session_id: 's', status: 'completed' });
   await rejected;
 });
+
+test('unresponsive legacy background never becomes an unknown action at startup', async () => {
+  const calls = [];
+  const { run } = setup({ message: async m => { calls.push(m); }, api: async () => assert.fail('backend not started') });
+  await assert.rejects(run.start(), /重新加载扩展/);
+  await run.stop();
+  const ended = await run.finish();
+  assert.equal(ended.safe, true);
+  assert.equal(ended.state, 'not_started');
+  assert.deepEqual(calls.map(m => m.command), ['probe']);
+});
+
+test('lost start acknowledgement attempts same-session cleanup without claiming unknown input', async () => {
+  const calls = [];
+  const { run } = setup({ message: async m => {
+    calls.push(m.command);
+    return m.command === 'probe' ? { ok: true, result: { protocol_version: 2 } } : undefined;
+  } });
+  await assert.rejects(run.start());
+  const ended = await run.finish();
+  assert.equal(ended.reason, 'startup_unconfirmed');
+  assert.equal(calls.includes('end'), true);
+});
+
+test('lost action reply remains uncertain even when no action acknowledgement arrived', async () => {
+  const { run } = setup();
+  await run.start();
+  run.io.message = async () => undefined;
+  await assert.rejects(run.execute({ action_id: 'a' }));
+  assert.equal((await run.finish()).reason, 'execution_unknown');
+});
+
+test('failed cleanup communication after a known result is not unknown execution', async () => {
+  const { run } = setup();
+  await run.start();
+  run.io.message = async () => ({ ok: true, result: { success: true, action_id: 'a', execution_state: 'completed' } });
+  await run.execute({ action_id: 'a' });
+  run.io.message = async () => undefined;
+  assert.equal((await run.finish()).reason, 'cleanup_unconfirmed');
+});
+
+test('stop during read-only probe never submits start or creates backend cancellation', async () => {
+  const calls = []; let release;
+  const { run } = setup({ message: m => { calls.push(m.command); return new Promise(r => { release = r; }); },
+    api: async () => assert.fail('backend was not contacted') });
+  const pending = run.start();
+  const rejected = assert.rejects(pending, { code: 'cancelled' });
+  await run.stop();
+  release({ ok: true, result: { protocol_version: 2 } });
+  await rejected;
+  assert.equal((await run.finish()).state, 'not_started');
+  assert.deepEqual(calls, ['probe']);
+});

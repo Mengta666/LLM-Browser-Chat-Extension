@@ -32,6 +32,29 @@ def body():
                            'interactive_elements': [{'id': 1, 'tag': 'button', 'text': '测试'}]}}
 
 
+def test_editor_capabilities_and_focus_reach_model(runtime):
+    from agent.context_builder import build_observation_message, _format_element, SYSTEM_PROMPT
+    from agent.state import PageState
+    editable = {'id': 7, 'tag': 'div', 'editor_type': 'codemirror5', 'editable': True,
+                'focused': True, 'value': '草稿'}
+    message = build_observation_message(PageState(
+        focused_element='[7] codemirror5 frame=test-frame', interactive_elements=[editable]))
+    for expected in ['当前焦点: [7]', 'frame=test-frame', 'editor=codemirror5', '可输入', '已聚焦', '草稿']:
+        assert expected in message
+    readonly = _format_element({**editable, 'editable': False, 'read_only': True})
+    assert '不可输入' in readonly and '只读' in readonly
+    assert 'clear=false' in SYSTEM_PROMPT and '不发送' in SYSTEM_PROMPT
+    assert 'modifiers' in SYSTEM_PROMPT
+
+
+def test_editing_params_survive_action_parser(runtime):
+    from agent.loop import _parse_action
+    typed = _parse_action('type', {'index': 7, 'text': '中文🙂\n草稿', 'clear': False})
+    assert typed.params == {'text': '中文🙂\n草稿', 'clear': False}
+    shortcut = _parse_action('press_key', {'index': 7, 'key': 'a', 'modifiers': ['Control']})
+    assert shortcut.params == {'key': 'a', 'modifiers': ['Control']}
+
+
 def test_cancelled_session_does_not_call_model(agent):
     loop, api, monkeypatch = agent
     session = loop.create_session('synthetic-agent', 'test', 'offline')

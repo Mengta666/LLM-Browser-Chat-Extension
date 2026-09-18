@@ -54,6 +54,66 @@ test('timed-out command must settle before releasing input ownership', async () 
   assert.equal((await pending).execution_state, 'partial');
   assert.equal(c.status(1, 's', 'a').safe, true);
 });
+
+test('end intent survives a late command; cleanup runs once before the next start', async () => {
+  const c = await setup(); let complete, cleanups = 0;
+  const pending = c.execute(1, 's', action, async ctx => {
+    ctx.dispatched = true;
+    ctx.track(new Promise(r => { complete = r; }), true);
+    return { success: false, error: 'timeout' };
+  });
+  await tick();
+  assert.equal((await c.end(1, 's', async () => { cleanups++; })).safe, false);
+  assert.equal(cleanups, 0);
+  await assert.rejects(c.start(1, 'new'), /任务/);
+  complete(); await pending;
+  await c.start(1, 'new');
+  assert.equal(cleanups, 1);
+  await c.end(1, 's', async () => assert.fail('old cleanup must not touch new task'));
+  assert.equal(c.getRun(1, 'new').cancelled, false);
+});
+
+test('cleanup failure is distinct from unknown input and can be retried by next start', async () => {
+  const c = await setup(); let attempts = 0;
+  const ended = await c.end(1, 's', async () => {
+    if (++attempts === 1) throw new Error('detach failed');
+  });
+  assert.equal(ended.reason, 'cleanup_failed');
+  assert.equal(c.getRun(1, 's').ended, false);
+  await c.start(1, 'new');
+  assert.equal(attempts, 2);
+});
+
+test('closing journal fences worker restart and ended is set only after persistence', async () => {
+  const c = await setup(); let cleanups = 0;
+  const write = c.store.write;
+  c.store.write = async (id, value) => {
+    if (value.state === 'finished') throw new Error('storage');
+    await write(id, value);
+  };
+  assert.equal((await c.end(1, 's', async () => { cleanups++; })).reason, 'cleanup_failed');
+  assert.equal(c.getRun(1, 's').ended, false);
+  await assert.rejects(new Controller(c.store).start(1, 'new'), /收尾|未知/);
+  c.store.write = write;
+  await c.start(1, 'new');
+  assert.equal(cleanups, 1);
+});
+
+test('concurrent end calls clean once, and a new task waits for cleanup completion', async () => {
+  const c = await setup(); let release, cleanups = 0, started = false;
+  const cleanup = () => { cleanups++; return new Promise(r => { release = r; }); };
+  const first = c.end(1, 's', cleanup);
+  await tick();
+  const second = c.end(1, 's', cleanup);
+  const next = c.start(1, 'new').then(() => { started = true; });
+  await tick();
+  assert.equal(started, false);
+  release();
+  assert.equal((await first).safe, true);
+  assert.equal((await second).safe, true);
+  await next;
+  assert.equal(cleanups, 1);
+});
 test('old observation cannot publish over a newer generation', async () => {
   const c = await setup(); const old = c.observeToken(1, 's', 'old');
   const newer = c.observeToken(1, 's', 'new'); let published;

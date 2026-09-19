@@ -137,6 +137,10 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             PRIMARY KEY(chat_id,request_id))""")
         if 'request_json' not in {row[1] for row in conn.execute('PRAGMA table_info(chat_turns)')}:
             conn.execute("ALTER TABLE chat_turns ADD COLUMN request_json TEXT NOT NULL DEFAULT ''")
+        columns = {row[1] for row in conn.execute('PRAGMA table_info(chat_turns)')}
+        for name in ('finish_reason', 'continuation_of'):
+            if name not in columns:
+                conn.execute(f"ALTER TABLE chat_turns ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_turn_role ON chat_messages(chat_id,request_id,role) WHERE request_id!=''")
 
 
@@ -346,7 +350,7 @@ def get_session(chat_id: str) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
-def begin_turn(chat_id: str, request_id: str, request_hash: str, expected_last_seq: int, content: str, request_json: str = '') -> dict[str, Any]:
+def begin_turn(chat_id: str, request_id: str, request_hash: str, expected_last_seq: int, content: str, request_json: str = '', continuation_of: str = '') -> dict[str, Any]:
     conn = _get_conn()
     now = _now_iso()
     with _lock, conn:
@@ -358,7 +362,7 @@ def begin_turn(chat_id: str, request_id: str, request_hash: str, expected_last_s
         if previous:
             if previous['request_hash'] != request_hash:
                 raise SessionError('request_conflict')
-            if previous['status'] == 'completed':
+            if previous['status'] in ('completed', 'partial'):
                 return dict(previous)
             if previous['status'] == 'running':
                 raise SessionError('request_in_progress')
@@ -373,19 +377,28 @@ def begin_turn(chat_id: str, request_id: str, request_hash: str, expected_last_s
             last_seq = session['last_seq'] if session else 0
             if last_seq != expected_last_seq:
                 raise SessionError('history_conflict')
+            if continuation_of:
+                parent = conn.execute('SELECT * FROM chat_turns WHERE chat_id=? AND request_id=?', (chat_id, continuation_of)).fetchone()
+                if not parent or parent['status'] != 'partial' or not parent['request_json']:
+                    raise SessionError('continuation_unavailable')
+                if parent['assistant_seq'] != last_seq:
+                    raise SessionError('continuation_stale')
             if session and session['summary_msg_count'] > conn.execute('SELECT COUNT(*) FROM chat_messages WHERE chat_id=?', (chat_id,)).fetchone()[0]:
                 raise SessionError('legacy_history_incomplete')
             if not session:
                 conn.execute('INSERT INTO chat_sessions(chat_id,title,created_at,updated_at) VALUES(?,?,?,?)', (chat_id, content[:_TITLE_MAX_LEN], now, now))
             user_seq = last_seq + 1
             conn.execute("INSERT INTO chat_messages(message_id,chat_id,role,content,created_at,seq,request_id) VALUES(?,?,'user',?,?,?,?)", (uuid4().hex, chat_id, content, now, user_seq, request_id))
-            conn.execute("INSERT INTO chat_turns(chat_id,request_id,request_hash,status,user_seq,created_at,updated_at,request_json) VALUES(?,?,?,'running',?,?,?,?)", (chat_id, request_id, request_hash, user_seq, now, now, request_json))
+            conn.execute("INSERT INTO chat_turns(chat_id,request_id,request_hash,status,user_seq,created_at,updated_at,request_json,continuation_of) VALUES(?,?,?,'running',?,?,?,?,?)", (chat_id, request_id, request_hash, user_seq, now, now, request_json, continuation_of))
             conn.execute('UPDATE chat_sessions SET last_seq=? WHERE chat_id=?', (user_seq, chat_id))
         conn.execute("UPDATE chat_sessions SET context_mode='server',active_request_id=?,updated_at=? WHERE chat_id=?", (request_id, now, chat_id))
         return dict(conn.execute('SELECT * FROM chat_turns WHERE chat_id=? AND request_id=?', (chat_id, request_id)).fetchone())
 
 
-def complete_turn(chat_id: str, request_id: str, attempt: int, content: str, tools: list) -> dict[str, Any]:
+def complete_turn(chat_id: str, request_id: str, attempt: int, content: str, tools: list, finish_reason: str = 'stop') -> dict[str, Any]:
+    if finish_reason not in ('stop', 'length') or not content.strip():
+        raise ValueError('invalid_answer')
+    status = 'partial' if finish_reason == 'length' else 'completed'
     conn = _get_conn()
     now = _now_iso()
     with _lock, conn:
@@ -396,7 +409,7 @@ def complete_turn(chat_id: str, request_id: str, attempt: int, content: str, too
             raise SessionError('stale_attempt')
         seq = session['last_seq'] + 1
         conn.execute("INSERT INTO chat_messages(message_id,chat_id,role,content,tools,created_at,seq,request_id) VALUES(?,?,'assistant',?,?,?,?,?)", (uuid4().hex, chat_id, content, json.dumps(tools, ensure_ascii=False), now, seq, request_id))
-        conn.execute("UPDATE chat_turns SET status='completed',assistant_seq=?,updated_at=? WHERE chat_id=? AND request_id=?", (seq, now, chat_id, request_id))
+        conn.execute("UPDATE chat_turns SET status=?,finish_reason=?,assistant_seq=?,updated_at=? WHERE chat_id=? AND request_id=?", (status, finish_reason, seq, now, chat_id, request_id))
         conn.execute("UPDATE chat_sessions SET last_seq=?,active_request_id='',updated_at=? WHERE chat_id=?", (seq, now, chat_id))
     return get_request(chat_id, request_id)
 
@@ -418,9 +431,12 @@ def get_request(chat_id: str, request_id: str) -> dict[str, Any] | None:
         result = dict(row)
         result.pop('request_hash')
         result['retry_request'] = json.loads(result.pop('request_json') or 'null')
-        session = conn.execute('SELECT last_seq,active_request_id FROM chat_sessions WHERE chat_id=?', (chat_id,)).fetchone()
+        session = conn.execute('SELECT last_seq,active_request_id,deleted_at FROM chat_sessions WHERE chat_id=?', (chat_id,)).fetchone()
         result['last_seq'] = session['last_seq']
         result['can_retry'] = row['status'] in ('failed', 'interrupted') and session['last_seq'] == row['user_seq'] and not session['active_request_id']
+        result['can_continue'] = bool(row['status'] == 'partial' and result['retry_request']
+                                      and session['last_seq'] == row['assistant_seq']
+                                      and not session['active_request_id'] and not session['deleted_at'])
         result['messages'] = [dict(message) for message in conn.execute('SELECT message_id,seq,role,content,tools FROM chat_messages WHERE chat_id=? AND request_id=? ORDER BY seq', (chat_id, request_id))]
         return result
 
@@ -429,9 +445,9 @@ def context_snapshot(chat_id: str) -> dict[str, Any]:
     conn = _get_conn()
     with _lock:
         session = dict(conn.execute('SELECT * FROM chat_sessions WHERE chat_id=?', (chat_id,)).fetchone())
-        rows = conn.execute("""SELECT m.* FROM chat_messages m LEFT JOIN chat_turns t
+        rows = conn.execute("""SELECT m.*,COALESCE(t.status,'completed') AS status FROM chat_messages m LEFT JOIN chat_turns t
             ON m.chat_id=t.chat_id AND m.request_id=t.request_id
-            WHERE m.chat_id=? AND m.seq>? AND (m.request_id='' OR t.status='completed') ORDER BY m.seq""", (chat_id, session['summary_upto_seq'])).fetchall()
+            WHERE m.chat_id=? AND m.seq>? AND (m.request_id='' OR t.status IN ('completed','partial')) ORDER BY m.seq""", (chat_id, session['summary_upto_seq'])).fetchall()
         return {'summary': session['context_summary'], 'upto_seq': session['summary_upto_seq'],
                 'version': session['summary_version'], 'messages': [dict(row) for row in rows]}
 
@@ -451,11 +467,16 @@ def message_page(chat_id: str, before_seq: int | None, limit: int) -> dict[str, 
         session = conn.execute('SELECT * FROM chat_sessions WHERE chat_id=?', (chat_id,)).fetchone()
         if session and session['deleted_at']:
             raise SessionError('session_deleted', 404)
-        rows = conn.execute("""SELECT m.*,COALESCE(t.status,'completed') AS status,t.error_code
+        rows = conn.execute("""SELECT m.*,COALESCE(t.status,'completed') AS status,t.error_code,t.finish_reason,t.continuation_of,
+            (t.status='partial' AND t.request_json!='') AS continuation_available
             FROM chat_messages m LEFT JOIN chat_turns t ON m.chat_id=t.chat_id AND m.request_id=t.request_id
             WHERE m.chat_id=? AND (? IS NULL OR m.seq<?) ORDER BY m.seq DESC LIMIT ?""",
             (chat_id, before_seq, before_seq, limit + 1)).fetchall()
         messages = [dict(row) for row in reversed(rows[:limit])]
+        for message in messages:
+            message['can_continue'] = bool(message.pop('continuation_available') and message['role'] == 'assistant'
+                                           and session and message['seq'] == session['last_seq']
+                                           and not session['active_request_id'])
         return {'chat_id': chat_id, 'messages': messages, 'count': len(messages),
                 'last_seq': session['last_seq'] if session else 0,
                 'context_mode': session['context_mode'] if session else 'client',

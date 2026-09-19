@@ -229,7 +229,7 @@ async function handleCallLlmStream(request) {
         const parsed = JSON.parse(dataStr);
         if (parsed.session_meta) sendLlmMessage(msgId, 'LLM_SESSION_META', { session_meta: parsed.session_meta });
         if (parsed.error || parsed.choices?.some(choice => choice.finish_reason === 'error')) {
-          sendLlmMessage(msgId, 'LLM_ERROR', { error: parsed.error?.code || '后端处理失败，请检查会话状态后重试' });
+          sendLlmMessage(msgId, 'LLM_ERROR', { error: parsed.error?.message || parsed.error?.code || '后端处理失败，请检查会话状态后重试' });
           await reader.cancel();
           return;
         }

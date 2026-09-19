@@ -1227,7 +1227,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       } else {
         input.value = '';
         if (attachedImage) clearAttachedImage();
-        // 搜索模式开启时,把输入文本作为 search_query 强制搜索;发送后自动关闭搜索模式
+        // search_query 非空表示本轮要求联网；后端结合会话生成实际搜索词。
         const searchQuery = isSearchMode() ? text : '';
         if (searchQuery) {
           const st = document.getElementById('webSearchToggle');
@@ -1399,7 +1399,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           state = { can_retry: true, last_seq: originalBody.expected_last_seq };
         }
         sessionSequences.set(`${base}|${chatId}`, state.last_seq);
-        if (state.status === 'completed') {
+        if (state.status === 'completed' || state.status === 'partial') {
           await resumeSession(chatId);
         } else if (state.status === 'running') {
           alert('后端仍在处理此请求，暂不重复提交，请稍后检查。');
@@ -1420,7 +1420,49 @@ document.addEventListener('DOMContentLoaded', async () => {
     container.appendChild(button);
   }
 
-  async function runServerChat(text, image, searchQuery, settings, retryBody = null) {
+  function addPartialAnswer(container, base, chatId, requestId, canContinue = true) {
+    const status = document.createElement('div');
+    status.className = 'partial-answer-status';
+    const label = document.createElement('div');
+    label.textContent = '已保存，回答因输出长度限制尚未完成。';
+    status.appendChild(label);
+    const button = document.createElement('button');
+    button.type = 'button'; button.className = 'tool-btn'; button.textContent = '继续生成';
+    button.disabled = !canContinue;
+    let continuationId = null;
+    button.addEventListener('click', async () => {
+      if (_sendingLock) return;
+      if (currentChatId !== chatId) { alert('请先打开此回答所属的会话。'); return; }
+      _sendingLock = true; button.disabled = true;
+      try {
+        const state = await callBackendApi(buildBackendEndpointUrl(base,
+          `/v1/sessions/${encodeURIComponent(chatId)}/requests/${encodeURIComponent(requestId)}`));
+        if (!state.can_continue) {
+          label.textContent = '已有正文已保存；此回答当前不可直接续写，请检查后续消息或重新提供必要的图片。';
+          return;
+        }
+        const settings = await resolveApiRequestConfig();
+        if (settings.safeApiUrl !== base || currentChatId !== chatId) {
+          throw new Error('会话或后端地址已改变，请回到原会话后继续。');
+        }
+        continuationId ||= createMessageId();
+        const original = state.retry_request;
+        const body = { context_mode: 'server', chat_id: chatId, request_id: continuationId,
+          continuation_of: requestId, expected_last_seq: state.last_seq, stream: true,
+          model: original.model, kb_id: original.kb_id || '', search_query: original.search_query || '',
+          messages: [{ role: 'user', content: '继续生成' }] };
+        sessionSequences.set(`${base}|${chatId}`, state.last_seq);
+        await runServerChat('继续生成', null, '', settings, body, true);
+      } catch (error) {
+        button.disabled = false;
+        alert('无法继续生成: ' + (error.message || error));
+      } finally { _sendingLock = false; }
+    });
+    status.appendChild(button);
+    container.appendChild(status);
+  }
+
+  async function runServerChat(text, image, searchQuery, settings, retryBody = null, newTurn = false) {
     const { apiKey, modelName, safeApiUrl: base } = settings;
     const chatId = retryBody?.chat_id || await getOrCreateCurrentChatId();
     const key = `${base}|${chatId}`;
@@ -1444,7 +1486,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       alert('无法同步会话，尚未提交: ' + error.message);
       return;
     }
-    if (!retryBody) {
+    if (!retryBody || newTurn) {
       const user = createMessageNode('user');
       user.dataset.requestId = body.request_id;
       const label = document.createElement('div'); label.textContent = text;
@@ -1470,6 +1512,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (meta?.persisted && !error) {
           sessionSequences.set(key, meta.last_seq);
           if (sources.length) renderSearchCitations(bubble, sources);
+          if (meta.status === 'partial') addPartialAnswer(bubble, base, chatId, body.request_id, meta.can_continue);
         } else {
           const status = document.createElement('div'); status.className = 'error-text';
           status.textContent = `未确认保存：${error || '连接已结束，但没有收到保存确认'}`;
@@ -1611,7 +1654,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         const node = document.createElement('div');
         node.textContent = m.content;
         bubble.appendChild(node);
-        if (managed && m.request_id && m.status !== 'completed') {
+        if (managed && m.request_id && !['completed', 'partial'].includes(m.status)) {
           const state = document.createElement('div'); state.textContent = `请求状态：${m.status}`;
           bubble.appendChild(state);
           addRequestRecovery(bubble, base, chatId, m.request_id);
@@ -1640,6 +1683,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
         if (allSources.length) {
           renderSearchCitations(bubble, allSources);
+        }
+        if (managed && m.status === 'partial') {
+          addPartialAnswer(bubble, base, chatId, m.request_id, m.can_continue === true);
         }
       }
     }
@@ -2063,8 +2109,8 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (step.type === 'evidence_check') {
         stepEl.classList.add('kb-result');
         stepEl.textContent = step.outcome === 'reviewed'
-          ? '📎 已完成引用格式与模型证据复核（不代表人工核实）'
-          : '⚠ 证据核对未完成，未通过的结论已收起';
+          ? '📎 历史记录：旧版模型复核已完成（不代表人工核实）'
+          : '⚠ 历史记录：旧版模型复核未完成';
         return;
       }
       stepEl.classList.toggle('kb-result', step.type === 'kb_search' || step.type === 'kb_list_documents');
@@ -2094,11 +2140,21 @@ document.addEventListener('DOMContentLoaded', async () => {
       const label = step.type === 'web_search' ? '已搜索' : '已检索知识库';
       const count = step.result_count || 0;
       const outcomeText = {
+        empty: '搜索完成，未找到匹配结果',
         empty_kb: '知识库没有文档',
         no_searchable_documents: '文档存在，暂无可检索文档',
         no_match: '检索完成，0 条匹配',
       }[step.outcome];
-      const countText = ` · ${count} 项`;
+      let countText = ` · ${count} 项${step.type === 'web_search' && step.outcome === 'partial' ? '（部分引擎失败）' : ''}`;
+      if (step.type === 'web_search' && step.reader) {
+        const reader = step.reader;
+        countText += `；已读取 ${Number(reader.read_count) || 0} 篇正文`;
+        if (Number.isInteger(reader.included_count)) countText += `，纳入 ${reader.included_count} 篇`;
+        if (reader.failed_count) countText += `，${Number(reader.failed_count) || 0} 篇读取失败`;
+        if (reader.error_code === 'reader_configuration_error') countText += '（正文服务配置无效，仅有摘要）';
+        else if (reader.error_code === 'budget_exhausted') countText += '（读取或上下文预算不足）';
+        else if (reader.outcome === 'error') countText += '（仅有搜索摘要）';
+      }
       const counts = step.counts;
       const stateText = step.outcome === 'no_searchable_documents' && counts
         ? `（共 ${counts.total} 份，已索引 ${counts.indexed} 份，处理中 ${counts.pending} 份，失败 ${counts.failed} 份）` : '';
@@ -2111,7 +2167,8 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
       stepEl.className = 'enhancement-step error';
       const failed = step.outcome === 'error';
-      stepEl.innerHTML = `<span class="step-icon">⚠</span><span class="step-text">${failed ? '知识库查询失败' : '工具未执行'}：${esc(step.error || '工具参数无效')}</span>`;
+      const label = failed ? (step.type === 'web_search' ? '联网搜索失败' : '知识库查询失败') : '工具未执行';
+      stepEl.innerHTML = `<span class="step-icon">⚠</span><span class="step-text">${label}：${esc(step.error || '工具参数无效')}</span>`;
       stepEl.title = step.error || '工具参数无效';
     }
   }
@@ -2131,6 +2188,10 @@ document.addEventListener('DOMContentLoaded', async () => {
       return [index, {
         index,
         title: String(source.title || ''), snippet: String(source.snippet || ''),
+        contentSource: source.content_source, readStatus: source.read_status,
+        contextStatus: source.context_status, structureMode: source.structure_mode,
+        readError: String(source.read_error || ''), truncated: Boolean(source.truncated),
+        fetchedAt: String(source.fetched_at || ''), extractedDate: String(source.extracted_date || ''),
         isKb: url.startsWith('kb://'), href,
         hasDocumentId: Boolean(source.doc_id),
         docKey: source.doc_id ? `${source.kb_id}/${source.doc_id}` : (url || `legacy-${index}`),
@@ -2220,6 +2281,27 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
         a.append(number, document.createTextNode(` ${source.title}`));
         item.appendChild(a);
+        if (source.contentSource) {
+          const status = document.createElement('div');
+          status.className = 'search-source-status';
+          status.textContent = source.contentSource === 'page'
+            ? (source.truncated ? '已读取正文节选' : '已读取提取正文')
+            : (source.readStatus === 'error' ? '正文读取失败，仅搜索摘要' : '仅搜索摘要');
+          const inclusion = {
+            reused: '本轮已有相关块，未重复纳入',
+            budget_exhausted: '上下文预算用尽，内容未纳入',
+            request_budget_exhausted: '完整请求预算不足，内容已移除',
+            no_complete_block: '可用预算不足以容纳完整片段，内容未纳入',
+          }[source.contextStatus];
+          if (inclusion) status.textContent = `${source.readStatus === 'ok' ? '正文读取成功；' : ''}${inclusion}`;
+          if (source.structureMode === 'legacy_text') status.textContent += '（旧版服务文本）';
+          const detail = [];
+          if (source.readError) detail.push(`错误代码：${source.readError}`);
+          if (source.extractedDate) detail.push(`页面提取日期（非核实）：${source.extractedDate}`);
+          if (source.fetchedAt) detail.push(`抓取时间：${source.fetchedAt}`);
+          status.title = detail.join('\n');
+          item.appendChild(status);
+        }
       }
       list.appendChild(item);
     }

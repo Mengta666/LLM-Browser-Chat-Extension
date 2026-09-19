@@ -1,0 +1,49 @@
+name: ${COMPOSE_PROJECT_NAME:-browser-agent-addons}
+
+services:
+  searxng:
+    image: ${SEARXNG_IMAGE:-searxng/searxng:2026.9.18-c0042add3@sha256:e0027a772aeeea55bf642256aae6fb3344ffa5f25ca665898c2ea821101334c4}
+    profiles: [search]
+    restart: unless-stopped
+    ports:
+      - "${SEARCH_BIND_IP:-127.0.0.1}:${SEARCH_PORT:-19080}:8080"
+    volumes:
+      - ./runtime/searxng:/etc/searxng:rw
+      - searxng-cache:/var/cache/searxng
+    healthcheck:
+      test: [CMD, /usr/local/searxng/.venv/bin/python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/config', timeout=3).read(1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  web-reader:
+    build:
+      context: ../addons/web-reader
+    image: ${WEB_READER_IMAGE:-browser-agent-web-reader:0.2.0}
+    profiles: [reader]
+    init: true
+    restart: unless-stopped
+    ports:
+      - "${READER_BIND_IP:-127.0.0.1}:${READER_PORT:-19081}:8000"
+    env_file: .env
+    environment:
+      READER_CONCURRENCY: ${READER_CONCURRENCY:-3}
+      READER_MAX_BYTES: ${READER_MAX_BYTES:-2097152}
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    mem_limit: 768m
+    cpus: 2
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read(1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  searxng-cache:

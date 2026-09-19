@@ -13,7 +13,7 @@
 联网搜索(批次 F):
 - 自动搜索:SEARCH_ENABLED 时第一次 LLM 调用带 tools=[web_search],LLM 自主判断
   是否搜索;返回 tool_call → 调 SearXNG → 二次 LLM 调用带搜索结果生成回答
-- 手动搜索:前端点"🔍"按钮 → ChatRequest.search_query 非空 → 直接搜索注入 system
+- 手动搜索:前端点"🔍"按钮 → ChatRequest.search_query 非空 → 模型结合上下文生成查询并执行搜索
 - 降级:模型不支持 tools 时 catch 400/422 → 去 tools 重试
 
 记忆能力复用 agent/memory 子系统(service 门面),全部 try/except 降级:
@@ -68,11 +68,12 @@ class ChatRequest(BaseModel):
     messages: list[dict[str, Any]] = []
     stream: bool = True
     chat_id: str = ""          # 前端会话标识(可选,用于日志关联)
-    search_query: str = ""     # 手动搜索:非空时直接搜→注入→LLM(不走 function calling)
+    search_query: str = ""     # 兼容旧前端：非空表示本轮要求联网，实际搜索词由模型结合上下文生成。
     kb_id: str = ""            # 当前绑定的知识库 id(前端 chip 选中后传入)
     context_mode: Literal['client', 'server'] = 'client'
     request_id: str = ''
     expected_last_seq: int | None = Field(default=None, ge=0)
+    continuation_of: str = ''
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -439,10 +440,8 @@ def _save_history(chat_id: str, user_text: str, assistant_text: str, tools_json:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 try:
-    from search.tools import (
-        WEB_SEARCH_TOOL, handle_tool_call,
-    )
-    from search import search_web, SEARCH_ENABLED as _SEARCH_ON
+    from search.tools import WEB_SEARCH_TOOL
+    from search import SEARCH_ENABLED as _SEARCH_ON
 except ImportError:
     _SEARCH_ON = False
     WEB_SEARCH_TOOL = None
@@ -489,7 +488,7 @@ def stream_chat(model: str, messages: list[dict[str, Any]],
                 user_text: str, chat_id: str,
                 use_tools: bool = False,
                 search_results: list = None,
-                tools_list: list[str] = None, bound_kb_id: str = "") -> StreamingResponse:
+                tools_list: list[str] = None, bound_kb_id: str = "", require_web_search: bool = False) -> StreamingResponse:
     """SSE 流式转发。use_tools=True 时走 function calling 链路。
 
     tools_list: ["web_search", "kb_search"] 显式指定启用哪些 tool。
@@ -533,7 +532,7 @@ def stream_chat(model: str, messages: list[dict[str, Any]],
                 if SEARCH_ENABLED:
                     tools.append(WEB_SEARCH_TOOL)
             else:
-                if "web_search" in tools_list and SEARCH_ENABLED:
+                if "web_search" in tools_list:
                     tools.append(WEB_SEARCH_TOOL)
                 if "kb_search" in tools_list:
                     tools.extend([KB_SEARCH_TOOL, KB_LIST_DOCUMENTS_TOOL])
@@ -555,7 +554,8 @@ def stream_chat(model: str, messages: list[dict[str, Any]],
             else:
                 # 走 agentic loop
                 try:
-                    for event in run_agentic_loop(model, messages, tools, chat_id=chat_id, stream=True, bound_kb_id=bound_kb_id):
+                    for event in run_agentic_loop(model, messages, tools, chat_id=chat_id, stream=True,
+                                                  bound_kb_id=bound_kb_id, require_web_search=require_web_search):
                         if event["type"] == "enhancement_step":
                             yield _sse({
                                 "choices": [{"delta": {"content": ""}, "finish_reason": None, "index": 0}],
@@ -600,7 +600,7 @@ def sync_chat(model: str, messages: list[dict[str, Any]],
               user_text: str, chat_id: str,
               use_tools: bool = False,
               search_results: list = None,
-              tools_list: list[str] = None, bound_kb_id: str = "") -> JSONResponse:
+              tools_list: list[str] = None, bound_kb_id: str = "", require_web_search: bool = False) -> JSONResponse:
     """非流式同步调用。use_tools=True 时走 agentic loop。"""
     t0 = time.monotonic()
     search_used = bool(search_results)
@@ -629,7 +629,7 @@ def sync_chat(model: str, messages: list[dict[str, Any]],
             if SEARCH_ENABLED:
                 tools.append(WEB_SEARCH_TOOL)
         else:
-            if "web_search" in tools_list and SEARCH_ENABLED:
+            if "web_search" in tools_list:
                 tools.append(WEB_SEARCH_TOOL)
             if "kb_search" in tools_list:
                 tools.extend([KB_SEARCH_TOOL, KB_LIST_DOCUMENTS_TOOL])
@@ -646,7 +646,8 @@ def sync_chat(model: str, messages: list[dict[str, Any]],
             # 走 agentic loop
             text = ""
             try:
-                for event in run_agentic_loop(model, messages, tools, chat_id=chat_id, stream=False, bound_kb_id=bound_kb_id):
+                for event in run_agentic_loop(model, messages, tools, chat_id=chat_id, stream=False,
+                                              bound_kb_id=bound_kb_id, require_web_search=require_web_search):
                     if event["type"] == "enhancement_step":
                         if event["step"]["status"] == "done" and event["step"].get("result_count", 0) > 0:
                             search_used = True
@@ -673,7 +674,8 @@ def sync_chat(model: str, messages: list[dict[str, Any]],
         _save_history(chat_id, user_text, text, tools_json=tools_json)
         _schedule_memory_write(user_text, text, chat_id)
 
-    return JSONResponse(content={"choices": [{"message": {"role": "assistant", "content": text}}]})
+    return JSONResponse(content={"choices": [{"message": {"role": "assistant", "content": text}}],
+                                 **({"enhancement_steps": tools_steps} if tools_steps else {})})
 
 
 @router.post("/chat/completions")
@@ -682,6 +684,8 @@ def chat_completions(item: ChatRequest):
     if item.context_mode == 'server':
         from api.server_chat import handle
         return handle(item)
+    if item.continuation_of:
+        return JSONResponse(status_code=409, content={'error': {'code': 'server_context_required'}})
     if item.chat_id:
         from storage import chat_store
         session = chat_store.get_session(item.chat_id)
@@ -695,44 +699,17 @@ def chat_completions(item: ChatRequest):
         "search_query": item.search_query[:60] if item.search_query else "",
         "kb_id": item.kb_id[:16] if item.kb_id else ""})
 
-    # 手动搜索:search_query 非空 → 搜索结果以 tool 消息注入,走二次 LLM(与自动搜索路径一致)
-    if item.search_query.strip():
-        from search.tools import format_search_results
-        results = search_web(item.search_query.strip()) if _SEARCH_ON else []
-        if not results:
-            from search.searxng import search_searxng
-            results = search_searxng(item.search_query.strip())
-        tool_result_text = format_search_results(results)
-        arguments = json.dumps({"query": item.search_query.strip()}, ensure_ascii=False)
-        assistant_msg = {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [{
-                "id": "manual_search_0",
-                "type": "function",
-                "function": {"name": "web_search", "arguments": arguments},
-            }],
-        }
-        tool_msg = {
-            "role": "tool",
-            "tool_call_id": "manual_search_0",
-            "content": tool_result_text,
-        }
-        messages = list(messages) + [assistant_msg, tool_msg]
-        if item.stream:
-            return stream_chat(item.model, messages, user_text, item.chat_id,
-                               search_results=results)
-        return sync_chat(item.model, messages, user_text, item.chat_id)
-
     # 自动搜索/KB 检索:根据 kb_id 和 _SEARCH_ON 决定 tools 列表
     use_tools_list = []
-    if _SEARCH_ON:
+    if _SEARCH_ON or item.search_query.strip():
         use_tools_list.append("web_search")
     if item.kb_id.strip():
         use_tools_list.append("kb_search")
 
     if item.stream:
         return stream_chat(item.model, messages, user_text, item.chat_id,
-                           use_tools=bool(use_tools_list), tools_list=use_tools_list, bound_kb_id=item.kb_id)
+                           use_tools=bool(use_tools_list), tools_list=use_tools_list, bound_kb_id=item.kb_id,
+                           require_web_search=bool(item.search_query.strip()))
     return sync_chat(item.model, messages, user_text, item.chat_id,
-                     use_tools=bool(use_tools_list), tools_list=use_tools_list, bound_kb_id=item.kb_id)
+                     use_tools=bool(use_tools_list), tools_list=use_tools_list, bound_kb_id=item.kb_id,
+                     require_web_search=bool(item.search_query.strip()))

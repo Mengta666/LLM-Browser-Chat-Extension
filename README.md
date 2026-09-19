@@ -1,316 +1,501 @@
 # Browser Agent
 
-基于 Chrome Manifest V3 侧边栏和 FastAPI 的浏览器 AI 助手，包含两条独立主流程：**浏览器自动化**和**聊天 / 文档知识库 / 长期记忆**。扩展负责观察页面及执行浏览器动作，后端负责模型调用、任务决策、会话管理和检索。
+Browser Agent 是一个运行在 Chrome 侧边栏中的 AI 助手。你可以用它与模型对话、操作当前网页、查询自己的文档，并结合联网搜索获取网页资料。
 
+项目由 **Chrome 扩展、Python 后端和可选增强服务**组成，支持连接自建或第三方 OpenAI-compatible 模型接口，扩展无需 npm 构建即可加载。
 
-## 当前能力
+## 功能概览
 
-| 模块 | 已实现的内容 | 使用边界 |
+- **浏览器自动化**：用自然语言描述任务，执行点击、输入、选择、滚动、导航等操作。
+- **聊天与会话管理**：支持图片、截图、Markdown、公式、历史会话和长会话摘要；回答达到输出上限时可手动继续生成。
+- **文档知识库**：上传 PDF、Markdown 和文本文件，在对话中检索文档并展示来源。
+- **长期记忆**：保存和管理偏好、稳定事实及事件信息，供后续对话参考。
+- **联网问答**：通过 SearXNG 搜索网页，结合上下文处理追问。
+- **网页正文提取**：可选接入 web-reader，从搜索结果中提取正文，按相关性与上下文额度选取内容。
+
+## 阅读导航
+
+- [部署组成与运行要求](#部署组成与运行要求)
+- [安装与启动](#安装与启动)
+- [功能使用](#功能使用)
+- [部署搜索与正文服务](#部署搜索与正文服务)
+- [配置参考](#配置参考)
+- [更新与维护](#更新与维护)
+- [开发与接口](#开发与接口)
+- [故障排查](#故障排查)
+- [安全与数据](#安全与数据)
+
+## 部署组成与运行要求
+
+| 组件 | 作用 | 何时需要 |
 | --- | --- | --- |
-| 浏览器自动化 | 页面观察、逐步决策、点击、输入、选择、滚动、导航等 | 需要扩展持续执行；后端不单独控制浏览器 |
-| 控件定位 | DOM / 可访问性信息、截图、SVG 与无文本控件识别、点击前几何与遮挡检查 | 复杂跨域 iframe、页面变化、受限页面仍可能失败 |
-| 侧边栏聊天 | 文本、图片、框选截图、Markdown / KaTeX、流式响应 | 图片理解、工具调用取决于所选模型能力 |
-| 服务端长会话 | 历史持久化、序号分页、请求幂等、恢复、分批摘要、上下文预算保护 | 仅本项目服务端会话协议支持；不是无限上下文 |
-| 文档知识库 | 建库、上传、后台索引、检索、可选精排、回收站和列表刷新 | 需要 embedding 与 Qdrant；扫描 PDF 暂无 OCR |
-| 长期记忆 | core / episodic 记忆、提取、检索、管理和定期 rethink | 与会话摘要不同，会产生额外模型调用和存储 |
-| 联网搜索 | 基于 SearXNG 的搜索及聊天工具调用 | 需单独部署并配置 SearXNG |
+| Chrome 扩展 | 聊天界面、页面观察、浏览器动作执行 | 使用侧边栏或自动化时 |
+| Python 后端 | 调用模型、管理会话、执行检索和任务决策 | 使用本项目完整功能时 |
+| 模型服务 | 提供 OpenAI-compatible 对话接口 | 必需，自行准备 |
+| Embedding + Qdrant | 文档与长期记忆的向量化、存储和检索 | 使用知识库或长期记忆时 |
+| Reranker | 对知识库候选内容重新排序 | 可选 |
+| SearXNG | 聚合搜索引擎结果 | 使用联网搜索时 |
+| web-reader | 抓取公开网页并提取正文 | 需要搜索正文增强时，可选 |
 
-知识库和联网搜索接入的是聊天工具链，不是浏览器自动化的动作注册表。旧版“当前网页快照 RAG”、页面身份 / 快照绑定说明已不适用。
+准备以下环境：
 
-## 工作方式
+- **Python 3.13**：用于后端和独立正文服务。后端依赖见 [requirements.txt](backend/requirements.txt)。
+- **Chrome**：支持 Manifest V3 和侧边栏，允许加载已解压的扩展。
+- **Git**：用于获取和更新代码。
+- **Docker Compose v2**：仅在通过本项目 Compose 部署增强服务时需要，运行 Linux 容器。
+- **Node.js**：仅开发检查需要，运行扩展不需要 Node.js 或 Playwright。
 
-### 浏览器自动化
+模型选择要求：
 
-1. 用户在侧边栏启用自动化，输入任务。
-2. 扩展采集当前页面状态，包括元素信息和截图，发送给后端。
-3. 后端模型输出本步判断、下一目标和结构化动作；扩展通过 Chrome DevTools Protocol（CDP）执行。
-4. 扩展回传执行结果并重新观察，后端决定继续、结束或报错。
+- 普通文字聊天需要兼容对话接口。
+- 图片理解和浏览器截图分析需要模型具备视觉能力。
+- 聊天中的知识库、联网搜索需要模型支持兼容的工具调用；手动联网搜索还使用命名工具强制调用。
+- 自动化通过结构化动作指令运行，不依赖聊天工具调用开关。
 
-自动化使用协议 v2，后端与扩展必须一起更新。任务绑定启动时的标签页，切换活动标签不会改变操作目标。观察失败时自动重新获取页面状态，不进入人工暂停，也不会用旧观察推进或重做上一动作；持续失败超过恢复预算才结束并报告原因。动作超时先确认原执行状态，不把等待超时当作“没有执行”。
+可以先完成“扩展 + 后端 + 模型”的基本部署，再按需接入其他服务。仅启动后端不会自动部署模型、Qdrant 或其他依赖。
 
-默认预算：单次观察 30 秒、一次观察恢复阶段 90 秒；单动作 120 秒、额外确认动作结束最多 30 秒；单次后端决策 180 秒；任务总时限 1 小时。预算耗尽不伪造成功。执行状态始终无法确认时，该标签页会阻止新输入；检查页面后可关闭该测试标签并重新打开，不应盲目重放有副作用的任务。
+## 安装与启动
 
-当前注册的动作：`click`、`type`、`select`、`scroll`、`scroll_to_element`、`hover`、`focus`、`clear`、`press_key`、`wait`、`navigate`。
+### 1. 获取代码
 
-输入支持原生 input / textarea、普通 contenteditable，以及已确认实例的 CodeMirror 5。`type` 默认替换全文，`clear=false` 在当前光标 / 选区插入；`press_key` 的组合键使用独立 `modifiers` 数组，例如 `key="a", modifiers=["Control"]`。观察提供编辑器类型、可输入 / 只读状态和焦点；写入后回读确认，失败或部分执行不会自动重放。文本中的换行不模拟 Enter；单行框拒绝多行文本。
+以下以 `agent-slim` 分支为例：
 
-CodeMirror 5 通过其公开接口更新文档，不把代理 textarea 的值当作全文，也不直接清除展示 DOM。普通富文本使用浏览器文本插入并按纯文本语义回读；不保证任意富文本框架的内部模型同步。CodeMirror 6 / Monaco 等尚未单独适配，多光标插入及无法可靠映射的富文本选区会明确拒绝。更新后需重新加载扩展、关闭重开侧边栏，并重启后端加载输入规则。
+```bash
+git clone --branch agent-slim https://github.com/Mengta666/LLM-Browser-Chat-Extension.git browser-agent
+cd browser-agent
+```
 
-模型通过结构化 JSON 描述动作，不依赖聊天的 Function Calling 开关。点击路径使用浏览器输入事件；页面脚本用于观察、焦点和已支持的编辑器适配，不应把“脚本返回成功”视为业务成功。
+除特别注明外，下文命令均从仓库根目录执行。
 
-目前没有通用拖拽动作、任意截图坐标操作工具、操作系统桌面鼠标控制或验证码自动处理流程。人工完成验证后页面出现“成功”，也不代表自动化具备了验证能力。
+### 2. 安装后端并创建配置
 
-### 聊天、上下文与记忆
-
-- 本项目后端通过能力探测启用服务端会话：前端只提交当前轮用户消息，后端从 SQLite 恢复历史。
-- 服务端使用 `chat_id`、`request_id` 和 `expected_last_seq` 做会话定位、请求幂等与并发冲突检查。
-- 长会话保留近期对话，对较早内容分批摘要，并在最终模型请求处检查上下文预算；摘要不是原文的无损替代。
-- 长期记忆会按配置提取并保存到独立的记忆存储；它不等同于完整聊天历史，也不等同于会话摘要。
-- 直接连接其他 OpenAI-compatible 服务时仍可使用兼容聊天模式，但第三方服务通常不提供本项目的会话、知识库和自动化接口。
-
-## 快速开始
-
-以下命令用于 Windows PowerShell，从仓库根目录执行。其他系统需要调整虚拟环境路径。
-
-### 1. 准备运行环境和服务
-
-- Python：当前本地核对环境为 3.13.2；依赖以 [backend/requirements.txt](backend/requirements.txt) 为准，不能只安装 FastAPI 和 OpenAI SDK。
-- Chrome：需要支持侧边栏及 Manifest V3，允许加载未打包扩展。
-- 模型服务：提供 OpenAI-compatible 接口。聊天 / 自动化使用的模型在扩展中选择；截图理解需要视觉能力，聊天自动调用知识库 / 搜索需要兼容的工具调用能力。
-- 完整知识库和长期记忆还需要 embedding 服务与 Qdrant；reranker、SearXNG 按需部署。
-- Node.js 仅用于下文前端回归检查；当前本地核对版本为 22.15.0。扩展运行不需要 npm 构建，也不需要安装 Playwright。
-
-仓库不负责自动部署上述模型与检索服务。只启动 FastAPI，不代表所有依赖服务已就绪。
-
-### 2. 安装后端依赖并准备配置
+**Windows PowerShell：**
 
 ```powershell
-cd backend
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-if (-not (Test-Path -LiteralPath 'config/.env')) {
-    Copy-Item -LiteralPath 'config/.env.example' -Destination 'config/.env'
+python -m venv backend/.venv
+.\backend\.venv\Scripts\python.exe -m pip install -r backend/requirements.txt
+if (-not (Test-Path -LiteralPath backend/config/.env)) {
+    Copy-Item -LiteralPath backend/config/.env.example -Destination backend/config/.env
 }
 ```
 
-编辑 `backend/config/.env`，按下文配置自己的服务地址、模型和密钥。已有真实配置时不要覆盖。
+**Linux / macOS：**
 
-> `config/.env.example` 尚包含旧字段，也缺少部分新字段，只能作为起点，不能原样当作已验证配置。本次文档更新未修改模板或真实 `.env`。有效字段应结合下文及 [配置源码](backend/agent/memory/config.py) 核对。
+```bash
+python3 -m venv backend/.venv
+backend/.venv/bin/python -m pip install -r backend/requirements.txt
+[ -f backend/config/.env ] || cp backend/config/.env.example backend/config/.env
+```
+
+用文本编辑器打开 `backend/config/.env`，首先填写：
+
+| 配置项 | 填写内容 |
+| --- | --- |
+| `MODEL_BASE_URL` | 上游模型服务地址，通常以 `/v1` 结尾，例如 `http://127.0.0.1:8001/v1` |
+| `OPENAI_API_KEY` | 上游服务的密钥；无鉴权服务也需填写 SDK 接受的非空占位值 |
+| `MEMORY_MODEL` | 服务中可用的模型 ID，用于会话标题、摘要和记忆等辅助任务 |
+| `CHAT_CONTEXT_LENGTH` | 实际部署模型允许的上下文窗口，不能超过服务端配置 |
+| `CHAT_MAX_OUTPUT_TOKENS` | 单次模型回复的输出上限，默认 `8192` |
+
+聊天和自动化所用的模型在扩展设置中选择，`MEMORY_MODEL` 不替代该设置。暂不使用搜索和正文服务时，保留 `SEARCH_ENABLED=0`、`WEB_READER_ENABLED=0`。暂不需要定期记忆整理时，可添加 `MEMORY_RETHINK_DAEMON_ENABLED=0`。
+
+模板中的地址、模型和向量维度是示例，需按实际服务调整。已有 `.env` 时只补齐缺项，不要用模板覆盖真实值。
 
 ### 3. 启动后端
 
-仍在 `backend` 目录：
+**Windows PowerShell：**
 
 ```powershell
-.\.venv\Scripts\python.exe -m uvicorn app:app --host 127.0.0.1 --port 8000 --workers 1
+.\backend\.venv\Scripts\python.exe -m uvicorn app:app --app-dir backend --host 127.0.0.1 --port 8000 --workers 1
 ```
 
-建议先仅监听本机、使用单个 worker。当前部分锁和运行状态保存在进程内，不能把多 worker 当作已经验证的部署方案。
+**Linux / macOS：**
 
-也可运行 `python app.py`，但该入口默认监听 `0.0.0.0:8000`，会扩大网络暴露范围。当前后端没有完整的请求鉴权 / 多租户隔离，CORS 也较宽松；不要直接公开到互联网。
+```bash
+backend/.venv/bin/python -m uvicorn app:app --app-dir backend --host 127.0.0.1 --port 8000 --workers 1
+```
 
-启动后可检查：
+保持终端运行，打开：
 
-- [Swagger 接口文档](http://127.0.0.1:8000/docs)
-- [OpenAPI 路由清单](http://127.0.0.1:8000/openapi.json)
-- [服务端会话能力探测](http://127.0.0.1:8000/v1/sessions/capabilities)
+- [接口文档](http://127.0.0.1:8000/docs)
+- [会话能力接口](http://127.0.0.1:8000/v1/sessions/capabilities)
 
-这些检查只能确认接口是否挂载，不能证明模型、Qdrant 或 reranker 健康。部分模块允许加载失败后继续启动；遇到功能接口 404 时检查启动日志中的 `app_startup_partial` / `modules_failed`。
+能力接口应返回 `server_context: true` 和 `protocol_version: 1`。这些检查确认后端接口可用，不代表上游模型或检索服务已经连通。
 
-### 4. 加载扩展
+部署时使用单个 worker：部分会话锁和自动化状态保存在进程内。后端缺少完整的请求鉴权与多租户隔离，默认仅监听本机；如需跨机器使用，应限制在受控网络中，不要直接暴露到公网。
 
-1. 打开 `chrome://extensions`，开启“开发者模式”。
-2. 选择“加载已解压的扩展程序”，选中仓库里的 **extension 目录**，不是仓库根目录。
-3. 打开扩展侧边栏，在设置中配置：
+### 4. 加载并配置扩展
 
-| 前端设置 | 使用本项目本机后端时 |
+1. 在 Chrome 打开 `chrome://extensions`。
+2. 开启“开发者模式”，选择“加载已解压的扩展程序”。
+3. 选择仓库中的 `extension` 目录。
+4. 打开扩展侧边栏，进入“设置”。
+
+| 扩展设置 | 本机部署示例 |
 | --- | --- |
-| API Base URL | `http://127.0.0.1:8000/v1`，不要填完整的 `/chat/completions` 地址 |
-| API Key | 本机 / 内网后端允许留空；此项不是后端的上游模型密钥配置 |
-| 模型名 | 填写上游实际部署并可调用的模型，不要盲用界面默认值 |
+| API Base URL | `http://127.0.0.1:8000/v1` |
+| API Key | 本项目后端未配置入口鉴权时可留空 |
+| 模型 | 上游实际提供的模型 ID |
 
-前端地址指向“本项目后端”，`.env` 中的 `MODEL_BASE_URL` 则指向“后端调用的模型服务”，两者不要混淆。后端上游密钥仍由 `OPENAI_API_KEY` 配置，前端填写的 Key 不会替换它。
+注意区分两个地址：**扩展连接本项目后端，后端再连接模型服务**。扩展中的 API Key 不会替换后端 `.env` 的 `OPENAI_API_KEY`。
 
-修改后端代码或 `.env` 后需重启实际运行的后端；PyCharm 中应停止后重新运行。修改扩展文件后需在扩展管理页重新加载，并关闭再打开侧边栏，仅刷新网页不够。扩展详细说明见 [extension/README.md](extension/README.md)。
+如果扩展直接连接第三方对话接口，可使用其兼容聊天能力，但不能因此获得本项目的会话管理、知识库和浏览器自动化接口。
+
+### 5. 完成第一次使用检查
+
+1. 在输入框旁关闭“自动化”和“搜索”，发送一个简单问题，确认模型能回答。
+2. 点击“会话”新建另一会话，再打开原会话，确认历史可恢复。
+3. 打开一个允许测试的普通网页，启用“自动化”，尝试“滚动到页面底部”等低风险操作。
+4. 接入知识库、搜索等服务后，再分别按下文验证对应功能。
+
+Chrome 内部页面、扩展管理页面等受限页面不能作为普通网页自动化目标。
+
+## 功能使用
+
+### 聊天、图片与历史会话
+
+在主面板中关闭“自动化”即可聊天。“图片”和“框选截图”可添加视觉材料；输入框支持 Enter 发送、Shift+Enter 换行。
+
+- 使用“会话”创建、切换和恢复对话。
+- 持续追问时保持在同一会话，后端会恢复历史并对较早内容生成摘要。
+- 出现“回答尚未完成”且提供“继续生成”按钮时，可继续最后一条可续写回答。续写保存为新回复，不覆盖原文。
+- 图片内容不会完整持久化恢复；涉及历史图片的重试可能需要重新附图。
+
+会话摘要用于控制上下文长度，并非原文的无损副本。重要约束可在新问题中再次明确。
+
+### 浏览器自动化
+
+1. 打开任务目标网页，先完成必要的登录，并确认账号及页面正确。
+2. 在输入框旁启用“自动化”。
+3. 描述目标、操作范围和结束条件，例如：“在当前测试表单中填写姓名为 Demo，检查必填项，但不要提交。”
+4. 查看执行步骤和页面变化，确认结果符合要求；需要终止时点击停止。
+
+任务绑定启动时的标签页。扩展采集页面元素及截图，后端决定动作，再由扩展通过 Chrome DevTools Protocol 执行。切换活动标签不会自动切换任务目标。
+
+可用动作包括 `click`、`type`、`clear`、`press_key`、`select`、`focus`、`hover`、`scroll`、`scroll_to_element`、`navigate`、`wait`。输入支持原生输入框、普通 contenteditable 和已适配的 CodeMirror 5；复杂富文本、跨域 iframe 等页面仍可能受限。
+
+观察失败时会重新获取页面状态；动作超时会先确认原动作状态，避免直接重复执行。如果提示执行状态无法确认，先检查网页实际结果，不要立即重试有副作用的任务。停止不会撤销已经发生的操作。
+
+不支持通用拖拽、桌面鼠标控制或自动通过验证码。验证码需人工处理；支付、转账、删除等操作应在明确授权和人工监督下进行。
+
+### 文档知识库
+
+**准备服务。** 配置 embedding 和 Qdrant，重启后端：
+
+| 配置项 | 说明 |
+| --- | --- |
+| `EMBEDDING_BASE_URL` / `EMBEDDING_API_KEY` | 向量化服务的兼容接口地址和密钥 |
+| `EMBEDDING_MODEL` | 实际部署的 embedding 模型 ID |
+| `MEMORY_VECTOR_SIZE` | embedding 实际输出维度，必须与集合一致 |
+| `QDRANT_URL` / `QDRANT_API_KEY` | Qdrant 地址和可选密钥 |
+| `QDRANT_MEMORY_COLLECTION` | 使用的集合名，未设置时为 `agent_memories` |
+
+知识库和长期记忆使用命名向量 `dense` / `text`，由不同的内容类型和标识区分。更换 embedding 模型或维度前应备份数据并规划重建索引；即使两个模型维度相同，也不能直接混用其向量。
+
+**上传并提问。**
+
+1. 进入“知识库”，点击“新建知识库”，填写名称。
+2. 打开该知识库，上传文档。
+3. 等待文档状态由 `pending` 变为 `indexed`；`failed` 表示未完成索引，需查看错误。
+4. 回到聊天，通过输入框旁的“知识库”按钮选择对应库。
+5. 提出文档中的具体问题，查看检索过程、回答及来源。
+
+支持 PDF、Markdown 和 UTF-8 文本，默认单文件上限为 50 MiB。扫描版 PDF 没有 OCR，需要先转换成可提取文字的文档。上传成功只代表文件已接收，索引成功后才能检索。
+
+可用“刷新”同步列表，删除的库可在“回收站”中查看或恢复。删除后同步未完成、恢复失败等状态需按提示处理；彻底删除不可恢复。
+
+**可选精排。** 若有兼容 rerank 服务，配置：
+
+```dotenv
+KB_RERANK_ENABLED=true
+KB_RERANK_API_URL=http://127.0.0.1:18200/rerank
+KB_RERANK_API_KEY=replace-with-your-reranker-key
+KB_RERANK_MODEL=your-reranker-model
+KB_RERANK_TOP_K=5
+```
+
+地址须包含服务实际提供的完整调用路径。适配器使用 `model/query/documents/top_n` 请求和 `results[].index/relevance_score` 响应；Key 要求非空。调用失败会退回原检索排序，精排分数阈值应结合自己的模型和文档调整。
+
+### 长期记忆
+
+长期记忆与知识库共用 embedding 和 Qdrant 配置，还需要可用的 `MEMORY_MODEL`。
+
+在“记忆”面板可以查看、添加、编辑、删除记忆，或点击“整理”让模型处理冲突、过期和重复信息。对话也会按配置触发记忆提取，但并非每条消息都会成为长期记忆。
+
+| 配置项 | 默认值 | 作用 |
+| --- | --- | --- |
+| `CHAT_WRITE_EVERY_N_TURNS` | `3` | 聊天记忆提取的轮次间隔 |
+| `MEMORY_RETHINK_DAEMON_ENABLED` | `1` | 是否启用定期整理；设为 `0` 关闭 |
+
+长期记忆保存偏好、稳定事实及事件信息；聊天历史保存对话记录；会话摘要压缩较早上下文。三者用途不同，删除或修改一种并不等于处理了全部数据。记忆提取和整理会产生额外模型调用。
+
+### 联网搜索与来源
+
+接入 SearXNG 后，在后端配置：
+
+```dotenv
+SEARCH_ENABLED=1
+SEARXNG_API_URL=http://127.0.0.1:19080/search
+SEARCH_RESULT_COUNT=5
+SEARCH_TIMEOUT=20
+```
+
+以上地址适用于本项目 Compose 的同机部署；已有搜索服务时填写自己的完整 `/search` 地址。后端模板中的示例端口是 `8888`，需按实际部署修改。
+
+- `SEARCH_ENABLED=1` 允许模型自行选择联网搜索。
+- 点击输入框旁“搜索”按钮，表示本轮要求联网；关闭自动搜索不等于禁用该按钮。
+- 模型结合会话生成查询，每条用户问题最多进行 3 次搜索，搜索和生成共用时间预算。
+- 联网失败和正常“无匹配”是不同状态；失败不能证明网上没有相关内容。
+
+回答中的 `[N]` 对应本轮来源。来源卡片表示检索到了资料，不一定已被正文引用；模型仍可能错引，重要结论应打开来源复核。查询时间、抓取时间也不等于网页发布时间。
+
+未启用正文服务时，模型使用搜索摘要；需要读取更多页面内容时，按下一节接入 web-reader。
+
+## 部署搜索与正文服务
+
+SearXNG 提供候选网页，web-reader 使用 Trafilatura 提取公开 HTML 正文。两者是独立服务，可分别启用。项目的 Compose 不包含 Open WebUI、模型服务、Qdrant 或主后端。
+
+完整参数及维护命令见 [部署文档](deploy/README.md)，正文协议见 [web-reader 文档](addons/web-reader/README.md)。下列命令在存放仓库的部署机器上运行；Linux 可将 `python` 换为 `python3`。
+
+### 1. 选择部署方式
+
+**已有 SearXNG，只新增正文服务：**
+
+```bash
+python deploy/init.py
+docker compose --env-file deploy/.env -f deploy/compose.yaml --profile reader config --quiet
+docker compose --env-file deploy/.env -f deploy/compose.yaml --profile reader up -d --build
+```
+
+**同时部署搜索和正文服务：**
+
+```bash
+python deploy/init.py --with-search
+docker compose --env-file deploy/.env -f deploy/compose.yaml --profile search --profile reader config --quiet
+docker compose --env-file deploy/.env -f deploy/compose.yaml --profile search --profile reader up -d --build
+```
+
+初始化只创建缺失配置并生成密钥，不覆盖已有 `deploy/.env`。仅部署 reader 不会启动另一套 SearXNG。
+
+### 2. 配置后端访问
+
+在 `backend/config/.env` 中设置：
+
+```dotenv
+WEB_READER_ENABLED=1
+WEB_READER_API_URL=http://127.0.0.1:19081
+WEB_READER_API_KEY=copy-the-key-from-deploy-env
+WEB_READER_MAX_PAGES=3
+WEB_READER_TIMEOUT=20
+WEB_READER_CONTEXT_TOKENS=6000
+```
+
+将占位密钥替换成 `deploy/.env` 中的同一个 `WEB_READER_API_KEY`，至少 32 个 ASCII 字符。服务地址填写基址，不添加 `/v1/extract`。保存后重启实际运行的后端。
+
+默认端口为 SearXNG `19080`、web-reader `19081`，仅绑定 `127.0.0.1`。跨机器部署时：
+
+1. 在 `deploy/.env` 修改 `READER_BIND_IP`；需要远程搜索时同时修改 `SEARCH_BIND_IP`。
+2. 重新执行对应的 `up -d`，使端口映射生效。
+3. 后端填写服务器可访问的地址，不要使用后端自身的 `127.0.0.1`。
+4. 限制允许访问的客户端，跨不可信网络使用 HTTPS / VPN。
+
+`0.0.0.0` 是监听所有 IPv4 网卡的地址，不是客户端应填写的目标地址。不同 Compose 项目默认网络隔离，不能假定通过服务名即可互通。
+
+### 3. 验证服务和实际使用
+
+以下示例在部署机器上执行，读取本地 `deploy/.env` 的密钥：
+
+```bash
+python deploy/check.py --reader-url http://127.0.0.1:19081
+python deploy/check.py --reader-url http://127.0.0.1:19081 --url https://www.python.org/downloads/
+python deploy/check.py --search-url http://127.0.0.1:19080/search
+```
+
+第一条检查进程就绪；第二条实际抓取网页，应有正文和结构块；第三条执行搜索。按已部署服务选择执行，不要频繁重复搜索检查。
+
+随后在侧边栏进行一次联网提问，查看搜索卡片中的“已读取”和“纳入”数量，以及来源的正文 / 节选 / 摘要标签：
+
+- **已读取**：正文服务成功提取了文本。
+- **已纳入**：本次工具结果实际放入模型上下文的正文来源。
+- 读取失败时保留搜索摘要；预算不足、没有可容纳的完整段落或本轮内容重复时，可能不新增正文。
+
+web-reader 不执行 JavaScript，不使用登录 Cookie，不处理 PDF 或验证码。它默认限制下载 / 解压数据为 2 MiB，返回正文最多 100000 字符、2048 个结构块；后端还会进一步节选，不会把提取上限直接作为模型输入量。
 
 ## 配置参考
 
-### 模型、向量与存储
+### 配置文件与生效方式
 
-| 字段 | 当前用途 / 注意事项 |
-| --- | --- |
-| `MODEL_BASE_URL` | 后端上游模型接口的 Base URL，通常以 `/v1` 结尾 |
-| `OPENAI_API_KEY` | 后端调用上游模型的密钥；无鉴权自建服务也需满足 SDK 的非空 Key 要求 |
-| `MEMORY_MODEL` | 会话标题、摘要及记忆等辅助任务使用的模型，应显式配置为可用模型；不替代扩展选择的聊天 / 自动化模型 |
-| `EMBEDDING_BASE_URL` / `EMBEDDING_API_KEY` / `EMBEDDING_MODEL` | 文档与记忆向量化使用的服务 |
-| `QDRANT_URL` / `QDRANT_API_KEY` | Qdrant 地址及可选鉴权 |
-| `QDRANT_MEMORY_COLLECTION` | 当前记忆与文档知识库使用的集合，默认 `agent_memories` |
-| `MEMORY_VECTOR_SIZE` | 当前 dense 向量维度，代码默认 `4096`；必须匹配 embedding 的实际输出 |
-| `QDRANT_DISTANCE` | 距离度量，默认 `Cosine` |
-
-当前向量存储使用命名向量 `dense` / `text`。旧模板中的 `QDRANT_VECTOR_SIZE`、`KNOWLEDGE_VECTOR_SIZE`、`QDRANT_COLLECTION` 不是当前知识库 / 记忆维数及集合的控制项。
-
-修改 `MEMORY_VECTOR_SIZE` 不会迁移已有集合。更换 embedding 模型或维度时，应先核对实际输出和集合结构，再安排备份及重新索引；即使维度相同，不同模型的向量也不应直接混用。
-
-模板里的 `AGENT_MODE`、`KNOWLEDGE_BACKEND`、旧 `KNOWLEDGE_*`、`MONGODB_*` 等字段不要当作当前主流程的有效切换开关。
-
-### 长会话与记忆
-
-下列数值是代码默认值，不是对任意模型都适用的推荐值；模板可能未包含所有键。
-
-| 字段 | 默认值 | 含义 |
+| 位置 | 管理的内容 | 修改后如何生效 |
 | --- | --- | --- |
-| `CHAT_CONTEXT_LENGTH` | 128000 | 上下文窗口预算，必须按模型服务实际配置调整 |
-| `CHAT_MAX_OUTPUT_TOKENS` | 8192 | 单次回复输出上限；输入预算会扣除这部分与安全余量 |
-| `CHAT_CONTEXT_SAFETY_TOKENS` | 2048 | 安全余量 |
-| `CHAT_COMPACT_TRIGGER_RATIO` | 0.70 | 开始压缩历史的预算比例 |
-| `CHAT_COMPACT_HARD_RATIO` | 0.90 | 硬预算比例 |
-| `CHAT_COMPACT_KEEP_PAIRS` | 3 | 压缩时保留的近期完整对话轮数 |
-| `CHAT_COMPACT_SUMMARY_MAX_TOKENS` | 800 | 保留摘要的目标上限 |
-| `CHAT_COMPACT_MAX_OUTPUT_TOKENS` | 4096 | 摘要生成请求的输出上限，与保留摘要长度不同 |
-| `CHAT_WRITE_EVERY_N_TURNS` | 3 | 聊天长期记忆提取的轮次间隔 |
-| `MEMORY_RETHINK_DAEMON_ENABLED` | 1 | 定期记忆整理开关，设为 `0` 关闭后台任务 |
+| 扩展“设置” | 后端地址、聊天 / 自动化模型及前端参数 | 保存设置 |
+| `backend/config/.env` | 上游服务、检索及聊天预算 | 重启后端 |
+| `deploy/.env` | 可选服务镜像、端口、密钥及资源参数 | 对相应服务重新执行 `docker compose ... up -d` |
 
-当前 token 计算仍是估算，不等于目标部署模型的精确 tokenizer。服务端预算保护不意味着旧兼容聊天和浏览器自动化已获得相同的长会话方案。
+两份 `.env` 不自动同步。模板见 [后端配置](backend/config/.env.example) 和 [部署配置](deploy/.env.example)。终端或 IDE 已设置的同名环境变量优先于后端 `.env`，修改文件后仍未生效时应检查启动环境。
 
-服务端会话在模型明确返回长度截断且已有正文时，会保存正文和引用，标记“已保存，回答尚未完成”，支持手动“继续生成”。续写创建关联的新请求，不覆盖原文；重发原请求只回放已保存内容。空正文、截断工具参数、连接失败仍走失败处理，不自动无限续写。含图请求的历史图片尚未持久化，因此不能直接恢复为续写；网络断流和进程崩溃下的实时草稿恢复不在此机制范围内。
+模板保留了兼容字段：`AGENT_MODE`、`QDRANT_VECTOR_SIZE`、`QDRANT_COLLECTION`、旧 `KNOWLEDGE_*` 和 `MONGODB_*` 不控制本文所述主流程。文档与记忆集合、维度以 `QDRANT_MEMORY_COLLECTION`、`MEMORY_VECTOR_SIZE` 为准。
 
-环境变量读取不会默认覆盖进程里已有的同名变量；如果改了 `.env` 却不生效，检查启动终端 / IDE 的环境配置后重启。
+### 上下文、输出与正文预算
 
-### 文档知识库、精排与搜索
+| 配置项 | 代码默认值 | 用途 |
+| --- | --- | --- |
+| `CHAT_CONTEXT_LENGTH` | `128000` | 模型上下文窗口，必须按实际服务调整 |
+| `CHAT_MAX_OUTPUT_TOKENS` | `8192` | 单次模型回复输出上限 |
+| `CHAT_CONTEXT_SAFETY_TOKENS` | `2048` | 给计数误差及请求包装预留余量 |
+| `CHAT_COMPACT_TRIGGER_RATIO` | `0.70` | 触发后台历史压缩的输入额度比例 |
+| `CHAT_COMPACT_HARD_RATIO` | `0.90` | 触发请求内同步压缩的比例 |
+| `CHAT_COMPACT_KEEP_PAIRS` | `3` | 压缩时保留的近期对话对数 |
+| `CHAT_COMPACT_SUMMARY_MAX_TOKENS` | `800` | 保留摘要的目标上限 |
+| `CHAT_COMPACT_MAX_OUTPUT_TOKENS` | `4096` | 摘要模型单次调用的输出上限 |
+| `WEB_READER_CONTEXT_TOKENS` | `6000` | 一条用户问题内网页正文和摘要共用的估算额度 |
 
-- 支持 `.pdf`、`.md`、`.markdown`、`.txt`。扫描 PDF 暂不提供 OCR，正文过少时可能拒绝索引；文本文件应使用 UTF-8。
-- 上传后通过文档状态确认索引完成：`pending` → `indexed` / `failed`。上传成功不等于可检索。
-- 新文档分批写入不可检索的暂存版本，完整校验后发布；检索还会核对 SQLite 中的库、文档和已发布版本，失败或已删除文档不能仅凭向量的 `valid=true` 被返回。
-- 删除先逻辑隐藏，向量同步失败时返回 `sync_pending=true`，后台每 30 秒尝试收敛。恢复必须完成向量校验和同步后才重新开放；暂时失败返回 503，可重试，不表示已还原。单独删除的文档不会随整库还原。
-- 首次升级会在元数据数据库旁生成 `*.kb-lifecycle-*.sqlite3` 备份，并以事务添加生命周期字段；旧索引先核对完整性再开放，不清空向量。重启中断的索引标为失败，需要重新上传；缺片的旧索引保持隔离，需人工核验。
-- `KB_MAX_FILE_BYTES` 后端默认 50 MiB，前端也有 50 MiB 限制；单改后端配置不会提高前端上限。
-- `KB_CHUNK_SIZE=512`、`KB_CHUNK_OVERLAP=0` 控制文档 token 分块；不应拿旧网页快照分块字段配置它。
-- 精排需设置 `KB_RERANK_ENABLED=true`，并填写 `KB_RERANK_API_URL`、`KB_RERANK_API_KEY`、`KB_RERANK_MODEL`。URL 必须是完整调用路径（例如服务实际提供的 `/rerank`），代码不会自动补路径。
-- 当前精排适配器要求非空 Key；服务无鉴权时，也需要使用该服务接受的非空占位值。接口需兼容 `model/query/documents/top_n` 请求及 `results[].index/relevance_score` 返回格式。
-- 精排缺少配置或调用失败会退回原检索排序；界面开关开启不证明精排实际成功，应结合日志验证。精排分数阈值应针对所用模型校准。
-- `SEARXNG_API_URL` 填 SearXNG 搜索接口的完整路径（通常为 `/search`），需支持 JSON 结果。`SEARCH_ENABLED=1` 开启聊天自动搜索工具；关闭它不等于禁用前端手动搜索路径。
-- 点击搜索按钮表示本轮必须联网：模型先结合会话历史生成独立查询，再检索和回答；需要支持兼容的命名工具强制调用。每轮最多搜索 3 次，可换词补搜；搜索、模型调用共用时间预算。接口不支持工具调用时明确报错，不退回原话搜索。
-- 服务端会话恢复最近最多 3 轮、每轮最多 5 条的历史网页来源摘要，并限制总长度；历史查询时间不等于网页发布时间，旧引用编号不作为本轮编号。搜索卡片区分正常无匹配、部分引擎失败和请求失败；`web_search_finished` 日志记录关联请求、实际查询、次数、耗时及状态。
+可用输入额度 = 上下文窗口 − 输出上限 − 安全余量。例如窗口为 65536、输出上限为 8192、安全余量为 2048 时，输入额度为 55296。
 
-### 可选正文增强
+网页资料额度包含在总输入额度内，多次搜索共享；下一条用户问题重新计数。历史消息、工具定义、标题和 URL 也占上下文。不是每次搜索都额外增加 6000，也没有固定的首次 / 后续分配比例。
 
-本项目提供独立的 [web-reader](addons/web-reader/README.md) 服务，可与官方 SearXNG 通过本项目的 Compose 按需部署。它不依赖其他聊天 UI、模型或向量数据库。完整步骤见 [部署说明](deploy/README.md)。已有 SearXNG 只需要启动 `reader`，无需重复部署搜索服务。
+token 数量采用估算，不等于目标模型的精确计数。遇到超额时会缩减可移除的网页资料或明确报错，不保证任意长度请求都可继续。降低正文额度会减少资料覆盖，提高输出上限则会减少可用输入空间。
 
-- 后端默认 `WEB_READER_ENABLED=0`；启用后配置 `WEB_READER_API_URL`（基址）及 `WEB_READER_API_KEY`，默认每次搜索读取 3 个去重页面。
-- 正文读取在 `web_search` 内自动执行，搜索和抓取共享本轮时间预算。长正文按相关段落及上下文额度节选；前端区分提取正文、正文节选和仅搜索摘要。
-- reader 0.2.0 返回标题/段落/列表/表格/代码的有序偏移；按完整窗口选择并保留邻近条件，不硬截半句话。旧服务会标记“旧版服务文本”，需同步升级远端 reader 才能修复原文结构。
-- `WEB_READER_CONTEXT_TOKENS` 默认 6000，作用域是一次用户提问到最终回答；多次搜索共用、缓存不重复注入相同块，下一条问题重新计数。完整请求还检查历史、工具、标题和 URL，并预留模型输出及安全余量。当前为保守估算，不是目标模型精确 tokenizer。
-- 失败只降级正文增强，不把抓取失败当成搜索失败，也不收起整段回答。搜索卡片显示读取成功/失败数量，单条来源显示读取状态。
-- 已读正文的必要节选和日期随来源保存，历史恢复仍受长度限制；不保存整页 HTML。正文可读不代表事实正确，也不保证来源是最新。
-- 服务不执行 JavaScript、不使用登录 Cookie、不处理 PDF。公开 URL 会受公网目标、重定向、大小和超时限制。真实配置和密钥不能提交。
+## 更新与维护
 
-## 常用操作
+### 更新应用
 
-- **聊天 / 自动化切换**：普通问答关闭自动化；操作网页时启用自动化，并确认当前目标标签页。
-- **知识库**：在知识库面板建库、上传并等待索引成功，再在聊天输入区域选择对应知识库。后端新增的库可用刷新按钮同步。
-- **历史会话**：使用本项目后端时，从历史列表恢复；不要手工拼接旧消息冒充服务端当前轮请求。
-- **图片 / 网页内容**：可上传图片、框选截图或读取网页文本辅助聊天；这不等于旧版网页快照自动入库。
-- **停止任务**：停止后续输入和模型结果发布，尝试释放已按下的键 / 鼠标；已发出的浏览器命令不能保证被中断，也不会撤销已经发生的网页操作。界面会区分正在停止和执行状态未确认。
+1. 结束正在运行的自动化任务，保留本地配置，并备份有价值的数据。
+2. 检查工作区改动，再更新所使用的分支。没有分叉时可使用：
+   ```bash
+   git status
+   git pull --ff-only
+   ```
+   如果存在冲突或分叉，先处理，不要强行覆盖本地更改。
+3. 按新版本的 `backend/requirements.txt` 更新依赖，对照模板补充配置，保留原有有效值。
+4. 停止并重启后端；在 `chrome://extensions` 重新加载扩展，然后关闭并重开侧边栏。仅刷新网页不够。
+5. 重新检查基本聊天、会话恢复，以及启用的知识库和搜索功能。
 
-## 后端接口概览
+后端与扩展应使用匹配版本。后端重启不会续接旧自动化任务；重新开始前先确认页面上已发生的操作。
 
-以运行中的 OpenAPI 和 [backend/api](backend/api) 为准。以下路径均相对于后端地址：
+### 更新或停用正文服务
 
-| 方法与路径 | 用途 |
+更新源码后，在部署机器重新构建对应服务：
+
+```bash
+docker compose --env-file deploy/.env -f deploy/compose.yaml --profile reader up -d --build web-reader
+```
+
+检查 `deploy/.env` 的镜像标签是否与新版本一致，保留已有绑定地址、端口和密钥，再运行服务检查。无需重建另一项目的 SearXNG。
+
+暂时停用增强时，将后端 `WEB_READER_ENABLED` 设为 `0` 并重启后端；搜索仍可使用摘要。容器升级、回退及更多维护步骤见 [部署文档](deploy/README.md)。
+
+### 备份与恢复
+
+| 数据 | 保存位置 |
 | --- | --- |
-| `POST /v1/chat/completions` | 聊天入口，支持服务端会话协议及兼容客户端模式 |
-| `POST /v1/agent/execute` | 创建自动化任务并取得首步决策 |
-| `POST /v1/agent/step`、`POST /v1/agent/cancel` | 回传观察 / 动作结果推进任务，或取消任务 |
-| `POST /v1/agent/status` | 按 `session_id`、`request_id` 查询原决策；超时不另起一步 |
-| `GET /v1/sessions/capabilities`、`GET /v1/sessions/list` | 能力探测与历史会话列表 |
-| `GET /v1/sessions/{chat_id}/messages` | 消息分页，支持 `before_seq`、`limit` |
-| `GET /v1/sessions/{chat_id}/requests/{request_id}` | 查询请求状态，供恢复与重试使用 |
-| `PATCH /v1/sessions/{chat_id}`、`DELETE /v1/sessions/{chat_id}` | 会话管理 |
-| `POST /v1/kb`、`GET /v1/kb` | 创建、列出知识库 |
-| `POST /v1/kb/{kb_id}/docs`、`GET /v1/kb/{kb_id}/docs`、`GET /v1/kb/{kb_id}/docs/{doc_id}/status` | 文档上传、列表、索引状态 |
-| `GET /v1/kb/trash`、`POST /v1/kb/{kb_id}/restore` | 知识库回收站与恢复；删除接口详见 OpenAPI |
-| `/v1/memory/*` | 长期记忆查询、管理及 rethink |
-| `GET /v1/logs/query`、`GET /v1/logs/sessions`、`GET /v1/logs/files` | 日志查询 |
+| 聊天历史和请求状态 | `backend/data/chat_history.sqlite3` |
+| 知识库元数据、记忆变更审计 | `backend/agent/data/agent_memory.sqlite3` |
+| 文档 / 记忆向量及内容 | 配置的 Qdrant 集合 |
+| 后端与部署配置 | `backend/config/.env`、`deploy/.env`、`deploy/runtime/` |
+| 运行日志 | `backend/logs/` |
 
-服务端聊天需设置 `context_mode: "server"`，携带会话 / 请求标识和预期序号，`messages` 只包含本轮一条用户消息。幂等重试应复用原请求 ID，不要每次生成新 ID；完整行为见 [服务端上下文回归说明](test/audit_review/SERVER_CONTEXT_RESULTS.md)。
+维护前停止相关写入，按 SQLite / Qdrant 对应方式制作一致性备份。只备份一个 SQLite 文件不能恢复全部知识库和记忆。恢复时应匹配数据库、向量集合及 embedding 配置；不要通过删除数据目录或 Docker 数据卷解决普通连接故障。
 
-当前应用没有旧的 `/api/pages/refresh_snapshot`、独立 `/search` 路由，也没有通用 `/v1/models` 代理。兼容聊天入口不等于实现了全部 OpenAI API。
+## 开发与接口
 
-## 项目结构
+### 目录结构
 
 ```text
 browser-agent/
 ├─ backend/
-│  ├─ app.py                  应用入口及路由挂载
-│  ├─ requirements.txt        后端依赖
-│  ├─ api/                    聊天、自动化、会话、知识库、记忆、日志接口
-│  ├─ agent/                  自动化决策、上下文、长期记忆与向量存储
-│  ├─ rag/                    文档解析、索引、检索与精排
-│  ├─ storage/                聊天历史与知识库 SQLite 存储
-│  ├─ search/                 SearXNG 接入及聊天检索工具
-│  ├─ tools/                  自动化动作白名单等工具代码
-│  ├─ config/                 .env 与模板
-│  ├─ data/                   聊天 SQLite 等运行数据
-│  └─ logs/                   分频道 JSONL 日志及可选调试截图
-├─ extension/
-│  ├─ manifest.json           扩展声明与权限
-│  ├─ background.js           CDP 连接、页面观察、浏览器动作执行
-│  ├─ agent_observation.js    自动化观察辅助及截图标注
-│  ├─ agent_editing.js        编辑目标识别、焦点确认与编辑器文档回读
-│  ├─ agent_execution.js      按标签页管理动作占用、去重与执行记录
-│  ├─ agent_runner.js         决策查询、观察恢复与停止协调
-│  ├─ sidepanel.html          侧边栏入口
-│  └─ sidepanel.js            聊天、自动化循环、知识库与历史交互
-├─ test/                      本地测试、用例与验收报告（Git 忽略）
-│  ├─ audit_review/           审计、隔离回归与真实服务验证材料
-│  ├─ eval/                   长期记忆评测
-│  └─ chat_eval/              聊天链路回归脚本
-└─ docs/                      本地文档目录（Git 忽略）
-   └─ TODO.md                 待办、已知问题与暂缓设计
+│  ├─ app.py              FastAPI 应用入口
+│  ├─ api/                聊天、会话、自动化、知识库、记忆和日志接口
+│  ├─ agent/              任务决策、上下文处理和长期记忆
+│  ├─ rag/                文档解析、索引、检索与精排
+│  ├─ search/             搜索、正文客户端、节选及请求预算
+│  ├─ storage/            聊天和知识库元数据存储
+│  └─ config/             后端配置与模板
+├─ extension/             Chrome 扩展界面、页面观察和动作执行
+├─ addons/web-reader/     独立正文服务、Dockerfile 及离线测试
+└─ deploy/                Compose、初始化和服务检查脚本
 ```
 
-## 开发检查与回归
+浏览器动作由扩展执行，后端本身不直接控制浏览器。知识库、搜索属于聊天工具链，不是自动化动作注册表。新增独立增强服务时参照 [addons 维护约定](addons/README.md)。
 
-以下命令从**仓库根目录**执行。`test/` 是本地保留并被 Git 忽略的目录，新克隆的仓库不包含这些测试及下方验收报告；需已有本地测试副本才能运行。测试依赖与前端检查所需的 Node.js 需另行安装。
+### API 入口
 
-```powershell
-.\backend\.venv\Scripts\python.exe -m pip install pytest httpx lxml
-.\backend\.venv\Scripts\python.exe -X utf8 -B -m pytest test/audit_review -q -p no:cacheprovider
+运行后查看 [Swagger](http://127.0.0.1:8000/docs) 或 [OpenAPI](http://127.0.0.1:8000/openapi.json) 中的完整字段。
 
-node test/audit_review/server_frontend.test.cjs
-node test/audit_review/kb_refresh.test.cjs
-node test/audit_review/kb_lifecycle.test.cjs
-node test/audit_review/svg_controls.test.cjs
-node test/audit_review/empty_controls.test.cjs
+| 接口 | 用途 |
+| --- | --- |
+| `POST /v1/chat/completions` | 聊天及检索工具调用 |
+| `GET /v1/sessions/capabilities`、`GET /v1/sessions/list` | 会话能力和历史列表 |
+| `GET /v1/sessions/{chat_id}/messages` | 消息分页 |
+| `GET /v1/sessions/{chat_id}/requests/{request_id}` | 请求状态、恢复及重试信息 |
+| `POST /v1/agent/execute`、`POST /v1/agent/step` | 自动化启动和推进 |
+| `POST /v1/agent/status`、`POST /v1/agent/cancel` | 自动化状态查询和取消 |
+| `/v1/kb` | 建库、文档上传、索引状态、删除与恢复 |
+| `/v1/memory/*` | 长期记忆管理 |
+| `/v1/logs/*` | 日志查询与文件列表 |
 
+自定义客户端使用服务端会话时，设置 `context_mode: "server"`，携带 `chat_id`、`request_id` 和 `expected_last_seq`，只提交本轮用户消息。重试复用原请求 ID；续写使用新请求 ID 并通过 `continuation_of` 关联原回答。实现见 [server_chat.py](backend/api/server_chat.py)。
+
+主后端不提供通用 `/v1/models` 代理。正文服务单独提供 `GET /health`、`POST /v1/extract`，不要将其路由拼到主后端地址下。
+
+### 开发检查
+
+扩展没有构建步骤。安装 Node.js 后可检查语法：
+
+```bash
 node --check extension/background.js
 node --check extension/sidepanel.js
-node --check extension/agent_observation.js
+node --check extension/agent_editing.js
+node --check extension/agent_runner.js
 ```
 
-上述 Python 审计回归使用隔离配置、临时 SQLite / 内存 Qdrant，并阻断外部网络，不应读写真实知识库。已知缺陷可能标记为 `xfail`，不表示已经修复。当前本地核对的 qdrant-client 版本为 1.18.0。
+web-reader 的测试随仓库发布，使用独立 Python 环境，不要与后端应用混装。Windows 示例：
 
-不要直接把整个 `test` 目录当成安全的离线套件：其中有旧架构脚本和真实服务测试，部分会调用模型、写入或清理集合。`live_*.py` 也需要明确的测试数据范围及服务准备，不应仅为检查文档随意运行。
+```powershell
+python -m venv addons/web-reader/.venv
+.\addons\web-reader\.venv\Scripts\python.exe -m pip install -r addons/web-reader/requirements-test.txt
+.\addons\web-reader\.venv\Scripts\python.exe -m pytest addons/web-reader/tests -q
+```
 
-验收记录：
+Linux / macOS 将解释器路径换为 `addons/web-reader/.venv/bin/python`。此套件禁止外部网络，部分测试需要创建子进程。新增行为应配套离线用例；真实模型、网页或知识库测试应使用明确的独立测试范围，避免写入业务数据。
 
-- [长会话与恢复](test/audit_review/SERVER_CONTEXT_RESULTS.md)
-- [SVG 控件](test/audit_review/SVG_CONTROLS_RESULTS.md)
-- [无文本控件](test/audit_review/EMPTY_CONTROLS_RESULTS.md)
-- [编辑器输入与按键](test/audit_review/EDITOR_INPUT_RESULTS.md)
-- [真实 reranker 测试](test/audit_review/LIVE_RERANK_RESULTS.md)
-- [知识库一致性修复与真实流程验收](test/audit_review/KB_LIFECYCLE_RESULTS.md)
-- [详细审计结果](test/audit_review/DEEP_AUDIT_RESULTS.md)
-
-历史报告描述的是各自测试时的环境和结果，不代替当前版本的重新验收。
+`test/`、`docs/`、`output/` 是被 Git 忽略的本地目录，新克隆仓库不包含其中的测试、待办和报告。独立服务接口与测试说明见 [web-reader 文档](addons/web-reader/README.md)。
 
 ## 故障排查
 
-| 现象 | 优先检查 |
+| 现象 | 检查方法 |
 | --- | --- |
-| 会话 / 知识库接口 404 | 前端是否连接本项目后端、路径是否带正确的 `/v1`、模块是否挂载失败 |
-| 模型 400 / 格式错误 | 模型名称、图片 / 工具能力、上游聊天模板、上下文窗口与请求结构；结合实际错误定位 |
-| `Connection error` | 从后端机器检查目标服务、端口与代理；不要把浏览器能访问当成后端可达 |
-| 改配置仍未生效 | 后端进程是否真正重启、IDE / 终端环境变量是否覆盖文件 |
-| 向量维度不匹配 | embedding 实际输出、`MEMORY_VECTOR_SIZE` 与已有 Qdrant 集合是否一致 |
-| 文档一直 pending / failed | 解析、embedding、Qdrant 连接与索引日志；上传成功只是接收文件成功 |
-| 开启精排但结果没变 | 完整 URL、非空 Key、模型、响应协议，以及是否触发回退 |
-| 改了扩展仍是旧行为 | 扩展管理页重新加载，关闭重开侧边栏 |
-| 点击返回成功但任务没完成 | 下一步页面观察是否满足业务条件；事件已发送不等于网页业务成功 |
+| 扩展无法连接 / 接口 404 | 确认后端已启动，扩展地址为后端的 `/v1` 基址；检查启动日志是否有模块加载失败 |
+| 模型报 400 | 核对模型 ID、视觉 / 工具能力、消息模板及实际上下文窗口，根据上游错误定位 |
+| `Connection error` | 从实际发起请求的机器检查服务地址、端口和代理；浏览器能访问不代表后端可达 |
+| 修改配置仍未生效 | 重启后端，检查 IDE / 终端的同名环境变量；部署端口变更需重新 `up -d` |
+| 修改扩展后行为不变 | 在扩展管理页重新加载，关闭并重开侧边栏 |
+| 自动化显示状态未确认 | 检查原网页执行结果，不要直接重复提交；停止不撤销已发生的操作 |
+| 文档一直 `pending` / `failed` | 查看文档错误及后端日志，检查文本解析、embedding、Qdrant 和向量维度 |
+| 开启精排但结果未变化 | 核对完整 rerank 地址、非空 Key、响应格式，以及日志中是否回退 |
+| 搜索返回 0 项 | 检查 SearXNG 的 `results` 与 `unresponsive_engines`；HTTP 200 或容器健康不等于搜索成功 |
+| `too many requests` / `CAPTCHA` / `Suspended` | 上游引擎限制或冷却；减少重复请求，等待恢复。关闭本地 limiter 不能解除上游限制 |
+| reader 本机可用、远端不通 | 检查绑定地址、宿主机端口和访问控制；`127.0.0.1` 只供本机使用 |
+| reader 健康但没有正文 | 显式用 `deploy/check.py --reader-url ... --url ...` 测试目标网页；核对密钥和读取错误 |
+| 已读取但没有纳入 / 回答不完整 | 检查来源的纳入状态、节选标签、上下文预算，以及是否达到输出上限 |
+| 来源卡片存在但正文没有引用 | 模型可能未引用；检索到来源与生成正文引用是两个环节，不能仅凭卡片判断答案有依据 |
 
-日志位于 `backend/logs/{channel}_YYYY-MM-DD.jsonl`。查询时尽量按频道、会话或事件缩小范围，例如 `/v1/logs/query?channel=agent&event=step_result&limit=20`；旧日志查询的完整性问题仍在待办中。启用 `AGENT_DEBUG_SCREENSHOT=1` 并重启后，可保存自动化调试截图到 `backend/logs/screenshots/`，排查结束后建议关闭。
+搜索尚未具备完善的统一限速、跨请求缓存和按引擎冷却状态提前结束补搜策略，遇到引擎不可用时可能连续出现失败提示。此时不要持续发送同类请求来测试是否恢复。
 
-## 数据、权限与当前限制
+日志按频道保存在 `backend/logs/{channel}_YYYY-MM-DD.jsonl`。例如：
 
-- 聊天历史持久化到 `backend/data/chat_history.sqlite3`；记忆审计与知识库元数据使用 `backend/agent/data/agent_memory.sqlite3`。Qdrant 还保存向量及内容 payload，不能只备份一个 SQLite 就认为数据完整。
-- 历史图片内容不做完整持久化恢复；关闭侧边栏后，某些图片失败请求重试需要重新附图。
-- 扩展的 API 地址、模型等设置保存在 `chrome.storage.local`，API Key 使用 `chrome.storage.session`。这不表示后端聊天、知识库和记忆不落盘。
-- 当前 manifest 包含 `debugger` 和 `<all_urls>` 等较广权限。启动自动化后会逐步采集页面内容和截图，并发送到配置的后端 / 模型服务；不只是用户手动截图时才发送。
-- 知识库文本会发送给 embedding 服务，启用精排后候选文本会发送给 reranker。记忆提取和后台 rethink 也可能调用配置的模型服务。
-- 日志与调试截图可能含页面信息、输入内容或其他敏感数据。`.gitignore` 忽略主要配置、数据库和后端日志，但不等于加密、彻底脱敏，也不覆盖所有手工导出目录。
-- 后端尚未完成生产级鉴权和多租户隔离；自动化前端也没有为所有敏感动作启用逐次确认。不要在未审查的任务中授权支付、删除、转账等高风险操作。
-- 自动化决策幂等和取消保护限于单后端进程及会话保留期；重启后不续接旧任务，也未支持多 worker。扩展后台重启发现未完成的执行记录时会阻止自动重放，不能据此宣称任意网页操作具有跨重启的 exactly-once 保证。
-- 旧隐私 / 发布材料（包括 `extension/PRIVACY.md`）尚需按当前权限与数据流另行校准，不能据此认定已满足发布合规要求。
+```text
+/v1/logs/query?channel=chat&event=web_search_finished&limit=20
+/v1/logs/query?channel=chat&event=web_context_selected&limit=20
+/v1/logs/query?channel=chat&event=agentic_context_budget&limit=20
+```
 
-更多已知问题、优先级和暂缓项统一维护在本地 `docs/TODO.md`（不随仓库分发）。本项目当前适合受控的本地开发和测试，不应把已有回归通过等同于生产安全认证。
+分别用于查看搜索结果、实际纳入资料和完整请求预算；通过 `session_id`、日志中的 `request_id` 关联问题。`/v1/logs/query` 只读取当前进程内存缓存，查看重启前的事件应读取对应磁盘日志。
+
+## 安全与数据
+
+- 部署用于受控的个人或团队环境。后端没有完整的入口鉴权及多租户隔离，不应直接开放公网。
+- 扩展拥有较广的网页访问和调试权限。自动化会发送页面内容和截图到后端 / 模型服务，只在信任的页面、账号和任务范围内使用。
+- 文档会发送给 embedding 服务，候选片段可能发送给 reranker；聊天、摘要和记忆处理会调用模型。联网查询发送给搜索服务，选中的网页内容也会进入模型上下文。
+- web-reader 不使用登录态、不持久化整页 HTML，但有限的来源节选会随聊天历史保存。它和后端正文客户端不继承系统 HTTP 代理，部署机器需具备所需网络连通性。
+- 真实 `.env`、数据库、日志和运行产物由 Git 忽略，不代表这些数据已加密或彻底脱敏。分享排障材料前检查其中的密钥、页面信息和用户输入。
+- 模型回答、引用和浏览器操作都需要结合实际结果判断。对敏感操作保留人工确认，不将输出“成功”视为已经完成业务验证。

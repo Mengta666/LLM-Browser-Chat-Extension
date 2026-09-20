@@ -3,7 +3,8 @@
  * 在 background.js (via importScripts) 和 sidepanel.html (via <script>) 中使用
  */
 
-const MAX_PROMPT_LENGTH = 8000;
+const MAX_AGENT_TASK_LENGTH = 8000;
+const DEFAULT_BACKEND_API_URL = 'http://127.0.0.1:8000/v1';
 const CUSTOM_API_BASE_URLS_KEY = 'customApiBaseUrls';
 
 function isPrivateIpv4Host(host) {

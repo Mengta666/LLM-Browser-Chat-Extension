@@ -24,7 +24,7 @@ from agent.state import (
     AgentSession, AgentStatus, PageAction, PageState, ActionResult, HistoryItem,
 )
 from agent.context_builder import (
-    SYSTEM_PROMPT, build_messages, build_plan_block,
+    SYSTEM_PROMPT, build_messages, build_plan_block, MAX_HISTORY_ITEMS,
 )
 from agent.router import should_confirm_action
 from tools.tool_registry import ALLOWED_ACTION_TYPES
@@ -59,7 +59,7 @@ RETRY_DELAYS = [0.5, 1, 2]
 MAX_PARSE_RETRIES = 3   # 结构化输出解析失败（多为网关输出截断）时，重试整次 LLM 调用的上限
 MAX_STALE_RETRIES = 3   # 连续编号失效重观察上限，防打转
 LLM_CALL_TIMEOUT = 90   # 单次 LLM 调用超时秒数（对齐 browser-use llm_timeout 75-90s，防单点卡死）
-COMPACT_TRIGGER_STEPS = 24   # history 超过此条数才触发 compaction（保守，短任务不触发）
+COMPACT_TRIGGER_STEPS = MAX_HISTORY_ITEMS
 COMPACT_KEEP_RECENT = 8      # 摘要后保留的最近步数（首项 + <摘要> + 最近 N 项）
 
 try:
@@ -386,16 +386,12 @@ def _maybe_compact_history(session: AgentSession) -> None:
     """步数很多时，把中间段历史 LLM 总结成一条 compacted_memory，保留 首项 + 摘要 + 最近 N 项。
 
     仅超长任务触发（COMPACT_TRIGGER_STEPS）。摘要失败则不动历史（滑动窗口兜底）。
-    已压过的历史（首项后紧跟 compacted 项）不重复压，避免每步都调 LLM。
+    在窗口将省略原文前更新摘要，已有摘要固定保留。
     """
     items = session.history_items
     if len(items) <= COMPACT_TRIGGER_STEPS:
         return
-    # 已有摘要项（step=-1 标记）紧跟首项 → 说明刚压过，暂不重复压
     if len(items) > 1 and items[1].step == -1:
-        # 只有当摘要后又堆积了足够多新步骤才再次压缩
-        if len(items) - 2 <= COMPACT_TRIGGER_STEPS:
-            return
         head, mid, recent = items[:1], items[2:-COMPACT_KEEP_RECENT], items[-COMPACT_KEEP_RECENT:]
         prev_summary = items[1].memory
     else:

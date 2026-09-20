@@ -19,7 +19,6 @@
     "alarms"
   ],
   "host_permissions": [
-    "https://api.openai.com/*",
     "<all_urls>"
   ],
   "optional_host_permissions": [

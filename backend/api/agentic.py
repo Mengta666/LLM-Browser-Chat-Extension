@@ -8,9 +8,11 @@ from typing import Any, Generator
 from search.tools import parse_tool_arguments, web_search_guidance
 from openai import APIConnectionError, APITimeoutError, APIStatusError
 from agent.memory.chat_context import ContextBudgetError
+from agent.memory.history_tools import HISTORY_TOOL_NAMES, TurnHistoryBudget
 from api.evidence import EvidenceLedger
-from search.excerpts import TurnWebBudget
-from search.context import COUNT_MODE, fit_request, is_context_rejection, render_evidence, request_tokens, sync_source_context
+from search.excerpts import TurnWebBudget, COUNT_MODE as EXCERPT_COUNT_MODE
+from search.context import fit_request, is_context_rejection, render_evidence, sync_source_context
+from agent.token_utils import RequestTokenCounter
 
 from api.chat import (
     _llm_client,
@@ -38,6 +40,9 @@ def run_agentic_loop(
     request_id: str = '',
     require_web_search: bool = False,
     deadline: float | None = None,
+    history_upto_seq: int | None = None,
+    check_active=None,
+    counter=None,
 ) -> Generator[dict, None, None]:
     """
     Agentic loop: 循环调用 LLM 直到不再请求工具（对齐 Anthropic）。
@@ -76,21 +81,25 @@ def run_agentic_loop(
     reader_cache = {}
     reader_budget = TurnWebBudget()
     web_contexts = {}
+    history_budget = TurnHistoryBudget(chat_id, history_upto_seq) if chat_id and history_upto_seq is not None else None
     context_retry_used = False
     if deadline is None and (bound_kb_id or web_enabled):
         deadline = time.monotonic() + max(1, CHAT_LLM_TIMEOUT - 10)
+    counter = counter or RequestTokenCounter(model, deadline=deadline)
     original_question = next((m.get('content', '') for m in reversed(messages) if m['role'] == 'user'), '')
     if not isinstance(original_question, str):
         original_question = ' '.join(p.get('text', '') for p in original_question if p.get('type') == 'text')
 
     for round_idx in range(max_rounds):
+        if check_active:
+            check_active()
         if deadline is not None and time.monotonic() >= deadline:
             yield {"type": "error", "code": "time_budget_exceeded", "content": "本轮生成时间预算已用尽", "steps": all_steps}
             return
         _chat_log.debug("agentic_round", session_id=chat_id, data={"round": round_idx + 1})
 
         # 1. Tool Clearing: token 超限时清除旧 tool_result（零 LLM）
-        tokens_est = _estimate_tokens(working_messages)
+        tokens_est = counter(working_messages, tools)
         if tokens_est > AGENTIC_TOOL_CLEAR_THRESHOLD:
             old_count = len(working_messages)
             working_messages = _clear_old_tool_results(working_messages, keep=AGENTIC_KEEP_RECENT_TOOLS)
@@ -106,7 +115,8 @@ def run_agentic_loop(
         final_reserve = 30 if web_enabled else 0
         finishing = deadline is not None and deadline - time.monotonic() <= final_reserve
         call_tools = None if is_last_round or tool_count >= 12 or finishing else [
-            t for t in tools if t['function']['name'] != 'web_search' or web_count < 3]
+            t for t in tools if (t['function']['name'] != 'web_search' or web_count < 3)
+            and (t['function']['name'] not in HISTORY_TOOL_NAMES or (history_budget and history_budget.available))]
         force_search = require_web_search and web_count == 0
         if force_search:
             call_tools = [t for t in (call_tools or []) if t['function']['name'] == 'web_search']
@@ -125,18 +135,17 @@ def run_agentic_loop(
                 extra['tool_choice'] = {'type': 'function', 'function': {'name': 'web_search'}}
             if enforce_budget or bound_kb_id or web_enabled:
                 from agent.memory import chat_context, config
-                if web_enabled:
-                    tokens, removed = fit_request(working_messages, call_tools, web_contexts)
-                else:
-                    tokens, removed = chat_context.check_budget(working_messages, call_tools), 0
+                tokens, removed = fit_request(working_messages, call_tools, web_contexts, counter=counter)
                 _chat_log.info('agentic_context_budget', session_id=chat_id, data={
                     'request_id': request_id, 'round': round_idx + 1, 'input_tokens': tokens,
-                    'input_limit': chat_context.input_budget(), 'count_mode': COUNT_MODE if web_enabled else 'request_estimate',
+                    'input_limit': chat_context.input_budget(counter), **counter.last,
                     'removed_sources': removed, 'web_used': reader_budget.used, 'web_remaining': reader_budget.remaining})
                 extra['max_tokens'] = config.CHAT_MAX_OUTPUT_TOKENS
             client = _llm_client.with_options(max_retries=0) if deadline is not None and _llm_client.max_retries else _llm_client
             for attempt in range(2):
                 try:
+                    if check_active:
+                        check_active()
                     resp = client.chat.completions.create(
                         model=model, messages=working_messages, tools=call_tools, stream=False,
                         timeout=max(.1, deadline - time.monotonic() - (final_reserve if call_tools else 0)) if deadline is not None else CHAT_LLM_TIMEOUT,
@@ -147,11 +156,11 @@ def run_agentic_loop(
                     if (attempt or context_retry_used or not web_contexts or not is_context_rejection(exc)
                             or (deadline is not None and deadline - time.monotonic() <= final_reserve)):
                         raise
-                    before = request_tokens(working_messages, call_tools)
-                    fit_request(working_messages, call_tools, web_contexts, target=max(0, int(before * .8)))
+                    before = counter(working_messages, call_tools)
+                    fit_request(working_messages, call_tools, web_contexts, target=max(0, int(before * .8)), counter=counter)
                     context_retry_used = True
                     _chat_log.warn('agentic_context_reduced_retry', session_id=chat_id,
-                                   data={'request_id': request_id, 'round': round_idx + 1, 'count_mode': COUNT_MODE})
+                                   data={'request_id': request_id, 'round': round_idx + 1, **counter.last})
         except Exception as exc:
             _chat_log.error("agentic_llm_failed", session_id=chat_id, data={
                 "round": round_idx + 1, "error_type": type(exc).__name__,
@@ -172,6 +181,8 @@ def run_agentic_loop(
             yield {"type": "error", "code": code, "content": content, "steps": all_steps}
             return
 
+        if check_active:
+            check_active()
         sync_source_context(all_steps, web_contexts)
         msg = resp.choices[0].message
         _chat_log.info('agentic_generation_finished', session_id=chat_id, data={
@@ -245,6 +256,9 @@ def run_agentic_loop(
                     if not bound_kb_id or args_dict["kb_id"] != bound_kb_id:
                         error_code = "kb_scope_mismatch"
                         raise ValueError("只能查询当前请求绑定的知识库，请使用绑定的 kb_id")
+                if tool_name in HISTORY_TOOL_NAMES and (not history_budget or not history_budget.available):
+                    error_code = 'tool_budget_exceeded'
+                    raise ValueError('本轮历史回查不可用或预算已用尽')
             except ValueError as exc:
                 error_step = {
                     "type": tool_name, "tool_call_id": tool_id, "status": "error",
@@ -277,14 +291,25 @@ def run_agentic_loop(
             }
 
             # 执行工具
+            if check_active:
+                check_active()
             options = {'timeout': max(.1, deadline - time.monotonic() - final_reserve)} if tool_name == 'web_search' else {}
             if tool_name == 'web_search':
                 options['reader_cache'] = reader_cache
                 options['reader_budget'] = reader_budget
                 from agent.memory import chat_context
-                options['reader_context_tokens'] = max(0, min(reader_budget.remaining, chat_context.input_budget()
-                    - request_tokens(working_messages, call_tools) - 2500))
+                used_tokens = counter(working_messages, call_tools)
+                options['reader_context_tokens'] = max(0, min(reader_budget.remaining, chat_context.input_budget(counter)
+                    - used_tokens - 2500))
+            elif tool_name in HISTORY_TOOL_NAMES:
+                from agent.memory import chat_context
+                options['history_budget'] = history_budget
+                used_tokens = counter(working_messages, call_tools)
+                options['history_context_tokens'] = max(0, chat_context.input_budget(counter)
+                    - used_tokens - 256)
             result_text, search_results, result_meta = _execute_tool(tool_name, args_dict, start_index=ledger.next_index, **options)
+            if check_active:
+                check_active()
             if tool_name == 'web_search':
                 web_count += 1
                 web_queries[query_key] = result_meta.get('outcome')
@@ -306,7 +331,7 @@ def run_agentic_loop(
                 result_text = render_evidence(numbered, result_meta)
                 candidate = working_messages + [{'role': 'tool', 'tool_call_id': tool_id, 'content': result_text}]
                 try:
-                    fit_request(candidate, call_tools, web_contexts)
+                    fit_request(candidate, call_tools, web_contexts, counter=counter)
                 except ContextBudgetError:
                     yield {'type': 'error', 'code': 'context_budget_exceeded',
                            'content': '基础会话与工具信息已超过输入预算，未继续调用模型。', 'steps': all_steps}
@@ -314,7 +339,7 @@ def run_agentic_loop(
                 result_text = candidate[-1]['content']
                 _chat_log.info('web_context_selected', session_id=chat_id, data={
                     'request_id': request_id, 'tool_call_id': tool_id,
-                    'used': reader_budget.used, 'remaining': reader_budget.remaining, 'count_mode': COUNT_MODE,
+                    'used': reader_budget.used, 'remaining': reader_budget.remaining, 'count_mode': EXCERPT_COUNT_MODE,
                     'sources': [{'index': r['citation_index'], 'original_chars': r.get('content_length', 0),
                         'selected_chars': len(r.get('content', '')), 'selected_blocks': r.get('selected_blocks', 0),
                         'context_tokens': r.get('context_tokens', 0), 'context_status': r.get('context_status'),
@@ -350,7 +375,8 @@ def run_agentic_loop(
 
 
 def _execute_tool(tool_name: str, args_dict: dict, start_index: int = 1, *, timeout: float | None = None,
-                  reader_cache=None, reader_context_tokens=None, reader_budget=None) -> tuple[str, list, dict]:
+                  reader_cache=None, reader_context_tokens=None, reader_budget=None,
+                  history_budget=None, history_context_tokens=0) -> tuple[str, list, dict]:
     """执行单个工具，返回正文、引用片段和结构化业务状态。"""
     if tool_name == "web_search":
         from search.tools import execute_web_search
@@ -359,6 +385,12 @@ def _execute_tool(tool_name: str, args_dict: dict, start_index: int = 1, *, time
     elif tool_name in ("kb_search", "kb_list_documents"):
         from search.tools import execute_kb_tool
         return execute_kb_tool(tool_name, args_dict, start_index=start_index)
+    elif tool_name in HISTORY_TOOL_NAMES and history_budget:
+        try:
+            return history_budget.execute(tool_name, args_dict, max_tokens=history_context_tokens)
+        except ValueError as exc:
+            meta = {'outcome': 'error', 'error_code': 'history_budget_exceeded', 'error': str(exc)}
+            return json.dumps(meta, ensure_ascii=False), [], meta
     else:
         return f"未知工具: {tool_name}", [], {"outcome": "error", "error_code": "tool_unavailable", "error": "工具不可用"}
 
@@ -391,16 +423,3 @@ def _clear_old_tool_results(messages: list[dict], keep: int = 3) -> list[dict]:
         else:
             result.append(msg)
     return result
-
-
-def _estimate_tokens(messages: list[dict]) -> int:
-    """粗估 token 数（字符数 / 1.5）。统计 content + tool_calls。"""
-    total_chars = 0
-    for m in messages:
-        # content 字段
-        total_chars += len(str(m.get("content", "")))
-        # tool_calls 字段（assistant 消息）
-        if m.get("tool_calls"):
-            import json
-            total_chars += len(json.dumps(m["tool_calls"]))
-    return int(total_chars / 1.5)

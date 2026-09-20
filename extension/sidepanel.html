@@ -76,17 +76,17 @@
 
   <!-- 设置 Tab -->
   <div id="settings" class="tab-content">
-    <label>API Base URL:</label>
-    <input type="text" id="apiUrl" placeholder="https://api.openai.com/v1">
-    <div class="settings-hint">默认使用 OpenAI。也可以填写可信的 HTTPS OpenAI-compatible API，例如 https://example.com/v1；首次保存会请求该域名权限。</div>
+    <label>Browser Agent 后端地址:</label>
+    <input type="text" id="apiUrl" placeholder="http://127.0.0.1:8000/v1">
+    <div class="settings-hint">必须连接本项目后端，不能填写上游模型接口。默认使用本机后端；远端可填写受信任的 HTTPS 后端地址，首次保存会请求该域名权限。</div>
 
-    <label>API Key:</label>
-    <input type="password" id="apiKey" placeholder="sk-...">
+    <label>后端访问凭证 (API Key):</label>
+    <input type="password" id="apiKey" placeholder="本机 / 内网后端可留空">
     <div id="apiKeyStatus" class="settings-hint"></div>
     <div class="settings-hint">切换 API 地址时需要重新输入该服务对应的 API Key，避免把旧 Key 发到错误服务。</div>
 
     <label>模型 (Model):</label>
-    <input type="text" id="modelName" placeholder="gpt-4o">
+    <input type="text" id="modelName" placeholder="后端上游提供的模型 ID">
 
     <label>自动化 LLM 高级参数(JSON,可选):</label>
     <textarea id="agentLlmParams" rows="6" placeholder='仅自动化模式使用,chat 不受影响。留空即默认。

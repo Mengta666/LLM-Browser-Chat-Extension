@@ -69,6 +69,9 @@ def execute_web_search(query: str, *, timeout: float | None = None, reader_cache
 
 
 def parse_tool_arguments(name: str, arguments: str | dict) -> dict:
+    from agent.memory.history_tools import HISTORY_TOOL_NAMES, parse_history_arguments
+    if name in HISTORY_TOOL_NAMES:
+        return parse_history_arguments(name, arguments)
     if name not in ("web_search", "kb_search", "kb_list_documents"):
         raise ValueError("工具不可用")
     try:

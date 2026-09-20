@@ -16,6 +16,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 from openai import OpenAI
+from openai import APIConnectionError, APITimeoutError, APIStatusError
 
 from agent.memory.config import (
     CHAT_COMPACT_KEEP_PAIRS,
@@ -82,22 +83,49 @@ CHAT_COMPACT_SYSTEM_PROMPT = f"""你是对话压缩器,把一段用户与AI助�
 # LLM 调用(纯文本输出,非 JSON)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _summarize_llm(system_prompt: str, user_prompt: str) -> str:
-    """调 LLM 生成摘要(纯文本)。失败返回空串。"""
+class SummaryError(Exception):
+    def __init__(self, code, retryable=False):
+        super().__init__(code)
+        self.code, self.retryable = code, retryable
+
+
+def _summarize_llm(system_prompt: str, user_prompt: str, *, timeout=90, strict=False) -> str:
+    """调用摘要模型；服务端严格模式抛出分类错误，旧入口失败返回空串。"""
     try:
-        resp = _llm_client.chat.completions.create(
-            model=_COMPACT_MODEL,
+        options = {}
+        if strict:
+            thinking = os.getenv('CHAT_COMPACT_ENABLE_THINKING', '').lower()
+            if thinking in ('true', 'false'):
+                options['extra_body'] = {'chat_template_kwargs': {'enable_thinking': thinking == 'true'}}
+        client = _llm_client.with_options(max_retries=0) if strict and _llm_client.max_retries else _llm_client
+        resp = client.chat.completions.create(
+            model=os.getenv('CHAT_COMPACT_MODEL') or _COMPACT_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            timeout=90,
+            timeout=timeout,
             max_tokens=CHAT_COMPACT_MAX_OUTPUT_TOKENS,
+            **options,
         )
         if resp.choices[0].finish_reason == 'length':
+            if strict:
+                raise SummaryError('compaction_output_truncated')
             return ''
-        return (resp.choices[0].message.content or "").strip()
+        content = (resp.choices[0].message.content or "").strip()
+        if strict and (resp.choices[0].finish_reason != 'stop' or not content):
+            raise SummaryError('compaction_invalid_output')
+        return content
     except Exception as exc:
+        if strict:
+            if isinstance(exc, SummaryError):
+                raise
+            if isinstance(exc, (APIConnectionError, APITimeoutError)):
+                raise SummaryError('compaction_network_error', True) from None
+            if isinstance(exc, APIStatusError):
+                raise SummaryError('compaction_upstream_error' if exc.status_code >= 500 or exc.status_code == 429
+                                   else 'compaction_configuration_error', exc.status_code >= 500 or exc.status_code == 429) from None
+            raise SummaryError('compaction_model_error') from None
         _log.error("compact_llm_failed", data={"error": str(exc)[:200]})
         return ""
 

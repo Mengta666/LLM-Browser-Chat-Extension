@@ -10,12 +10,13 @@ from starlette.concurrency import iterate_in_threadpool
 
 from agent.memory import chat_context as context
 from agent.memory import config as C
+from agent.token_utils import RequestTokenCounter
 from storage import chat_store as store
 
 
 def handle(item):
     from api import chat
-    deadline = time.monotonic() + max(1, chat.CHAT_LLM_TIMEOUT - 10)
+    turn_deadline = time.monotonic() + max(1, min(570, C.CHAT_TURN_TIMEOUT))
     if not item.chat_id or not item.request_id or item.expected_last_seq is None:
         return JSONResponse(status_code=422, content={'error': {'code': 'session_fields_required'}})
     if len(item.messages) != 1 or item.messages[0].get('role') != 'user':
@@ -40,7 +41,10 @@ def handle(item):
         turn = store.begin_turn(item.chat_id, item.request_id, digest, item.expected_last_seq, user_text or '[图片]', retry_json,
                                 continuation_of=item.continuation_of)
     except store.SessionError as exc:
-        return JSONResponse(status_code=exc.status, content={'error': {'code': exc.code}})
+        payload = {'error': {'code': exc.code}}
+        if exc.code == 'context_compaction_pending':
+            payload['context_compaction'] = store.compaction_progress(store.get_compaction(item.chat_id))
+        return JSONResponse(status_code=exc.status, content=payload)
     except Exception:
         return JSONResponse(status_code=503, content={'error': {'code': 'history_unavailable'}})
 
@@ -48,6 +52,8 @@ def handle(item):
         saved = turn['status'] in ('completed', 'partial')
         finish_reason = 'stop'
         error_message = ''
+        def check_active():
+            store.ensure_turn_active(item.chat_id, item.request_id, turn['attempt'])
         try:
             if saved:
                 record = store.get_request(item.chat_id, item.request_id)
@@ -56,6 +62,8 @@ def handle(item):
                     yield {'enhancement_step': step}
                 yield {'choices': [{'delta': {'content': answer['content']}, 'index': 0}]}
             else:
+                check_active()
+                counter = RequestTokenCounter(item.model, deadline=turn_deadline)
                 from search.tools import WEB_SEARCH_TOOL, KB_SEARCH_TOOL, KB_LIST_DOCUMENTS_TOOL, KB_TOOL_GUIDANCE
                 tools = []
                 if chat._SEARCH_ON or item.search_query.strip():
@@ -68,6 +76,7 @@ def handle(item):
                                  '本条独立呈现，代码和公式请组织成可独立阅读的格式。'
                                  '历史编号只属于历史消息，不能沿用为本轮来源；需要引用时使用本轮检索结果编号。')
                 memory = chat._build_memory_system(user_text, chat_id=item.chat_id)
+                check_active()
                 if memory:
                     parts.append(memory)
                 if item.kb_id:
@@ -76,7 +85,25 @@ def handle(item):
                     if not kb or kb['user_id'] != C.CHAT_USER_ID or kb.get('deleted_at') or kb.get('sync_action'):
                         raise store.SessionError('kb_not_found', 404)
                     parts.append(f'当前绑定知识库「{kb["name"]}」(id: {item.kb_id})。只能查询该库。' + KB_TOOL_GUIDANCE)
-                messages = context.prepare(item.chat_id, current, parts, tools)
+                from agent.memory.history_tools import HISTORY_TOOLS, HISTORY_GUIDANCE
+                history_enabled = store.get_session(item.chat_id)['summary_upto_seq'] > 0
+                if history_enabled:
+                    tools.extend(HISTORY_TOOLS)
+                    parts.append(HISTORY_GUIDANCE)
+                compact_deadline = min(turn_deadline - min(30, chat.CHAT_LLM_TIMEOUT), time.monotonic() + C.CHAT_COMPACT_TIMEOUT)
+                messages = yield from context.prepare_steps(item.chat_id, current, parts, tools,
+                    request_id=item.request_id, attempt=turn['attempt'], deadline=compact_deadline,
+                    counter=counter,
+                    after_compaction=None if history_enabled else (parts + [HISTORY_GUIDANCE], tools + HISTORY_TOOLS))
+                if not history_enabled and store.get_session(item.chat_id)['summary_upto_seq'] > 0:
+                    tools.extend(HISTORY_TOOLS)
+                deadline = min(turn_deadline, time.monotonic() + chat.CHAT_LLM_TIMEOUT)
+                if time.monotonic() >= deadline:
+                    raise store.SessionError('time_budget_exceeded', 502)
+                store.set_turn_phase(item.chat_id, item.request_id, turn['attempt'], 'generating')
+                job = store.get_compaction(item.chat_id)
+                if job and job['request_id'] == item.request_id:
+                    yield {'context_compaction': {**store.compaction_progress(job), 'phase': 'generating'}}
                 full_text = ''
                 steps = []
                 if tools:
@@ -86,6 +113,9 @@ def handle(item):
                                                   bound_kb_id=item.kb_id,
                                                   allow_partial=True,
                                                   request_id=item.request_id,
+                                                  history_upto_seq=turn['user_seq'] - 1,
+                                                  check_active=check_active,
+                                                  counter=counter,
                                                   require_web_search=bool(item.search_query.strip()) and not item.continuation_of,
                                                   deadline=deadline):
                         if event['type'] == 'enhancement_step':
@@ -102,11 +132,16 @@ def handle(item):
                 else:
                     started = time.monotonic()
                     usage = None
-                    response = chat._llm_client.chat.completions.create(model=item.model, messages=messages,
-                        stream=item.stream, timeout=chat.CHAT_LLM_TIMEOUT, max_tokens=C.CHAT_MAX_OUTPUT_TOKENS)
+                    client = chat._llm_client.with_options(max_retries=0) if chat._llm_client.max_retries else chat._llm_client
+                    check_active()
+                    response = client.chat.completions.create(model=item.model, messages=messages,
+                        stream=item.stream, timeout=max(.1, deadline - time.monotonic()), max_tokens=C.CHAT_MAX_OUTPUT_TOKENS)
                     if item.stream:
                         try:
                             for chunk in response:
+                                check_active()
+                                if time.monotonic() >= deadline:
+                                    raise store.SessionError('time_budget_exceeded', 502)
                                 if chunk.usage:
                                     usage = chunk.usage
                                 if chunk.choices:
@@ -121,6 +156,7 @@ def handle(item):
                         finally:
                             response.close()
                     else:
+                        check_active()
                         if response.choices[0].message.tool_calls:
                             raise store.SessionError('unexpected_tool_call', 502)
                         usage = response.usage
@@ -136,6 +172,8 @@ def handle(item):
                     raise store.SessionError('empty_model_answer', 502)
                 if finish_reason not in ('stop', 'length'):
                     raise store.SessionError('model_response_incomplete', 502)
+                if time.monotonic() >= deadline:
+                    raise store.SessionError('time_budget_exceeded', 502)
                 record = store.complete_turn(item.chat_id, item.request_id, turn['attempt'], full_text, steps, finish_reason)
                 saved = True
                 if record['status'] == 'completed' and not item.continuation_of:
@@ -150,7 +188,7 @@ def handle(item):
                    'user_seq': record['user_seq'], 'assistant_seq': record['assistant_seq']},
                    'choices': [{'delta': {}, 'index': 0, 'finish_reason': record['finish_reason'] or 'stop'}]}
         except Exception as exc:
-            code = exc.code if isinstance(exc, store.SessionError) else (
+            code = exc.code if isinstance(exc, (store.SessionError, context.jobs.CompactionError)) else (
                 'context_budget_exceeded' if isinstance(exc, context.ContextBudgetError) else
                 'history_unavailable' if isinstance(exc, sqlite3.Error) else 'turn_failed')
             try:
@@ -158,8 +196,10 @@ def handle(item):
                     store.fail_turn(item.chat_id, item.request_id, turn['attempt'], code)
             except Exception:
                 code = 'history_unavailable'
+            state = store.get_request(item.chat_id, item.request_id) if code != 'history_unavailable' else None
             yield {'error': {'code': code, **({'message': error_message} if error_message else {})}, 'session_meta': {'chat_id': item.chat_id,
-                   'request_id': item.request_id, 'status': 'failed', 'persisted': False},
+                   'request_id': item.request_id, 'status': state['status'] if state else 'failed', 'persisted': False,
+                   'user_persisted': bool(state), 'context_compaction': state.get('context_compaction') if state else None},
                    'choices': [{'delta': {}, 'index': 0, 'finish_reason': 'error'}]}
         finally:
             if not saved:

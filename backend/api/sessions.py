@@ -33,7 +33,16 @@ def list_sessions() -> dict[str, Any]:
 
 @router.get('/capabilities')
 def capabilities():
-    return {'server_context': True, 'protocol_version': 1}
+    return {'server_context': True, 'protocol_version': 1, 'resumable_compaction': True}
+
+
+@router.post('/{chat_id}/requests/{request_id}/cancel')
+def cancel_request(chat_id: str, request_id: str):
+    try:
+        CS.cancel_turn(chat_id, request_id)
+        return CS.get_request(chat_id, request_id)
+    except CS.SessionError as exc:
+        raise HTTPException(exc.status, exc.code)
 
 
 @router.get('/{chat_id}/requests/{request_id}')

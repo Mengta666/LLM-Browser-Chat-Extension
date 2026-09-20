@@ -6,10 +6,11 @@
 单进程、单连接 + 锁。服务端模式以历史为事实源，写入失败不能确认回答已保存；
 旧客户端模式保留其兼容入口。
 
-三张表:
+主要表:
 - chat_sessions:会话身份(chat_id, title, 时间戳, 软删标记)
 - chat_messages:消息正文(message_id, chat_id, role, content, 时间戳)
 - chat_turns:请求幂等、尝试次数和持久化状态
+- chat_compactions:历史压缩计划、检查点和执行版本
 """
 
 import sqlite3
@@ -54,6 +55,7 @@ def _get_conn() -> sqlite3.Connection:
                 with conn:
                     conn.execute("UPDATE chat_turns SET status='interrupted', error_code='backend_restarted' WHERE status='running'")
                     conn.execute("UPDATE chat_sessions SET active_request_id='' WHERE active_request_id!=''")
+                    conn.execute("UPDATE chat_compactions SET status='interrupted',error_code='backend_restarted',generation=generation+1 WHERE status='running'")
             except Exception:
                 conn.close()
                 raise
@@ -138,10 +140,19 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         if 'request_json' not in {row[1] for row in conn.execute('PRAGMA table_info(chat_turns)')}:
             conn.execute("ALTER TABLE chat_turns ADD COLUMN request_json TEXT NOT NULL DEFAULT ''")
         columns = {row[1] for row in conn.execute('PRAGMA table_info(chat_turns)')}
-        for name in ('finish_reason', 'continuation_of'):
+        for name in ('finish_reason', 'continuation_of', 'phase'):
             if name not in columns:
                 conn.execute(f"ALTER TABLE chat_turns ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_turn_role ON chat_messages(chat_id,request_id,role) WHERE request_id!=''")
+        conn.execute("""CREATE TABLE IF NOT EXISTS chat_compactions (
+            chat_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, request_id TEXT NOT NULL,
+            status TEXT NOT NULL, generation INTEGER NOT NULL DEFAULT 1,
+            base_version INTEGER NOT NULL, base_upto_seq INTEGER NOT NULL, through_seq INTEGER NOT NULL,
+            plan_json TEXT NOT NULL, fingerprint TEXT NOT NULL,
+            next_batch INTEGER NOT NULL DEFAULT 0, summary TEXT NOT NULL DEFAULT '',
+            candidate TEXT NOT NULL DEFAULT '', phase TEXT NOT NULL DEFAULT 'summarize',
+            calls INTEGER NOT NULL DEFAULT 0, error_code TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL
+        )""")
 
 
 def ensure_session(chat_id: str, first_user_text: str = "") -> bool:
@@ -359,18 +370,24 @@ def begin_turn(chat_id: str, request_id: str, request_hash: str, expected_last_s
         if session and session['deleted_at']:
             raise SessionError('session_deleted', 404)
         previous = conn.execute('SELECT * FROM chat_turns WHERE chat_id=? AND request_id=?', (chat_id, request_id)).fetchone()
+        job = conn.execute('SELECT request_id,status FROM chat_compactions WHERE chat_id=?', (chat_id,)).fetchone()
         if previous:
             if previous['request_hash'] != request_hash:
                 raise SessionError('request_conflict')
             if previous['status'] in ('completed', 'partial'):
                 return dict(previous)
+        if job and job['status'] in ('running', 'failed', 'interrupted') and job['request_id'] != request_id:
+            raise SessionError('context_compaction_pending')
+        if previous:
             if previous['status'] == 'running':
                 raise SessionError('request_in_progress')
+            if previous['status'] == 'cancelled':
+                raise SessionError('request_cancelled')
             if session['active_request_id']:
                 raise SessionError('chat_busy')
             if session['last_seq'] != previous['user_seq']:
                 raise SessionError('retry_stale')
-            conn.execute("UPDATE chat_turns SET status='running',attempt=attempt+1,error_code='',updated_at=? WHERE chat_id=? AND request_id=?", (now, chat_id, request_id))
+            conn.execute("UPDATE chat_turns SET status='running',phase='preparing',attempt=attempt+1,error_code='',updated_at=? WHERE chat_id=? AND request_id=?", (now, chat_id, request_id))
         else:
             if session and session['active_request_id']:
                 raise SessionError('chat_busy')
@@ -420,6 +437,8 @@ def fail_turn(chat_id: str, request_id: str, attempt: int, code: str, interrupte
         cur = conn.execute("UPDATE chat_turns SET status=?,error_code=?,updated_at=? WHERE chat_id=? AND request_id=? AND attempt=? AND status='running'", ('interrupted' if interrupted else 'failed', code, _now_iso(), chat_id, request_id, attempt))
         if cur.rowcount:
             conn.execute("UPDATE chat_sessions SET active_request_id='' WHERE chat_id=? AND active_request_id=?", (chat_id, request_id))
+            conn.execute("UPDATE chat_compactions SET status=?,error_code=?,generation=generation+1,updated_at=? WHERE chat_id=? AND request_id=? AND status='running'",
+                         ('interrupted' if interrupted else 'failed', code, _now_iso(), chat_id, request_id))
 
 
 def get_request(chat_id: str, request_id: str) -> dict[str, Any] | None:
@@ -438,7 +457,124 @@ def get_request(chat_id: str, request_id: str) -> dict[str, Any] | None:
                                       and session['last_seq'] == row['assistant_seq']
                                       and not session['active_request_id'] and not session['deleted_at'])
         result['messages'] = [dict(message) for message in conn.execute('SELECT message_id,seq,role,content,tools FROM chat_messages WHERE chat_id=? AND request_id=? ORDER BY seq', (chat_id, request_id))]
+        job = get_compaction(chat_id)
+        result['context_compaction'] = compaction_progress(job) if job and job['request_id'] == request_id else None
+        result['can_cancel'] = row['status'] in ('running', 'failed', 'interrupted') and session['last_seq'] == row['user_seq'] and not session['deleted_at']
         return result
+
+
+def ensure_turn_active(chat_id, request_id, attempt):
+    conn = _get_conn()
+    with _lock:
+        row = conn.execute("SELECT 1 FROM chat_turns t JOIN chat_sessions s ON s.chat_id=t.chat_id "
+                           "WHERE t.chat_id=? AND t.request_id=? AND t.attempt=? AND t.status='running' "
+                           "AND s.active_request_id=t.request_id AND s.deleted_at=''",
+                           (chat_id, request_id, attempt)).fetchone()
+        if not row:
+            raise SessionError('stale_attempt')
+
+
+def set_turn_phase(chat_id, request_id, attempt, phase):
+    conn = _get_conn()
+    with _lock, conn:
+        cur = conn.execute("UPDATE chat_turns SET phase=?,updated_at=? WHERE chat_id=? AND request_id=? AND attempt=? AND status='running'",
+                           (phase, _now_iso(), chat_id, request_id, attempt))
+        if not cur.rowcount:
+            raise SessionError('stale_attempt')
+
+
+def cancel_turn(chat_id, request_id):
+    conn = _get_conn()
+    with _lock, conn:
+        conn.execute('BEGIN IMMEDIATE')
+        row = conn.execute('SELECT status,user_seq FROM chat_turns WHERE chat_id=? AND request_id=?', (chat_id, request_id)).fetchone()
+        session = conn.execute('SELECT last_seq,deleted_at FROM chat_sessions WHERE chat_id=?', (chat_id,)).fetchone()
+        if not row or not session or session['deleted_at']:
+            raise SessionError('request_not_found', 404)
+        if row['status'] == 'cancelled':
+            return
+        if row['status'] not in ('running', 'failed', 'interrupted') or row['user_seq'] != session['last_seq']:
+            raise SessionError('request_not_cancellable')
+        conn.execute("UPDATE chat_turns SET status='cancelled',error_code='request_cancelled',attempt=attempt+1,updated_at=? WHERE chat_id=? AND request_id=?", (_now_iso(), chat_id, request_id))
+        conn.execute("UPDATE chat_sessions SET active_request_id='' WHERE chat_id=? AND active_request_id=?", (chat_id, request_id))
+        conn.execute("UPDATE chat_compactions SET status='cancelled',error_code='request_cancelled',generation=generation+1,updated_at=? WHERE chat_id=? AND request_id=? AND status!='completed'", (_now_iso(), chat_id, request_id))
+
+
+def get_compaction(chat_id):
+    conn = _get_conn()
+    with _lock:
+        row = conn.execute('SELECT * FROM chat_compactions WHERE chat_id=?', (chat_id,)).fetchone()
+    if not row:
+        return None
+    result = dict(row)
+    result['plan'] = json.loads(result.pop('plan_json'))
+    return result
+
+
+def compaction_progress(job):
+    return {key: job[key] for key in ('job_id', 'request_id', 'status', 'phase', 'next_batch', 'calls', 'error_code')} | {
+        'total_batches': len(job['plan']), 'through_seq': job['through_seq']}
+
+
+def claim_compaction(chat_id, request_id, attempt, snapshot, plan, fingerprint):
+    conn = _get_conn()
+    with _lock, conn:
+        conn.execute('BEGIN IMMEDIATE')
+        session = conn.execute('SELECT * FROM chat_sessions WHERE chat_id=?', (chat_id,)).fetchone()
+        if not session or session['deleted_at'] or session['summary_version'] != snapshot['version']:
+            raise SessionError('compaction_stale')
+        if request_id:
+            turn = conn.execute('SELECT status,attempt FROM chat_turns WHERE chat_id=? AND request_id=?', (chat_id, request_id)).fetchone()
+            if not turn or turn['status'] != 'running' or turn['attempt'] != attempt or session['active_request_id'] != request_id:
+                raise SessionError('stale_attempt')
+        elif session['active_request_id']:
+            raise SessionError('chat_busy')
+        old = get_compaction(chat_id)
+        if old and old['status'] == 'running':
+            raise SessionError('compaction_in_progress')
+        reusable = (old and old['status'] != 'completed' and old['base_version'] == snapshot['version']
+                    and old['fingerprint'] == fingerprint and plan[:len(old['plan'])] == old['plan'])
+        if reusable:
+            conn.execute("UPDATE chat_compactions SET request_id=?,status='running',generation=generation+1,error_code='',plan_json=?,through_seq=?,updated_at=? WHERE chat_id=?",
+                         (request_id, json.dumps(plan), plan[-1][-1]['seq'], _now_iso(), chat_id))
+        else:
+            conn.execute("""INSERT OR REPLACE INTO chat_compactions
+                (chat_id,job_id,request_id,status,generation,base_version,base_upto_seq,through_seq,plan_json,fingerprint,summary,updated_at)
+                VALUES(?,?,?,'running',?,?,?,?,?,?,?,?)""",
+                (chat_id, uuid4().hex, request_id, (old['generation'] + 1) if old else 1, snapshot['version'],
+                 snapshot['upto_seq'], plan[-1][-1]['seq'], json.dumps(plan), fingerprint, snapshot['summary'], _now_iso()))
+        return get_compaction(chat_id)
+
+
+def checkpoint_compaction(job, *, summary=None, candidate=None, phase=None, next_batch=None, calls=None,
+                          status=None, error_code=None):
+    fields = {k: v for k, v in locals().copy().items() if k != 'job' and v is not None}
+    fields['updated_at'] = _now_iso()
+    conn = _get_conn()
+    with _lock, conn:
+        cur = conn.execute(f"UPDATE chat_compactions SET {','.join(k+'=?' for k in fields)} WHERE chat_id=? AND generation=? AND status='running'",
+                           (*fields.values(), job['chat_id'], job['generation']))
+        if not cur.rowcount:
+            raise SessionError('compaction_interrupted')
+        return get_compaction(job['chat_id'])
+
+
+def publish_compaction(job):
+    conn = _get_conn()
+    with _lock, conn:
+        conn.execute('BEGIN IMMEDIATE')
+        current = get_compaction(job['chat_id'])
+        if not current or current['status'] != 'running' or current['generation'] != job['generation']:
+            raise SessionError('compaction_interrupted')
+        if current['next_batch'] != len(current['plan']) or not current['summary']:
+            raise SessionError('compaction_incomplete')
+        cur = conn.execute("""UPDATE chat_sessions SET context_summary=?,summary_upto_seq=?,summary_version=summary_version+1
+            WHERE chat_id=? AND summary_version=? AND summary_upto_seq=? AND deleted_at=''""",
+            (current['summary'], current['through_seq'], job['chat_id'], current['base_version'], current['base_upto_seq']))
+        if not cur.rowcount:
+            raise SessionError('compaction_stale')
+        conn.execute("UPDATE chat_compactions SET status='completed',phase='completed',updated_at=? WHERE chat_id=?", (_now_iso(), job['chat_id']))
+        return get_compaction(job['chat_id'])
 
 
 def context_snapshot(chat_id: str) -> dict[str, Any]:
@@ -450,6 +586,48 @@ def context_snapshot(chat_id: str) -> dict[str, Any]:
             WHERE m.chat_id=? AND m.seq>? AND (m.request_id='' OR t.status IN ('completed','partial')) ORDER BY m.seq""", (chat_id, session['summary_upto_seq'])).fetchall()
         return {'summary': session['context_summary'], 'upto_seq': session['summary_upto_seq'],
                 'version': session['summary_version'], 'messages': [dict(row) for row in rows]}
+
+
+def history_records(chat_id: str, upto_seq: int, *, terms: list[str] | None = None,
+                    start_seq: int = 1, end_seq: int | None = None, offset: int = 0,
+                    limit: int = 5) -> tuple[list[dict], bool]:
+    conn = _get_conn()
+    with _lock:
+        session = conn.execute('SELECT deleted_at FROM chat_sessions WHERE chat_id=?', (chat_id,)).fetchone()
+        if not session or session['deleted_at']:
+            raise SessionError('history_unavailable', 404)
+        hits = ','.join(f'instr(lower(m.content),?) AS hit_{i}' for i in range(len(terms or [])))
+        sql = f"""WITH eligible AS (
+            SELECT m.seq,m.role,m.content,m.created_at,COALESCE(t.status,'completed') AS status
+                {',' + hits if hits else ''}
+            FROM chat_messages m LEFT JOIN chat_turns t ON m.chat_id=t.chat_id AND m.request_id=t.request_id
+            WHERE m.chat_id=? AND m.seq<=? AND m.role IN ('user','assistant')
+                AND (m.request_id='' OR t.status IN ('completed','partial'))
+        )"""
+        params = [*(terms or []), chat_id, upto_seq]
+        if terms:
+            score = '+'.join(f'(hit_{i}>0)' for i in range(len(terms)))
+            positions = [f'CASE WHEN hit_{i}>0 THEN hit_{i} ELSE length(content)+1 END' for i in range(len(terms))]
+            first = f'min({",".join(positions)})' if len(positions) > 1 else positions[0]
+            sql += f""", selected AS (
+                SELECT *,max(0,({first})-121) AS content_offset FROM eligible
+                WHERE ({score})>0 ORDER BY ({score}) DESC,seq DESC LIMIT ?
+            )"""
+            params.append(limit + 1)
+            chars = 800
+        else:
+            sql += """, selected AS (
+                SELECT *,CASE WHEN seq=? THEN ? ELSE 0 END AS content_offset FROM eligible
+                WHERE seq BETWEEN ? AND ? ORDER BY seq LIMIT ?
+            )"""
+            params.extend([start_seq, offset, start_seq, min(end_seq or start_seq, upto_seq), limit + 1])
+            chars = 8000
+        sql += """ SELECT seq,role,created_at,status,content_offset,length(content) AS content_length,
+                    substr(content,content_offset+1,?) AS content FROM selected"""
+        sql += f' ORDER BY ({score}) DESC,seq DESC' if terms else ' ORDER BY seq'
+        params.append(chars)
+        rows = conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows[:limit]], len(rows) > limit
 
 
 def publish_summary(chat_id: str, text: str, upto_seq: int, previous_version: int) -> bool:
@@ -482,4 +660,5 @@ def message_page(chat_id: str, before_seq: int | None, limit: int) -> dict[str, 
                 'context_mode': session['context_mode'] if session else 'client',
                 'active_request_id': session['active_request_id'] if session else '',
                 'has_more': len(rows) > limit, 'before_seq': messages[0]['seq'] if len(rows) > limit else None,
+                'context_compaction': compaction_progress(job) if (job := get_compaction(chat_id)) else None,
                 'total': conn.execute('SELECT COUNT(*) FROM chat_messages WHERE chat_id=?', (chat_id,)).fetchone()[0]}

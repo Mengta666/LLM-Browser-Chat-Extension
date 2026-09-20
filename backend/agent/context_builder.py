@@ -136,8 +136,8 @@ SYSTEM_PROMPT_TEXT_MODE = SYSTEM_PROMPT
 # 消息构建（每步从 history_items 重建，token 定长；对齐 browser-use）
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# 历史滑动窗口：保留 首项 + 最近 (N-1) 项，中间用一行省略标记（对齐 browser-use max_history_items）
-MAX_HISTORY_ITEMS = 12
+# 与压缩触发阈值一致；摘要独立保留，不随最近步骤窗口滚出。
+MAX_HISTORY_ITEMS = 24
 
 
 def build_messages(session: "AgentSession", page_state: PageState) -> list[dict[str, str]]:
@@ -188,26 +188,25 @@ def build_messages(session: "AgentSession", page_state: PageState) -> list[dict[
 
 
 def render_history_block(session: "AgentSession") -> str:
-    """把结构化历史渲染成定长文本块：首项 + 最近 N 项，中间省略。"""
+    """保留首项、已有摘要和最近步骤；压缩失败时明确标记未覆盖的省略区间。"""
     items = session.history_items
     if not items:
         return ""
     lines = ["## 历史轨迹（你之前每步的自评/动作/结果/记忆）"]
 
+    pinned = items[:2] if len(items) > 1 and items[1].step == -1 else items[:1]
     if len(items) <= MAX_HISTORY_ITEMS:
         kept = items
         omitted = 0
     else:
-        recent = MAX_HISTORY_ITEMS - 1                 # -1 给首项
-        kept = [items[0]] + items[-recent:]
-        omitted = len(items) - 1 - recent
+        recent = MAX_HISTORY_ITEMS - len(pinned)
+        kept = pinned + items[-recent:]
+        omitted = len(items) - len(kept)
 
-    rendered_first = False
-    for it in kept:
+    for index, it in enumerate(kept):
         lines.append("  " + it.to_string())
-        if not rendered_first and omitted > 0:
-            lines.append(f"  <... 中间省略 {omitted} 步 ...>")
-            rendered_first = True
+        if index == len(pinned) - 1 and omitted > 0:
+            lines.append(f"  <中间 {omitted} 步未纳入，摘要尚未覆盖这些步骤；不能据此断言未尝试或已完成。>")
     return "\n".join(lines)
 
 

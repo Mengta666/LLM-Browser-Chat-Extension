@@ -1,9 +1,6 @@
 document.addEventListener('DOMContentLoaded', async () => {
   let attachedImage = null;
   let currentChatId = '';
-  // 仅兼容直连模式使用前端历史；本项目后端由服务端管理上下文。
-  let chatMessages = [];
-  const serverContextBases = new Set();
   const sessionSequences = new Map();
   const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
   const MAX_IMAGE_PIXELS = 20_000_000;
@@ -13,9 +10,9 @@ document.addEventListener('DOMContentLoaded', async () => {
   const PAGE_REFRESH_ENDPOINT_PATH = '/api/pages/refresh_snapshot';
   const ALLOWED_IMAGE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
   const DEFAULT_API_BASE_URLS = new Set([
-    'https://api.openai.com/v1'
+    DEFAULT_BACKEND_API_URL
   ]);
-  const DEFAULT_API_URL = 'https://api.openai.com/v1';
+  const DEFAULT_API_URL = DEFAULT_BACKEND_API_URL;
 
   // 取当前活动标签页:所有截图/观察/执行动作的入口(observePageState、executePageAction 等)。
   // 两种 query 兜底:优先 lastFocusedWindow(侧边栏聚焦时更准),再退 currentWindow。
@@ -379,6 +376,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   async function resetCurrentChatId() {
     currentChatId = createChatId();
+    updateSendButton();
     await chrome.storage.session.set({ [CURRENT_CHAT_ID_KEY]: currentChatId });
     return currentChatId;
   }
@@ -438,7 +436,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       `确认添加自定义 API 地址：${apiUrl}`,
       '',
       `之后对话内容、图片和你输入的 API Key 会发送到 ${hostname}。`,
-      '请确认这是你信任的 OpenAI-compatible API 服务。'
+      '请确认这是你信任的 Browser Agent 后端，不是上游模型接口。'
     ].join('\n'));
     if (!ok) {
       throw new Error('已取消添加自定义 API 地址');
@@ -451,7 +449,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
 
-  async function validateOpenAIApiConfig(apiUrl, apiKey) {
+  async function validateBackendApiConfig(apiUrl, apiKey) {
     const normalizedApiUrl = normalizeApiBaseUrl(apiUrl);
     const allowedUrls = await getAllowedApiBaseUrls();
 
@@ -465,26 +463,17 @@ document.addEventListener('DOMContentLoaded', async () => {
       throw new Error('请先在设置中配置 API Key！');
     }
 
-    if (new URL(normalizedApiUrl).hostname === 'api.openai.com' && !normalizedApiKey.startsWith('sk-')) {
-      throw new Error('API Key 格式异常');
-    }
-
     return normalizedApiUrl;
   }
 
-  async function resolveApiRequestConfig({ requireBackendApi = false } = {}) {
+  async function resolveApiRequestConfig() {
     const { apiUrl, modelName } = await chrome.storage.local.get(['apiUrl', 'modelName']);
     const { apiKey, apiKeyApiUrl } = await getStoredApiCredential();
-    const safeApiUrl = await validateOpenAIApiConfig(apiUrl || DEFAULT_API_URL, apiKey);
-    const shouldEnforceApiKeyBinding = Boolean(String(apiKey || '').trim())
-      && !isPrivateOrLocalHost(new URL(safeApiUrl).hostname);
+    const safeApiUrl = await validateBackendApiConfig(apiUrl || DEFAULT_API_URL, apiKey);
+    const shouldEnforceApiKeyBinding = Boolean(String(apiKey || '').trim());
 
     if (shouldEnforceApiKeyBinding && apiKeyApiUrl && apiKeyApiUrl !== safeApiUrl) {
       throw new Error('当前 API Key 与 API 地址不匹配，请在设置中重新保存配置');
-    }
-
-    if (requireBackendApi && DEFAULT_API_BASE_URLS.has(safeApiUrl)) {
-      throw new Error('刷新快照需要连接 browser-agent 后端 API 地址，不能使用 OpenAI 官方 API 地址');
     }
 
     return {
@@ -502,12 +491,13 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     if (localApiKey) {
       if (!sessionApiKey) {
-        await chrome.storage.session.set({ apiKey: localApiKey, apiKeyApiUrl: DEFAULT_API_URL });
+        // 旧凭证保留原服务绑定，不能随默认后端变更而转发到新地址。
+        await chrome.storage.session.set({ apiKey: localApiKey, apiKeyApiUrl: 'https://api.openai.com/v1' });
       }
       await chrome.storage.local.remove(['apiKey']);
       return {
         apiKey: sessionApiKey || localApiKey,
-        apiKeyApiUrl: apiKeyApiUrl || DEFAULT_API_URL
+        apiKeyApiUrl: apiKeyApiUrl || 'https://api.openai.com/v1'
       };
     }
 
@@ -544,8 +534,13 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   // 会话历史 + 记忆管理 CRUD:走 background 的 CALL_BACKEND_API 通道(支持 GET/POST/PATCH/DELETE)。
-  function callBackendApi(url, method = 'GET', body = null) {
+  async function callBackendApi(url, method = 'GET', body = null) {
+    const { apiKey, safeApiUrl } = await resolveApiRequestConfig();
+    if (!url.startsWith(buildBackendEndpointUrl(safeApiUrl, '/'))) {
+      throw new Error('后端地址已改变，请切回原后端后操作');
+    }
     const options = { method, headers: { 'Content-Type': 'application/json' } };
+    if (apiKey) options.headers.Authorization = `Bearer ${apiKey}`;
     if (body != null) options.body = JSON.stringify(body);
     return new Promise((resolve, reject) => {
       chrome.runtime.sendMessage(
@@ -674,7 +669,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const ok = confirm([
       '首次使用前请确认：',
       '',
-      '1. 你的输入、主动选择的网页文本、上传图片和框选截图会发送到配置的模型 API。',
+      '1. 你的输入、主动选择的网页文本、上传图片和框选截图会发送到本项目后端，由后端调用模型服务。',
       '2. API Key 仅保存在当前浏览器会话中，重启浏览器后可能需要重新输入。',
       '3. 扩展不会在后台持续读取网页内容，也不会自动发送网页内容。'
     ].join('\n'));
@@ -1069,7 +1064,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   function updateApiKeyStatus(hasKey, apiKeyUrl = '') {
     apiKeyInput.value = '';
-    apiKeyInput.placeholder = hasKey ? '已保存 API Key，留空则保留' : 'sk-...';
+    apiKeyInput.placeholder = hasKey ? '已保存 API Key，留空则保留' : '本机 / 内网后端可留空';
     if (apiKeyStatus) {
       apiKeyStatus.textContent = hasKey
         ? `已保存 API Key；页面不会显示明文。适用地址：${apiKeyUrl || '当前 API 地址'}`
@@ -1124,14 +1119,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     try {
       safeApiUrl = normalizeApiBaseUrl(apiUrl);
       const isLocalApi = isPrivateOrLocalHost(new URL(safeApiUrl).hostname);
-      if (!isLocalApi && !enteredApiKey && savedCredential.apiKeyApiUrl && savedCredential.apiKeyApiUrl !== safeApiUrl) {
-        throw new Error('切换 API 地址时请重新输入该服务对应的 API Key');
+      if (!enteredApiKey && effectiveApiKey && savedCredential.apiKeyApiUrl && savedCredential.apiKeyApiUrl !== safeApiUrl) {
+        throw new Error('切换后端地址时请重新输入访问凭证，或先清除旧凭证');
       }
       if (!isLocalApi && !DEFAULT_API_BASE_URLS.has(safeApiUrl) && !enteredApiKey && savedCredential.apiKeyApiUrl !== safeApiUrl) {
         throw new Error('添加自定义 API 地址时请同时输入该服务对应的 API Key');
       }
       await ensureCustomApiBaseUrlAllowed(safeApiUrl);
-      safeApiUrl = await validateOpenAIApiConfig(safeApiUrl, effectiveApiKey);
+      safeApiUrl = await validateBackendApiConfig(safeApiUrl, effectiveApiKey);
     } catch (error) {
       showSettingsMessage(error.message || '配置无效', 'error');
       return;
@@ -1171,21 +1166,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     return bubble;
   }
 
-  function showTypingIndicator(container) {
-    container.textContent = '';
-    const indicator = document.createElement('div');
-    indicator.className = 'typing-indicator';
-    for (let index = 0; index < 3; index += 1) {
-      const dot = document.createElement('div');
-      dot.className = 'dot';
-      indicator.appendChild(dot);
-    }
-    container.appendChild(indicator);
-  }
-
-  function scrollToBottom() {
+  function scrollToBottom(behavior = 'smooth') {
     const chatHistory = document.getElementById('chatHistory');
-    chatHistory.scrollTo({ top: chatHistory.scrollHeight, behavior: 'smooth' });
+    chatHistory.scrollTo({ top: chatHistory.scrollHeight, behavior });
   }
 
   function showCaptureBanner(text) {
@@ -1199,24 +1182,88 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // 4. 发送与流式接收核心逻辑
   let _sendingLock = false;
-  // 发送分流：自动化开关开(或 /browser-operation 前缀)→ 启动 agent；否则走轻量直连聊天。
+  let _chatRequest = null;
+
+  function updateSendButton() {
+    const button = document.getElementById('sendBtn');
+    if (!button) return;
+    const request = _chatRequest?.chatId === currentChatId ? _chatRequest : null;
+    const active = request && (request.status === 'running' || request.stopping);
+    button.textContent = active ? (request.stopping ? '正在停止…' : '■ 停止') : '发送';
+    button.title = active ? '停止当前提问，不删除会话；已完成的压缩进度会保留' : '发送消息';
+    button.disabled = active ? request.stopping : (_sendingLock || agentState.active);
+  }
+
+  function bindChatRequest(base, chatId, requestId, onSettled, live = false) {
+    if (_chatRequest?.base === base && _chatRequest.chatId === chatId && _chatRequest.requestId === requestId) {
+      return _chatRequest;
+    }
+    if (_chatRequest?.live || _chatRequest?.stopping) return null;
+    _chatRequest = { base, chatId, requestId, onSettled, live, status: 'running', stopping: false };
+    updateSendButton();
+    return _chatRequest;
+  }
+
+  function releaseChatRequest(request, status) {
+    if (!request) return;
+    request.status = status;
+    if (_chatRequest === request && !request.stopping) _chatRequest = null;
+    updateSendButton();
+  }
+
+  async function cancelChatRequest(base, chatId, requestId) {
+    const endpoint = buildBackendEndpointUrl(base,
+      `/v1/sessions/${encodeURIComponent(chatId)}/requests/${encodeURIComponent(requestId)}`);
+    let state;
+    try {
+      state = await callBackendApi(`${endpoint}/cancel`, 'POST', {});
+    } catch (error) {
+      // 取消可能已生效但响应丢失，也可能正常完成先于取消到达。
+      try { state = await callBackendApi(endpoint); } catch { throw error; }
+      if (!['cancelled', 'completed', 'partial'].includes(state.status)) throw error;
+    }
+    if (!['cancelled', 'completed', 'partial'].includes(state.status)) throw new Error('后端尚未确认停止');
+    sessionSequences.set(`${base}|${chatId}`, state.last_seq);
+    return state;
+  }
+
+  async function stopChatRequest() {
+    const request = _chatRequest;
+    if (!request || request.chatId !== currentChatId || request.stopping || request.status !== 'running') return;
+    request.stopping = true;
+    updateSendButton();
+    try {
+      const state = await cancelChatRequest(request.base, request.chatId, request.requestId);
+      request.status = state.status;
+      await request.onSettled(state);
+    } catch (error) {
+      alert('停止未确认，请稍后重试：' + (error.message || error));
+    } finally {
+      request.stopping = false;
+      if (request.status !== 'running') releaseChatRequest(request, request.status);
+      else updateSendButton();
+    }
+  }
+
+  // 发送分流：自动化开关开(或 /browser-operation 前缀)→ 启动 agent；否则走服务端聊天。
   async function handleSend() {
-    if (_sendingLock) return;
+    if (_sendingLock || (_chatRequest?.chatId === currentChatId &&
+        (_chatRequest.status === 'running' || _chatRequest.stopping))) return;
     if (agentState.active) return;
     const input = document.getElementById('chatInput');
     const text = (input.value || '').trim();
     if (!text) return;
-    if (text.length > MAX_PROMPT_LENGTH) {
-      alert(`单次发送不能超过 ${MAX_PROMPT_LENGTH} 字。`);
+    const useAgent = shouldUseAgent(text);
+    if (useAgent && text.length > MAX_AGENT_TASK_LENGTH) {
+      alert(`自动化指令不能超过 ${MAX_AGENT_TASK_LENGTH} 字。`);
       return;
     }
 
     _sendingLock = true;
-    const sendBtn = document.getElementById('sendBtn');
-    if (sendBtn) sendBtn.disabled = true;
+    updateSendButton();
     try {
       const image = attachedImage ? attachedImage.dataUrl : '';
-      if (shouldUseAgent(text)) {
+      if (useAgent) {
         // 自动化模式：去掉命令前缀,启动 agent,图片作视觉输入
         const task = text.startsWith(AGENT_COMMAND.trim())
           ? text.slice(AGENT_COMMAND.trim().length).trim()
@@ -1225,169 +1272,127 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (attachedImage) clearAttachedImage();
         await runAgentTask(task, image);
       } else {
-        input.value = '';
-        if (attachedImage) clearAttachedImage();
         // search_query 非空表示本轮要求联网；后端结合会话生成实际搜索词。
         const searchQuery = isSearchMode() ? text : '';
-        if (searchQuery) {
-          const st = document.getElementById('webSearchToggle');
-          const sb = document.getElementById('webSearchBtn');
-          if (st) st.checked = false;
-          if (sb) sb.classList.remove('is-active');
-        }
-        await runPlainChat(text, image, searchQuery);
+        await runChat(text, image, searchQuery);
       }
     } finally {
       _sendingLock = false;
-      if (sendBtn) sendBtn.disabled = false;
+      updateSendButton();
     }
   }
 
-  // 轻量直连聊天：不点自动化按钮时,消息直接发给用户配置的 OpenAI 兼容接口,流式返回。
-  // search_query 非空时附带搜索参数(手动搜索)。
-  async function runPlainChat(text, image, search_query = '') {
-    let apiKey, modelName, safeApiUrl;
+  async function runChat(text, image, searchQuery = '') {
+    let settings;
     try {
-      ({ apiKey, modelName, safeApiUrl } = await resolveApiRequestConfig());
+      settings = await resolveApiRequestConfig();
     } catch (error) {
-      alert(error.message || 'API 配置无效');
+      alert(error.message || '后端配置无效');
       return;
     }
     if (!(await ensurePrivacyNoticeAccepted())) return;
-
-    if (await supportsServerContext(safeApiUrl)) {
-      await runServerChat(text, image, search_query, { apiKey, modelName, safeApiUrl });
-      return;
-    }
-
-    const safeModelName = String(modelName || '').trim() || 'gpt-4o';
-
-    // 用户气泡
-    const userBubble = createMessageNode('user');
-    const userTextNode = document.createElement('div');
-    userTextNode.textContent = text;
-    userBubble.appendChild(userTextNode);
-    if (image) {
-      const previewImage = document.createElement('img');
-      previewImage.className = 'user-upload-preview';
-      previewImage.src = image;
-      previewImage.alt = '上传图片';
-      userBubble.appendChild(previewImage);
-    }
-    scrollToBottom();
-
-    // AI 气泡
-    const aiBubble = createMessageNode('ai');
-    showTypingIndicator(aiBubble);
-    scrollToBottom();
-
-    const userContent = image
-      ? [{ type: 'text', text: text || '请分析这张图片' }, { type: 'image_url', image_url: { url: image } }]
-      : text;
-    // 带上多轮历史 + chat_id:后端据此做上下文续写与记忆抽取(chat_id 让"攒 N 轮"去抖生效)。
-    const chatId = await getOrCreateCurrentChatId();
-    const requestBody = {
-      model: safeModelName,
-      messages: [...chatMessages, { role: 'user', content: userContent }],
-      stream: true,
-      chat_id: chatId,
-      search_query: search_query || '',
-      kb_id: window._kbBoundId || '',
-    };
-    const requestHeaders = { 'Content-Type': 'application/json' };
-    if (String(apiKey || '').trim()) {
-      requestHeaders.Authorization = `Bearer ${String(apiKey).trim()}`;
-    }
-
-    const msgId = createMessageId();
-    let fullReply = '';
-    let done = false;
-    let _searchSources = [];  // 联网搜索结果元数据
-    // aiBubble 内部结构分离：增强卡片区 + markdown 内容区
-    // streamer 只渲染 markdown 内容区，不影响增强卡片
-    aiBubble.textContent = '';
-    const mdBody = document.createElement('div');
-    mdBody.className = 'markdown-body';
-    aiBubble.appendChild(mdBody);
-    const streamer = createMarkdownStreamer(mdBody);
-
-    await new Promise((resolve) => {
-      const finalize = () => {
-        if (done) return;
-        done = true;
-        if (!fullReply) mdBody.textContent = '响应为空。';
-        else {
-          streamer.finalize(fullReply);
-          // 联网搜索:渲染引用 [1][2] 为可点击链接 + 来源面板
-          if (_searchSources.length) {
-            renderSearchCitations(aiBubble, _searchSources);
-          }
-          chatMessages.push({ role: 'user', content: image ? (text || '[图片]') : text });
-          chatMessages.push({ role: 'assistant', content: fullReply });
-        }
-        chrome.runtime.onMessage.removeListener(listener);
-        resolve();
-      };
-      const listener = (msg) => {
-        if (msg.msgId !== msgId) return;
-        if (msg.type === 'LLM_CHUNK') {
-          fullReply += msg.chunk;
-          streamer.update(fullReply);
-          scrollToBottom();
-        } else if (msg.type === 'LLM_SEARCH_RESULTS') {
-          _searchSources = msg.search_results || [];
-        } else if (msg.type === 'LLM_ENHANCEMENT_STEP') {
-          // 增强步骤事件：更新增强卡片
-          updateEnhancementCard(aiBubble, msg.step);
-          // 工具调用完成时收集搜索来源(供 finalize 渲染引用面板)
-          if (msg.step.status === 'done' && msg.step.sources && msg.step.sources.length) {
-            _searchSources = _searchSources.concat(msg.step.sources);
-          }
-        } else if (msg.type === 'LLM_DONE') {
-          finalize();
-        } else if (msg.type === 'LLM_ERROR') {
-          streamer.cancel();
-          aiBubble.textContent = '';
-          const errorSpan = document.createElement('span');
-          errorSpan.className = 'error-text';
-          errorSpan.textContent = `⚠️ 错误: ${msg.error}`;
-          aiBubble.appendChild(errorSpan);
-          done = true;
-          chrome.runtime.onMessage.removeListener(listener);
-          resolve();
-        }
-      };
-      chrome.runtime.onMessage.addListener(listener);
-      chrome.runtime.sendMessage({
-        type: 'CALL_LLM_STREAM',
-        msgId,
-        url: `${safeApiUrl}/chat/completions`,
-        options: { method: 'POST', headers: requestHeaders, body: JSON.stringify(requestBody) }
-      });
-      setTimeout(finalize, 120000);
-    });
+    await runServerChat(text, image, searchQuery, settings);
   }
 
-  async function supportsServerContext(base) {
-    if (serverContextBases.has(base)) return true;
+  async function requireServerContext(base) {
+    let data;
     try {
-      const data = await callBackendApi(buildBackendEndpointUrl(base, '/v1/sessions/capabilities'));
-      if (data?.server_context === true && data.protocol_version === 1) {
-        serverContextBases.add(base);
-        return true;
-      }
-    } catch {}
-    return false;
+      data = await callBackendApi(buildBackendEndpointUrl(base, '/v1/sessions/capabilities'));
+    } catch (error) {
+      throw new Error(error.status === 404
+        ? '当前地址未提供 Browser Agent 会话接口，请在设置中填写本项目后端地址，而不是模型接口。'
+        : '无法连接或验证 Browser Agent 后端，请检查后端是否启动、地址和访问凭证是否正确。');
+    }
+    if (data?.server_context !== true || data.protocol_version !== 1) {
+      throw new Error('后端会话协议不兼容，请更新本项目后端；不再支持直接连接模型接口。');
+    }
   }
 
-  function addRequestRecovery(container, base, chatId, requestId, originalBody = null) {
+  function compactionLabel(progress) {
+    const count = `${progress.next_batch}/${progress.total_batches}`;
+    if (progress.phase === 'generating') return '历史上下文整理完成，正在回答原问题…';
+    if (progress.status === 'completed') return '历史上下文整理完成';
+    if (progress.status === 'cancelled') return '本轮已取消，历史和压缩检查点仍保留';
+    const errors = {
+      compaction_output_truncated: '摘要生成被输出上限截断，请检查摘要模型的推理和输出配置',
+      compaction_configuration_error: '摘要模型或预算配置不可用，请检查配置后恢复',
+      compaction_timeout: '压缩阶段超时',
+      compaction_summary_too_large: '摘要精简后仍超过目标预算',
+      compaction_insufficient_space: '摘要完成后空间仍不足',
+      compaction_input_budget_exceeded: '摘要请求超过输入预算，请检查配置',
+      backend_restarted: '后端已重启',
+    };
+    if (progress.status !== 'running') {
+      return `历史压缩未完成（${count} 批），进度已保留。${errors[progress.error_code] || '压缩已中断或失败'}；当前问题尚未继续回答。`;
+    }
+    return `正在整理历史上下文：已完成 ${count} 批${progress.phase === 'reduce' ? '，正在精简摘要' : ''}。完成后自动继续回答。`;
+  }
+
+  function addRequestCancel(container, base, chatId, requestId, onCancelled) {
+    const button = document.createElement('button');
+    button.type = 'button'; button.className = 'tool-btn'; button.textContent = '结束本次提问';
+    button.addEventListener('click', async () => {
+      button.disabled = true;
+      try {
+        const state = await cancelChatRequest(base, chatId, requestId);
+        await onCancelled?.(state);
+      } catch (error) {
+        button.disabled = false;
+        alert('取消未确认，请检查请求状态：' + (error.message || error));
+      }
+    });
+    container.appendChild(button);
+    return button;
+  }
+
+  function addRequestRecovery(container, base, chatId, requestId, originalBody = null, initialMessage = '') {
+    const label = document.createElement('div'); container.appendChild(label);
+    label.className = 'error-text'; label.textContent = initialMessage;
     const button = document.createElement('button');
     button.type = 'button'; button.className = 'tool-btn';
-    button.textContent = '检查状态 / 重试';
+    button.textContent = '检查处理状态';
+    const cancel = addRequestCancel(container, base, chatId, requestId, state => update(state));
+    cancel.hidden = true;
+    let observedRequest = null;
+    const update = state => {
+      if (observedRequest && ['cancelled', 'completed', 'partial'].includes(observedRequest.status)
+          && state.status === 'running') return;
+      const progress = state.context_compaction;
+      const pending = progress && ['running', 'failed', 'interrupted'].includes(progress.status);
+      const labels = { running: '正在处理当前提问…', cancelled: '本轮已停止，问题记录和已完成的压缩进度仍保留。',
+        completed: '回答已保存。', partial: '已有回答已保存，可继续生成。', failed: '本轮处理失败。', interrupted: '本轮处理已中断。' };
+      label.textContent = state.status === 'cancelled' ? labels.cancelled : pending ? compactionLabel(progress)
+        : (labels[state.status] || '暂时无法确认处理状态。');
+      label.className = ['failed', 'interrupted'].includes(state.status) ? 'error-text' : 'request-status';
+      button.textContent = state.can_retry ? (pending ? '继续处理原问题' : '重试本次提问')
+        : ['completed', 'partial'].includes(state.status) ? '查看已保存回答' : '检查处理状态';
+      button.hidden = state.status === 'cancelled';
+      button.disabled = false;
+      cancel.hidden = !state.can_cancel || !['failed', 'interrupted'].includes(state.status);
+      if (state.status === 'running' && container.isConnected && currentChatId === chatId) {
+        observedRequest = bindChatRequest(base, chatId, requestId, async result => {
+          update(result);
+          if (currentChatId === chatId && ['completed', 'partial'].includes(result.status)) await resumeSession(chatId);
+        });
+      } else if (observedRequest && !observedRequest.live) {
+        releaseChatRequest(observedRequest, state.status);
+      }
+    };
+    const refresh = async () => {
+      if (!container.isConnected || currentChatId !== chatId) return;
+      try {
+        const state = await callBackendApi(buildBackendEndpointUrl(base,
+          `/v1/sessions/${encodeURIComponent(chatId)}/requests/${encodeURIComponent(requestId)}`));
+        update(state);
+        if (state.status === 'running') setTimeout(refresh, 3000);
+      } catch { /* 状态读取失败时保留手动检查入口。 */ }
+    };
+    setTimeout(refresh, 0);
     button.addEventListener('click', async () => {
-      if (_sendingLock) return;
+      if (_sendingLock || _chatRequest?.stopping) return;
       if (currentChatId !== chatId) { alert('请先打开此请求所属的会话。'); return; }
       _sendingLock = true;
+      updateSendButton();
       button.disabled = true;
       try {
         let state;
@@ -1399,6 +1404,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           state = { can_retry: true, last_seq: originalBody.expected_last_seq };
         }
         sessionSequences.set(`${base}|${chatId}`, state.last_seq);
+        update(state);
         if (state.status === 'completed' || state.status === 'partial') {
           await resumeSession(chatId);
         } else if (state.status === 'running') {
@@ -1415,7 +1421,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
       } catch (error) {
         alert('无法确认请求状态: ' + (error.message || error));
-      } finally { button.disabled = false; _sendingLock = false; }
+      } finally { _sendingLock = false; updateSendButton(); refresh(); }
     });
     container.appendChild(button);
   }
@@ -1431,9 +1437,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     button.disabled = !canContinue;
     let continuationId = null;
     button.addEventListener('click', async () => {
-      if (_sendingLock) return;
+      if (_sendingLock || _chatRequest?.stopping) return;
       if (currentChatId !== chatId) { alert('请先打开此回答所属的会话。'); return; }
       _sendingLock = true; button.disabled = true;
+      updateSendButton();
       try {
         const state = await callBackendApi(buildBackendEndpointUrl(base,
           `/v1/sessions/${encodeURIComponent(chatId)}/requests/${encodeURIComponent(requestId)}`));
@@ -1456,7 +1463,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       } catch (error) {
         button.disabled = false;
         alert('无法继续生成: ' + (error.message || error));
-      } finally { _sendingLock = false; }
+      } finally { _sendingLock = false; updateSendButton(); }
     });
     status.appendChild(button);
     container.appendChild(status);
@@ -1468,9 +1475,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     const key = `${base}|${chatId}`;
     let body;
     try {
-      if (!sessionSequences.has(key)) {
+      await requireServerContext(base);
+      if (!retryBody || !sessionSequences.has(key)) {
         const state = await callBackendApi(buildBackendEndpointUrl(base, `/v1/sessions/${encodeURIComponent(chatId)}/messages?limit=1`));
         sessionSequences.set(key, state.last_seq);
+        if (!retryBody && state.context_compaction && ['running', 'failed', 'interrupted'].includes(state.context_compaction.status)) {
+          throw new Error('当前会话有未完成的历史压缩，请先恢复或取消原请求。');
+        }
       }
       body = retryBody || {
         context_mode: 'server', chat_id: chatId, request_id: createMessageId(),
@@ -1481,10 +1492,22 @@ document.addEventListener('DOMContentLoaded', async () => {
         ] : text }],
       };
     } catch (error) {
-      document.getElementById('chatInput').value = text;
-      if (image) applyAttachedImage({ dataUrl: image, name: '待发送图片' });
+      if (!retryBody) {
+        if (!document.getElementById('chatInput').value) document.getElementById('chatInput').value = text;
+        if (image && !attachedImage) applyAttachedImage({ dataUrl: image, name: '待发送图片' });
+      }
       alert('无法同步会话，尚未提交: ' + error.message);
       return;
+    }
+    if (!retryBody) {
+      const input = document.getElementById('chatInput');
+      if (input.value.trim() === text) input.value = '';
+      if (image && attachedImage?.dataUrl === image) clearAttachedImage();
+      if (searchQuery) {
+        const toggle = document.getElementById('webSearchToggle');
+        if (toggle) toggle.checked = false;
+        document.getElementById('webSearchBtn')?.classList.remove('is-active');
+      }
     }
     if (!retryBody || newTurn) {
       const user = createMessageNode('user');
@@ -1500,24 +1523,32 @@ document.addEventListener('DOMContentLoaded', async () => {
     bubble.dataset.requestId = body.request_id;
     const content = document.createElement('div'); content.className = 'markdown-body'; bubble.appendChild(content);
     const streamer = createMarkdownStreamer(content);
+    const progressLabel = document.createElement('div'); bubble.appendChild(progressLabel);
     const msgId = createMessageId();
     let reply = ''; let meta = null; let sources = []; let done = false;
+    scrollToBottom('instant');
     await new Promise(resolve => {
+      let request = null;
       const finish = (error = '') => {
         if (done) return;
         done = true;
         clearTimeout(timer);
         chrome.runtime.onMessage.removeListener(listener);
+        releaseChatRequest(request, meta?.status || 'interrupted');
+        progressLabel.remove();
         if (reply) streamer.finalize(reply); else streamer.cancel();
         if (meta?.persisted && !error) {
           sessionSequences.set(key, meta.last_seq);
           if (sources.length) renderSearchCitations(bubble, sources);
           if (meta.status === 'partial') addPartialAnswer(bubble, base, chatId, body.request_id, meta.can_continue);
         } else {
-          const status = document.createElement('div'); status.className = 'error-text';
-          status.textContent = `未确认保存：${error || '连接已结束，但没有收到保存确认'}`;
-          bubble.appendChild(status);
-          addRequestRecovery(bubble, base, chatId, body.request_id, body);
+          const status = meta?.status === 'cancelled' ? '本轮已停止，问题记录和已完成的压缩进度仍保留。' : meta?.context_compaction && meta.context_compaction.status !== 'completed'
+            ? compactionLabel(meta.context_compaction)
+            : `未确认保存：${error || '连接已结束，但没有收到保存确认'}`;
+          if (meta?.status === 'cancelled') {
+            const label = document.createElement('div'); label.className = 'request-status'; label.textContent = status;
+            bubble.appendChild(label);
+          } else addRequestRecovery(bubble, base, chatId, body.request_id, body, status);
         }
         resolve();
       };
@@ -1525,6 +1556,12 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (msg.msgId !== msgId) return;
         if (msg.type === 'LLM_CHUNK') { reply += msg.chunk; streamer.update(reply); scrollToBottom(); }
         else if (msg.type === 'LLM_SESSION_META') meta = msg.session_meta;
+        else if (msg.type === 'LLM_CONTEXT_COMPACTION') {
+          const history = document.getElementById('chatHistory');
+          const following = history.scrollHeight - history.scrollTop - history.clientHeight < 80;
+          progressLabel.textContent = compactionLabel(msg.progress);
+          if (following) scrollToBottom('instant');
+        }
         else if (msg.type === 'LLM_ENHANCEMENT_STEP') {
           updateEnhancementCard(bubble, msg.step);
           if (msg.step.status === 'done') sources.push(...(msg.step.sources || []));
@@ -1532,6 +1569,11 @@ document.addEventListener('DOMContentLoaded', async () => {
         else if (msg.type === 'LLM_DONE') finish();
       };
       const timer = setTimeout(() => finish('等待超时，请检查后端状态'), 605000);
+      request = bindChatRequest(base, chatId, body.request_id, async state => {
+        meta = { ...state, persisted: ['completed', 'partial'].includes(state.status) };
+        finish();
+        if (meta.persisted && currentChatId === chatId) await resumeSession(chatId);
+      }, true);
       chrome.runtime.onMessage.addListener(listener);
       const headers = { 'Content-Type': 'application/json' };
       if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
@@ -1613,30 +1655,19 @@ document.addEventListener('DOMContentLoaded', async () => {
     try { base = await backendBase(); } catch { return; }
     let data;
     try {
-      const managed = await supportsServerContext(base);
-      const query = managed ? `?limit=100${beforeSeq ? `&before_seq=${beforeSeq}` : ''}` : '';
+      await requireServerContext(base);
+      const query = `?limit=100${beforeSeq ? `&before_seq=${beforeSeq}` : ''}`;
       data = await callBackendApi(buildBackendEndpointUrl(base, `/v1/sessions/${encodeURIComponent(chatId)}/messages${query}`), 'GET');
     } catch (e) {
       alert('载入会话失败: ' + (e?.message || ''));
       return;
     }
     const messages = data?.messages || [];
-    const summary = data?.summary || '';
-    const summaryMsgCount = data?.summary_msg_count || 0;
-    // 切到该会话:重建内存历史 + DOM 气泡
+    // 切到该会话，只恢复展示；模型上下文始终由后端构建。
     currentChatId = chatId;
+    updateSendButton();
     await chrome.storage.session.set({ [CURRENT_CHAT_ID_KEY]: chatId });
-    // chatMessages 用于发给 LLM:摘要 + tail 原文
-    chatMessages = [];
-    const managed = serverContextBases.has(base);
-    if (managed) sessionSequences.set(`${base}|${chatId}`, data.last_seq);
-    if (summary && !managed) {
-      chatMessages.push({ role: 'system', content: '## 本会话此前摘要\n' + summary });
-    }
-    const tail = managed ? [] : summaryMsgCount > 0 ? messages.slice(summaryMsgCount) : messages;
-    for (const m of tail) {
-      chatMessages.push({ role: m.role, content: m.content });
-    }
+    sessionSequences.set(`${base}|${chatId}`, data.last_seq);
     // DOM 全量渲染(用户看得到完整历史)
     const historyEl = document.getElementById('chatHistory');
     const oldNodes = beforeSeq ? Array.from(historyEl.children).filter(node => node.id !== 'loadOlderMessages') : [];
@@ -1654,9 +1685,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         const node = document.createElement('div');
         node.textContent = m.content;
         bubble.appendChild(node);
-        if (managed && m.request_id && !['completed', 'partial'].includes(m.status)) {
-          const state = document.createElement('div'); state.textContent = `请求状态：${m.status}`;
-          bubble.appendChild(state);
+        if (m.request_id && !['completed', 'partial'].includes(m.status)) {
           addRequestRecovery(bubble, base, chatId, m.request_id);
         }
       } else {
@@ -1684,7 +1713,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (allSources.length) {
           renderSearchCitations(bubble, allSources);
         }
-        if (managed && m.status === 'partial') {
+        if (m.status === 'partial') {
           addPartialAnswer(bubble, base, chatId, m.request_id, m.can_continue === true);
         }
       }
@@ -1714,7 +1743,6 @@ document.addEventListener('DOMContentLoaded', async () => {
       // 若删的是当前会话,顺带清空并开新会话
       if (chatId === currentChatId) {
         document.getElementById('chatHistory').replaceChildren();
-        chatMessages = [];
         await resetCurrentChatId();
       }
       await loadSessionList();
@@ -2088,7 +2116,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     const stepId = step.tool_call_id || `${step.type}_${step.query || ''}`;
     let stepEl = card.querySelector(`[data-step-id="${CSS.escape(stepId)}"]`);
 
-    const icon = step.type === 'web_search' ? '🔍' : '📚';
+    const isHistory = step.type === 'search_session_history' || step.type === 'read_session_history';
+    const icon = isHistory ? '🕘' : step.type === 'web_search' ? '🔍' : '📚';
 
     if (step.status === 'running') {
       if (!stepEl) {
@@ -2097,7 +2126,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         card.appendChild(stepEl);
       }
       stepEl.className = 'enhancement-step running';
-      const label = step.type === 'web_search' ? '正在搜索' : step.type === 'kb_list_documents' ? '正在读取知识库目录' : '正在检索知识库';
+      const label = isHistory ? '正在回查会话历史' : step.type === 'web_search' ? '正在搜索' : step.type === 'kb_list_documents' ? '正在读取知识库目录' : '正在检索知识库';
       stepEl.innerHTML = `<span class="step-icon">${icon}</span><span class="step-text">${label}${step.query ? ` “${esc(step.query)}”` : ''}</span>`;
     } else if (step.status === 'done') {
       if (!stepEl) {
@@ -2106,6 +2135,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         card.appendChild(stepEl);
       }
       stepEl.className = 'enhancement-step done';
+      if (isHistory) {
+        const seqs = (step.history_seqs || []).filter(Number.isInteger).join('、');
+        const detail = seqs ? `消息 ${seqs}${step.has_more ? '（未读完）' : ''}`
+          : step.outcome === 'budget_exhausted' ? '预算不足，未纳入原文' : '本次未找到匹配，不代表历史中不存在';
+        stepEl.textContent = `🕘 已回查会话历史：${detail}`;
+        return;
+      }
       if (step.type === 'evidence_check') {
         stepEl.classList.add('kb-result');
         stepEl.textContent = step.outcome === 'reviewed'
@@ -2167,7 +2203,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
       stepEl.className = 'enhancement-step error';
       const failed = step.outcome === 'error';
-      const label = failed ? (step.type === 'web_search' ? '联网搜索失败' : '知识库查询失败') : '工具未执行';
+      const label = failed ? (isHistory ? '会话历史回查失败' : step.type === 'web_search' ? '联网搜索失败' : '知识库查询失败') : '工具未执行';
       stepEl.innerHTML = `<span class="step-icon">⚠</span><span class="step-text">${label}：${esc(step.error || '工具参数无效')}</span>`;
       stepEl.title = step.error || '工具参数无效';
     }
@@ -2317,7 +2353,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   // 5. 绑定各种交互事件
   getOrCreateCurrentChatId().catch(console.error);
 
-  document.getElementById('sendBtn').addEventListener('click', handleSend);
+  document.getElementById('sendBtn').addEventListener('click', () => {
+    if (_chatRequest?.chatId === currentChatId && (_chatRequest.status === 'running' || _chatRequest.stopping)) {
+      stopChatRequest();
+    } else handleSend();
+  });
   document.getElementById('chatInput').addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); }
   });
@@ -2342,7 +2382,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   document.getElementById('drawerMask')?.addEventListener('click', closeDrawer);
   document.getElementById('newSessionBtn')?.addEventListener('click', async () => {
     document.getElementById('chatHistory').replaceChildren();
-    chatMessages = [];
     await resetCurrentChatId();
     closeDrawer();
   });
@@ -2413,7 +2452,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     document.getElementById('chatHistory').replaceChildren();
     document.getElementById('chatInput').value = '';
     clearAttachedImage();
-    chatMessages = [];   // 清空多轮历史,新会话从零开始
     await resetCurrentChatId();
   });
 
@@ -2796,6 +2834,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       const tab = await getActiveBrowserTab();
       if (!tab?.id) throw new Error('无法获取当前标签页');
       const { apiKey, modelName, safeApiUrl } = await resolveApiRequestConfig();
+      await requireServerContext(safeApiUrl);
       let llmParams = {};
       try {
         const stored = await chrome.storage.local.get(['agentLlmParams']);

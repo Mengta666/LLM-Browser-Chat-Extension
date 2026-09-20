@@ -169,17 +169,27 @@ RETHINK_DAEMON_ENABLED = os.getenv("MEMORY_RETHINK_DAEMON_ENABLED", "1") == "1"
 # ─── Chat 对话上下文压缩(Context Compaction)───────────────────
 # 模型上下文窗口大小(token);标准 /v1/models 不返回此值,需手动配置。
 CHAT_CONTEXT_LENGTH = int(os.getenv("CHAT_CONTEXT_LENGTH", "128000"))
-# 后台预压缩阈值:超过此比例时触发后台异步压缩,当次请求不阻塞
+# 服务端聊天达到此输入预算比例后，先完成压缩再回答。
 CHAT_COMPACT_TRIGGER_RATIO = float(os.getenv("CHAT_COMPACT_TRIGGER_RATIO", "0.70"))
-# 同步兜底阈值:超过此比例时当次请求同步阻塞压缩
+# 仅旧客户端压缩入口使用；服务端聊天不再并行后台压缩。
 CHAT_COMPACT_HARD_RATIO = float(os.getenv("CHAT_COMPACT_HARD_RATIO", "0.90"))
-# 保留最近 N 对(user+assistant)原文不压缩
+# 优先保留最近 N 对原文，空间不足时缩小保留范围。
 CHAT_COMPACT_KEEP_PAIRS = int(os.getenv("CHAT_COMPACT_KEEP_PAIRS", "3"))
 # 摘要输出 token 上限(prompt 约束)
 CHAT_COMPACT_SUMMARY_MAX_TOKENS = int(os.getenv("CHAT_COMPACT_SUMMARY_MAX_TOKENS", "800"))
 CHAT_COMPACT_MAX_OUTPUT_TOKENS = int(os.getenv("CHAT_COMPACT_MAX_OUTPUT_TOKENS", "4096"))
+CHAT_COMPACT_TIMEOUT = float(os.getenv("CHAT_COMPACT_TIMEOUT", "360"))
+CHAT_COMPACT_CALL_TIMEOUT = float(os.getenv("CHAT_COMPACT_CALL_TIMEOUT", "90"))
+CHAT_COMPACT_MAX_ATTEMPTS = int(os.getenv("CHAT_COMPACT_MAX_ATTEMPTS", "2"))
+CHAT_COMPACT_TARGET_RATIO = float(os.getenv("CHAT_COMPACT_TARGET_RATIO", "0.50"))
+CHAT_TURN_TIMEOUT = float(os.getenv("CHAT_TURN_TIMEOUT", "540"))
 CHAT_MAX_OUTPUT_TOKENS = int(os.getenv("CHAT_MAX_OUTPUT_TOKENS", "8192"))
 CHAT_CONTEXT_SAFETY_TOKENS = int(os.getenv("CHAT_CONTEXT_SAFETY_TOKENS", "2048"))
+CHAT_TOKENIZER_URL = os.getenv('CHAT_TOKENIZER_URL', '')
+CHAT_TOKENIZER_MODEL = os.getenv('CHAT_TOKENIZER_MODEL', '')
+CHAT_TOKENIZER_API_KEY = os.getenv('CHAT_TOKENIZER_API_KEY', '')
+CHAT_TOKENIZER_TIMEOUT = float(os.getenv('CHAT_TOKENIZER_TIMEOUT', '2'))
+CHAT_TOKENIZER_SAFETY_RATIO = float(os.getenv('CHAT_TOKENIZER_SAFETY_RATIO', '1.05'))
 # 中文字符/token 安全系数(tiktoken 对非 OpenAI 模型中文误差 20-40%,乘此系数粗估)
 CHAT_TOKEN_CHAR_RATIO_CN = float(os.getenv("CHAT_TOKEN_CHAR_RATIO_CN", "1.5"))
 

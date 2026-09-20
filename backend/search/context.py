@@ -4,14 +4,8 @@ import json
 import re
 
 from agent.memory import chat_context
-from .excerpts import history_excerpt, COUNT_MODE as WEB_COUNT_MODE
-
-
-COUNT_MODE = WEB_COUNT_MODE.replace('_estimate_', '_request_estimate_')
-
-
-def request_tokens(messages, tools=None):
-    return (chat_context.request_tokens(messages, tools) * 5 + 3) // 4
+from agent.token_utils import request_tokens, REQUEST_COUNT_MODE as COUNT_MODE
+from .excerpts import history_excerpt
 
 
 def render_evidence(rows, meta):
@@ -34,9 +28,10 @@ def render_evidence(rows, meta):
     return '\n'.join(lines)
 
 
-def fit_request(messages, tools, contexts, target=None):
-    limit = chat_context.input_budget() if target is None else min(target, chat_context.input_budget())
-    count = request_tokens(messages, tools)
+def fit_request(messages, tools, contexts, target=None, *, counter=None):
+    count_tokens = counter or request_tokens
+    count = count_tokens(messages, tools)
+    limit = chat_context.input_budget(counter) if target is None else min(target, chat_context.input_budget(counter))
     removed = 0
     for message in reversed(messages):
         context = contexts.get(message.get('tool_call_id')) if message.get('role') == 'tool' else None
@@ -52,11 +47,11 @@ def fit_request(messages, tools, contexts, target=None):
                 continue
             row.update(content='', snippet='', context_status='request_budget_exhausted', context_tokens=0, selected_blocks=0)
             message['content'] = render_evidence(rows, meta)
-            count = request_tokens(messages, tools)
+            count = count_tokens(messages, tools)
             removed += 1
         if count > limit:
             message['content'] = '[联网资料已移除：完整请求预算不足，不得据此声称已核实。]'
-            count = request_tokens(messages, tools)
+            count = count_tokens(messages, tools)
     if count > limit:
         raise chat_context.ContextBudgetError('context_budget_exceeded')
     return count, removed

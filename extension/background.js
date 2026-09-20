@@ -32,7 +32,7 @@ function buildBackendRootFromApiBase(apiBaseUrl) {
 async function getAllowedPageRefreshUrls() {
   const { [CUSTOM_API_BASE_URLS_KEY]: customUrls = [] } = await chrome.storage.local.get([CUSTOM_API_BASE_URLS_KEY]);
   return new Set(
-    customUrls
+    [DEFAULT_BACKEND_API_URL, ...customUrls]
       .map((url) => {
         try {
           return `${buildBackendRootFromApiBase(url)}${PAGE_REFRESH_ENDPOINT_PATH}`;
@@ -61,7 +61,7 @@ async function isAllowedAgentUrl(value) {
     const url = new URL(String(value || ''));
     const { [CUSTOM_API_BASE_URLS_KEY]: customUrls = [] } = await chrome.storage.local.get([CUSTOM_API_BASE_URLS_KEY]);
     const normalized = normalizeChatUrl(url.href);
-    for (const baseUrl of customUrls) {
+    for (const baseUrl of [DEFAULT_BACKEND_API_URL, ...customUrls]) {
       try {
         const root = buildBackendRootFromApiBase(baseUrl);
         for (const path of AGENT_ENDPOINT_PATHS) {
@@ -81,7 +81,7 @@ async function isAllowedBackendApiUrl(value) {
     const url = new URL(String(value || ''));
     const { [CUSTOM_API_BASE_URLS_KEY]: customUrls = [] } = await chrome.storage.local.get([CUSTOM_API_BASE_URLS_KEY]);
     const normalized = normalizeChatUrl(url.href);
-    for (const baseUrl of customUrls) {
+    for (const baseUrl of [DEFAULT_BACKEND_API_URL, ...customUrls]) {
       try {
         const root = buildBackendRootFromApiBase(baseUrl);
         for (const prefix of BACKEND_API_PREFIXES) {
@@ -96,7 +96,7 @@ async function isAllowedBackendApiUrl(value) {
 }
 
 const DEFAULT_ALLOWED_CHAT_URLS = new Set([
-  'https://api.openai.com/v1/chat/completions'
+  `${DEFAULT_BACKEND_API_URL}/chat/completions`
 ]);
 
 async function getAllowedChatUrls() {
@@ -170,6 +170,11 @@ async function handleCallLlmStream(request) {
     return;
   }
 
+  if (parsedBody?.context_mode !== 'server') {
+    sendLlmMessage(msgId, 'LLM_ERROR', { error: '聊天必须使用 Browser Agent 后端的服务端会话协议' });
+    return;
+  }
+
   const requestHeaders = { 'Content-Type': 'application/json' };
   if (hasBearerAuth) requestHeaders.Authorization = authHeader;
 
@@ -179,7 +184,7 @@ async function handleCallLlmStream(request) {
     redirect: 'error',
     headers: requestHeaders,
     body,
-    signal: AbortSignal.timeout(parsedBody.context_mode === 'server' ? 600000 : 120000)
+    signal: AbortSignal.timeout(600000)
   });
 
   if (!response.ok) {
@@ -228,6 +233,7 @@ async function handleCallLlmStream(request) {
       try {
         const parsed = JSON.parse(dataStr);
         if (parsed.session_meta) sendLlmMessage(msgId, 'LLM_SESSION_META', { session_meta: parsed.session_meta });
+        if (parsed.context_compaction) sendLlmMessage(msgId, 'LLM_CONTEXT_COMPACTION', { progress: parsed.context_compaction });
         if (parsed.error || parsed.choices?.some(choice => choice.finish_reason === 'error')) {
           sendLlmMessage(msgId, 'LLM_ERROR', { error: parsed.error?.message || parsed.error?.code || '后端处理失败，请检查会话状态后重试' });
           await reader.cancel();

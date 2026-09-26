@@ -33,7 +33,9 @@ def list_sessions() -> dict[str, Any]:
 
 @router.get('/capabilities')
 def capabilities():
-    return {'server_context': True, 'protocol_version': 1, 'resumable_compaction': True}
+    from storage.chat_attachments import capabilities as attachment_capabilities
+    return {'server_context': True, 'protocol_version': 1, 'resumable_compaction': True,
+            'attachments': attachment_capabilities()}
 
 
 @router.post('/{chat_id}/requests/{request_id}/cancel')

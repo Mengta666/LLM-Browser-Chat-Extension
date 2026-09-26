@@ -1,5 +1,10 @@
 document.addEventListener('DOMContentLoaded', async () => {
   let attachedImage = null;
+  let chatImage = null;
+  let chatImageProcessing = false;
+  let chatAttachmentEpoch = 0;
+  let chatUpload = null;
+  const chatImageViews = new Set();
   let currentChatId = '';
   const sessionSequences = new Map();
   const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
@@ -375,6 +380,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   async function resetCurrentChatId() {
+    invalidateChatAttachments();
     currentChatId = createChatId();
     updateSendButton();
     await chrome.storage.session.set({ [CURRENT_CHAT_ID_KEY]: currentChatId });
@@ -592,12 +598,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     return `${parsed.protocol}//${parsed.hostname}/*`;
   }
 
-  function getPageHostPermissionPattern(value) {
-    const parsed = new URL(String(value || '').trim());
-    if (!['http:', 'https:'].includes(parsed.protocol)) return '';
-    return `${parsed.protocol}//${parsed.hostname}/*`;
-  }
-
   async function ensureImageHostPermission(value) {
     if (!chrome.permissions?.request) {
       throw new Error('当前浏览器不支持运行时站点授权');
@@ -623,39 +623,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     ].join('\n'));
   }
 
-  async function ensureCapturePermission() {
-    if (!chrome.permissions?.request) return false;
-    try {
-      const permission = { origins: ['<all_urls>'] };
-      if (chrome.permissions.contains && await chrome.permissions.contains(permission)) return true;
-      return await chrome.permissions.request(permission);
-    } catch {
-      return false;
-    }
-  }
-
   async function ensurePageContextPermission() {
     if (!chrome.permissions?.request) return true;
     try {
       const permission = { origins: ['<all_urls>'] };
       if (chrome.permissions.contains && await chrome.permissions.contains(permission)) return true;
-      return await chrome.permissions.request(permission);
-    } catch {
-      return false;
-    }
-  }
-
-  async function ensurePageHostPermission(value) {
-    if (!chrome.permissions?.request) return true;
-
-    const pattern = getPageHostPermissionPattern(value);
-    if (!pattern) return true;
-
-    const permission = { origins: [pattern] };
-    try {
-      if (chrome.permissions.contains && await chrome.permissions.contains(permission)) {
-        return true;
-      }
       return await chrome.permissions.request(permission);
     } catch {
       return false;
@@ -669,7 +641,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const ok = confirm([
       '首次使用前请确认：',
       '',
-      '1. 你的输入、主动选择的网页文本、上传图片和框选截图会发送到本项目后端，由后端调用模型服务。',
+      '1. 你的输入、主动选择的网页文本和上传图片会发送到本项目后端，由后端调用模型服务。',
       '2. API Key 仅保存在当前浏览器会话中，重启浏览器后可能需要重新输入。',
       '3. 扩展不会在后台持续读取网页内容，也不会自动发送网页内容。'
     ].join('\n'));
@@ -725,16 +697,28 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   function applyAttachedImage(image) {
     attachedImage = image;
+    renderComposerImage();
+  }
 
+  function renderComposerImage() {
+    const useAgent = shouldUseAgent(document.getElementById('chatInput').value || '');
+    const image = useAgent ? attachedImage : chatImage;
     const imagePreview = document.getElementById('imagePreview');
     const imagePreviewImg = document.getElementById('imagePreviewImg');
     const imagePreviewName = document.getElementById('imagePreviewName');
     const imagePreviewSize = document.getElementById('imagePreviewSize');
     const clearImageBtn = document.getElementById('clearImageBtn');
 
-    imagePreviewImg.src = image.dataUrl;
+    if (!image) {
+      imagePreview.classList.add('hidden');
+      imagePreviewImg.removeAttribute('src');
+      clearImageBtn.hidden = true;
+      return;
+    }
+    imagePreviewImg.src = useAgent ? image.dataUrl : image.previewUrl;
     imagePreviewName.textContent = image.name || 'image';
-    imagePreviewSize.textContent = `${image.type || 'image'} · ${formatFileSize(image.size || 0)}`;
+    imagePreviewSize.textContent = useAgent ? `${image.type || 'image'} · ${formatFileSize(image.size || 0)}`
+      : `${image.mime} · ${ChatImages.format(image.size)} · ${image.width} × ${image.height}${image.first_frame ? ' · 仅发送第一帧' : ''}${chatUpload ? ' · 上传中…' : chatImageProcessing ? ' · 处理中…' : ''}`;
     imagePreview.classList.remove('hidden');
     clearImageBtn.hidden = false;
   }
@@ -748,6 +732,108 @@ document.addEventListener('DOMContentLoaded', async () => {
     imageInput.value = '';
     imagePreview.classList.add('hidden');
     clearImageBtn.hidden = true;
+    renderComposerImage();
+  }
+
+  function cancelChatUpload() {
+    if (chatUpload) chatUpload.controller.abort();
+  }
+
+  function clearChatImage() {
+    chatAttachmentEpoch++;
+    chatImageProcessing = false;
+    cancelChatUpload();
+    if (chatImage?.previewUrl) URL.revokeObjectURL(chatImage.previewUrl);
+    chatImage = null;
+    document.getElementById('imageInput').value = '';
+    renderComposerImage();
+    updateSendButton();
+  }
+
+  function clearChatImageViews() {
+    for (const view of chatImageViews) {
+      view.controller.abort();
+      view.observer?.disconnect();
+      if (view.url) URL.revokeObjectURL(view.url);
+    }
+    chatImageViews.clear();
+    document.querySelectorAll('.chat-image-dialog').forEach(dialog => dialog.close());
+  }
+
+  function invalidateChatAttachments() {
+    clearChatImage();
+    clearChatImageViews();
+  }
+
+  async function selectChatImage(files) {
+    if (files.length !== 1) throw new Error('第一批每条消息只支持一张图片，请一次选择一张。');
+    const epoch = ++chatAttachmentEpoch;
+    cancelChatUpload();
+    chatImageProcessing = true;
+    renderComposerImage();
+    updateSendButton();
+    try {
+      const image = await ChatImages.prepare(files[0]);
+      if (epoch !== chatAttachmentEpoch) { URL.revokeObjectURL(image.previewUrl); return; }
+      if (chatImage?.previewUrl) URL.revokeObjectURL(chatImage.previewUrl);
+      chatImage = image;
+    } finally {
+      if (epoch === chatAttachmentEpoch) {
+        chatImageProcessing = false;
+        renderComposerImage();
+        updateSendButton();
+      }
+    }
+  }
+
+  function renderChatAttachment(container, attachment, base, chatId, localImage = null) {
+    const card = document.createElement('div'); card.className = 'chat-attachment-card';
+    const img = document.createElement('img'); img.alt = attachment.name || '聊天图片'; img.hidden = true;
+    const meta = document.createElement('div'); meta.className = 'chat-attachment-meta';
+    meta.textContent = `${attachment.name || '图片'} · ${ChatImages.format(attachment.size)} · ${attachment.width} × ${attachment.height}${attachment.first_frame ? ' · 仅发送第一帧' : ''}`;
+    const status = document.createElement('span'); status.textContent = '图片待加载';
+    const retry = document.createElement('button'); retry.type = 'button'; retry.textContent = '加载图片';
+    const reuse = document.createElement('button'); reuse.type = 'button'; reuse.textContent = '再次引用';
+    card.append(img, meta, status, retry, reuse); container.appendChild(card);
+    const view = { controller: new AbortController(), url: '', observer: null };
+    chatImageViews.add(view);
+    const load = async () => {
+      retry.disabled = true; status.textContent = '图片加载中…';
+      try {
+        const settings = await resolveApiRequestConfig();
+        if (settings.safeApiUrl !== base || currentChatId !== chatId) throw new Error('请在原后端和原会话查看图片');
+        const url = localImage?.blob ? URL.createObjectURL(localImage.blob)
+          : await ChatImages.preview(buildBackendEndpointUrl(base, `/v1/sessions/${encodeURIComponent(chatId)}/attachments/${attachment.attachment_id}/access`),
+              settings.apiKey, path => buildBackendEndpointUrl(base, path), view.controller.signal);
+        if (!card.isConnected || view.controller.signal.aborted) { URL.revokeObjectURL(url); return; }
+        if (view.url) URL.revokeObjectURL(view.url);
+        view.url = url; img.src = url; img.hidden = false; status.textContent = ''; retry.hidden = true;
+      } catch (error) {
+        if (!view.controller.signal.aborted) { status.textContent = error.message || '图片不可用'; retry.textContent = '重试加载'; }
+      } finally { retry.disabled = false; }
+    };
+    retry.addEventListener('click', load);
+    img.addEventListener('click', () => ChatImages.enlarge(view.url));
+    reuse.addEventListener('click', async () => {
+      if (chatUpload || _sendingLock || agentState.active || shouldUseAgent(document.getElementById('chatInput').value)) {
+        alert('请在空闲的 Chat 模式下再次引用图片。'); return;
+      }
+      const epoch = ++chatAttachmentEpoch;
+      try {
+        const settings = await resolveApiRequestConfig();
+        if (settings.safeApiUrl !== base || currentChatId !== chatId) throw new Error('只能在原后端、原会话再次引用');
+        const previewUrl = await ChatImages.preview(buildBackendEndpointUrl(base, `/v1/sessions/${encodeURIComponent(chatId)}/attachments/${attachment.attachment_id}/access`),
+          settings.apiKey, path => buildBackendEndpointUrl(base, path), view.controller.signal);
+        if (epoch !== chatAttachmentEpoch || currentChatId !== chatId) { URL.revokeObjectURL(previewUrl); return; }
+        if (chatImage?.previewUrl) URL.revokeObjectURL(chatImage.previewUrl);
+        chatImage = { ...attachment, previewUrl, uploaded: attachment, base, chatId };
+        renderComposerImage();
+      } catch (error) { if (!view.controller.signal.aborted) alert(error.message); }
+    });
+    view.observer = new IntersectionObserver(entries => {
+      if (entries.some(entry => entry.isIntersecting)) { view.observer.disconnect(); load(); }
+    }, { root: document.getElementById('chatHistory'), rootMargin: '200px' });
+    view.observer.observe(card);
   }
 
   async function setAttachedImage(file) {
@@ -776,255 +862,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     const loadedImage = await loadImageFromSource(image);
     applyAttachedImage(loadedImage);
     return loadedImage;
-  }
-
-  async function requestPageRegionSelection(tabId) {
-    const [{ result }] = await chrome.scripting.executeScript({
-      target: { tabId },
-      func: () => new Promise((resolve) => {
-        const existing = document.getElementById('__llm_assistant_capture_overlay__');
-        if (existing) existing.remove();
-
-        const overlay = document.createElement('div');
-        overlay.id = '__llm_assistant_capture_overlay__';
-        overlay.style.cssText = [
-          'position:fixed',
-          'inset:0',
-          'z-index:2147483647',
-          'cursor:crosshair',
-          'background:rgba(15,23,42,0.18)',
-          'user-select:none'
-        ].join(';');
-
-        const hint = document.createElement('div');
-        hint.textContent = '拖动选择截图区域，点击右上角取消';
-        hint.style.cssText = [
-          'position:fixed',
-          'top:16px',
-          'left:50%',
-          'transform:translateX(-50%)',
-          'padding:8px 12px',
-          'border-radius:6px',
-          'background:rgba(15,23,42,0.92)',
-          'color:#fff',
-          'font:13px/1.4 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif',
-          'box-shadow:0 8px 24px rgba(0,0,0,0.2)',
-          'pointer-events:none'
-        ].join(';');
-
-        const selectionBox = document.createElement('div');
-        selectionBox.style.cssText = [
-          'position:fixed',
-          'display:none',
-          'border:2px solid #38bdf8',
-          'background:rgba(56,189,248,0.18)',
-          'box-shadow:0 0 0 99999px rgba(15,23,42,0.45)',
-          'box-sizing:border-box',
-          'pointer-events:none'
-        ].join(';');
-
-        overlay.appendChild(hint);
-        overlay.appendChild(selectionBox);
-        const cancelButton = document.createElement('button');
-        cancelButton.type = 'button';
-        cancelButton.textContent = '取消';
-        cancelButton.style.cssText = [
-          'position:fixed',
-          'top:16px',
-          'right:16px',
-          'z-index:2147483647',
-          'padding:8px 12px',
-          'border:1px solid rgba(255,255,255,0.35)',
-          'border-radius:6px',
-          'background:rgba(15,23,42,0.92)',
-          'color:#fff',
-          'font:13px/1.2 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif',
-          'cursor:pointer'
-        ].join(';');
-        overlay.appendChild(cancelButton);
-        document.documentElement.appendChild(overlay);
-
-        let startX = 0;
-        let startY = 0;
-        let isDragging = false;
-        let resolved = false;
-
-        function cleanup(result) {
-          if (resolved) return;
-          resolved = true;
-          overlay.removeEventListener('mousedown', onMouseDown, true);
-          overlay.removeEventListener('mousemove', onMouseMove, true);
-          overlay.removeEventListener('mouseup', onMouseUp, true);
-          overlay.removeEventListener('contextmenu', onContextMenu, true);
-          cancelButton.removeEventListener('mousedown', onCancelButtonMouseDown, true);
-          cancelButton.removeEventListener('click', onCancelButtonClick, true);
-          overlay.remove();
-          resolve(result);
-        }
-
-        function updateBox(currentX, currentY) {
-          const left = Math.min(startX, currentX);
-          const top = Math.min(startY, currentY);
-          const width = Math.abs(currentX - startX);
-          const height = Math.abs(currentY - startY);
-
-          selectionBox.style.display = 'block';
-          selectionBox.style.left = `${left}px`;
-          selectionBox.style.top = `${top}px`;
-          selectionBox.style.width = `${width}px`;
-          selectionBox.style.height = `${height}px`;
-        }
-
-        function onMouseDown(event) {
-          if (event.target === cancelButton) return;
-          if (event.button !== 0) return;
-          event.preventDefault();
-          event.stopPropagation();
-          hint.style.display = 'none';
-          cancelButton.style.display = 'none';
-          isDragging = true;
-          startX = event.clientX;
-          startY = event.clientY;
-          updateBox(startX, startY);
-        }
-
-        function onMouseMove(event) {
-          if (!isDragging) return;
-          event.preventDefault();
-          event.stopPropagation();
-          updateBox(event.clientX, event.clientY);
-        }
-
-        function onMouseUp(event) {
-          if (!isDragging) return;
-          event.preventDefault();
-          event.stopPropagation();
-          isDragging = false;
-
-          const left = Math.max(0, Math.min(startX, event.clientX));
-          const top = Math.max(0, Math.min(startY, event.clientY));
-          const width = Math.min(window.innerWidth - left, Math.abs(event.clientX - startX));
-          const height = Math.min(window.innerHeight - top, Math.abs(event.clientY - startY));
-
-          if (width < 8 || height < 8) {
-            cleanup({ cancelled: true });
-            return;
-          }
-
-          cleanup({
-            x: left,
-            y: top,
-            width,
-            height,
-            viewportWidth: window.innerWidth,
-            viewportHeight: window.innerHeight
-          });
-        }
-
-        function onContextMenu(event) {
-          event.preventDefault();
-          event.stopPropagation();
-          cleanup({ cancelled: true });
-        }
-
-        function onCancelButtonMouseDown(event) {
-          event.preventDefault();
-          event.stopPropagation();
-        }
-
-        function onCancelButtonClick(event) {
-          event.preventDefault();
-          event.stopPropagation();
-          cleanup({ cancelled: true });
-        }
-
-        overlay.addEventListener('mousedown', onMouseDown, true);
-        overlay.addEventListener('mousemove', onMouseMove, true);
-        overlay.addEventListener('mouseup', onMouseUp, true);
-        overlay.addEventListener('contextmenu', onContextMenu, true);
-        cancelButton.addEventListener('mousedown', onCancelButtonMouseDown, true);
-        cancelButton.addEventListener('click', onCancelButtonClick, true);
-      })
-    });
-
-    return result;
-  }
-
-  async function cropDataUrlToSelection(dataUrl, selection) {
-    const image = await loadImageElement(dataUrl);
-    const imageWidth = image.naturalWidth || image.width;
-    const imageHeight = image.naturalHeight || image.height;
-    assertImageDimensionsSafe(imageWidth, imageHeight);
-
-    const viewportWidth = Number(selection?.viewportWidth || 0);
-    const viewportHeight = Number(selection?.viewportHeight || 0);
-    if (!viewportWidth || !viewportHeight) {
-      throw new Error('截图区域参数无效');
-    }
-
-    const scaleX = imageWidth / viewportWidth;
-    const scaleY = imageHeight / viewportHeight;
-    const sourceX = Math.max(0, Math.round(Number(selection.x || 0) * scaleX));
-    const sourceY = Math.max(0, Math.round(Number(selection.y || 0) * scaleY));
-    const sourceWidth = Math.max(1, Math.min(imageWidth - sourceX, Math.round(Number(selection.width || 0) * scaleX)));
-    const sourceHeight = Math.max(1, Math.min(imageHeight - sourceY, Math.round(Number(selection.height || 0) * scaleY)));
-
-    assertImageDimensionsSafe(sourceWidth, sourceHeight);
-
-    const canvas = document.createElement('canvas');
-    canvas.width = sourceWidth;
-    canvas.height = sourceHeight;
-    const context = canvas.getContext('2d');
-    if (!context) throw new Error('无法创建截图画布');
-
-    context.drawImage(image, sourceX, sourceY, sourceWidth, sourceHeight, 0, 0, sourceWidth, sourceHeight);
-    const croppedDataUrl = canvas.toDataURL('image/png');
-    if (!isAllowedDataImageUrl(croppedDataUrl)) {
-      throw new Error('裁剪后的截图超过 10MB');
-    }
-    return croppedDataUrl;
-  }
-
-  async function captureSelectedRegionAsImage() {
-    if (!(await ensurePrivacyNoticeAccepted())) return;
-
-    const tab = await getActiveBrowserTab();
-    if (!tab?.windowId) {
-      throw new Error('没有可截图的当前标签页');
-    }
-
-    await ensureCapturePermission();
-
-    if (tab.url && isReadablePageUrl(tab.url)) {
-      await ensurePageHostPermission(tab.url);
-    }
-
-    let selection = null;
-    try {
-      selection = await requestPageRegionSelection(tab.id);
-      if (!selection) {
-        throw new Error('当前页面不允许注入框选层，请使用系统截图后粘贴或上传。');
-      }
-    } catch (error) {
-      throw new Error(error.message || '当前页面不允许注入框选层，请使用系统截图后粘贴或上传。');
-    }
-
-    if (selection?.cancelled) return;
-
-    let dataUrl;
-    try {
-      dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
-    } catch {
-      throw new Error('无法截取当前标签页。请确认已授予截图权限，并避开 Chrome 商店页、浏览器内置页或受保护页面。');
-    }
-    const croppedDataUrl = await cropDataUrlToSelection(dataUrl, selection);
-
-    await attachImageFromSource({
-      dataUrl: croppedDataUrl,
-      type: 'image/png',
-      name: `screenshot-region-${new Date().toISOString().replace(/[:.]/g, '-')}.png`,
-      size: estimateDataUrlBytes(croppedDataUrl)
-    });
   }
 
   function activateTab(target) {
@@ -1136,6 +973,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       await chrome.storage.session.set({ apiKey: enteredApiKey, apiKeyApiUrl: safeApiUrl });
     }
 
+    invalidateChatAttachments();
     await chrome.storage.local.set({ apiUrl: safeApiUrl, modelName, agentLlmParams: agentLlmParamsInput.value.trim() });
     apiUrlInput.value = safeApiUrl;
     updateApiKeyStatus(Boolean(enteredApiKey || effectiveApiKey), safeApiUrl);
@@ -1171,15 +1009,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     chatHistory.scrollTo({ top: chatHistory.scrollHeight, behavior });
   }
 
-  function showCaptureBanner(text) {
-    const chatHistory = document.getElementById('chatHistory');
-    const banner = document.createElement('div');
-    banner.className = 'capture-warning-banner';
-    banner.textContent = text;
-    chatHistory.appendChild(banner);
-    scrollToBottom();
-  }
-
   // 4. 发送与流式接收核心逻辑
   let _sendingLock = false;
   let _chatRequest = null;
@@ -1187,11 +1016,17 @@ document.addEventListener('DOMContentLoaded', async () => {
   function updateSendButton() {
     const button = document.getElementById('sendBtn');
     if (!button) return;
+    if (chatUpload?.chatId === currentChatId) {
+      button.textContent = chatUpload.controller.signal.aborted ? '正在停止…' : '■ 停止';
+      button.title = '停止图片上传，不提交聊天';
+      button.disabled = chatUpload.controller.signal.aborted;
+      return;
+    }
     const request = _chatRequest?.chatId === currentChatId ? _chatRequest : null;
     const active = request && (request.status === 'running' || request.stopping);
     button.textContent = active ? (request.stopping ? '正在停止…' : '■ 停止') : '发送';
     button.title = active ? '停止当前提问，不删除会话；已完成的压缩进度会保留' : '发送消息';
-    button.disabled = active ? request.stopping : (_sendingLock || agentState.active);
+    button.disabled = active ? request.stopping : (_sendingLock || agentState.active || chatImageProcessing);
   }
 
   function bindChatRequest(base, chatId, requestId, onSettled, live = false) {
@@ -1228,6 +1063,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   async function stopChatRequest() {
+    if (chatUpload?.chatId === currentChatId) { cancelChatUpload(); updateSendButton(); return; }
     const request = _chatRequest;
     if (!request || request.chatId !== currentChatId || request.stopping || request.status !== 'running') return;
     request.stopping = true;
@@ -1247,13 +1083,14 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // 发送分流：自动化开关开(或 /browser-operation 前缀)→ 启动 agent；否则走服务端聊天。
   async function handleSend() {
+    if (chatImageProcessing || chatUpload) return;
     if (_sendingLock || (_chatRequest?.chatId === currentChatId &&
         (_chatRequest.status === 'running' || _chatRequest.stopping))) return;
     if (agentState.active) return;
     const input = document.getElementById('chatInput');
     const text = (input.value || '').trim();
-    if (!text) return;
     const useAgent = shouldUseAgent(text);
+    if (!text && (useAgent || !chatImage)) return;
     if (useAgent && text.length > MAX_AGENT_TASK_LENGTH) {
       alert(`自动化指令不能超过 ${MAX_AGENT_TASK_LENGTH} 字。`);
       return;
@@ -1262,7 +1099,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     _sendingLock = true;
     updateSendButton();
     try {
-      const image = attachedImage ? attachedImage.dataUrl : '';
+      const image = useAgent ? (attachedImage ? attachedImage.dataUrl : '') : chatImage;
       if (useAgent) {
         // 自动化模式：去掉命令前缀,启动 agent,图片作视觉输入
         const task = text.startsWith(AGENT_COMMAND.trim())
@@ -1283,6 +1120,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   async function runChat(text, image, searchQuery = '') {
+    const epoch = chatAttachmentEpoch;
+    const chatId = await getOrCreateCurrentChatId();
     let settings;
     try {
       settings = await resolveApiRequestConfig();
@@ -1291,6 +1130,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       return;
     }
     if (!(await ensurePrivacyNoticeAccepted())) return;
+    if (epoch !== chatAttachmentEpoch || currentChatId !== chatId) return;
     await runServerChat(text, image, searchQuery, settings);
   }
 
@@ -1306,6 +1146,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (data?.server_context !== true || data.protocol_version !== 1) {
       throw new Error('后端会话协议不兼容，请更新本项目后端；不再支持直接连接模型接口。');
     }
+    return data;
   }
 
   function compactionLabel(progress) {
@@ -1471,11 +1312,24 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   async function runServerChat(text, image, searchQuery, settings, retryBody = null, newTurn = false) {
     const { apiKey, modelName, safeApiUrl: base } = settings;
+    const kbId = window._kbBoundId || '';
     const chatId = retryBody?.chat_id || await getOrCreateCurrentChatId();
     const key = `${base}|${chatId}`;
+    const epoch = chatAttachmentEpoch;
+    const pending = !retryBody && image ? { chatId, base, controller: new AbortController() } : null;
+    if (pending) { chatUpload = pending; renderComposerImage(); updateSendButton(); }
+    const checkPending = () => {
+      if (pending?.controller.signal.aborted || epoch !== chatAttachmentEpoch || currentChatId !== chatId) {
+        throw new DOMException('发送已取消或会话已切换', 'AbortError');
+      }
+    };
     let body;
     try {
-      await requireServerContext(base);
+      const capabilities = await requireServerContext(base);
+      checkPending();
+      if ((image || retryBody?.attachment_ids?.length) && (capabilities.attachments?.protocol_version !== 1 || !capabilities.attachments.enabled)) {
+        throw new Error('后端尚未启用 Chat 附件协议，请更新后端并配置附件地址和签名密钥。');
+      }
       if (!retryBody || !sessionSequences.has(key)) {
         const state = await callBackendApi(buildBackendEndpointUrl(base, `/v1/sessions/${encodeURIComponent(chatId)}/messages?limit=1`));
         sessionSequences.set(key, state.last_seq);
@@ -1483,26 +1337,38 @@ document.addEventListener('DOMContentLoaded', async () => {
           throw new Error('当前会话有未完成的历史压缩，请先恢复或取消原请求。');
         }
       }
+      checkPending();
+      if (image && !retryBody) {
+        if (image.uploaded && (image.base !== base || image.chatId !== chatId)) throw new Error('图片属于其他后端或会话，请重新选择');
+        if (!image.uploaded) {
+          const uploaded = await ChatImages.upload(buildBackendEndpointUrl(base, `/v1/sessions/${encodeURIComponent(chatId)}/attachments`), apiKey, image, pending.controller.signal);
+          image.uploaded = uploaded; image.base = base; image.chatId = chatId;
+        }
+      }
+      checkPending();
+      const currentSettings = await resolveApiRequestConfig();
+      checkPending();
+      if (currentSettings.safeApiUrl !== base || currentSettings.modelName !== modelName || currentSettings.apiKey !== apiKey) throw new Error('发送期间配置已改变，尚未提交聊天');
       body = retryBody || {
         context_mode: 'server', chat_id: chatId, request_id: createMessageId(),
         expected_last_seq: sessionSequences.get(key), model: String(modelName).trim(), stream: true,
-        kb_id: window._kbBoundId || '', search_query: searchQuery,
-        messages: [{ role: 'user', content: image ? [
-          { type: 'text', text: text || '请分析这张图片' }, { type: 'image_url', image_url: { url: image } }
-        ] : text }],
+        kb_id: kbId, search_query: searchQuery,
+        messages: [{ role: 'user', content: text }],
+        attachment_ids: image ? [image.uploaded.attachment_id] : [],
       };
     } catch (error) {
-      if (!retryBody) {
+      if (!retryBody && epoch === chatAttachmentEpoch && currentChatId === chatId) {
         if (!document.getElementById('chatInput').value) document.getElementById('chatInput').value = text;
-        if (image && !attachedImage) applyAttachedImage({ dataUrl: image, name: '待发送图片' });
       }
-      alert('无法同步会话，尚未提交: ' + error.message);
+      if (error.name !== 'AbortError') alert('尚未提交聊天: ' + error.message);
       return;
+    } finally {
+      if (pending && chatUpload === pending) { chatUpload = null; renderComposerImage(); updateSendButton(); }
     }
     if (!retryBody) {
       const input = document.getElementById('chatInput');
       if (input.value.trim() === text) input.value = '';
-      if (image && attachedImage?.dataUrl === image) clearAttachedImage();
+      if (image && chatImage === image) clearChatImage();
       if (searchQuery) {
         const toggle = document.getElementById('webSearchToggle');
         if (toggle) toggle.checked = false;
@@ -1515,8 +1381,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       const label = document.createElement('div'); label.textContent = text;
       user.appendChild(label);
       if (image) {
-        const preview = document.createElement('img'); preview.className = 'user-upload-preview';
-        preview.src = image; preview.alt = '本轮图片'; user.appendChild(preview);
+        renderChatAttachment(user, { ...image.uploaded, first_frame: image.first_frame || image.uploaded.first_frame }, base, chatId, image);
       }
     }
     const bubble = createMessageNode('ai');
@@ -1651,6 +1516,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   async function resumeSession(chatId, beforeSeq = null) {
+    if (!beforeSeq) invalidateChatAttachments();
+    const epoch = chatAttachmentEpoch;
     let base;
     try { base = await backendBase(); } catch { return; }
     let data;
@@ -1659,14 +1526,17 @@ document.addEventListener('DOMContentLoaded', async () => {
       const query = `?limit=100${beforeSeq ? `&before_seq=${beforeSeq}` : ''}`;
       data = await callBackendApi(buildBackendEndpointUrl(base, `/v1/sessions/${encodeURIComponent(chatId)}/messages${query}`), 'GET');
     } catch (e) {
+      if (epoch !== chatAttachmentEpoch) return;
       alert('载入会话失败: ' + (e?.message || ''));
       return;
     }
+    if (epoch !== chatAttachmentEpoch || (beforeSeq && currentChatId !== chatId)) return;
     const messages = data?.messages || [];
     // 切到该会话，只恢复展示；模型上下文始终由后端构建。
     currentChatId = chatId;
     updateSendButton();
     await chrome.storage.session.set({ [CURRENT_CHAT_ID_KEY]: chatId });
+    if (epoch !== chatAttachmentEpoch) return;
     sessionSequences.set(`${base}|${chatId}`, data.last_seq);
     // DOM 全量渲染(用户看得到完整历史)
     const historyEl = document.getElementById('chatHistory');
@@ -1685,6 +1555,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         const node = document.createElement('div');
         node.textContent = m.content;
         bubble.appendChild(node);
+        for (const attachment of m.attachments || []) renderChatAttachment(bubble, attachment, base, chatId);
         if (m.request_id && !['completed', 'partial'].includes(m.status)) {
           addRequestRecovery(bubble, base, chatId, m.request_id);
         }
@@ -2354,7 +2225,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   getOrCreateCurrentChatId().catch(console.error);
 
   document.getElementById('sendBtn').addEventListener('click', () => {
-    if (_chatRequest?.chatId === currentChatId && (_chatRequest.status === 'running' || _chatRequest.stopping)) {
+    if (chatUpload?.chatId === currentChatId || (_chatRequest?.chatId === currentChatId && (_chatRequest.status === 'running' || _chatRequest.stopping))) {
       stopChatRequest();
     } else handleSend();
   });
@@ -2403,33 +2274,52 @@ document.addEventListener('DOMContentLoaded', async () => {
     document.getElementById('imageInput').click();
   });
 
-  document.getElementById('captureVisibleTabBtn').addEventListener('click', async () => {
-    const captureButton = document.getElementById('captureVisibleTabBtn');
-    captureButton.disabled = true;
-    try {
-      await captureSelectedRegionAsImage();
-    } catch (error) {
-      showCaptureBanner(error.message || '当前页面不允许注入框选层，请使用系统截图后粘贴或上传。');
-    } finally {
-      captureButton.disabled = false;
-    }
-  });
-
   document.getElementById('imageInput').addEventListener('change', async (event) => {
     const file = event.target.files?.[0];
     if (!file) return;
 
     try {
-      await setAttachedImage(file);
+      if (shouldUseAgent(document.getElementById('chatInput').value)) await setAttachedImage(file);
+      else await selectChatImage(Array.from(event.target.files));
     } catch (error) {
       alert(error.message || '图片读取失败');
-      clearAttachedImage();
+      if (shouldUseAgent(document.getElementById('chatInput').value)) clearAttachedImage();
     }
   });
 
-  document.getElementById('clearImageBtn').addEventListener('click', clearAttachedImage);
+  document.getElementById('clearImageBtn').addEventListener('click', () => {
+    if (shouldUseAgent(document.getElementById('chatInput').value)) clearAttachedImage(); else clearChatImage();
+  });
+  document.getElementById('imagePreviewImg').addEventListener('click', event => {
+    if (!shouldUseAgent(document.getElementById('chatInput').value) && chatImage) ChatImages.enlarge(event.target.src);
+  });
+  let composerWasAgent = false;
+  document.getElementById('chatInput').addEventListener('input', () => {
+    const isAgent = shouldUseAgent(document.getElementById('chatInput').value);
+    if (isAgent !== composerWasAgent) { chatAttachmentEpoch++; chatImageProcessing = false; cancelChatUpload(); }
+    composerWasAgent = isAgent; renderComposerImage(); updateSendButton();
+  });
+  const composer = document.querySelector('.composer');
+  composer.addEventListener('dragover', event => {
+    if (!shouldUseAgent(document.getElementById('chatInput').value) && Array.from(event.dataTransfer.types).includes('Files')) event.preventDefault();
+  });
+  composer.addEventListener('drop', async event => {
+    if (shouldUseAgent(document.getElementById('chatInput').value) || !event.dataTransfer.files.length) return;
+    event.preventDefault();
+    try { await selectChatImage(Array.from(event.dataTransfer.files)); } catch (error) { alert(error.message); }
+  });
+  window.addEventListener('pagehide', invalidateChatAttachments);
 
   document.getElementById('chatInput').addEventListener('paste', async (event) => {
+    if (!shouldUseAgent(document.getElementById('chatInput').value)) {
+      const files = Array.from(event.clipboardData?.items || []).filter(item => item.kind === 'file').map(item => item.getAsFile()).filter(Boolean);
+      if (!files.length) return;
+      event.preventDefault();
+      const text = event.clipboardData.getData('text/plain');
+      if (text) { const input = event.target; input.setRangeText(text, input.selectionStart, input.selectionEnd, 'end'); }
+      try { await selectChatImage(files); } catch (error) { alert(error.message); }
+      return;
+    }
     const pastedText = event.clipboardData?.getData('text/plain') || '';
     const normalizedDataUrl = pastedText.trim().replace(/\s+/g, '');
     if (!isAllowedDataImageUrl(normalizedDataUrl)) return;
@@ -2957,7 +2847,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     // 按钮点击切换自动化模式
     if (agentBtn && toggleEl) {
       agentBtn.addEventListener('click', () => {
+        chatAttachmentEpoch++; chatImageProcessing = false; cancelChatUpload();
         toggleEl.checked = !toggleEl.checked;
+        composerWasAgent = toggleEl.checked;
+        renderComposerImage(); updateSendButton();
         agentBtn.classList.toggle('is-active', toggleEl.checked);
         inputEl.placeholder = toggleEl.checked
           ? '输入自动化指令 (如: 帮我点击搜索按钮)...'
@@ -2980,6 +2873,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         item.innerHTML = `<span class="slash-menu-cmd">${cmd.name}</span><span class="slash-menu-desc">${cmd.description}</span>`;
         item.addEventListener('click', () => {
           inputEl.value = cmd.name + ' ';
+          inputEl.dispatchEvent(new Event('input'));
           inputEl.focus();
           hideSlashMenu();
         });

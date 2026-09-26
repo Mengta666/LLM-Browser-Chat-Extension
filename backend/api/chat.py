@@ -74,6 +74,7 @@ class ChatRequest(BaseModel):
     request_id: str = ''
     expected_last_seq: int | None = Field(default=None, ge=0)
     continuation_of: str = ''
+    attachment_ids: list[str] = Field(default_factory=list, max_length=1)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

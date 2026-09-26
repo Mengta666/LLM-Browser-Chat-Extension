@@ -20,6 +20,7 @@ mmh3==5.2.1               # term id 哈希，对齐 FastEmbed（sparse.py）
 langchain-text-splitters>=0.3.0   # RecursiveCharacterTextSplitter 语义切片
 pymupdf4llm>=0.0.17               # PDF → Markdown 提取（LLM 友好）
 python-multipart>=0.0.7           # FastAPI multipart 文件上传
+Pillow>=11.0                     # Chat 图片实际格式、像素校验及动图第一帧
 
 # ── 可选：RAG 网页问答 / 向量检索 / 搜索 ──
 # app.py 以 try/except 懒加载这些模块，未安装时仅跳过网页问答与搜索，

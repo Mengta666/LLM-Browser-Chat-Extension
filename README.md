@@ -154,12 +154,38 @@ Chrome 内部页面、扩展管理页面等受限页面不能作为普通网页�
 
 ### 聊天、图片与历史会话
 
-在主面板中关闭“自动化”即可聊天。“图片”和“框选截图”可添加视觉材料；输入框支持 Enter 发送、Shift+Enter 换行。
+在主面板中关闭“自动化”即可聊天。使用“图片”选择文件，或粘贴、拖拽图片添加视觉材料；输入框支持 Enter 发送、Shift+Enter 换行。
 
 - 使用“会话”创建、切换和恢复对话。
 - 持续追问时保持在同一会话，后端会恢复历史并对较早内容生成摘要。
 - 出现“回答尚未完成”且提供“继续生成”按钮时，可继续最后一条可续写回答。续写保存为新回复，不覆盖原文。
-- 图片内容不会完整持久化恢复；涉及历史图片的重试可能需要重新附图。
+- Chat 每条消息最多一张图片，支持文件选择、图片粘贴、拖拽和纯图片发送；普通文字粘贴不变。需要截图时，可使用系统截图工具后粘贴或选择图片文件。
+- 单图最多 **10 MiB、2000 万像素**，超限请裁剪后重传。静态 PNG/JPEG/WebP 保留原格式；动图只发送第一帧 PNG，界面会明确提示，不自动缩放或有损压缩。
+- 选图时仅本地预览；发送后先上传二进制文件，聊天请求只携带附件 ID。上传、压缩、生成期间都可点击发送按钮位置的“■ 停止”。上传失败保留草稿，聊天提交后状态不确定时先检查原请求，不重复创建提问。
+- 历史图片按需加载，可放大查看；只有点击“再次引用”才会加入原会话的新模型请求。普通追问只保留历史附件标记，不自动携带旧图；“继续生成”沿用原请求图片。
+- 更新前没有持久化的历史图片无法补回；未发送草稿不保证跨扩展重启恢复。自动化仍使用原有图片协议。
+
+#### 启用 Chat 附件
+
+安装最新后端依赖（含 Pillow），然后初始化附件配置。将下例地址替换为**模型服务或模型容器能够访问**的本项目后端根地址，不要使用模型接口地址，也不要带 `/v1`：
+
+```powershell
+.\backend\.venv\Scripts\python.exe backend/configure_chat_attachments.py --base-url http://10.8.125.10:8000
+```
+
+Linux / macOS 使用 `backend/.venv/bin/python`。脚本只补齐 `.env` 中缺少或为空的三个附件字段，本地生成独立随机密钥，不打印密钥、不覆盖已有模型参数。若已有非空附件地址需要调整，请编辑 `.env`。
+
+| 配置 | 含义 |
+| --- | --- |
+| `CHAT_ATTACHMENT_BASE_URL` | 模型可达的后端根地址，签名链接只使用此配置，不信任请求 Host |
+| `CHAT_ATTACHMENT_SIGNING_KEY` | 本地随机生成并持久保存的签名密钥，至少 32 字符，不能提交到 Git |
+| `CHAT_ATTACHMENT_URL_TTL_SECONDS` | 默认 900 秒，允许 600～86400；每次模型调用前重新签名 |
+
+重启后端，并在 `chrome://extensions` 重新加载扩展、重新打开侧边栏。`GET /v1/sessions/capabilities` 中的 `attachments.enabled` 应为 `true`。配置缺失只禁用附件，文字聊天仍可使用；新扩展遇到旧后端会提示升级，不回退 Base64。
+
+后端必须监听模型可访问的网卡，并仅向可信内网开放相应端口。如果使用代理，限制上传请求体为至少 12 MiB，关闭该下载路由的查询参数日志；应用自身会隐藏签名参数。先从模型容器验证 `/docs` 可达，再发送合成图片验证真实读图；仅 `/docs` 返回 200 不代表视觉模型已经可用。模型不支持视觉或下载失败时会明确报错，附件保留供重试，不回退 Base64。
+
+附件存储在聊天数据库同目录的 `chat_attachments/` 下，数据库只记录元数据和引用，不保存图片二进制或临时签名 URL。备份时需同时保留数据库和文件目录。未被消息引用的附件超过 24 小时会在启动时及每小时回收；已关联图片不因停止、失败或链接到期删除。删除会话会立即拒绝新的图片访问，但第一批不物理清除已关联文件。签名链接在有效期内可读取图片，请不要分享；本项目仍按可信内网、单用户部署，签名下载不替代登录鉴权。
 
 会话摘要用于控制上下文长度，并非原文的无损副本。重要约束可在新问题中再次明确。
 
@@ -418,6 +444,7 @@ docker compose --env-file deploy/.env -f deploy/compose.yaml --profile reader up
 | 数据 | 保存位置 |
 | --- | --- |
 | 聊天历史和请求状态 | `backend/data/chat_history.sqlite3` |
+| Chat 图片文件 | `backend/data/chat_attachments/`，需与聊天数据库一起备份 |
 | 知识库元数据、记忆变更审计 | `backend/agent/data/agent_memory.sqlite3` |
 | 文档 / 记忆向量及内容 | 配置的 Qdrant 集合 |
 | 后端与部署配置 | `backend/config/.env`、`deploy/.env`、`deploy/runtime/` |
@@ -456,6 +483,10 @@ browser-agent/
 | `GET /v1/sessions/capabilities`、`GET /v1/sessions/list` | 会话能力和历史列表 |
 | `GET /v1/sessions/{chat_id}/messages` | 消息分页 |
 | `GET /v1/sessions/{chat_id}/requests/{request_id}` | 请求状态、恢复及重试信息 |
+| `POST /v1/sessions/{chat_id}/attachments` | multipart 单图上传，不创建聊天轮次 |
+| `POST /v1/sessions/{chat_id}/attachments/{id}/access` | 获取短期图片预览链接 |
+| `GET /v1/chat-attachments/{id}/content` | 校验签名、有效期和会话状态后返回图片 |
+| `DELETE /v1/sessions/{chat_id}/attachments/{id}` | 删除未关联消息的附件；已关联返回 409 |
 | `POST /v1/agent/execute`、`POST /v1/agent/step` | 自动化启动和推进 |
 | `POST /v1/agent/status`、`POST /v1/agent/cancel` | 自动化状态查询和取消 |
 | `/v1/kb` | 建库、文档上传、索引状态、删除与恢复 |
@@ -463,6 +494,8 @@ browser-agent/
 | `/v1/logs/*` | 日志查询与文件列表 |
 
 自定义客户端使用服务端会话时，设置 `context_mode: "server"`，携带 `chat_id`、`request_id` 和 `expected_last_seq`，只提交本轮用户消息。重试复用原请求 ID；续写使用新请求 ID 并通过 `continuation_of` 关联原回答。实现见 [server_chat.py](backend/api/server_chat.py)。
+
+Chat 图片先向该会话上传 `file` 和稳定的 `client_attachment_id`，然后在聊天请求中传 `attachment_ids: ["att_..."]`。最多一个 ID，纯图片的用户 `content` 可为空字符串；不要再在服务端 Chat 消息中传内联 `image_url` 或 Base64。同会话相同上传标识与内容幂等返回原附件，换内容返回 409；请求状态和历史消息会返回 `attachments` 元数据。附件链接只在使用时获取，不持久化到消息中。
 
 主后端不提供通用 `/v1/models` 代理。正文服务单独提供 `GET /health`、`POST /v1/extract`，不要将其路由拼到主后端地址下。
 

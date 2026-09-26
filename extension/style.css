@@ -203,7 +203,6 @@ textarea#chatInput { min-height: 88px; }
 .image-preview-name { font-size: 12px; font-weight: 700; color: var(--app-text); word-break: break-all; }
 .image-preview-size { font-size: 11px; color: var(--app-muted); margin-top: 2px; }
 .image-copy-btn { align-self: flex-start; padding: 5px 10px; font-size: 12px; }
-.capture-warning-banner { margin: 8px 0 14px; padding: 10px 12px; border: 1px solid var(--app-danger-border); border-radius: 6px; background: var(--app-danger-soft); color: var(--app-danger); font-size: 13px; line-height: 1.5; }
 textarea { width: 100%; resize: none; padding: 8px; border: 1px solid var(--app-border-strong); border-radius: 4px; font-family: inherit; background: var(--app-surface-3); color: var(--app-text);}
 button { padding: 8px 15px; background: var(--app-accent); color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold;}
 button:hover { background: var(--app-accent-hover); }
@@ -959,3 +958,10 @@ input { width: 100%; padding: 8px; margin-top: 5px; box-sizing: border-box; bord
   opacity: 0.8;
   margin-top: 4px;
 }
+.chat-image-dialog { max-width: 95vw; max-height: 95vh; background: #1e293b; color: #fff; border: 1px solid #64748b; border-radius: 10px; }
+.chat-image-dialog::backdrop { background: #000a; }
+.chat-image-dialog img { display: block; max-width: 85vw; max-height: 80vh; object-fit: contain; }
+.chat-image-dialog button, .chat-attachment-card button { cursor: pointer; margin: 4px; }
+.chat-attachment-card { margin-top: 8px; }
+.chat-attachment-card img { max-width: 100%; max-height: 240px; cursor: zoom-in; object-fit: contain; }
+.chat-attachment-meta { font-size: 12px; overflow-wrap: anywhere; opacity: .85; }

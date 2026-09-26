@@ -123,7 +123,7 @@ class AgentSession:
     last_memory: str = ""
     progress: str = ""                   # 供前端展示（= 最近 next_goal）
 
-    task_image: str = ""                 # 任务附带的视觉上下文（用户上传图/框选截图，data URL）；随首条 user 消息注入
+    task_image: str = ""                 # 任务附带的视觉上下文（用户上传图，data URL）；随首条 user 消息注入
 
     # 自定义 LLM 参数(前端设置面板配的 JSON,如关思考模式)。仅本 session 生效,chat 不受影响。
     # 结构:{顶层参数(如 reasoning_effort), "extra_body": {供应商私有参数如 thinking/enable_thinking}}

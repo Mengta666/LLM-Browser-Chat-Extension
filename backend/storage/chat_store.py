@@ -156,6 +156,8 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         )""")
         if 'reduce_attempts' not in {row[1] for row in conn.execute('PRAGMA table_info(chat_compactions)')}:
             conn.execute('ALTER TABLE chat_compactions ADD COLUMN reduce_attempts INTEGER NOT NULL DEFAULT 0')
+        from storage.chat_attachments import init_schema
+        init_schema(conn)
 
 
 def ensure_session(chat_id: str, first_user_text: str = "") -> bool:
@@ -364,7 +366,7 @@ def get_session(chat_id: str) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
-def begin_turn(chat_id: str, request_id: str, request_hash: str, expected_last_seq: int, content: str, request_json: str = '', continuation_of: str = '') -> dict[str, Any]:
+def begin_turn(chat_id: str, request_id: str, request_hash: str, expected_last_seq: int, content: str, request_json: str = '', continuation_of: str = '', attachment_ids=None) -> dict[str, Any]:
     conn = _get_conn()
     now = _now_iso()
     with _lock, conn:
@@ -379,6 +381,8 @@ def begin_turn(chat_id: str, request_id: str, request_hash: str, expected_last_s
                 raise SessionError('request_conflict')
             if previous['status'] in ('completed', 'partial'):
                 return dict(previous)
+        from storage.chat_attachments import validate_ids
+        validate_ids(conn, chat_id, attachment_ids or [])
         if job and job['status'] in ('running', 'failed', 'interrupted') and job['request_id'] != request_id:
             raise SessionError('context_compaction_pending')
         if previous:
@@ -406,9 +410,13 @@ def begin_turn(chat_id: str, request_id: str, request_hash: str, expected_last_s
             if session and session['summary_msg_count'] > conn.execute('SELECT COUNT(*) FROM chat_messages WHERE chat_id=?', (chat_id,)).fetchone()[0]:
                 raise SessionError('legacy_history_incomplete')
             if not session:
-                conn.execute('INSERT INTO chat_sessions(chat_id,title,created_at,updated_at) VALUES(?,?,?,?)', (chat_id, content[:_TITLE_MAX_LEN], now, now))
+                conn.execute('INSERT INTO chat_sessions(chat_id,title,created_at,updated_at) VALUES(?,?,?,?)', (chat_id, content[:_TITLE_MAX_LEN] or ('[图片]' if attachment_ids else ''), now, now))
             user_seq = last_seq + 1
             conn.execute("INSERT INTO chat_messages(message_id,chat_id,role,content,created_at,seq,request_id) VALUES(?,?,'user',?,?,?,?)", (uuid4().hex, chat_id, content, now, user_seq, request_id))
+            for position, identity in enumerate(attachment_ids or []):
+                conn.execute('''INSERT INTO chat_message_attachments(message_id,attachment_id,position)
+                    SELECT message_id,?,? FROM chat_messages WHERE chat_id=? AND seq=?''',
+                    (identity, position, chat_id, user_seq))
             conn.execute("INSERT INTO chat_turns(chat_id,request_id,request_hash,status,user_seq,created_at,updated_at,request_json,continuation_of) VALUES(?,?,?,'running',?,?,?,?,?)", (chat_id, request_id, request_hash, user_seq, now, now, request_json, continuation_of))
             conn.execute('UPDATE chat_sessions SET last_seq=? WHERE chat_id=?', (user_seq, chat_id))
         conn.execute("UPDATE chat_sessions SET context_mode='server',active_request_id=?,updated_at=? WHERE chat_id=?", (request_id, now, chat_id))
@@ -460,6 +468,8 @@ def get_request(chat_id: str, request_id: str) -> dict[str, Any] | None:
                                       and session['last_seq'] == row['assistant_seq']
                                       and not session['active_request_id'] and not session['deleted_at'])
         result['messages'] = [dict(message) for message in conn.execute('SELECT message_id,seq,role,content,tools FROM chat_messages WHERE chat_id=? AND request_id=? ORDER BY seq', (chat_id, request_id))]
+        from storage.chat_attachments import enrich
+        enrich(conn, result['messages'])
         job = get_compaction(chat_id)
         result['context_compaction'] = compaction_progress(job) if job and job['request_id'] == request_id else None
         result['can_cancel'] = row['status'] in ('running', 'failed', 'interrupted') and session['last_seq'] == row['user_seq'] and not session['deleted_at']
@@ -587,8 +597,14 @@ def context_snapshot(chat_id: str) -> dict[str, Any]:
         rows = conn.execute("""SELECT m.*,COALESCE(t.status,'completed') AS status FROM chat_messages m LEFT JOIN chat_turns t
             ON m.chat_id=t.chat_id AND m.request_id=t.request_id
             WHERE m.chat_id=? AND m.seq>? AND (m.request_id='' OR t.status IN ('completed','partial')) ORDER BY m.seq""", (chat_id, session['summary_upto_seq'])).fetchall()
+        messages = [dict(row) for row in rows]
+        from storage.chat_attachments import enrich
+        enrich(conn, messages)
+        for message in messages:
+            if message['attachments']:
+                message['content'] += '\n[此历史消息附有图片；原图未纳入本轮输入，需要用户再次引用。]'
         return {'summary': session['context_summary'], 'upto_seq': session['summary_upto_seq'],
-                'version': session['summary_version'], 'messages': [dict(row) for row in rows]}
+                'version': session['summary_version'], 'messages': messages}
 
 
 def _history_excerpt(text, terms, size=800):
@@ -644,7 +660,8 @@ def history_records(chat_id: str, upto_seq: int, *, terms: list[str] | None = No
             raise SessionError('history_unavailable', 404)
         hits = ','.join(f'instr(lower(m.content),?) AS hit_{i}' for i in range(len(terms or [])))
         sql = f"""WITH eligible AS (
-            SELECT m.seq,m.role,m.content,m.created_at,COALESCE(t.status,'completed') AS status
+            SELECT m.seq,m.role,m.content,m.created_at,COALESCE(t.status,'completed') AS status,
+                EXISTS(SELECT 1 FROM chat_message_attachments a WHERE a.message_id=m.message_id) AS has_attachment
                 {',' + hits if hits else ''}
             FROM chat_messages m LEFT JOIN chat_turns t ON m.chat_id=t.chat_id AND m.request_id=t.request_id
             WHERE m.chat_id=? AND m.seq<=? AND m.role IN ('user','assistant')
@@ -666,7 +683,7 @@ def history_records(chat_id: str, upto_seq: int, *, terms: list[str] | None = No
             )"""
             params.extend([start_seq, offset, start_seq, min(end_seq or start_seq, upto_seq), limit + 1])
             chars = 8000
-        sql += """ SELECT seq,role,created_at,status,content_offset,length(content) AS content_length,"""
+        sql += """ SELECT seq,role,created_at,status,has_attachment,content_offset,length(content) AS content_length,"""
         sql += ' content FROM selected' if terms else ' substr(content,content_offset+1,?) AS content FROM selected'
         sql += f' ORDER BY ({score}) DESC,seq DESC' if terms else ' ORDER BY seq'
         if not terms:
@@ -700,6 +717,8 @@ def message_page(chat_id: str, before_seq: int | None, limit: int) -> dict[str, 
             WHERE m.chat_id=? AND (? IS NULL OR m.seq<?) ORDER BY m.seq DESC LIMIT ?""",
             (chat_id, before_seq, before_seq, limit + 1)).fetchall()
         messages = [dict(row) for row in reversed(rows[:limit])]
+        from storage.chat_attachments import enrich
+        enrich(conn, messages)
         for message in messages:
             message['can_continue'] = bool(message.pop('continuation_available') and message['role'] == 'assistant'
                                            and session and message['seq'] == session['last_seq']

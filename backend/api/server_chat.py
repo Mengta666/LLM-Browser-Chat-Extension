@@ -12,6 +12,7 @@ from agent.memory import chat_context as context
 from agent.memory import config as C
 from agent.token_utils import RequestTokenCounter
 from storage import chat_store as store
+from storage import chat_attachments as assets
 
 
 def handle(item):
@@ -22,24 +23,38 @@ def handle(item):
     if len(item.messages) != 1 or item.messages[0].get('role') != 'user':
         return JSONResponse(status_code=422, content={'error': {'code': 'single_user_message_required'}})
     current = item.messages[0]
-    user_text = chat._extract_last_user_text(item.messages)
-    if not isinstance(current.get('content'), (str, list)) or not current['content']:
+    content = current.get('content')
+    if not isinstance(content, (str, list)):
         return JSONResponse(status_code=422, content={'error': {'code': 'empty_input'}})
+    if isinstance(content, list) and any(not isinstance(p, dict) or p.get('type') != 'text' or not isinstance(p.get('text'), str) for p in content):
+        return JSONResponse(status_code=422, content={'error': {'code': 'attachment_protocol_required',
+            'message': '图片请通过附件接口上传并传 attachment_ids；请重新加载扩展。'}})
+    user_text = chat._extract_last_user_text(item.messages)
     try:
         if item.continuation_of:
             parent = store.get_request(item.chat_id, item.continuation_of)
             if not parent or parent['status'] != 'partial' or not parent['retry_request']:
                 raise store.SessionError('continuation_unavailable')
             original = parent['retry_request']
-            item = item.model_copy(update={key: original[key] for key in ('model', 'kb_id', 'search_query')})
+            item = item.model_copy(update={**{key: original[key] for key in ('model', 'kb_id', 'search_query')},
+                                           'attachment_ids': original.get('attachment_ids', [])})
+        if not user_text and not item.attachment_ids:
+            raise store.SessionError('empty_input', 422)
+        if item.attachment_ids:
+            assets.require_enabled()
         identity = {'messages': item.messages, 'model': item.model,
                     'kb_id': item.kb_id, 'search_query': item.search_query}
         if item.continuation_of:
             identity['continuation_of'] = item.continuation_of
+        if item.attachment_ids:
+            identity['attachment_ids'] = item.attachment_ids
         digest = hashlib.sha256(json.dumps(identity, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
-        retry_json = json.dumps(item.model_dump(), ensure_ascii=False) if isinstance(current['content'], str) else ''
-        turn = store.begin_turn(item.chat_id, item.request_id, digest, item.expected_last_seq, user_text or '[图片]', retry_json,
-                                continuation_of=item.continuation_of)
+        retry_json = json.dumps(item.model_dump(), ensure_ascii=False)
+        turn = store.begin_turn(item.chat_id, item.request_id, digest, item.expected_last_seq, user_text, retry_json,
+                                continuation_of=item.continuation_of, attachment_ids=item.attachment_ids)
+        current = {'role': 'user', 'content': ([{'type': 'text', 'text': user_text or '请分析这张图片'},
+                    *[{'type': 'chat_attachment', 'attachment_id': identity} for identity in item.attachment_ids]]
+                    if item.attachment_ids else user_text)}
     except store.SessionError as exc:
         payload = {'error': {'code': exc.code}}
         if exc.code == 'context_compaction_pending':
@@ -117,6 +132,7 @@ def handle(item):
                                                   check_active=check_active,
                                                   counter=counter,
                                                   require_web_search=bool(item.search_query.strip()) and not item.continuation_of,
+                                                  prepare_model_messages=lambda value: assets.model_messages(value, item.chat_id),
                                                   deadline=deadline):
                         if event['type'] == 'enhancement_step':
                             yield {'enhancement_step': event['step']}
@@ -134,7 +150,7 @@ def handle(item):
                     usage = None
                     client = chat._llm_client.with_options(max_retries=0) if chat._llm_client.max_retries else chat._llm_client
                     check_active()
-                    response = client.chat.completions.create(model=item.model, messages=messages,
+                    response = client.chat.completions.create(model=item.model, messages=assets.model_messages(messages, item.chat_id),
                         stream=item.stream, timeout=max(.1, deadline - time.monotonic()), max_tokens=C.CHAT_MAX_OUTPUT_TOKENS)
                     if item.stream:
                         try:
@@ -191,6 +207,11 @@ def handle(item):
             code = exc.code if isinstance(exc, (store.SessionError, context.jobs.CompactionError)) else (
                 'context_budget_exceeded' if isinstance(exc, context.ContextBudgetError) else
                 'history_unavailable' if isinstance(exc, sqlite3.Error) else 'turn_failed')
+            if code == 'turn_failed' and item.attachment_ids:
+                from openai import BadRequestError
+                if isinstance(exc, BadRequestError):
+                    code = 'image_model_request_failed'
+                    error_message = '模型未能处理图片请求，请检查视觉能力、签名图片地址访问及模型输入额度；附件已保留。'
             try:
                 if not saved:
                     store.fail_turn(item.chat_id, item.request_id, turn['attempt'], code)

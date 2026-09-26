@@ -43,6 +43,7 @@ def run_agentic_loop(
     history_upto_seq: int | None = None,
     check_active=None,
     counter=None,
+    prepare_model_messages=None,
 ) -> Generator[dict, None, None]:
     """
     Agentic loop: 循环调用 LLM 直到不再请求工具（对齐 Anthropic）。
@@ -173,7 +174,7 @@ def run_agentic_loop(
                     if check_active:
                         check_active()
                     resp = client.chat.completions.create(
-                        model=model, messages=working_messages, tools=call_tools, stream=False,
+                        model=model, messages=prepare_model_messages(working_messages) if prepare_model_messages else working_messages, tools=call_tools, stream=False,
                         timeout=max(.1, deadline - time.monotonic() - (final_reserve if call_tools else 0)) if deadline is not None else CHAT_LLM_TIMEOUT,
                         **extra,
                     )
@@ -199,6 +200,9 @@ def run_agentic_loop(
                 code, content = "model_timeout", "模型调用超时"
             elif isinstance(exc, APIConnectionError):
                 code, content = "model_connection_error", "无法连接模型服务"
+            elif (isinstance(exc, APIStatusError) and exc.status_code in (400, 422)
+                  and any(isinstance(m.get('content'), list) and any(p.get('type') == 'chat_attachment' for p in m['content']) for m in working_messages)):
+                code, content = 'image_model_request_failed', '模型未能处理图片请求，请检查视觉能力、图片地址访问及模型输入额度；附件已保留。'
             elif (force_search and isinstance(exc, APIStatusError) and exc.status_code in (400, 422)
                   and any(word in str(exc).lower() for word in ('tool_choice', 'tool choice', 'function calling'))):
                 code, content = 'search_tool_unsupported', '当前模型接口不支持所需的搜索工具调用，请检查模型服务的工具调用配置。'

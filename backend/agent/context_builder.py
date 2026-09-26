@@ -162,7 +162,7 @@ def build_messages(session: "AgentSession", page_state: PageState) -> list[dict[
     parts.append(build_observation_message(page_state))
     user_text = "\n\n".join(parts)
 
-    # 多模态：user 消息可带多张图——任务附带的视觉上下文（用户上传/框选，仅前几步注入）
+    # 多模态：user 消息可带多张图——任务附带的视觉上下文（用户上传，仅前几步注入）
     # + 当前观察截图（是否标注及编号集合由本轮观察明确说明）。
     image_blocks = []
     task_image = getattr(session, "task_image", "") or ""

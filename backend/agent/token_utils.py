@@ -50,7 +50,7 @@ def _msg_text(m: dict[str, Any]) -> str:
 def _img_count(m: dict[str, Any]) -> int:
     c = m.get("content") if isinstance(m, dict) else None
     if isinstance(c, list):
-        return sum(1 for p in c if isinstance(p, dict) and p.get("type") == "image_url")
+        return sum(1 for p in c if isinstance(p, dict) and p.get("type") in ("image_url", "chat_attachment"))
     return 0
 
 

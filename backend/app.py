@@ -2,6 +2,7 @@
 
 import os
 import time
+import logging
 
 import uvicorn
 from fastapi import FastAPI
@@ -11,11 +12,14 @@ from api.agent import router as agent_router
 from api.chat import router as chat_router
 from api.logs import router as logs_router
 from observability.logger import get_logger
+from api.attachments import router as attachment_router, AttachmentBodyLimit, AttachmentAccessLogFilter
 
 _log = get_logger("system")
 _start_ts = time.monotonic()
 
 app = FastAPI()
+app.add_middleware(AttachmentBodyLimit)
+logging.getLogger('uvicorn.access').addFilter(AttachmentAccessLogFilter())
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,6 +31,7 @@ app.add_middleware(
 app.include_router(agent_router)
 app.include_router(chat_router)
 app.include_router(logs_router)
+app.include_router(attachment_router)
 
 # 记忆管理路由
 _modules_loaded = ["agent", "chat", "logs"]
@@ -71,6 +76,8 @@ if _modules_failed:
 
 @app.on_event("shutdown")
 async def _on_shutdown():
+    from storage.chat_attachments import stop_cleanup
+    stop_cleanup()
     if "kb" in _modules_loaded:
         from rag import kb
         kb.stop_recovery()
@@ -82,6 +89,8 @@ async def _on_shutdown():
 def _init_chat_sessions():
     from storage import chat_store
     chat_store._get_conn()
+    from storage.chat_attachments import start_cleanup
+    start_cleanup()
     if "kb" in _modules_loaded:
         from rag import kb
         kb.start_recovery()

@@ -6,7 +6,7 @@ import os
 import time
 
 from agent.memory import chat_compact as compact, config as C
-from agent.token_utils import estimate_text_tokens, request_tokens
+from agent.token_utils import estimate_text_tokens, request_tokens, RequestTokenCounter
 from storage import chat_store as store
 from observability.logger import get_logger
 
@@ -19,9 +19,16 @@ class CompactionError(Exception):
         self.code = code
 
 
-def summary_instructions():
+def summary_target(reduce_attempts=0):
+    target = max(1, min(C.CHAT_COMPACT_SUMMARY_TARGET_TOKENS, C.CHAT_COMPACT_SUMMARY_MAX_TOKENS))
+    return max(1, int(target * (1 - .2 * reduce_attempts)))
+
+
+def summary_instructions(target=None):
+    if target is None:
+        target = summary_target()
     return (f'你是会话压缩器。只输出供后续模型继续任务的中文摘要，总长不超过 {C.CHAT_COMPACT_SUMMARY_MAX_TOKENS} tokens。'
-            f'建议正文控制在 {max(80, C.CHAT_COMPACT_SUMMARY_MAX_TOKENS // 2)} 字左右；不输出思考过程、寒暄或代码围栏。'
+            f'目标约 {target} tokens，留出长度余量；不输出思考过程、寒暄或代码围栏。'
             '\n保持五段：## 对话目标、## 关键交互、## 重要细节、## 用户纠正、## 待做事项。'
             '\n优先保留当前任务状态、未完成问题、关键决策、最新有效配置、明确授权及禁止事项；区分不同任务，不迁移授权。'
             '\n用户纠正覆盖旧结论，但必要时标明旧值与新值；助手推测、失败或未验证的结果不得改写为已确认事实。'
@@ -59,6 +66,8 @@ def make_plan(messages):
         'prompt': summary_instructions(), 'budget': budget,
         'summary_limit': C.CHAT_COMPACT_SUMMARY_MAX_TOKENS,
         'model': os.getenv('CHAT_COMPACT_MODEL') or compact._COMPACT_MODEL,
+        'tokenizer': (C.CHAT_TOKENIZER_URL, C.CHAT_TOKENIZER_MODEL, C.CHAT_TOKENIZER_SAFETY_RATIO),
+        'reduction_version': 2,
     }, ensure_ascii=False).encode()).hexdigest()
     return plan, fingerprint
 
@@ -66,6 +75,8 @@ def make_plan(messages):
 def run(chat_id, snapshot, plan, fingerprint, *, request_id='', attempt=0, deadline=None, validate=None):
     deadline = min(deadline or float('inf'), time.monotonic() + C.CHAT_COMPACT_TIMEOUT)
     job = store.claim_compaction(chat_id, request_id, attempt, snapshot, plan, fingerprint)
+    counter = RequestTokenCounter(os.getenv('CHAT_COMPACT_MODEL') or compact._COMPACT_MODEL,
+                                  deadline=deadline, time_budget=30.0)
     records = {m['seq']: m for m in snapshot['messages']}
 
     def check():
@@ -87,17 +98,30 @@ def run(chat_id, snapshot, plan, fingerprint, *, request_id='', attempt=0, deadl
                     text += '\n\n[服务端状态：以上回答因输出长度限制被截断，尚未完成。]'
                 batch.append({'role': record['role'], 'content': f'[本会话消息 {piece["seq"]}，字符 {piece["offset"]}:{piece["end"]}]\n' + text[piece['offset']:piece['end']]})
             reducing = job['phase'] == 'reduce'
-            prompt = (f'请精简下面摘要到约 {C.CHAT_COMPACT_SUMMARY_MAX_TOKENS // 2} tokens，仍保留五段、关键事实、纠正与约束，不新增信息。\n\n' + job['candidate']
-                      if reducing else compact._build_compact_user_prompt(job['summary'], batch))
-            available = C.CHAT_CONTEXT_LENGTH - C.CHAT_COMPACT_MAX_OUTPUT_TOKENS - C.CHAT_CONTEXT_SAFETY_TOKENS
-            if request_tokens([{'role': 'system', 'content': summary_instructions()}, {'role': 'user', 'content': prompt}]) > available:
+            target = summary_target(job['reduce_attempts'] if reducing else 0)
+            system_prompt = summary_instructions(target)
+            if reducing:
+                if job['reduce_attempts'] >= 3:
+                    raise CompactionError('compaction_summary_too_large')
+                candidate_tokens = counter.count_text(job['candidate'])
+                prompt = (f'第 {job["reduce_attempts"] + 1}/3 次精简。当前摘要计数 {candidate_tokens} tokens，'
+                          f'计数方式 {counter.last["count_mode"]}；请压到约 {target} tokens。'
+                          '保留五段、当前状态、用户纠正和授权/禁止事项，不新增信息。'
+                          '合并重复叙述，长清单仅保留原文消息序号和检索线索，不逐项抄录。\n\n' + job['candidate'])
+            else:
+                prompt = compact._build_compact_user_prompt(job['summary'], batch)
+            input_tokens = counter([{'role': 'system', 'content': system_prompt}, {'role': 'user', 'content': prompt}])
+            window = min(C.CHAT_CONTEXT_LENGTH, counter.model_window or C.CHAT_CONTEXT_LENGTH)
+            available = window - C.CHAT_COMPACT_MAX_OUTPUT_TOKENS - C.CHAT_CONTEXT_SAFETY_TOKENS
+            check()
+            if input_tokens > available:
                 raise CompactionError('compaction_input_budget_exceeded')
             for trial in range(max(1, min(5, C.CHAT_COMPACT_MAX_ATTEMPTS))):
                 check()
                 job = store.checkpoint_compaction(job, calls=job['calls'] + 1)
                 yield store.compaction_progress(job)
                 try:
-                    summary = compact._summarize_llm(summary_instructions(), prompt,
+                    summary = compact._summarize_llm(system_prompt, prompt,
                         timeout=max(.1, min(C.CHAT_COMPACT_CALL_TIMEOUT, deadline - time.monotonic())), strict=True)
                     break
                 except compact.SummaryError as exc:
@@ -112,13 +136,24 @@ def run(chat_id, snapshot, plan, fingerprint, *, request_id='', attempt=0, deadl
             check()
             if not summary or not summary.strip():
                 raise CompactionError('compaction_invalid_output')
-            if estimate_text_tokens(summary) > C.CHAT_COMPACT_SUMMARY_MAX_TOKENS:
+            summary_tokens = counter.count_text(summary)
+            check()
+            _log.info('compaction_summary_measured', data={'chat_id': chat_id, 'job_id': job['job_id'],
+                      'batch': job['next_batch'], 'reducing': reducing, 'summary_tokens': summary_tokens,
+                      'summary_target': target, 'summary_limit': C.CHAT_COMPACT_SUMMARY_MAX_TOKENS, **counter.last})
+            if summary_tokens > C.CHAT_COMPACT_SUMMARY_MAX_TOKENS:
+                candidate = summary
                 if reducing:
-                    raise CompactionError('compaction_summary_too_large')
-                job = store.checkpoint_compaction(job, candidate=summary, phase='reduce', error_code='')
+                    previous_tokens = counter.count_text(job['candidate'])
+                    # 计数中途降级时使用同一口径比较，不把精确数与本地估算混排。
+                    summary_tokens = counter.count_text(summary)
+                    if previous_tokens <= summary_tokens:
+                        candidate = job['candidate']
+                job = store.checkpoint_compaction(job, candidate=candidate, phase='reduce', error_code='',
+                                                 reduce_attempts=job['reduce_attempts'] + 1 if reducing else 0)
             else:
                 job = store.checkpoint_compaction(job, summary=summary, candidate='', phase='summarize',
-                                                 next_batch=job['next_batch'] + 1, error_code='')
+                                                 next_batch=job['next_batch'] + 1, error_code='', reduce_attempts=0)
             yield store.compaction_progress(job)
         check()
         if validate:

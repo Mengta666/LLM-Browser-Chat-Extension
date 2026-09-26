@@ -82,7 +82,7 @@ def request_tokens(messages: list[dict], tools=None) -> int:
 class RequestTokenCounter:
     """单轮完整聊天请求计数；模型匹配时调用 vLLM，其余情况保守估算。"""
 
-    def __init__(self, model: str, *, deadline=None):
+    def __init__(self, model: str, *, deadline=None, time_budget=8.0):
         from agent.memory import config as C
         self.model = model
         self.deadline = deadline
@@ -95,7 +95,7 @@ class RequestTokenCounter:
         self._disabled = ('not_configured' if not self.url or not C.CHAT_TOKENIZER_MODEL else
                           'model_mismatch' if model != C.CHAT_TOKENIZER_MODEL else '')
         self._cache = {}
-        self._remaining = 8.0
+        self._remaining = time_budget
 
     def __call__(self, messages, tools=None):
         reason = self._disabled
@@ -106,6 +106,13 @@ class RequestTokenCounter:
         payload = {'model': self.model, 'messages': messages, 'add_generation_prompt': True}
         if tools:
             payload['tools'] = tools
+        return self._count(payload, lambda: request_tokens(messages, tools), reason=reason)
+
+    def count_text(self, text):
+        return self._count({'model': self.model, 'prompt': text, 'add_special_tokens': False},
+                           lambda: estimate_text_tokens(text), body=True, reason=self._disabled)
+
+    def _count(self, payload, fallback, *, reason='', body=False):
         key = hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()).digest()
         if not reason and key in self._cache:
             count, self.last = self._cache[key]
@@ -123,12 +130,13 @@ class RequestTokenCounter:
                     response.raise_for_status()
                     data = response.json()
                     raw, window = data.get('count'), data.get('max_model_len')
-                    if type(raw) is not int or raw <= 0 or type(window) is not int or window <= 0:
+                    if type(raw) is not int or raw < (0 if body else 1) or type(window) is not int or window <= 0:
                         raise ValueError('invalid_tokenizer_response')
                     self.model_window = min(self.model_window or window, window)
-                    count = math.ceil(raw * self.ratio)
-                    self.last = {'count_mode': 'vllm_tokenize', 'input_tokens_raw': raw,
-                                 'token_safety_margin': count - raw, 'token_safety_ratio': self.ratio,
+                    ratio = 1.0 if body else self.ratio
+                    count = math.ceil(raw * ratio)
+                    self.last = {'count_mode': 'vllm_tokenize_text' if body else 'vllm_tokenize', 'input_tokens_raw': raw,
+                                 'token_safety_margin': count - raw, 'token_safety_ratio': ratio,
                                  'tokenizer_model_window': self.model_window, 'tokenizer_fallback': ''}
                     if len(self._cache) >= 64:
                         self._cache.pop(next(iter(self._cache)))
@@ -139,5 +147,6 @@ class RequestTokenCounter:
                                                else type(exc).__name__)
                 finally:
                     self._remaining -= time.monotonic() - started
-        self.last = {'count_mode': REQUEST_COUNT_MODE, 'tokenizer_fallback': reason}
-        return request_tokens(messages, tools)
+        mode = ('cl100k_text_estimate' if _tok_enc is not None else 'heuristic_text_estimate') if body else REQUEST_COUNT_MODE
+        self.last = {'count_mode': mode, 'tokenizer_fallback': reason}
+        return fallback()

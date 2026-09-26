@@ -16,6 +16,7 @@
 import sqlite3
 import threading
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -153,6 +154,8 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             candidate TEXT NOT NULL DEFAULT '', phase TEXT NOT NULL DEFAULT 'summarize',
             calls INTEGER NOT NULL DEFAULT 0, error_code TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL
         )""")
+        if 'reduce_attempts' not in {row[1] for row in conn.execute('PRAGMA table_info(chat_compactions)')}:
+            conn.execute('ALTER TABLE chat_compactions ADD COLUMN reduce_attempts INTEGER NOT NULL DEFAULT 0')
 
 
 def ensure_session(chat_id: str, first_user_text: str = "") -> bool:
@@ -512,7 +515,7 @@ def get_compaction(chat_id):
 
 
 def compaction_progress(job):
-    return {key: job[key] for key in ('job_id', 'request_id', 'status', 'phase', 'next_batch', 'calls', 'error_code')} | {
+    return {key: job[key] for key in ('job_id', 'request_id', 'status', 'phase', 'next_batch', 'calls', 'reduce_attempts', 'error_code')} | {
         'total_batches': len(job['plan']), 'through_seq': job['through_seq']}
 
 
@@ -547,7 +550,7 @@ def claim_compaction(chat_id, request_id, attempt, snapshot, plan, fingerprint):
 
 
 def checkpoint_compaction(job, *, summary=None, candidate=None, phase=None, next_batch=None, calls=None,
-                          status=None, error_code=None):
+                          status=None, error_code=None, reduce_attempts=None):
     fields = {k: v for k, v in locals().copy().items() if k != 'job' and v is not None}
     fields['updated_at'] = _now_iso()
     conn = _get_conn()
@@ -588,6 +591,49 @@ def context_snapshot(chat_id: str) -> dict[str, Any]:
                 'version': session['summary_version'], 'messages': [dict(row) for row in rows]}
 
 
+def _history_excerpt(text, terms, size=800):
+    terms = [term for term in terms if term]
+    patterns = [re.compile(re.escape(term), re.IGNORECASE) for term in terms]
+    counts = [sum(1 for _ in pattern.finditer(text)) for pattern in patterns]
+    windows = set()
+    for pattern, count in zip(patterns, counts):
+        if not count:
+            continue
+        # 高频词均匀采样且包含首尾；每个词最多 24 个候选，不枚举命中组合。
+        selected = {i * (count - 1) // max(1, min(24, count) - 1) for i in range(min(24, count))}
+        for index, hit in enumerate(pattern.finditer(text)):
+            if index not in selected:
+                continue
+            start = max(0, hit.start() - 120)
+            boundary = text.rfind('\n', max(0, start - 120), start)
+            if boundary >= 0:
+                start = boundary + 1
+            end = min(len(text), start + size)
+            boundary = max(text.rfind(mark, hit.end(), end) for mark in ('\n', '。', '！', '？'))
+            if boundary >= hit.end():
+                end = boundary + 1
+            windows.add((start, end))
+    best, best_score = (0, min(size, len(text))), None
+    for start, end in sorted(windows):
+        matched = []
+        exact = 0
+        for term, pattern, count in zip(terms, patterns, counts):
+            hits = list(pattern.finditer(text, start, end))
+            if hits:
+                matched.append((count, hits[0].start(), hits[-1].end()))
+                if re.search(r'[0-9_:/.-]', term):
+                    exact += any((hit.start() == 0 or text[hit.start() - 1] not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_')
+                                 and (hit.end() == len(text) or text[hit.end()] not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_')
+                                 for hit in hits)
+        if not matched:
+            continue
+        span = max(row[2] for row in matched) - min(row[1] for row in matched)
+        score = (len(matched), sum(1 / row[0] for row in matched), exact, len(matched) / max(1, span), -start)
+        if best_score is None or score > best_score:
+            best, best_score = (start, end), score
+    return best[0], text[best[0]:best[1]]
+
+
 def history_records(chat_id: str, upto_seq: int, *, terms: list[str] | None = None,
                     start_seq: int = 1, end_seq: int | None = None, offset: int = 0,
                     limit: int = 5) -> tuple[list[dict], bool]:
@@ -607,10 +653,8 @@ def history_records(chat_id: str, upto_seq: int, *, terms: list[str] | None = No
         params = [*(terms or []), chat_id, upto_seq]
         if terms:
             score = '+'.join(f'(hit_{i}>0)' for i in range(len(terms)))
-            positions = [f'CASE WHEN hit_{i}>0 THEN hit_{i} ELSE length(content)+1 END' for i in range(len(terms))]
-            first = f'min({",".join(positions)})' if len(positions) > 1 else positions[0]
             sql += f""", selected AS (
-                SELECT *,max(0,({first})-121) AS content_offset FROM eligible
+                SELECT *,0 AS content_offset FROM eligible
                 WHERE ({score})>0 ORDER BY ({score}) DESC,seq DESC LIMIT ?
             )"""
             params.append(limit + 1)
@@ -622,12 +666,17 @@ def history_records(chat_id: str, upto_seq: int, *, terms: list[str] | None = No
             )"""
             params.extend([start_seq, offset, start_seq, min(end_seq or start_seq, upto_seq), limit + 1])
             chars = 8000
-        sql += """ SELECT seq,role,created_at,status,content_offset,length(content) AS content_length,
-                    substr(content,content_offset+1,?) AS content FROM selected"""
+        sql += """ SELECT seq,role,created_at,status,content_offset,length(content) AS content_length,"""
+        sql += ' content FROM selected' if terms else ' substr(content,content_offset+1,?) AS content FROM selected'
         sql += f' ORDER BY ({score}) DESC,seq DESC' if terms else ' ORDER BY seq'
-        params.append(chars)
+        if not terms:
+            params.append(chars)
         rows = conn.execute(sql, params).fetchall()
-        return [dict(row) for row in rows[:limit]], len(rows) > limit
+        result = [dict(row) for row in rows[:limit]]
+    if terms:
+        for row in result:
+            row['content_offset'], row['content'] = _history_excerpt(row['content'], terms, chars)
+    return result, len(rows) > limit
 
 
 def publish_summary(chat_id: str, text: str, upto_seq: int, previous_version: int) -> bool:

@@ -20,6 +20,7 @@ from openai import APIConnectionError, APITimeoutError, APIStatusError
 
 from agent.memory.config import (
     CHAT_COMPACT_KEEP_PAIRS,
+    CHAT_COMPACT_SUMMARY_TARGET_TOKENS,
     CHAT_COMPACT_SUMMARY_MAX_TOKENS,
     CHAT_COMPACT_MAX_OUTPUT_TOKENS,
     CHAT_CONTEXT_LENGTH,
@@ -76,6 +77,7 @@ CHAT_COMPACT_SYSTEM_PROMPT = f"""你是对话压缩器,把一段用户与AI助�
 - 客观陈述,不要评论、不要"总结起来";
 - 不要生成指令性内容(不要"接下来应该""建议"),只是记录;
 - 严禁使用 ``` 代码块包裹(会破坏后续拼装);
+- 目标约 {max(1, min(CHAT_COMPACT_SUMMARY_TARGET_TOKENS, CHAT_COMPACT_SUMMARY_MAX_TOKENS))} tokens;
 - 总长控制在 {CHAT_COMPACT_SUMMARY_MAX_TOKENS} tokens 以内。"""
 
 

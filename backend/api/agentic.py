@@ -83,14 +83,19 @@ def run_agentic_loop(
     web_contexts = {}
     history_budget = TurnHistoryBudget(chat_id, history_upto_seq) if chat_id and history_upto_seq is not None else None
     context_retry_used = False
-    if deadline is None and (bound_kb_id or web_enabled):
+    if deadline is None and tools:
         deadline = time.monotonic() + max(1, CHAT_LLM_TIMEOUT - 10)
     counter = counter or RequestTokenCounter(model, deadline=deadline)
     original_question = next((m.get('content', '') for m in reversed(messages) if m['role'] == 'user'), '')
     if not isinstance(original_question, str):
         original_question = ' '.join(p.get('text', '') for p in original_question if p.get('type') == 'text')
 
-    for round_idx in range(max_rounds):
+    empty_retry_used = False
+    runtime_guidance = ''
+    base_system = working_messages[0]['content'] if working_messages and working_messages[0]['role'] == 'system' else None
+    for round_idx in range(max_rounds + 1):
+        if round_idx == max_rounds and not empty_retry_used:
+            break
         if check_active:
             check_active()
         if deadline is not None and time.monotonic() >= deadline:
@@ -112,10 +117,11 @@ def run_agentic_loop(
 
         # 2. 最后一轮强制不给 tools（防死循环，逼 LLM 出文本）
         is_last_round = (round_idx >= max_rounds - 1)
-        final_reserve = 30 if web_enabled else 0
+        final_reserve = min(30, max(1, CHAT_LLM_TIMEOUT / 3)) if tools else 0
         finishing = deadline is not None and deadline - time.monotonic() <= final_reserve
-        call_tools = None if is_last_round or tool_count >= 12 or finishing else [
+        call_tools = None if empty_retry_used or is_last_round or tool_count >= 12 or finishing else [
             t for t in tools if (t['function']['name'] != 'web_search' or web_count < 3)
+            and (t['function']['name'] != 'kb_search' or search_count < 8)
             and (t['function']['name'] not in HISTORY_TOOL_NAMES or (history_budget and history_budget.available))]
         force_search = require_web_search and web_count == 0
         if force_search:
@@ -126,6 +132,26 @@ def run_agentic_loop(
                 return
         call_tools = call_tools or None
         allowed_tools = {tool["function"]["name"] for tool in (call_tools or [])}
+        notes = []
+        if history_budget and not history_budget.available:
+            notes.append('本轮历史回查额度已用尽，不再调用历史工具；其他工具是否可用以本次 tools 为准。')
+        if not call_tools:
+            reason = ('空正文补救' if empty_retry_used else '时间预留' if finishing else
+                      '轮数上限' if is_last_round else '次数上限' if tool_count >= 12 else '无可用工具')
+            notes.append(f'进入最终回答阶段（{reason}）。禁止再请求工具，必须在 content 中直接回答用户问题。'
+                         '依据已获得的内容说明结论；不足时明确已读范围、缺项和不能确认的部分。'
+                         '预算耗尽不等于没有相关信息，未读部分不得声称已核实。')
+        if notes and history_budget:
+            notes.append('服务端记录的本轮历史读取范围（字符左闭右开；记录被工具清理不代表其正文仍可见）：' +
+                         json.dumps(history_budget.read_ranges, ensure_ascii=False))
+        note = '\n'.join(notes)
+        if note != runtime_guidance:
+            content = (base_system + '\n\n' if base_system is not None else '') + note
+            if base_system is None and not runtime_guidance:
+                working_messages.insert(0, {'role': 'system', 'content': content})
+            else:
+                working_messages[0] = {**working_messages[0], 'content': content}
+            runtime_guidance = note
 
         # 3. 调用 LLM（非流式，中间轮需判断 tool_calls）
         started = time.monotonic()
@@ -211,11 +237,22 @@ def run_agentic_loop(
         if not pending_calls:
             final_content = msg.content or ""
             if not final_content.strip():
+                remaining = deadline - time.monotonic() if deadline is not None else CHAT_LLM_TIMEOUT
+                if not empty_retry_used and resp.choices[0].finish_reason == 'stop' and remaining >= 5:
+                    empty_retry_used = True
+                    _chat_log.warn('agentic_empty_answer_retry', session_id=chat_id,
+                                   data={'request_id': request_id, 'round': round_idx + 1, 'remaining_s': round(remaining, 3)})
+                    continue
                 yield {"type": "error", "code": "empty_model_answer",
-                       "content": "模型未返回正文", "steps": all_steps}
+                       "content": "模型未生成可用正文，本轮回答未完成；未将空回答保存为成功，也未重复执行工具。", "steps": all_steps}
                 return
             yield {"type": "final", "content": final_content, "finish_reason": resp.choices[0].finish_reason,
                    "messages": working_messages, "steps": all_steps}
+            return
+
+        if empty_retry_used:
+            yield {'type': 'error', 'code': 'final_answer_unavailable',
+                   'content': '模型在收尾补救时仍请求工具，未生成可用回答；没有重复执行工具。', 'steps': all_steps}
             return
 
         # 5. 有 tool_call → 执行所有工具
@@ -237,7 +274,7 @@ def run_agentic_loop(
                     error_code = "tool_unavailable"
                     raise ValueError("本轮工具不可用，请使用允许的工具或直接回答")
                 args_dict = parse_tool_arguments(tool_name, tool_args_str)
-                if deadline is not None and time.monotonic() >= deadline:
+                if deadline is not None and deadline - time.monotonic() <= final_reserve:
                     error_code = "tool_budget_exceeded"
                     raise ValueError("本轮时间预算已用尽")
                 cost = len(args_dict.get("questions") or [args_dict.get("query")]) if tool_name == "kb_search" else 0

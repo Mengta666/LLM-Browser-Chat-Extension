@@ -69,6 +69,9 @@ def execute_web_search(query: str, *, timeout: float | None = None, reader_cache
 
 
 def parse_tool_arguments(name: str, arguments: str | dict) -> dict:
+    from agent.memory import document_analysis
+    if name == document_analysis.NAME:
+        return document_analysis.parse(arguments)
     from agent.memory.history_tools import HISTORY_TOOL_NAMES, parse_history_arguments
     if name in HISTORY_TOOL_NAMES:
         return parse_history_arguments(name, arguments)

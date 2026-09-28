@@ -1,10 +1,12 @@
-"""服务端会话上下文：稳定序号、完整分段摘要与最终请求预算。"""
+"""服务端会话上下文：稳定序号、增量工作状态与最终请求预算。"""
 
 import json
 
 from agent.memory import config as C
 from agent.memory import chat_compact as compact
 from agent.memory import compaction_job as jobs
+from agent.memory import context_state as state
+from agent.memory import context_selection as selection
 from agent.token_utils import request_tokens, REQUEST_COUNT_MODE
 from storage import chat_store as store
 from observability.logger import get_logger
@@ -29,7 +31,9 @@ def check_budget(messages, tools=None, *, counter=None):
 
 
 def _history_content(message):
-    text = message['content']
+    text = f'[原文 M{message["seq"]}；role={message["role"]}；范围 [0,{len(message["content"])})]\n' + message['content']
+    if message.get('attachments'):
+        text += '\n[此历史消息附有图片；原图未纳入本轮输入，需要用户再次引用。]'
     if message.get('status') == 'partial' and message['role'] == 'assistant':
         text += '\n\n[服务端状态：以上回答因输出长度限制被截断，尚未完成。]'
     return text
@@ -77,8 +81,19 @@ def _history_web_context(message, char_budget):
             + json.dumps(records, ensure_ascii=False))
 
 
+def _state_view(value, *, query='', counter=None, limit=None):
+    try:
+        return state.render(state.select(state.load(value), target=C.CHAT_COMPACT_SUMMARY_MAX_TOKENS,
+                            limit=min(C.CHAT_CONTEXT_STATE_MAX_TOKENS, limit) if limit is not None else C.CHAT_CONTEXT_STATE_MAX_TOKENS,
+                            count=counter.count_text if counter else None, query=query))
+    except state.StateError as exc:
+        raise jobs.CompactionError(exc.code) from None
+
+
 def compress(chat_id):
     snapshot = store.context_snapshot(chat_id)
+    if snapshot['upto_seq'] and not snapshot.get('state'):
+        snapshot = store.context_snapshot(chat_id, include_compacted=True)
     messages = snapshot['messages']
     endings = [i for i, message in enumerate(messages) if message['role'] == 'assistant']
     keep = max(0, C.CHAT_COMPACT_KEEP_PAIRS)
@@ -86,8 +101,13 @@ def compress(chat_id):
         return False
     evicted = messages[:endings[-keep - 1] + 1]
     try:
-        plan, fingerprint = jobs.make_plan(evicted)
-        for _ in jobs.run(chat_id, snapshot, plan, fingerprint):
+        counter = jobs.new_counter()
+        plan, fingerprint = jobs.make_plan(evicted, working=snapshot.get('state'), counter=counter)
+        pending = store.get_compaction(chat_id)
+        if pending and pending['status'] != 'completed' and pending['base_version'] == snapshot['version'] and pending['fingerprint'] == fingerprint:
+            extra = [m for m in evicted if m['seq'] > pending['through_seq']]
+            plan = pending['plan'] + (jobs.make_plan(extra, working=snapshot.get('state'), counter=counter)[0] if extra else [])
+        for _ in jobs.run(chat_id, snapshot, plan, fingerprint, counter=counter):
             pass
         return True
     except (jobs.CompactionError, store.SessionError):
@@ -95,8 +115,35 @@ def compress(chat_id):
 
 
 def prepare_steps(chat_id, current_message, system_parts, tools=None, *, request_id='', attempt=0,
-                  deadline=None, after_compaction=None, counter=None):
+                  deadline=None, after_compaction=None, counter=None, history_budget=None):
     count_tokens = counter or request_tokens
+    current_message = dict(current_message)
+    original = current_message.get('content', '')
+    current_seq = history_budget.upto_seq if history_budget else None
+    base = [{'role': 'system', 'content': '\n\n'.join(system_parts)}, current_message]
+    if isinstance(original, str) and count_tokens(base, tools) > input_budget(counter):
+        if not history_budget:
+            raise ContextBudgetError('context_budget_exceeded')
+        low, high = 0, len(original)
+        def preview(end):
+            return (f'[当前原文 M{current_seq} 已完整保存，共 {len(original)} 字符；本轮仅纳入 [0,{end})。'
+                    '以下是有界预览；未读部分可从该编号回查。要求和资料混杂或任务不明确时先只读定位或澄清，不能宣称通读。]\n' + original[:end])
+        while low < high:
+            mid = (low + high + 1) // 2
+            if count_tokens([{'role': 'user', 'content': preview(mid)}]) <= min(4000, input_budget(counter) // 4):
+                low = mid
+            else:
+                high = mid - 1
+        current_message['content'] = preview(low)
+    elif isinstance(original, str) and current_seq:
+        current_message['content'] = f'[当前原文 M{current_seq}；范围 [0,{len(original)})]\n' + original
+    if history_budget:
+        available = input_budget(counter) - count_tokens([{'role': 'system', 'content': '\n\n'.join(system_parts)}, current_message], tools)
+        directory = history_budget.initial_catalog(max_tokens=max(0, min(400, available - 128)),
+                                                  query=original if isinstance(original, str) else '')
+        system_parts = [*system_parts, directory] if directory else system_parts
+        if after_compaction and directory:
+            after_compaction = (after_compaction[0] + [directory], after_compaction[1])
     def assemble(snapshot, base_parts):
         parts = list(base_parts)
         if snapshot['summary']:
@@ -119,6 +166,10 @@ def prepare_steps(chat_id, current_message, system_parts, tools=None, *, request
         return result
 
     snapshot = store.context_snapshot(chat_id)
+    content = original
+    query = content if isinstance(content, str) else '\n'.join(p.get('text', '') for p in content if p.get('type') == 'text')
+    if snapshot.get('state'):
+        snapshot['summary'] = _state_view(snapshot['state'], query=query, counter=counter)
     messages = assemble(snapshot, system_parts)
     check_budget(assemble({'summary': '', 'messages': []}, system_parts), tools, counter=counter)
     tokens = count_tokens(messages, tools)
@@ -135,36 +186,55 @@ def prepare_steps(chat_id, current_message, system_parts, tools=None, *, request
         if not endings:
             raise jobs.CompactionError('compaction_no_history')
         remove = max(1, len(endings) - max(0, C.CHAT_COMPACT_KEEP_PAIRS))
-        reserve = int(C.CHAT_COMPACT_SUMMARY_MAX_TOKENS * 1.25) + 64
+        reserve = int(C.CHAT_CONTEXT_STATE_MAX_TOKENS * 1.25) + 64
         target = input_budget(counter) * C.CHAT_COMPACT_TARGET_RATIO
         for end in endings[remove - 1:]:
             tail = {'summary': '', 'messages': snapshot['messages'][end + 1:]}
             if count_tokens(assemble(tail, final_parts), final_tools) + reserve <= target:
                 break
-        plan, fingerprint = jobs.make_plan(snapshot['messages'][:end + 1])
+        through_seq = snapshot['messages'][end]['seq']
+        if snapshot['upto_seq'] and not snapshot.get('state'):
+            # 旧文字摘要无条目来源，第一次切换须重新读取原文，不将旧摘要当事实导入。
+            snapshot = store.context_snapshot(chat_id, include_compacted=True)
+            if not any(m['seq'] == snapshot['upto_seq'] for m in snapshot['messages']):
+                raise jobs.CompactionError('compaction_legacy_history_missing')
+        selected = [m for m in snapshot['messages'] if m['seq'] <= through_seq]
+        compact_counter = jobs.new_counter(deadline)
+        plan, fingerprint = jobs.make_plan(selected, working=snapshot.get('state'), counter=compact_counter)
         # 恢复同一任务时保持原分批边界；新增压缩范围只在原计划末尾追加。
         if pending and pending['status'] != 'completed' and pending['base_version'] == snapshot['version'] and pending['fingerprint'] == fingerprint:
             covered = pending['through_seq']
-            extra = [m for m in snapshot['messages'][:end + 1] if m['seq'] > covered]
-            plan = pending['plan'] + (jobs.make_plan(extra)[0] if extra else [])
+            extra = [m for m in selected if m['seq'] > covered]
+            plan = pending['plan'] + (jobs.make_plan(extra, working=snapshot.get('state'), counter=compact_counter)[0] if extra else [])
 
         def validate(job):
-            candidate = {'summary': job['summary'], 'messages': [m for m in snapshot['messages'] if m['seq'] > job['through_seq']]}
+            tail = [m for m in snapshot['messages'] if m['seq'] > job['through_seq']]
+            remaining = input_budget(counter) - count_tokens(assemble({'summary': '', 'messages': tail}, final_parts), final_tools)
+            rendered = _state_view(job['state_json'], query=query, counter=counter, limit=max(0, int(remaining / 1.25) - 64))
+            candidate = {'summary': rendered, 'messages': tail}
             if count_tokens(assemble(candidate, final_parts), final_tools) > input_budget(counter):
                 raise jobs.CompactionError('compaction_insufficient_space')
+            store.checkpoint_compaction(job, summary=rendered)
 
         if request_id:
             store.set_turn_phase(chat_id, request_id, attempt, 'compacting')
         for progress in jobs.run(chat_id, snapshot, plan, fingerprint, request_id=request_id, attempt=attempt,
-                                 deadline=deadline, validate=validate):
+                                 deadline=deadline, validate=validate, counter=compact_counter, query=query):
             yield {'context_compaction': progress}
         system_parts, tools = final_parts, final_tools
         snapshot = store.context_snapshot(chat_id)
         messages = assemble(snapshot, system_parts)
+    # 压缩仍以上面的完整近期档案计算触发及发布条件；投影只控制实际发送内容。
+    raw_tokens = count_tokens(messages, tools)
+    available = input_budget(counter) - count_tokens([messages[0], messages[-1]], tools) - 32
+    recent = selection.select_recent(messages[1:-1], count_tokens,
+        total=max(0, min(C.CHAT_RECENT_TOKENS, available)),
+        per_message=C.CHAT_RECENT_MESSAGE_TOKENS, query=query)
+    messages = [messages[0], *recent, messages[-1]]
     tokens = check_budget(messages, tools, counter=counter)
     _log.info('context_prepared', data={'chat_id': chat_id, 'summary_version': snapshot['version'],
               'summary_upto_seq': snapshot['upto_seq'], 'history_count': len(snapshot['messages']),
-              'input_tokens_estimate': tokens, 'input_budget': input_budget(counter),
+              'input_tokens_estimate': tokens, 'unprojected_tokens': raw_tokens, 'input_budget': input_budget(counter),
               **(counter.last if counter else {'count_mode': REQUEST_COUNT_MODE})})
     return messages
 

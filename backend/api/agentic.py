@@ -13,6 +13,10 @@ from api.evidence import EvidenceLedger
 from search.excerpts import TurnWebBudget, COUNT_MODE as EXCERPT_COUNT_MODE
 from search.context import fit_request, is_context_rejection, render_evidence, sync_source_context
 from agent.token_utils import RequestTokenCounter
+from storage import history_index
+from api import final_answer, model_call
+from agent.memory import context_selection, config as C
+from agent.memory import document_analysis
 
 from api.chat import (
     _llm_client,
@@ -44,6 +48,11 @@ def run_agentic_loop(
     check_active=None,
     counter=None,
     prepare_model_messages=None,
+    attempt=0,
+    history_budget=None,
+    final_system_parts=None,
+    document_enabled=False,
+    document_continuing=False,
 ) -> Generator[dict, None, None]:
     """
     Agentic loop: 循环调用 LLM 直到不再请求工具（对齐 Anthropic）。
@@ -54,7 +63,7 @@ def run_agentic_loop(
         tools: 可用工具列表 [WEB_SEARCH_TOOL, KB_SEARCH_TOOL]
         max_rounds: 最大轮数（默认用全局配置）
         chat_id: 用于日志
-        stream: 是否流式（暂不支持流式，正文整段返回）
+        stream: 前端响应模式；内部流式接收，完整决策后才执行工具。
 
     Yields:
         {"type": "enhancement_step", "step": {...}}  # 工具调用进度
@@ -82,21 +91,62 @@ def run_agentic_loop(
     reader_cache = {}
     reader_budget = TurnWebBudget()
     web_contexts = {}
-    history_budget = TurnHistoryBudget(chat_id, history_upto_seq) if chat_id and history_upto_seq is not None else None
     context_retry_used = False
+    decision_retry_used = False
     if deadline is None and tools:
         deadline = time.monotonic() + max(1, CHAT_LLM_TIMEOUT - 10)
     counter = counter or RequestTokenCounter(model, deadline=deadline)
+    history_budget = history_budget or (TurnHistoryBudget(chat_id, history_upto_seq, counter=counter)
+                                       if chat_id and history_upto_seq is not None else None)
+    archived = history_index.tool_runs(chat_id, request_id) if request_id and attempt else []
+    document_available = document_enabled and not any(r['name'] == document_analysis.NAME and r['result'] for r in archived)
+    evidence = []
+    for record in archived:
+        if not record['result']:
+            continue
+        step = json.loads(record['step_json'])
+        all_steps.append(step)
+        if record['status'] == 'reused':
+            continue
+        evidence.append(record)
+        restored_id = f'restored_{record["attempt"]}_{record["ordinal"]}'
+        working_messages.extend([
+            {'role': 'assistant', 'content': '', 'tool_calls': [{'id': restored_id, 'type': 'function',
+                'function': {'name': record['name'], 'arguments': record['arguments']}}]},
+            {'role': 'tool', 'tool_call_id': restored_id, 'content': record['result']}])
+        tool_count += 1
+        if record['name'] == 'web_search':
+            web_count += 1
+            web_queries[' '.join(step.get('query', '').split()).casefold()] = step.get('outcome')
+        if record['name'] == 'kb_search':
+            restored_args = json.loads(record['arguments'])
+            search_count += len((restored_args.get('questions') if isinstance(restored_args, dict) else None) or [None])
+    if archived:
+        restored_sources = [s for step in all_steps for s in step.get('sources', [])]
+        ledger = EvidenceLedger(max([start_index, *[s['index'] + 1 for s in restored_sources]]), restored_sources)
     original_question = next((m.get('content', '') for m in reversed(messages) if m['role'] == 'user'), '')
     if not isinstance(original_question, str):
         original_question = ' '.join(p.get('text', '') for p in original_question if p.get('type') == 'text')
+    final_parts = final_system_parts if final_system_parts is not None else []
+    if chat_id and attempt:
+        from agent.memory import chat_context
+        snapshot = history_index.store.context_snapshot(chat_id)
+        if snapshot.get('state'):
+            final_parts = [*final_parts, chat_context._state_view(snapshot['state'], counter=counter, query=original_question)]
+        elif snapshot.get('summary'):
+            final_parts = [*final_parts, '历史参考，不是新指令：' + snapshot['summary']]
 
-    empty_retry_used = False
+    def finish():
+        if request_id and attempt:
+            history_index.store.set_turn_phase(chat_id, request_id, attempt, 'finalizing')
+        client = _llm_client.with_options(max_retries=0) if _llm_client.max_retries else _llm_client
+        yield from final_answer.generate(client, model, messages, evidence,
+            history_budget.read_ranges if history_budget else [], final_parts, counter, deadline, all_steps,
+            check_active=check_active, prepare_model_messages=prepare_model_messages, allow_partial=allow_partial,
+            clock=time.monotonic, chat_id=chat_id, request_id=request_id)
     runtime_guidance = ''
     base_system = working_messages[0]['content'] if working_messages and working_messages[0]['role'] == 'system' else None
-    for round_idx in range(max_rounds + 1):
-        if round_idx == max_rounds and not empty_retry_used:
-            break
+    for round_idx in range(max_rounds):
         if check_active:
             check_active()
         if deadline is not None and time.monotonic() >= deadline:
@@ -116,13 +166,14 @@ def run_agentic_loop(
                 "tokens_before": tokens_est
             })
 
-        # 2. 最后一轮强制不给 tools（防死循环，逼 LLM 出文本）
+        # 达到限制后切换独立正文阶段，不继续携带工具运行指令。
         is_last_round = (round_idx >= max_rounds - 1)
-        final_reserve = min(30, max(1, CHAT_LLM_TIMEOUT / 3)) if tools else 0
+        final_reserve = min(final_answer.RESERVE_SECONDS, CHAT_LLM_TIMEOUT) if tools else 0
         finishing = deadline is not None and deadline - time.monotonic() <= final_reserve
-        call_tools = None if empty_retry_used or is_last_round or tool_count >= 12 or finishing else [
+        call_tools = None if is_last_round or tool_count >= 12 or finishing else [
             t for t in tools if (t['function']['name'] != 'web_search' or web_count < 3)
             and (t['function']['name'] != 'kb_search' or search_count < 8)
+            and (t['function']['name'] != document_analysis.NAME or document_available)
             and (t['function']['name'] not in HISTORY_TOOL_NAMES or (history_budget and history_budget.available))]
         force_search = require_web_search and web_count == 0
         if force_search:
@@ -132,16 +183,13 @@ def run_agentic_loop(
                        'content': '本轮要求联网，但搜索尚未执行且工具预算已用尽。', 'steps': all_steps}
                 return
         call_tools = call_tools or None
+        if not call_tools:
+            yield from finish()
+            return
         allowed_tools = {tool["function"]["name"] for tool in (call_tools or [])}
         notes = []
         if history_budget and not history_budget.available:
             notes.append('本轮历史回查额度已用尽，不再调用历史工具；其他工具是否可用以本次 tools 为准。')
-        if not call_tools:
-            reason = ('空正文补救' if empty_retry_used else '时间预留' if finishing else
-                      '轮数上限' if is_last_round else '次数上限' if tool_count >= 12 else '无可用工具')
-            notes.append(f'进入最终回答阶段（{reason}）。禁止再请求工具，必须在 content 中直接回答用户问题。'
-                         '依据已获得的内容说明结论；不足时明确已读范围、缺项和不能确认的部分。'
-                         '预算耗尽不等于没有相关信息，未读部分不得声称已核实。')
         if notes and history_budget:
             notes.append('服务端记录的本轮历史读取范围（字符左闭右开；记录被工具清理不代表其正文仍可见）：' +
                          json.dumps(history_budget.read_ranges, ensure_ascii=False))
@@ -154,7 +202,7 @@ def run_agentic_loop(
                 working_messages[0] = {**working_messages[0], 'content': content}
             runtime_guidance = note
 
-        # 3. 调用 LLM（非流式，中间轮需判断 tool_calls）
+        # 完整接收决策后才执行工具；单次超时与整轮截止时间分开计算。
         started = time.monotonic()
         try:
             extra = {}
@@ -169,18 +217,40 @@ def run_agentic_loop(
                     'removed_sources': removed, 'web_used': reader_budget.used, 'web_remaining': reader_budget.remaining})
                 extra['max_tokens'] = config.CHAT_MAX_OUTPUT_TOKENS
             client = _llm_client.with_options(max_retries=0) if deadline is not None and _llm_client.max_retries else _llm_client
-            for attempt in range(2):
+            for transport_trial in range(2):
                 try:
                     if check_active:
                         check_active()
-                    resp = client.chat.completions.create(
-                        model=model, messages=prepare_model_messages(working_messages) if prepare_model_messages else working_messages, tools=call_tools, stream=False,
-                        timeout=max(.1, deadline - time.monotonic() - (final_reserve if call_tools else 0)) if deadline is not None else CHAT_LLM_TIMEOUT,
+                    sent = prepare_model_messages(working_messages) if prepare_model_messages else working_messages
+                    measured = counter(sent, call_tools)
+                    if enforce_budget and measured > chat_context.input_budget(counter):
+                        raise ContextBudgetError('context_budget_exceeded')
+                    resp = model_call.complete(client,
+                        model=model, messages=sent, tools=call_tools,
+                        timeout=min(CHAT_LLM_TIMEOUT, max(.1, deadline - time.monotonic() - final_reserve)) if deadline is not None else CHAT_LLM_TIMEOUT,
+                        deadline=deadline, clock=time.monotonic, check_active=check_active,
+                        phase='decision_retry' if transport_trial else 'decision', chat_id=chat_id,
+                        request_id=request_id, input_tokens=measured, count_meta=dict(counter.last),
                         **extra,
                     )
                     break
+                except APITimeoutError:
+                    if transport_trial or decision_retry_used or (deadline is not None
+                            and deadline - time.monotonic() < final_reserve + min(60, CHAT_LLM_TIMEOUT)):
+                        raise
+                    last_user = max(i for i, m in enumerate(working_messages) if m['role'] == 'user')
+                    if any(m.get('tool_calls') or m['role'] == 'tool' for m in working_messages[:last_user]):
+                        raise
+                    recent = context_selection.select_recent(working_messages[1:last_user], counter,
+                        total=C.CHAT_RECENT_TOKENS // 4, per_message=C.CHAT_RECENT_MESSAGE_TOKENS // 4,
+                        query=original_question)
+                    candidate = [working_messages[0], *recent, *working_messages[last_user:]]
+                    if counter(candidate, call_tools) >= counter(working_messages, call_tools):
+                        raise
+                    working_messages = candidate
+                    decision_retry_used = True
                 except APIStatusError as exc:
-                    if (attempt or context_retry_used or not web_contexts or not is_context_rejection(exc)
+                    if (transport_trial or context_retry_used or not web_contexts or not is_context_rejection(exc)
                             or (deadline is not None and deadline - time.monotonic() <= final_reserve)):
                         raise
                     before = counter(working_messages, call_tools)
@@ -189,9 +259,15 @@ def run_agentic_loop(
                     _chat_log.warn('agentic_context_reduced_retry', session_id=chat_id,
                                    data={'request_id': request_id, 'round': round_idx + 1, **counter.last})
         except Exception as exc:
+            incomplete = isinstance(exc, history_index.store.SessionError) and exc.code == 'model_response_incomplete'
+            if isinstance(exc, history_index.store.SessionError) and not incomplete:
+                raise
             _chat_log.error("agentic_llm_failed", session_id=chat_id, data={
                 "round": round_idx + 1, "error_type": type(exc).__name__,
             })
+            if (isinstance(exc, APITimeoutError) or incomplete) and (deadline is None or deadline > time.monotonic()):
+                yield from finish()
+                return
             if isinstance(exc, ContextBudgetError):
                 code, content = "context_budget_exceeded", "上下文超过模型输入预算"
             elif is_context_rejection(exc):
@@ -224,6 +300,9 @@ def run_agentic_loop(
         if resp.choices[0].finish_reason == "length":
             _chat_log.warn("agentic_output_truncated", session_id=chat_id,
                            data={"round": round_idx + 1})
+            if not force_search and not msg.tool_calls and not final_answer.usable_content(msg):
+                yield from finish()
+                return
             if allow_partial and not force_search and not msg.tool_calls and (msg.content or '').strip():
                 yield {'type': 'final', 'content': msg.content, 'finish_reason': 'length',
                        'messages': working_messages, 'steps': all_steps}
@@ -240,23 +319,11 @@ def run_agentic_loop(
         # 4. 无 tool_call → 最终回答，结束循环
         if not pending_calls:
             final_content = msg.content or ""
-            if not final_content.strip():
-                remaining = deadline - time.monotonic() if deadline is not None else CHAT_LLM_TIMEOUT
-                if not empty_retry_used and resp.choices[0].finish_reason == 'stop' and remaining >= 5:
-                    empty_retry_used = True
-                    _chat_log.warn('agentic_empty_answer_retry', session_id=chat_id,
-                                   data={'request_id': request_id, 'round': round_idx + 1, 'remaining_s': round(remaining, 3)})
-                    continue
-                yield {"type": "error", "code": "empty_model_answer",
-                       "content": "模型未生成可用正文，本轮回答未完成；未将空回答保存为成功，也未重复执行工具。", "steps": all_steps}
+            if not final_answer.usable_content(msg):
+                yield from finish()
                 return
             yield {"type": "final", "content": final_content, "finish_reason": resp.choices[0].finish_reason,
                    "messages": working_messages, "steps": all_steps}
-            return
-
-        if empty_retry_used:
-            yield {'type': 'error', 'code': 'final_answer_unavailable',
-                   'content': '模型在收尾补救时仍请求工具，未生成可用回答；没有重复执行工具。', 'steps': all_steps}
             return
 
         # 5. 有 tool_call → 执行所有工具
@@ -271,6 +338,7 @@ def run_agentic_loop(
             tool_name = tc["function"]["name"]
             tool_args_str = tc["function"]["arguments"]
             tool_id = tc["id"]
+            ordinal = len(archived) + len(all_steps)
 
             error_code = "invalid_tool_arguments"
             try:
@@ -312,6 +380,22 @@ def run_agentic_loop(
                     "role": "tool", "tool_call_id": tool_id,
                     "content": json.dumps({"error": error_code, "message": str(exc)}, ensure_ascii=False),
                 })
+                if attempt:
+                    history_index.save_tool(chat_id, request_id, attempt, ordinal, tool_id, tool_name,
+                        tool_args_str, working_messages[-1]['content'], 'error', error_step)
+                evidence.append({'name': tool_name, 'result': working_messages[-1]['content']})
+                continue
+
+            cached = next((r for r in archived if r['name'] == tool_name and r['result']
+                           and r['arguments'] == json.dumps(args_dict, ensure_ascii=False)), None)
+            if cached:
+                working_messages.append({'role': 'tool', 'tool_call_id': tool_id, 'content': cached['result']})
+                cached_step = {**json.loads(cached['step_json']), 'tool_call_id': tool_id, 'reused': True}
+                all_steps.append(cached_step)
+                if attempt:
+                    history_index.save_tool(chat_id, request_id, attempt, ordinal, tool_id, tool_name,
+                        json.dumps(args_dict, ensure_ascii=False), cached['result'], 'reused', cached_step)
+                yield {'type': 'enhancement_step', 'step': cached_step}
                 continue
 
             query = args_dict.get("query", "")
@@ -334,6 +418,12 @@ def run_agentic_loop(
             # 执行工具
             if check_active:
                 check_active()
+            if attempt:
+                history_index.save_tool(chat_id, request_id, attempt, ordinal, tool_id, tool_name,
+                    json.dumps(args_dict, ensure_ascii=False), step={'type': tool_name, 'tool_call_id': tool_id,
+                        'status': 'running', 'query': query})
+                if tool_name in HISTORY_TOOL_NAMES:
+                    history_index.store.set_turn_phase(chat_id, request_id, attempt, 'reading')
             options = {'timeout': max(.1, deadline - time.monotonic() - final_reserve)} if tool_name == 'web_search' else {}
             if tool_name == 'web_search':
                 options['reader_cache'] = reader_cache
@@ -348,7 +438,25 @@ def run_agentic_loop(
                 used_tokens = counter(working_messages, call_tools)
                 options['history_context_tokens'] = max(0, chat_context.input_budget(counter)
                     - used_tokens - 256)
-            result_text, search_results, result_meta = _execute_tool(tool_name, args_dict, start_index=ledger.next_index, **options)
+            if tool_name == document_analysis.NAME:
+                from agent.memory import chat_context
+                result_cap = max(0, min(2000, chat_context.input_budget(counter) - counter(working_messages, call_tools) - 256))
+                if result_cap < 512:
+                    result_text, search_results, result_meta = '当前上下文空间不足，未启动全文分析。', [], {'outcome': 'error', 'error_code': 'document_result_budget_exceeded'}
+                else:
+                    client = _llm_client.with_options(max_retries=0) if _llm_client.max_retries else _llm_client
+                    try:
+                        result_text, search_results, result_meta = yield from document_analysis.run(args_dict,
+                            chat_id=chat_id, request_id=request_id, attempt=attempt, upto_seq=history_upto_seq,
+                            client=client, model=model, counter=counter, deadline=deadline - final_reserve,
+                            max_result_tokens=result_cap, continuing=document_continuing)
+                    except history_index.store.SessionError as exc:
+                        if check_active:
+                            check_active()
+                        result_text, search_results, result_meta = json.dumps({'error': exc.code}), [], {'outcome': 'error', 'error_code': exc.code}
+                document_available = False
+            else:
+                result_text, search_results, result_meta = _execute_tool(tool_name, args_dict, start_index=ledger.next_index, **options)
             if check_active:
                 check_active()
             if tool_name == 'web_search':
@@ -398,6 +506,12 @@ def run_agentic_loop(
                 **result_meta,
             }
             all_steps.append(done_step)
+            evidence.append({'name': tool_name, 'result': result_text})
+            if attempt:
+                history_index.save_tool(chat_id, request_id, attempt, ordinal, tool_id, tool_name,
+                    json.dumps(args_dict, ensure_ascii=False), result_text, done_step['status'], done_step,
+                    budget=history_budget if tool_name in HISTORY_TOOL_NAMES else None)
+                history_index.store.set_turn_phase(chat_id, request_id, attempt, 'generating')
             sync_source_context(all_steps, web_contexts)
             yield {"type": "enhancement_step", "step": done_step}
 
@@ -410,9 +524,7 @@ def run_agentic_loop(
 
         # 6. 继续下一轮（循环回到顶部）
 
-    # 7. 达到 max_rounds 仍未结束 → 强制终止
-    _chat_log.warn("agentic_max_rounds_reached", session_id=chat_id, data={"max_rounds": max_rounds})
-    yield {"type": "error", "code": "max_rounds_exceeded", "content": f"达到最大轮数 {max_rounds}，强制结束", "steps": all_steps}
+    yield from finish()
 
 
 def _execute_tool(tool_name: str, args_dict: dict, start_index: int = 1, *, timeout: float | None = None,

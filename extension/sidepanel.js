@@ -1155,18 +1155,36 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (progress.status === 'completed') return '历史上下文整理完成';
     if (progress.status === 'cancelled') return '本轮已取消，历史和压缩检查点仍保留';
     const errors = {
-      compaction_output_truncated: '摘要生成被输出上限截断，请检查摘要模型的推理和输出配置',
+      compaction_output_truncated: '状态提取被输出上限截断，请检查辅助模型的输出配置',
       compaction_configuration_error: '摘要模型或预算配置不可用，请检查配置后恢复',
       compaction_timeout: '压缩阶段超时',
       compaction_summary_too_large: '摘要精简后仍超过目标预算',
       compaction_insufficient_space: '摘要完成后空间仍不足',
       compaction_input_budget_exceeded: '摘要请求超过输入预算，请检查配置',
+      compaction_patch_invalid: '状态变更格式或更新规则未通过检查，可恢复原问题重新提取',
+      compaction_source_invalid: '状态变更的原文来源未通过检查，可恢复原问题重新提取',
+      compaction_state_invalid: '已保存的状态格式异常，需要检查历史存储',
+      compaction_state_budget_exceeded: '必须保留的任务或约束超过状态预算，请调整预算后恢复',
+      compaction_replan_exhausted: '本次拆分尝试已用尽，失败批次已保留，请检查输出配置后恢复',
+      compaction_legacy_history_missing: '旧摘要对应的原文不完整，未切换会话状态格式',
       backend_restarted: '后端已重启',
     };
     if (progress.status !== 'running') {
       return `历史压缩未完成（${count} 批），进度已保留。${errors[progress.error_code] || '压缩已中断或失败'}；当前问题尚未继续回答。`;
     }
-    return `正在整理历史上下文：已完成 ${count} 批${progress.phase === 'reduce' ? '，正在精简摘要' : ''}。完成后自动继续回答。`;
+    const phase = { extract: '提取有来源的状态变更', repair: '修复状态变更格式或来源',
+      replan: '重新划分失败批次', render: '整理预算内的会话状态', validate: '检查完整上下文预算', reduce: '精简旧摘要' }[progress.phase];
+    return `正在整理历史上下文：已完成 ${count} 批${phase ? `，正在${phase}` : ''}。完成后自动继续回答。`;
+  }
+
+  function documentAnalysisLabel(progress) {
+    const end = progress?.processed_range?.[1] || 0;
+    const total = progress?.saved_chars || 0;
+    const status = { running: '正在分片分析', completed: '全文处理完成（结论仍需核实）',
+      paused: '本次分析额度已用尽，请明确回复“继续全文分析”', interrupted: '全文分析已中断，不会自动继续',
+      continued: '此任务已由后续提问继续，以下为任务最新处理范围',
+      failed: '全文分析失败，可检查后明确继续' }[progress?.status] || '全文分析状态待确认';
+    return `${status}：原文 ${progress?.source_ref || ''} 已保存 ${total} 字符，辅助分析已处理 [0,${end})；调用 ${progress?.calls || 0}/16。不是主模型逐字已读。`;
   }
 
   function addRequestCancel(container, base, chatId, requestId, onCancelled) {
@@ -1202,8 +1220,13 @@ document.addEventListener('DOMContentLoaded', async () => {
       const pending = progress && ['running', 'failed', 'interrupted'].includes(progress.status);
       const labels = { running: '正在处理当前提问…', cancelled: '本轮已停止，问题记录和已完成的压缩进度仍保留。',
         completed: '回答已保存。', partial: '已有回答已保存，可继续生成。', failed: '本轮处理失败。', interrupted: '本轮处理已中断。' };
+      if (state.status === 'running') labels.running = { reading: '正在读取原文片段…', generating: '正在生成回答…',
+        finalizing: '正在根据已取得的证据生成最终回答…' }[state.phase] || labels.running;
+      for (const step of state.tool_steps || []) updateEnhancementCard(container,
+        step.status === 'running' && state.status !== 'running' ? { ...step, status: 'error', error: '步骤已中断，结果尚未确认' } : step);
       label.textContent = state.status === 'cancelled' ? labels.cancelled : pending ? compactionLabel(progress)
         : (labels[state.status] || '暂时无法确认处理状态。');
+      if (state.document_analysis) label.textContent += '\n' + documentAnalysisLabel(state.document_analysis);
       label.className = ['failed', 'interrupted'].includes(state.status) ? 'error-text' : 'request-status';
       button.textContent = state.can_retry ? (pending ? '继续处理原问题' : '重试本次提问')
         : ['completed', 'partial'].includes(state.status) ? '查看已保存回答' : '检查处理状态';
@@ -1427,6 +1450,9 @@ document.addEventListener('DOMContentLoaded', async () => {
           progressLabel.textContent = compactionLabel(msg.progress);
           if (following) scrollToBottom('instant');
         }
+        else if (msg.type === 'LLM_DOCUMENT_ANALYSIS') {
+          progressLabel.textContent = documentAnalysisLabel(msg.progress);
+        }
         else if (msg.type === 'LLM_ENHANCEMENT_STEP') {
           updateEnhancementCard(bubble, msg.step);
           if (msg.step.status === 'done') sources.push(...(msg.step.sources || []));
@@ -1557,6 +1583,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         bubble.appendChild(node);
         for (const attachment of m.attachments || []) renderChatAttachment(bubble, attachment, base, chatId);
         if (m.request_id && !['completed', 'partial'].includes(m.status)) {
+          for (const step of m.tool_steps || []) updateEnhancementCard(bubble,
+            step.status === 'running' && m.status !== 'running' ? { ...step, status: 'error', error: '步骤已中断，结果尚未确认' } : step);
           addRequestRecovery(bubble, base, chatId, m.request_id);
         }
       } else {
@@ -1987,8 +2015,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     const stepId = step.tool_call_id || `${step.type}_${step.query || ''}`;
     let stepEl = card.querySelector(`[data-step-id="${CSS.escape(stepId)}"]`);
 
-    const isHistory = step.type === 'search_session_history' || step.type === 'read_session_history';
-    const icon = isHistory ? '🕘' : step.type === 'web_search' ? '🔍' : '📚';
+    const isHistory = ['list_session_history', 'search_session_history', 'read_session_history'].includes(step.type);
+    const isDocument = step.type === 'analyze_session_document';
+    const icon = isHistory ? '🕘' : isDocument ? '📄' : step.type === 'web_search' ? '🔍' : '📚';
 
     if (step.status === 'running') {
       if (!stepEl) {
@@ -1997,7 +2026,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         card.appendChild(stepEl);
       }
       stepEl.className = 'enhancement-step running';
-      const label = isHistory ? '正在回查会话历史' : step.type === 'web_search' ? '正在搜索' : step.type === 'kb_list_documents' ? '正在读取知识库目录' : '正在检索知识库';
+      const label = isDocument ? '正在分片分析原文' : isHistory ? '正在回查会话历史' : step.type === 'web_search' ? '正在搜索' : step.type === 'kb_list_documents' ? '正在读取知识库目录' : '正在检索知识库';
       stepEl.innerHTML = `<span class="step-icon">${icon}</span><span class="step-text">${label}${step.query ? ` “${esc(step.query)}”` : ''}</span>`;
     } else if (step.status === 'done') {
       if (!stepEl) {
@@ -2006,9 +2035,18 @@ document.addEventListener('DOMContentLoaded', async () => {
         card.appendChild(stepEl);
       }
       stepEl.className = 'enhancement-step done';
+      if (isDocument) {
+        stepEl.textContent = '📄 ' + documentAnalysisLabel(step.document_analysis);
+        return;
+      }
       if (isHistory) {
+        if (step.type === 'list_session_history') {
+          stepEl.textContent = `🕘 已浏览历史目录：${step.result_count || 0} 项（目录不代表已读正文）`;
+          return;
+        }
         const seqs = (step.history_seqs || []).filter(Number.isInteger).join('、');
-        const detail = seqs ? `消息 ${seqs}${step.has_more ? '（未读完）' : ''}`
+        const ranges = (step.history_ranges || []).map(r => `M${r.seq}[${r.content_offset},${r.content_end})`).join('、');
+        const detail = seqs ? `${ranges || `消息 ${seqs}`}${step.has_more || step.has_unread_content ? '（未读完，仅本次片段）' : ''}`
           : step.outcome === 'budget_exhausted' ? '预算不足，未纳入原文' : '本次未找到匹配，不代表历史中不存在';
         stepEl.textContent = `🕘 已回查会话历史：${detail}`;
         return;

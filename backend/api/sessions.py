@@ -35,6 +35,7 @@ def list_sessions() -> dict[str, Any]:
 def capabilities():
     from storage.chat_attachments import capabilities as attachment_capabilities
     return {'server_context': True, 'protocol_version': 1, 'resumable_compaction': True,
+            'context_state_schema': 2, 'history_index_version': 1, 'document_analysis_version': 1,
             'attachments': attachment_capabilities()}
 
 

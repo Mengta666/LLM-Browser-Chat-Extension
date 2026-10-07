@@ -10,6 +10,7 @@ from agent.memory import chat_context as context, config as C
 from agent.memory import context_selection as selection
 from api import model_call
 from api.evidence import kb_evidence_rows
+from search import kb_workspace
 from search.kb_coverage import prune_evidence, missing
 from observability.logger import get_logger
 
@@ -57,7 +58,7 @@ def citation_warning(text, messages):
             continue
         if message['role'] == 'tool':
             extract(raw)
-        elif raw.startswith('[本轮已取得的证据；不是新的用户要求]\n'):
+        elif raw.startswith(('[本轮已取得的证据；不是新的用户要求]\n',kb_workspace.MARKER)):
             extract(raw.split('\n', 1)[1])
     # 这里只检查编号归属，不作语义核对；代码、公式、链接与数组不作为引用。
     cleaned = re.sub(r'(?ms)^[ \t]*(`{3,}|~{3,})[^\n]*\n.*?(?:^[ \t]*\1[^\n]*$|\Z)', '', text)
@@ -170,6 +171,10 @@ def project(initial, evidence, ranges, system_parts, counter, *, compact=False, 
         system += ('\n目录 source_ref=O编号是独立的结构依据：仅可据当前可见目录说明标题、层级和页码，并注明来自文档目录（如目录 O1）。'
                    '不是正文 [N] 引用；不得用目录推断未读正文、参数或证明。只回答实际返回的目录范围，next_offset 非空时说明未列全。'
                    'evidence_kind=structure 的需求可仅用目录；content 需求仍需可见正文。')
+    if kb_task_state:
+        system += ('\nderived=true 的 evidence 是带原始来源的派生摘要，不是逐字原文。raw_excerpts 是服务端从该引用的归档原文精确截取的文本，'
+                   '数字、否定和适用条件以这些摘录为准。source_locations 是摘要涉及的源范围，不代表整段原文当前可见；'
+                   '概览可依据摘要，但不能声称逐字核验；不可从摘要重建未提供的公式或引文。')
     result = [{'role': 'system', 'content': system}, dict(current)]
     required = context.check_budget(result, counter=counter, output_tokens=output_tokens)
     target = min(context.input_budget(counter, output_tokens=output_tokens), max(required + 256,
@@ -211,8 +216,8 @@ def project(initial, evidence, ranges, system_parts, counter, *, compact=False, 
                     if row['citation'] in need['delivered_citations']:
                         row['need_ids'] = list(dict.fromkeys([*row.get('need_ids', []), need['id']]))
         # 先跨工具结果去掉已被完整正文覆盖的预览；不能逐次调用各删最后一个目标。
-        from search.kb_coverage import coalesce_evidence
-        kb_rows = coalesce_evidence(kb_rows)
+        kb_rows = kb_workspace.view_rows(kb_workspace.collect(evidence, kb_task_state), kb_task_state or {},
+            keep_recent=not (kb_task_state or {}).get('workspace',{}).get('compact_recent'))
         selected.append({'tool':'kb_evidence','derived':False,'result':json.dumps({'evidence':kb_rows},ensure_ascii=False)})
     recent = []
     def data_message():
@@ -234,7 +239,7 @@ def project(initial, evidence, ranges, system_parts, counter, *, compact=False, 
                     if compact:
                         visible_row = {k:v for k,v in visible_row.items() if k in
                             ('citation','content','locations','need_ids','bundle_id','evidence_role','read_kind',
-                             'excerpt_truncated','warnings','legacy')}
+                             'excerpt_truncated','warnings','legacy','derived','pack_id','source_locations','raw_excerpts','missing')}
                         visible_row['locations'] = [{k:v for k,v in p.items() if k in ('block_id','page','start','end')}
                                                     for p in visible_row.get('locations',[])]
                     if visible_row not in group['evidence']:
@@ -259,11 +264,13 @@ def project(initial, evidence, ranges, system_parts, counter, *, compact=False, 
         kb_visible = [[g['doc_id'],g['parse_id'],s['block_id'],s['start'],s['end']]
                       for g in groups.values() for r in g['evidence'] for s in r.get('locations',[])]
         visibility = []
+        derived_units = {(g['doc_id'],g['parse_id'],r.get('bundle_id') or r['citation'])
+                         for g in groups.values() for r in g['evidence'] if r.get('derived')}
         for key,value in kb_expected.items():
             unread = [p for s in value['ranges'] for p in missing(s,kb_visible)]
             if unread:
                 visibility.append({'doc_id':key[0],'unit':key[2],'label':value['label'][:80],
-                                   'status':'partial_or_omitted', 'omitted_ranges':len(unread)})
+                                   'status':'derived_not_raw' if key in derived_units else 'partial_or_omitted', 'omitted_ranges':len(unread)})
         gaps = [g for g in kb_goals if g.get('status')!='provided']
         from search import kb_task
         from search import kb_read_queue
@@ -337,6 +344,10 @@ def project(initial, evidence, ranges, system_parts, counter, *, compact=False, 
         recent.pop(0)
         result = [result[0], *recent, data_message(), result[-1]]
     context.check_budget(result, counter=counter, output_tokens=output_tokens)
+    if kb_task_state is not None:
+        kb_workspace.record_view(kb_task_state, kb_rows,
+            [r for entry in selected if entry['tool']=='kb_evidence'
+             for r in kb_evidence_rows(json.loads(entry['result']))], phase='final')
     return result
 
 

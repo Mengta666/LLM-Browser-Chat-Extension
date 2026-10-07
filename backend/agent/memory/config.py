@@ -238,6 +238,10 @@ def kb_answer_settings(model):
 def chat_generation_extra(model, phase, *, kb_answer=False):
     template = chat_reasoning_kwargs(model)
     extra = {}
+    if phase == 'kb_compact':
+        thinking = (os.getenv('KB_WORKSPACE_ENABLE_THINKING', '').strip() or os.getenv('CHAT_COMPACT_ENABLE_THINKING', '')).lower()
+        if thinking in ('true','false'):
+            return {'chat_template_kwargs':{'enable_thinking':thinking=='true'}}
     kb_settings = kb_answer_settings(model) if kb_answer and phase in ('final', 'final_repair') else {}
     if kb_settings.get('reasoning_effort'):
         template = {'reasoning_effort': kb_settings['reasoning_effort']}

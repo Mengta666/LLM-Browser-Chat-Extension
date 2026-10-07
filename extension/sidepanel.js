@@ -2027,7 +2027,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const card = getOrCreateEnhancementCard(bubbleEl);
     const esc = (t) => String(t || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
-    const stepId = step.tool_call_id || `${step.type}_${step.query || ''}`;
+    const stepId = step.tool_call_id || `${step.type}_${step.batch_id || step.query || ''}_${step.part || ''}`;
     let stepEl = card.querySelector(`[data-step-id="${CSS.escape(stepId)}"]`);
 
     const isHistory = ['list_session_history', 'search_session_history', 'read_session_history'].includes(step.type);
@@ -2041,7 +2041,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         card.appendChild(stepEl);
       }
       stepEl.className = 'enhancement-step running';
-      const label = isDocument ? '正在分片分析原文' : isHistory ? '正在回查会话历史' : step.type === 'web_search' ? '正在搜索' : step.type === 'kb_list_documents' ? '正在读取知识库目录' : step.type === 'kb_read_document' ? '正在读取知识库正文' : '正在检索知识库';
+      const label = step.type === 'kb_workspace' ? `正在整理已取得资料（片段 ${step.part || 1}/${step.parts || 1}）` : isDocument ? '正在分片分析原文' : isHistory ? '正在回查会话历史' : step.type === 'web_search' ? '正在搜索' : step.type === 'kb_list_documents' ? '正在读取知识库目录' : step.type === 'kb_read_document' ? '正在读取知识库正文' : '正在检索知识库';
       stepEl.innerHTML = `<span class="step-icon">${icon}</span><span class="step-text">${label}${step.query ? ` “${esc(step.query)}”` : ''}</span>`;
     } else if (step.status === 'done') {
       if (!stepEl) {
@@ -2050,6 +2050,11 @@ document.addEventListener('DOMContentLoaded', async () => {
         card.appendChild(stepEl);
       }
       stepEl.className = 'enhancement-step done';
+      if (step.type === 'kb_workspace') {
+        const labels = {complete:'资料整理已保存，原文仍可回查', processing:'本片整理已保存，整包尚未发布', no_gain:'整理未减少输入，继续保留原文', failed:'本包整理失败，原文仍保留', too_large:'本包无法在整理窗口内处理，原文仍保留'};
+        stepEl.textContent = `📚 ${labels[step.outcome] || '资料整理进度已保存'}（${step.part || 1}/${step.parts || 1}；不代表结论已核实）`;
+        return;
+      }
       if (step.type === 'citation_warning') {
         bubbleEl.dataset.invalidCitations = JSON.stringify(step.invalid_indices || []);
         stepEl.textContent = `⚠ 引用 ${(step.invalid_indices || []).map(i => `[${i}]`).join('、')} 未对应本次可见证据，未自动改引（不做语义核验）`;
@@ -2065,6 +2070,11 @@ document.addEventListener('DOMContentLoaded', async () => {
         const optional = pending.length - missing;
         stepEl.textContent = `📚 ${reasons[step.kb_stop_reason] || '开始整理已取得的知识库资料'}${missing ? `；仍有 ${missing} 项读取缺口，回答将注明限制` : ''}${optional ? `；另有 ${optional} 段未读范围，可按需续读` : ''}`;
         if (step.kb_read_coverage?.status === 'selected_reads_complete') stepEl.textContent += '；已选择的完整原文范围均已交付（不代表结论已核实）';
+        if (step.kb_workspace?.version) {
+          const w = step.kb_workspace;
+          stepEl.textContent += `；当前可见：原文 ${w.raw_citations?.length || 0} 项，派生摘要 ${w.derived_citations?.length || 0} 项`;
+          if (w.pending_parts) stepEl.textContent += `；尚有 ${w.pending_parts} 片未整理，已保存片段可恢复`;
+        }
         if (step.kb_goals?.length) {
           const details = document.createElement('details');
           const summary = document.createElement('summary');

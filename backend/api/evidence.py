@@ -66,6 +66,7 @@ class EvidenceLedger:
                         "parse_id": row.get('parse_id', ''), "locations": row.get('locations', []),
                         "structure_id":row.get('structure_id',''),"node_id":row.get('node_id',''),
                         "node_path":row.get('node_path',[]),"bundle_id":row.get('bundle_id',''),
+                        "atomic":row.get('atomic',False),"node_kind":row.get('node_kind',''),
                         "read_kind": row.get('read_kind', 'preview'), "warnings": row.get('warnings', []),
                         "ledger_key": key} if is_kb else {}),
                 }

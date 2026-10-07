@@ -51,6 +51,8 @@ def capabilities():
             'kb_answer_generation_version': 1,
             'kb_source_association_version': 1,
             'kb_outline_sources_version': 1,
+            'kb_workspace_version': 1,
+            'kb_workspace_compaction_version': 2,
             'attachments': attachment_capabilities()}
 
 

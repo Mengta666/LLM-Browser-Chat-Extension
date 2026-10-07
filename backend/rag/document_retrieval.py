@@ -293,7 +293,7 @@ def search(kb_id, query, *, doc_id=None, page=None, section_id=None, node_id=Non
     trace = {}
     with KS._transaction() as conn:
         KS._owned_kb(conn,kb_id,CHAT_USER_ID,active=True)
-        doc_ids = [r[0] for r in conn.execute("SELECT doc_id FROM kb_docs WHERE kb_id=? AND deleted_at='' AND status='indexed' AND sync_pending=0",(kb_id,))]
+        doc_ids = [r[0] for r in conn.execute("SELECT doc_id FROM kb_docs WHERE kb_id=? AND deleted_at='' AND status='indexed' AND sync_pending=0 AND published_parse_id<>''",(kb_id,))]
     for did in doc_ids:
         if doc_id and did != doc_id:
             continue

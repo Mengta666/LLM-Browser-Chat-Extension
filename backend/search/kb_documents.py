@@ -24,10 +24,11 @@ KB_DOCUMENT_TOOLS = [
                     'required': ['kb_id'], 'oneOf': [{'required': ['doc_id']}, {'required': ['doc_name']}],
                     'additionalProperties': False}}},
     {'type': 'function', 'function': {'name': 'kb_read_document',
-     'description': '按 targets 批量读取。各目标分别返回 delivery：complete、partial、not_provided、failed；partial/not_provided 复用 items.next_read 续读，不能当作已读完。每项只选一种 mode：node结构单元、block整块、range字符范围、rows表格行、page页、section章节、formula公式编号、related已确认关联。cursor/block_offset 是该模式的顺序游标，只复用返回值，不自行推算。已知位置直接读；问答优先检索相关证据，不默认通读。字符和行范围零起左闭右开。doc_name为唯一完整文件名。局部读取不是全文，OCR可能有误。',
+     'description': '按 targets 批量读取；或只传 citations 正整数数组，重新载入本请求已取得的原始片段（含 PDF/TXT/MD），不与 targets 混用。citations 回读不是整篇文档。各目标分别返回 delivery：complete、partial、not_provided、failed；partial/not_provided 复用 items.next_read 续读，不能当作已读完。每项只选一种 mode：node结构单元、block整块、range字符范围、rows表格行、page页、section章节、formula公式编号、related已确认关联。cursor/block_offset 是该模式的顺序游标，只复用返回值，不自行推算。已知位置直接读，已移出上下文的来源允许复查。字符和行范围零起左闭右开。局部读取不是全文，OCR可能有误。',
      'parameters': {'type': 'object', 'properties': {'kb_id': {'type': 'string'},
-         'targets': {'type': 'array', 'minItems': 1, 'maxItems': C.READ_MAX_TARGETS, 'items': P.target_schema()}},
-         'required': ['kb_id', 'targets'], 'additionalProperties': False}}},
+         'targets': {'type': 'array', 'minItems': 1, 'maxItems': C.READ_MAX_TARGETS, 'items': P.target_schema()},
+         'citations': {'type':'array','minItems':1,'maxItems':C.READ_MAX_TARGETS,'items':{'type':'integer','minimum':1}}},
+         'required': ['kb_id'], 'oneOf':[{'required':['targets']},{'required':['citations']}], 'additionalProperties': False}}},
 ]
 
 
@@ -43,6 +44,10 @@ def parse(name, arguments):
             raise ValueError('need_ids 必须为需求编号数组')
         return {**parse(name, {k:v for k,v in args.items() if k != 'need_ids'}), 'need_ids': ids}
     if name == 'kb_read_document':
+        if 'citations' in args:
+            if set(args) != {'kb_id','citations'} or not isinstance(args['citations'],list) or not args['citations'] or any(type(n)!=int or n<1 for n in args['citations']):
+                raise ValueError('citations 必须为非空正整数数组，不能与其他定位参数混用')
+            return args
         if 'targets' in args:
             if set(args) != {'kb_id', 'targets'}:
                 raise ValueError('targets 不能与旧定位参数混用')
@@ -345,6 +350,7 @@ def render(rows, meta):
             refs[identity] = f'D{len(refs) + 1}'
             documents.append({'ref': refs[identity], 'kb_id': row.get('kb_id'), 'doc_id': row.get('doc_id'),
                               'parse_id': row.get('parse_id'), 'document': row.get('source'),
+                              **({'index_run_id':row['index_run_id']} if row.get('index_run_id') and not row.get('parse_id') else {}),
                               **({'structure_id':row['structure_id']} if row.get('structure_id') else {}),
                               **({'warnings': common_warnings[identity]} if common_warnings[identity] else {})})
         warnings = [w for w in row.get('warnings', []) if w not in common_warnings[identity]]
@@ -352,7 +358,7 @@ def render(rows, meta):
                          'locations': [{k:v for k,v in p.items() if k not in ('bbox', 'block_length') and v is not None}
                                                                      for p in row.get('locations', [])],
                          'content': row.get('content', ''),
-                         **({k:row[k] for k in ('node_kind','bundle_id','bundle_role','evidence_role','need_ids','read_kind') if row.get(k)}),
+                         **({k:row[k] for k in ('node_kind','bundle_id','bundle_role','evidence_role','need_ids','read_kind','atomic') if row.get(k)}),
                          **({'path':[row['node_path'][-1]]} if row.get('node_path') else {}),
                          **({'sampled':True,'unit_source_count':row['unit_source_count']} if row.get('sampled') else {}),
                          **({'scope_limited':True} if row.get('scope_limited') else {}),
@@ -456,7 +462,7 @@ class TurnKBBudget:
     def call_allowed(self, phase):
         if self.task_mode:
             return True
-        reserve = 2 if phase == 'decision' else 0
+        reserve = 2 if phase in ('decision','kb_compact') else 0
         return self.state['model_calls'] < self.settings['MODEL_CALL_LIMIT'] - reserve
 
     @property
@@ -585,6 +591,7 @@ class TurnKBBudget:
                 need.update(citations=[], outline_refs=[], status='open', missing='原来源已不可访问', answer_points='')
             self.state['visible_citations'] = []
             self.state.pop('answer_draft', None)
+            self.state.pop('workspace', None)
             self.state['versions'] = {}
             raise
 
@@ -610,6 +617,47 @@ class TurnKBBudget:
                 return text, [], {'outcome':'task_updated', 'kb_needs':kb_task.public(self.state),
                                   'kb_tokens':tokens, 'provided_count':0}
             args = {k:v for k,v in args.items() if k != 'need_ids'}
+            if name == 'kb_read_document' and 'citations' in args:
+                parsed = parse(name,args)
+                if len(parsed['citations']) > self.settings['READ_MAX_TARGETS']:
+                    raise ValueError('citations 超过单次读取项数')
+                from storage import kb_store as KS, kb_document_store as DS
+                from agent.memory.config import CHAT_USER_ID
+                rows = []
+                for ref in parsed['citations']:
+                    source = ledger.sources.get(ref)
+                    if not source or source.get('kb_id') != args['kb_id'] or not source.get('content'):
+                        raise ValueError('来源未取得、不可访问或不属于当前知识库')
+                    with KS._transaction() as conn:
+                        KS._owned_kb(conn,args['kb_id'],CHAT_USER_ID,active=True)
+                        doc = DS.owned(conn,args['kb_id'],source['doc_id'])
+                        if not source.get('parse_id') and doc['published_run_id'] != source.get('index_run_id'):
+                            raise KS.KBConflict('旧文本索引已换版，不能复用原来源')
+                    if source.get('parse_id'):
+                        resolve_scope({k:source[k] for k in ('kb_id','doc_id','parse_id')},self.state['versions'])
+                    rows.append({'citation':ref,'content':source['content'], 'document':source['title'],
+                        **{k:source[k] for k in ('kb_id','doc_id','parse_id','index_run_id','locations','warnings','atomic','node_kind','bundle_id') if k in source},
+                        'read_kind':source.get('read_kind','preview'),'need_ids':need_ids})
+                selected = []
+                for row in rows:
+                    candidate = json.dumps({'evidence':[*selected,row],'outcome':'archive_read'},ensure_ascii=False)
+                    if self.counter.count_text(candidate)<=cap:
+                        selected.append(row)
+                text = json.dumps({'evidence':selected,'outcome':'archive_read' if selected else 'budget_exhausted',
+                    'omitted_citations':[r['citation'] for r in rows if r not in selected],
+                    'notice':'只重新载入此前取得的原文片段，不代表整篇文档。'},ensure_ascii=False)
+                while selected and self.counter.count_text(text)>cap:
+                    selected.pop()
+                    text=json.dumps({'evidence':selected,'outcome':'archive_read' if selected else 'budget_exhausted'},ensure_ascii=False)
+                if self.counter.count_text(text)>cap:
+                    text=json.dumps({'evidence':[],'outcome':'budget_exhausted'})
+                for row in selected:
+                    kb_task.delivered(self.state,[{**row,'citation_index':row['citation']}],need_ids)
+                self.state['used'] += self.counter.count_text(text)
+                self.state['archive_reads'] = self.state.get('archive_reads',0)+len(selected)
+                return text, [ledger.sources[r['citation']] | {'content':''} for r in selected], {
+                    'outcome':'archive_read' if selected else 'budget_exhausted','provided_count':len(selected),
+                    'kb_tokens':self.counter.count_text(text),'reloaded_citations':[r['citation'] for r in selected]}
             if name == 'kb_search' and not (args.get('doc_id') or args.get('doc_name')):
                 named = self.state.get('named_documents', [])
                 if len(named) == 1:
@@ -628,7 +676,8 @@ class TurnKBBudget:
                     record_stage(entry.setdefault('retrieval_trace', {}), 'unit_expanded',
                                  [r for r in rows if r.get('question') == entry['question']])
                 original_count = len(rows)
-                rows = coverage.novel_rows(rows,self.state['ranges'])
+                visible = self.state.get('workspace', {}).get('visible_ranges', self.state['ranges'])
+                rows = coverage.novel_rows(rows, visible)
                 meta['duplicate_units_omitted'] = original_count-len(rows)
                 for entry in meta.get('retrievals', []):
                     record_stage(entry['retrieval_trace'], 'novel_candidates',
@@ -692,7 +741,8 @@ class TurnKBBudget:
                     and any(r.get('question')==row.get('question') for r in omitted)):
                 continue
             if name=='kb_search':
-                novel = coverage.novel_rows([row],self.state['ranges']+[span for r in selected for span in coverage.row_ranges(r)])
+                visible = self.state.get('workspace', {}).get('visible_ranges', self.state['ranges'])
+                novel = coverage.novel_rows([row],visible+[span for r in selected for span in coverage.row_ranges(r)])
                 if not novel:
                     continue
                 row = novel[0]

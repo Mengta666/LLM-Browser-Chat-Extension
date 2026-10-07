@@ -30,6 +30,17 @@ def checkpoint(chat_id, request_id, attempt, state):
         save(conn, chat_id, request_id, state)
 
 
+def workspace_progress(state):
+    workspace=state.get('workspace', {})
+    packs=list(workspace.get('packs',{}).values())
+    return {k:v for k,v in workspace.items() if k in
+        ('version','phase','archived_count','omitted_count','raw_citations','derived_citations')} | {
+        'completed_packs':sum(p['status']=='complete' for p in packs),
+        'failed_packs':sum(p['status']=='failed' for p in packs),
+        'saved_parts':sum(len(p.get('parts',[])) for p in packs),
+        'pending_parts':sum(len(p.get('plan',[]))-len(p.get('parts',[])) for p in packs if p['status']=='processing')}
+
+
 def progress(chat_id, request_id):
     from search import kb_coverage, kb_read_queue
     state = load(chat_id, request_id)
@@ -42,4 +53,5 @@ def progress(chat_id, request_id):
     if reason == 'no_progress' and needs and all(n['status'] in ('ready', 'unresolved') for n in needs) and not coverage['missing_scope_count']:
         reason = 'needs_assessed'
     return {'type': 'kb_progress', 'status': 'done', 'kb_stop_reason': reason,
-            'kb_pending': state['pending'], 'kb_read_coverage': coverage}
+            'kb_pending': state['pending'], 'kb_read_coverage': coverage,
+            'kb_workspace': workspace_progress(state)}

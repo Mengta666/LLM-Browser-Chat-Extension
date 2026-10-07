@@ -21,8 +21,9 @@ from storage import history_index
 from storage import kb_runtime
 from search import kb_task
 from search import kb_read_queue
+from search import kb_workspace
 from search.kb_coverage import covered_chars
-from api import final_answer, model_call
+from api import final_answer, model_call, kb_compaction
 from agent.memory import context_selection, config as C
 from agent.memory import document_analysis
 
@@ -171,6 +172,9 @@ def run_agentic_loop(
     if archived:
         restored_sources = [s for step in all_steps for s in step.get('sources', [])]
         ledger = EvidenceLedger(max([start_index, *[s['index'] + 1 for s in restored_sources]]), restored_sources)
+        for row in kb_workspace.collect(evidence):
+            if row['citation'] in ledger.sources:
+                ledger.sources[row['citation']]['content'] = row['content']
     if kb_enabled:
         tool_count = max(tool_count, kb_budget.state['tool_count'])
         search_count = max(search_count, kb_budget.state['search_count'])
@@ -202,12 +206,44 @@ def run_agentic_loop(
             history_index.store.set_turn_phase(chat_id, request_id, attempt, 'finalizing')
         client = _llm_client.with_options(max_retries=0) if _llm_client.max_retries else _llm_client
         if kb_enabled:
+            from agent.memory import chat_context
+            raw = kb_workspace.collect(evidence, kb_budget.state)
+            output = C.kb_answer_settings(model).get('max_tokens', C.CHAT_MAX_OUTPUT_TOKENS)
+            pressure = [*messages, {'role':'user','content':json.dumps(kb_workspace.payload(raw,len(raw)),ensure_ascii=False)}]
+            for event in kb_compaction.prepare(client, model, pressure, None, evidence, kb_budget.state,
+                    counter, chat_context.input_budget(counter,output_tokens=output), deadline=deadline,
+                    checkpoint=persist_kb,check_active=check_active,chat_id=chat_id,request_id=request_id,before_call=model_permit):
+                if event['step']['status']=='done':
+                    all_steps.append(event['step'])
+                yield event
+            try:
+                final_answer.project(messages, evidence, history_budget.read_ranges if history_budget else [],
+                    final_parts, counter, kb_task_state=kb_budget.state, output_tokens=output)
+            except chat_context.ContextBudgetError:
+                for event in kb_compaction.prepare(client, model, pressure, None, evidence, kb_budget.state,
+                        counter, chat_context.input_budget(counter,output_tokens=output), deadline=deadline,
+                        checkpoint=persist_kb,check_active=check_active,chat_id=chat_id,request_id=request_id,
+                        before_call=model_permit,force=True):
+                    if event['step']['status']=='done':
+                        all_steps.append(event['step'])
+                    yield event
+                try:
+                    final_answer.project(messages,evidence,history_budget.read_ranges if history_budget else [],
+                        final_parts,counter,kb_task_state=kb_budget.state,output_tokens=output)
+                except chat_context.ContextBudgetError:
+                    persist_kb()
+                    yield {'type':'error','code':'kb_required_evidence_overflow',
+                        'content':'必要资料整理后仍超出模型输入窗口，未删掉关键材料或发送超限请求。原文、读取过程与整理检查点已保存；请缩小本次问题范围或分项提问。',
+                        'steps':all_steps}
+                    return
+        if kb_enabled:
             progress = {'type': 'kb_progress', 'status': 'done', 'kb_id': bound_kb_id,
                         'kb_pending': kb_budget.state['pending'], 'kb_stop_reason': kb_budget.state['stop_reason'],
                         'kb_model_calls': kb_budget.state['model_calls'],
                         'kb_needs': kb_task.public(kb_budget.state),
                         'kb_read_coverage': kb_read_queue.report(kb_budget.state),
                         'kb_execution_mode': 'task' if kb_budget.task_mode else 'bounded',
+                        'kb_workspace':kb_runtime.workspace_progress(kb_budget.state),
                         'kb_remaining_tokens': None if kb_budget.task_mode else kb_budget.remaining}
             from search.kb_coverage import public_goals
             progress['kb_goals'] = public_goals(kb_budget.state)
@@ -251,7 +287,8 @@ def run_agentic_loop(
         tokens_est = counter(working_messages, tools)
         if tokens_est > AGENTIC_TOOL_CLEAR_THRESHOLD:
             old_count = len(working_messages)
-            working_messages = _clear_old_tool_results(working_messages, keep=AGENTIC_KEEP_RECENT_TOOLS)
+            working_messages = _clear_old_tool_results(working_messages, keep=AGENTIC_KEEP_RECENT_TOOLS,
+                protected=KB_TOOL_NAMES if kb_enabled else ())
             _chat_log.info("agentic_tool_cleared", session_id=chat_id, data={
                 "round": round_idx + 1,
                 "old_count": old_count,
@@ -353,6 +390,26 @@ def run_agentic_loop(
                 extra['tool_choice'] = 'required'
             if enforce_budget or bound_kb_id or web_enabled:
                 from agent.memory import chat_context, config
+                if kb_enabled:
+                    compact_client = _llm_client.with_options(max_retries=0) if _llm_client.max_retries else _llm_client
+                    for event in kb_compaction.prepare(compact_client, model, working_messages, call_tools,
+                            evidence, kb_budget.state, counter, chat_context.input_budget(counter),deadline=deadline,
+                            checkpoint=persist_kb,check_active=check_active,chat_id=chat_id,request_id=request_id,before_call=model_permit):
+                        if event['step']['status']=='done':
+                            all_steps.append(event['step'])
+                        yield event
+                    working_messages, workspace_event = kb_workspace.decision_view(
+                        working_messages, call_tools, evidence, kb_budget.state, counter,
+                        chat_context.input_budget(counter))
+                    if workspace_event:
+                        kb_budget.state['visible_citations'] = kb_task.visible_citations(working_messages)
+                        kb_budget.state['visible_outline_refs'] = kb_task.visible_outline_refs(working_messages)
+                        notes[0] = kb_budget.guidance()
+                        runtime_guidance = '\n'.join(notes)
+                        working_messages[0] = {**working_messages[0], 'content': (base_system+'\n\n' if base_system else '')+runtime_guidance}
+                        persist_kb()
+                        _chat_log.info('kb_workspace_selected', session_id=chat_id,
+                            data={'request_id':request_id, **workspace_event})
                 tokens, removed = fit_request(working_messages, call_tools, web_contexts, counter=counter)
                 _chat_log.info('agentic_context_budget', session_id=chat_id, data={
                     'request_id': request_id, 'round': round_idx + 1, 'input_tokens': tokens,
@@ -551,7 +608,7 @@ def run_agentic_loop(
                     error_code = "tool_budget_exceeded"
                     raise ValueError("本轮时间预算已用尽")
                 cost = len(args_dict.get("questions") or [args_dict.get("query")]) if tool_name == "kb_search" else 0
-                tool_cost = len(args_dict['targets']) if tool_name == 'kb_read_document' else 1
+                tool_cost = len(args_dict.get('targets', args_dict.get('citations', []))) if tool_name == 'kb_read_document' else 1
                 if ((not task_mode and (tool_count + tool_cost > 12 or search_count + cost > 8))
                         or (task_mode and tool_name not in KB_TOOL_NAMES and other_tool_count + tool_cost > 12)):
                     error_code = "tool_budget_exceeded"
@@ -781,7 +838,7 @@ def _execute_tool(tool_name: str, args_dict: dict, start_index: int = 1, *, time
         return f"未知工具: {tool_name}", [], {"outcome": "error", "error_code": "tool_unavailable", "error": "工具不可用"}
 
 
-def _clear_old_tool_results(messages: list[dict], keep: int = 3) -> list[dict]:
+def _clear_old_tool_results(messages: list[dict], keep: int = 3, protected=()) -> list[dict]:
     """
     Tool Clearing（对齐 Anthropic）：清除旧 tool 消息内容，保留最近 keep 个。
     纯字符串操作，零 LLM 调用。
@@ -793,7 +850,8 @@ def _clear_old_tool_results(messages: list[dict], keep: int = 3) -> list[dict]:
     Returns:
         压缩后的 messages
     """
-    tool_indices = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
+    names = {c['id']:c['function']['name'] for m in messages for c in m.get('tool_calls', [])}
+    tool_indices = [i for i, m in enumerate(messages) if m.get("role") == "tool" and names.get(m.get('tool_call_id')) not in protected]
     if len(tool_indices) <= keep:
         return messages
 

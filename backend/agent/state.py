@@ -20,6 +20,7 @@ class AgentStatus(str, Enum):
     RUNNING = "running"
     ACTION_REQUIRED = "action_required"
     CONFIRM_REQUIRED = "confirm_required"
+    OBSERVATION_REQUIRED = "observation_required"
     COMPLETED = "completed"
     ERROR = "error"
     CANCELLED = "cancelled"
@@ -42,6 +43,7 @@ class ActionResult(BaseModel):
     error: Optional[str] = None
     timestamp: int = 0
     stale: bool = False                  # 编号失效（页面已重渲染）→ 需重新观察，不计失败
+    material_verification: Optional[dict[str, Any]] = None
     state_changes: Optional[dict[str, Any]] = None
 
 
@@ -128,6 +130,10 @@ class AgentSession:
     # 自定义 LLM 参数(前端设置面板配的 JSON,如关思考模式)。仅本 session 生效,chat 不受影响。
     # 结构:{顶层参数(如 reasoning_effort), "extra_body": {供应商私有参数如 thinking/enable_thinking}}
     llm_params: dict[str, Any] = field(default_factory=dict)
+    kb_id: str = ""
+    material_state: dict[str, Any] = field(default_factory=dict)
+    material_continuation: str = ""
+    material_observation_id: str = ""
 
     # 长期记忆(分层):
     # - resident_preferences: 常驻用户偏好,每步无条件注入 prompt(首步检索一次)。

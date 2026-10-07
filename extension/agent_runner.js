@@ -120,6 +120,13 @@
 
     async execute(action) {
       this.check();
+      if (action.params?.material_id) {
+        const validation = await this.wait(this.io.api('/v1/agent/material-check', {
+          session_id: this.sessionId, action_id: action.action_id
+        }), 10000);
+        if (!validation?.allowed) return { action_id: action.action_id, execution_state: 'not_dispatched',
+          action_type: action.type, success: false, error: validation?.error || '无法确认物料来源，未执行填写' };
+      }
       // 先记可能已送达；回复丢失不能被当成没有执行。
       this.pendingActionId = action.action_id;
       try {

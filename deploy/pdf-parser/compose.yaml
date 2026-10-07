@@ -1,0 +1,118 @@
+name: ${OCR_COMPOSE_PROJECT_NAME:-browser-agent-ocr}
+
+x-parser-build: &parser-build
+  context: ../..
+  dockerfile: addons/pdf-parser/Dockerfile
+  args:
+    CUDA_IMAGE: ${PDF_PARSER_CUDA_IMAGE:-nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04}
+
+x-gpu: &gpu
+  resources:
+    reservations:
+      devices:
+        - driver: nvidia
+          device_ids: ["${OCR_CUDA_VISIBLE_DEVICES:?Set OCR_CUDA_VISIBLE_DEVICES to one GPU ID}"]
+          capabilities: [gpu]
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: "3"
+
+services:
+  models:
+    profiles: [tools]
+    image: ${PDF_PARSER_IMAGE:-browser-agent-pdf-parser:0.2.0}
+    build: *parser-build
+    init: true
+    restart: "no"
+    command: [prepare-models, --from-environment]
+    environment:
+      OCR_LAYOUT_MODEL_DIR: /models/PP-DocLayoutV3
+      OCR_VLLM_MODEL_DIR: /models/PaddleOCR-VL-1.6
+    volumes:
+      - ocr-models:/models
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    logging: *logging
+
+  ocr-vllm:
+    image: ${OCR_VLLM_IMAGE:-browser-agent-ocr-vllm:0.11.1-cu128}
+    build:
+      context: ../..
+      dockerfile: deploy/pdf-parser/Dockerfile.vllm
+      args:
+        CUDA_IMAGE: ${OCR_VLLM_CUDA_IMAGE:-nvidia/cuda:12.8.1-base-ubuntu24.04}
+    init: true
+    restart: "no"
+    entrypoint: [python3, /opt/browser-agent-ocr/deploy/pdf-parser/manage.py]
+    command: [vllm, --from-environment]
+    environment:
+      OCR_VLLM_API_KEY: ${OCR_VLLM_API_KEY:?Initialize deploy/pdf-parser/.env first}
+      OCR_VLLM_MODEL: ${OCR_VLLM_MODEL:-PaddlePaddle/PaddleOCR-VL-1.6}
+      OCR_VLLM_MODEL_DIR: /models/PaddleOCR-VL-1.6
+      OCR_VLLM_HOST: 0.0.0.0
+      OCR_VLLM_PORT: "8000"
+      OCR_CUDA_VISIBLE_DEVICES: "0"
+      OCR_VLLM_GPU_MEMORY_UTILIZATION: ${OCR_VLLM_GPU_MEMORY_UTILIZATION:-0.25}
+      OCR_VLLM_MAX_MODEL_LEN: ${OCR_VLLM_MAX_MODEL_LEN:-16384}
+      OCR_VLLM_MAX_NUM_SEQS: ${OCR_VLLM_MAX_NUM_SEQS:-2}
+    volumes:
+      - ocr-models:/models:ro
+      - ./manage.py:/opt/browser-agent-ocr/deploy/pdf-parser/manage.py:ro
+    deploy: *gpu
+    shm_size: 2gb
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    logging: *logging
+    healthcheck:
+      test: [CMD, python3, -c, "import os,urllib.request; r=urllib.request.Request('http://127.0.0.1:8000/health',headers={'Authorization':'Bearer '+os.environ['OCR_VLLM_API_KEY']}); urllib.request.build_opener(urllib.request.ProxyHandler({})).open(r,timeout=5).read(1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 4
+      start_period: 600s
+
+  pdf-parser:
+    image: ${PDF_PARSER_IMAGE:-browser-agent-pdf-parser:0.2.0}
+    build: *parser-build
+    init: true
+    restart: "no"
+    depends_on:
+      ocr-vllm:
+        condition: service_healthy
+    ports:
+      - "${PDF_PARSER_HOST:-127.0.0.1}:${PDF_PARSER_PORT:-19082}:8000"
+    environment:
+      PDF_PARSER_API_KEY: ${PDF_PARSER_API_KEY:?Initialize deploy/pdf-parser/.env first}
+      PDF_PARSER_HOST: 0.0.0.0
+      PDF_PARSER_PORT: "8000"
+      OCR_VLLM_API_KEY: ${OCR_VLLM_API_KEY:?Initialize deploy/pdf-parser/.env first}
+      OCR_VLLM_BASE_URL: http://ocr-vllm:8000/v1
+      OCR_VLLM_MODEL: ${OCR_VLLM_MODEL:-PaddlePaddle/PaddleOCR-VL-1.6}
+      OCR_LAYOUT_MODEL_DIR: /models/PP-DocLayoutV3
+      OCR_CUDA_VISIBLE_DEVICES: "0"
+      OCR_LAYOUT_DEVICE: ${OCR_LAYOUT_DEVICE:-gpu:0}
+      OCR_VLM_CONCURRENCY: ${OCR_VLM_CONCURRENCY:-2}
+      OCR_MAX_NEW_TOKENS: ${OCR_MAX_NEW_TOKENS:-4096}
+      OCR_IMAGE_TEXT: ${OCR_IMAGE_TEXT:-true}
+      PDF_PARSER_MAX_BYTES: ${PDF_PARSER_MAX_BYTES:-8388608}
+      PDF_PARSER_MAX_PIXELS: ${PDF_PARSER_MAX_PIXELS:-16000000}
+      PDF_PARSER_PAGE_TIMEOUT: ${PDF_PARSER_PAGE_TIMEOUT:-180}
+      PDF_PARSER_STARTUP_TIMEOUT: ${PDF_PARSER_STARTUP_TIMEOUT:-180}
+    volumes:
+      - ocr-models:/models:ro
+    deploy: *gpu
+    shm_size: 1gb
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    logging: *logging
+    healthcheck:
+      test: [CMD, python, deploy/pdf-parser/check.py, --from-environment, --parser-url, "http://127.0.0.1:8000"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 210s
+
+volumes:
+  ocr-models:

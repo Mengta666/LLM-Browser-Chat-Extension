@@ -36,6 +36,21 @@ def capabilities():
     from storage.chat_attachments import capabilities as attachment_capabilities
     return {'server_context': True, 'protocol_version': 1, 'resumable_compaction': True,
             'context_state_schema': 2, 'history_index_version': 1, 'document_analysis_version': 1,
+            'kb_structure_version': 1, 'kb_evidence_bundles_version': 1,
+            'kb_task_evidence_version': 1,
+            'kb_evidence_organization_version': 1,
+            'kb_retrieval_trace_version': 1,
+            'kb_continuous_passages_version': 1,
+            'kb_read_delivery_version': 2,
+            'kb_selected_read_queue_version': 1,
+            'chat_generation_timeout_version': 1,
+            'chat_reasoning_effort_version': 1,
+            'kb_task_update_by_id_version': 1,
+            'kb_coverage_projection_version': 1,
+            'chat_final_recovery_version': 1,
+            'kb_answer_generation_version': 1,
+            'kb_source_association_version': 1,
+            'kb_outline_sources_version': 1,
             'attachments': attachment_capabilities()}
 
 

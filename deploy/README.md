@@ -2,6 +2,8 @@
 
 本入口仅管理本项目可选的 SearXNG 和 web-reader，不部署聊天 UI、后端主服务、模型或浏览器扩展，也不修改其他 Compose 项目。
 
+PDF 解析与 OCR 模型另见 [pdf-parser Docker / WSL 部署说明](pdf-parser/DOCKER.md)：使用独立 Compose 项目，不加入本 Compose，不修改现有搜索服务。
+
 ## 前提
 
 - Linux Docker Engine 或支持 Linux 容器的 Docker Desktop，以及 Docker Compose v2。

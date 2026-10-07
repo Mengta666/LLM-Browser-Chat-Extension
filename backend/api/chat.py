@@ -526,6 +526,7 @@ def stream_chat(model: str, messages: list[dict[str, Any]],
         else:
             # 有工具：走 agentic loop
             from search.tools import WEB_SEARCH_TOOL, KB_SEARCH_TOOL, KB_LIST_DOCUMENTS_TOOL, SEARCH_ENABLED
+            from search.kb_documents import KB_DOCUMENT_TOOLS
             from api.agentic import run_agentic_loop
 
             tools = []
@@ -536,7 +537,7 @@ def stream_chat(model: str, messages: list[dict[str, Any]],
                 if "web_search" in tools_list:
                     tools.append(WEB_SEARCH_TOOL)
                 if "kb_search" in tools_list:
-                    tools.extend([KB_SEARCH_TOOL, KB_LIST_DOCUMENTS_TOOL])
+                    tools.extend([KB_SEARCH_TOOL, KB_LIST_DOCUMENTS_TOOL, *KB_DOCUMENT_TOOLS])
 
             if not tools:
                 # 无可用工具，降级普通流式
@@ -623,6 +624,7 @@ def sync_chat(model: str, messages: list[dict[str, Any]],
     else:
         # 有工具：走 agentic loop
         from search.tools import WEB_SEARCH_TOOL, KB_SEARCH_TOOL, KB_LIST_DOCUMENTS_TOOL, SEARCH_ENABLED
+        from search.kb_documents import KB_DOCUMENT_TOOLS
         from api.agentic import run_agentic_loop
 
         tools = []
@@ -633,7 +635,7 @@ def sync_chat(model: str, messages: list[dict[str, Any]],
             if "web_search" in tools_list:
                 tools.append(WEB_SEARCH_TOOL)
             if "kb_search" in tools_list:
-                tools.extend([KB_SEARCH_TOOL, KB_LIST_DOCUMENTS_TOOL])
+                tools.extend([KB_SEARCH_TOOL, KB_LIST_DOCUMENTS_TOOL, *KB_DOCUMENT_TOOLS])
 
         if not tools:
             # 无可用工具，降级普通调用

@@ -133,7 +133,7 @@ def get_session(session_id: str) -> Optional[AgentSession]:
 def create_session(session_id: str, task: str, model: str,
                    require_confirmation: Optional[list[str]] = None,
                    task_image: str = "",
-                   llm_params: Optional[dict[str, Any]] = None) -> AgentSession:
+                   llm_params: Optional[dict[str, Any]] = None, *, kb_id: str = '') -> AgentSession:
     with _sessions_lock:
         _cleanup_expired_sessions()
         if session_id in _sessions:
@@ -148,7 +148,11 @@ def create_session(session_id: str, task: str, model: str,
             require_confirmation=require_confirmation or [],
             task_image=task_image or "",
             llm_params=llm_params or {},
+            kb_id=kb_id,
         )
+        if kb_id:
+            from agent.materials import initial_state
+            session.material_state = initial_state()
         _sessions[session_id] = session
     _agent_log.info("session_create", session_id=session_id,
                     data={"task": task, "model": model, "has_image": bool(task_image),
@@ -210,9 +214,15 @@ def _run_step(session: AgentSession, page_state: PageState,
     force_done=True（前端整轮超时触发）：强制本步只接受 task_complete，给用户一个交代。
     """
     session.last_activity = time.time()   # 刷新活动时间：活跃任务不会被空闲 TTL 误清
+    if session.kb_id:
+        from agent.materials import revalidate
+        revalidate(session)
 
     # 1. 记录上一步结果为一条结构化 HistoryItem（不累积 messages；messages 每步重建）
     if action_result and session.pending_action:
+        if session.kb_id:
+            from agent.materials import record_result
+            record_result(session, session.pending_action, action_result)
         if action_result.stale:
             session.stale_retries += 1
             _agent_log.info("step_result", session_id=session.session_id,
@@ -264,6 +274,7 @@ def _run_step(session: AgentSession, page_state: PageState,
     session.force_done = force_done or (session.current_step >= session.max_steps - 1)
 
     # 3~5 决策循环：一轮出一个动作即返回（页面动作下发前端 / task_complete 收尾）。
+    material_repairs = 0
     while True:
         # 3. compaction（对齐 browser-use maybe_compact_messages）：步数很多时把中间段 LLM 总结成一条摘要，
         #    保留 首项 + <摘要> + 最近若干项。超长任务防止滑动窗口丢失中间进展。
@@ -273,6 +284,20 @@ def _run_step(session: AgentSession, page_state: PageState,
 
         # 4. 每步重建 messages（system + 任务 + 历史块 + 计划 + 当前观察）
         session.messages = build_messages(session, page_state)
+        if session.kb_id:
+            from agent.token_utils import RequestTokenCounter
+            from agent.memory import config as C
+            counter = RequestTokenCounter(session.model, deadline=session.decision_deadline,
+                chat_template_kwargs=(session.llm_params.get('extra_body') or {}).get('chat_template_kwargs'))
+            from agent.materials import OUTPUT_TOKENS
+            counted = counter(session.messages)
+            window = min(counter.model_window or C.CHAT_CONTEXT_LENGTH, C.CHAT_CONTEXT_LENGTH)
+            reserve = int(session.llm_params.get('max_completion_tokens') or session.llm_params.get('max_tokens') or OUTPUT_TOKENS)
+            if counted + reserve + C.CHAT_CONTEXT_SAFETY_TOKENS > window:
+                session.status = AgentStatus.ERROR
+                session.success = False
+                session.error = '当前页面及物料超过模型输入窗口，请缩小本次字段范围；未下发动作'
+                return _build_response(session)
 
         # 5. 调 LLM（结构化 JSON）
         _log_observation(session, page_state)
@@ -311,10 +336,42 @@ def _run_step(session: AgentSession, page_state: PageState,
             session.error = f"LLM 输出缺少 action。回复片段: {json.dumps(parsed, ensure_ascii=False)[:200]}"
             return _build_response(session)
 
+        if func_name == 'prepare_materials' and session.kb_id and not session.force_done:
+            from agent import materials
+            def generate_materials(messages):
+                response = _create_with_retry(_llm_client, session.model, messages, session=session,
+                    overrides={'max_tokens': materials.OUTPUT_TOKENS})
+                return response.choices[0].message.content if response else None
+            try:
+                materials.prepare(session, page_state, action_obj, generate_materials)
+            except (ValueError, TimeoutError) as exc:
+                session.material_state['error'] = str(exc)[:300]
+                if isinstance(exc, ValueError) and not session.material_state['fields'] and material_repairs < 2:
+                    material_repairs += 1
+                    continue
+            if session.cancel_event.is_set() or session.status == AgentStatus.ERROR:
+                return _build_response(session)
+            session.pending_action = None
+            session.material_continuation = uuid4().hex
+            session.material_observation_id = page_state.observation_id
+            session.current_step += 1
+            session.history_items.append(HistoryItem(step=session.current_step, action='prepare_materials',
+                result='物料准备已结束；' + (session.material_state.get('error') or '已有可用物料请直接引用 MAT 编号填写，缺失/冲突项保留'),
+                next_goal='重新观察页面后逐项填写并回读；不要重复相同取材'))
+            session.status = AgentStatus.OBSERVATION_REQUIRED
+            session.progress = '物料读取结束，请重新观察页面再填写'
+            return _build_response(session)
+
         if func_name == "task_complete":
             session.status = AgentStatus.COMPLETED
             session.summary = action_obj.get("summary", "任务完成")
             session.success = bool(action_obj.get("success", True))
+            if session.kb_id:
+                from agent.materials import incomplete
+                remaining_fields = incomplete(session)
+                if remaining_fields:
+                    session.success = False
+                    session.summary = '物料字段未全部核实：' + '、'.join(remaining_fields) + '。\n' + str(session.summary)
             _agent_log.info("session_complete", session_id=session.session_id,
                             data={"summary": session.summary, "success": session.success,
                                   "total_steps": session.current_step,
@@ -337,9 +394,23 @@ def _run_step(session: AgentSession, page_state: PageState,
             session.error = f"未知的操作类型: {func_name}"
             return _build_response(session)
 
+        action = _parse_action(func_name, action_obj)
+        if session.kb_id:
+            from agent.materials import bind_action
+            try:
+                bind_action(session, page_state, action, action_obj)
+                session.material_state['error'] = ''
+            except ValueError as exc:
+                session.material_state['error'] = str(exc)
+                material_repairs += 1
+                if material_repairs <= 2:
+                    continue
+                session.status = AgentStatus.ERROR
+                session.success = False
+                session.error = '物料动作未通过校验：' + str(exc)
+                return _build_response(session)
         break  # 页面动作：跳出循环，走下发前端流程
 
-    action = _parse_action(func_name, action_obj)
     action.action_id = uuid4().hex
     action.observation_id = page_state.observation_id
     session.pending_action = action
@@ -357,7 +428,9 @@ def _run_step(session: AgentSession, page_state: PageState,
     if selected:
         log_data['target_evidence'] = {key: selected.get(key) for key in (
             'tag', 'role', 'label_source', 'interaction_source', 'bounding_box', 'target_hint')}
-    if func_name == "type":
+    if action.params.get('material_id'):
+        log_data['material_id'] = action.params['material_id']
+    elif func_name == "type":
         log_data["text"] = (action.params.get("text", "") or "")[:60]
     elif func_name == "select":
         log_data["option"] = action.params.get("option_text", "")
@@ -371,7 +444,7 @@ def _run_step(session: AgentSession, page_state: PageState,
     session.step_history.append(
         {"step": session.current_step, "thought": session.progress, "action": action.model_dump()})
 
-    if should_confirm_action(action, session.require_confirmation):
+    if action.params.get('confirm_overwrite') or should_confirm_action(action, session.require_confirmation):
         session.status = AgentStatus.CONFIRM_REQUIRED
     else:
         session.status = AgentStatus.ACTION_REQUIRED
@@ -490,9 +563,16 @@ def _build_create_kwargs(model: str, messages: list, llm_params: dict) -> dict:
     return kwargs
 
 
-def _create_with_retry(client: OpenAI, model: str, messages: list, session: Optional[AgentSession] = None):
+def _create_with_retry(client: OpenAI, model: str, messages: list, session: Optional[AgentSession] = None, *, overrides=None):
     llm_params = (session.llm_params if session else None) or {}
     create_kwargs = _build_create_kwargs(model, messages, llm_params)
+    if session and session.kb_id and not any(k in create_kwargs for k in ('max_tokens', 'max_completion_tokens')):
+        from agent.materials import OUTPUT_TOKENS
+        create_kwargs['max_tokens'] = OUTPUT_TOKENS
+    if overrides:
+        if 'max_tokens' in overrides:
+            create_kwargs.pop('max_completion_tokens', None)
+        create_kwargs.update(overrides)
     last_error = None
     for attempt in range(MAX_LLM_RETRIES):
         if session and session.cancel_event.is_set():
@@ -587,7 +667,7 @@ def _parse_structured(text: str) -> Optional[dict]:
             return data
         # 无 action 键但像动作（极端兜底）
         if (data.get("type") in ALLOWED_ACTION_TYPES
-                or data.get("type") == "task_complete"):
+                or data.get("type") in ("task_complete", "prepare_materials")):
             return {"action": data}
     return None
 
@@ -766,4 +846,9 @@ def _build_response(session: AgentSession, thought: str = "") -> dict[str, Any]:
     }
     if session.pending_action:
         resp["action"] = session.pending_action.model_dump()
+    if session.kb_id:
+        from agent.materials import public_state
+        resp['materials_version'] = 1
+        resp['materials'] = public_state(session)
+        resp['continuation_id'] = session.material_continuation
     return resp

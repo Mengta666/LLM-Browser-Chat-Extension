@@ -39,7 +39,8 @@ def _transaction():
 def _ensure_tables() -> None:
     with _transaction() as conn:
         old_columns = {r["name"] for r in conn.execute("PRAGMA table_info(kb_docs)")}
-        if old_columns and "index_run_id" not in old_columns:
+        page_columns = {r['name'] for r in conn.execute('PRAGMA table_info(kb_pages)')}
+        if old_columns and ("published_structure_id" not in old_columns or (page_columns and 'error' not in page_columns)):
             backup = Path(MEMORY_DB_PATH).with_name(
                 f"{Path(MEMORY_DB_PATH).stem}.kb-lifecycle-{uuid4().hex[:8]}.sqlite3")
             with closing(sqlite3.connect(str(backup))) as target:
@@ -70,6 +71,12 @@ def _ensure_tables() -> None:
                         "delete_batch_id": "TEXT NOT NULL DEFAULT ''",
                         "index_run_id": "TEXT NOT NULL DEFAULT ''",
                         "published_run_id": "TEXT NOT NULL DEFAULT ''",
+                        "published_parse_id": "TEXT NOT NULL DEFAULT ''",
+                        "published_structure_id": "TEXT NOT NULL DEFAULT ''",
+                        "active_parse_id": "TEXT NOT NULL DEFAULT ''",
+                        "original_path": "TEXT NOT NULL DEFAULT ''",
+                        "sha256": "TEXT NOT NULL DEFAULT ''",
+                        "page_count": "INTEGER NOT NULL DEFAULT 0",
                         "sync_pending": "INTEGER NOT NULL DEFAULT 0",
                         "sync_error": "TEXT NOT NULL DEFAULT ''"},
         }
@@ -90,6 +97,8 @@ def _ensure_tables() -> None:
                               AND kb_kbs.deleted_at!='')""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_kb_kbs_user ON kb_kbs(user_id,deleted_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_kb_docs_kb ON kb_docs(kb_id,deleted_at)")
+        from storage.kb_document_schema import migrate
+        migrate(conn)
 
 
 _ensure_tables()
@@ -225,6 +234,7 @@ def mark_doc_deleted(kb_id: str, doc_id: str, now: str, user_id: str) -> None:
                 status=CASE WHEN status='pending' THEN 'failed' ELSE status END,
                 error_msg=CASE WHEN status='pending' THEN '索引已取消，请重新上传' ELSE error_msg END,
                 sync_pending=1 WHERE kb_id=? AND doc_id=?""", (now,kb_id,doc_id))
+        conn.execute("UPDATE kb_parse_versions SET status='cancelled',lease='' WHERE doc_id=? AND status IN ('queued','parsing','indexing')", (doc_id,))
 
 
 def mark_kb_deleted(kb_id: str, now: str, user_id: str) -> None:
@@ -233,6 +243,7 @@ def mark_kb_deleted(kb_id: str, now: str, user_id: str) -> None:
         if kb["sync_action"] == "purge":
             raise KBConflict("知识库正在彻底删除")
         batch = kb["delete_batch_id"] if kb["deleted_at"] else uuid4().hex
+        conn.execute("UPDATE kb_parse_versions SET status='cancelled',lease='' WHERE doc_id IN (SELECT doc_id FROM kb_docs WHERE kb_id=?) AND status IN ('queued','parsing','indexing')", (kb_id,))
         conn.execute("""
             UPDATE kb_docs SET deleted_at=?,deleted_reason='cascade_from_kb',delete_batch_id=?,
                 status=CASE WHEN status='pending' THEN 'failed' ELSE status END,
@@ -298,6 +309,25 @@ def finish_purge(kb_id: str) -> int:
         kb = conn.execute("SELECT * FROM kb_kbs WHERE kb_id=?", (kb_id,)).fetchone()
         if not kb or kb["sync_action"] != "purge" or not kb["deleted_at"]:
             raise KBConflict("彻底删除状态已改变")
+        from rag.document_config import document_path
+        import shutil
+        for row in conn.execute("SELECT doc_id,original_path FROM kb_docs WHERE kb_id=?", (kb_id,)).fetchall():
+            if row['original_path']:
+                folder = document_path(row['doc_id'])
+                if folder.exists():
+                    shutil.rmtree(folder)
+            versions = [r[0] for r in conn.execute("SELECT parse_id FROM kb_parse_versions WHERE doc_id=?", (row['doc_id'],))]
+            for version in versions:
+                for structure in conn.execute('SELECT structure_id FROM kb_structure_versions WHERE parse_id=?',(version,)).fetchall():
+                    for table in ('kb_node_relations','kb_node_sources','kb_document_nodes'):
+                        conn.execute(f'DELETE FROM {table} WHERE structure_id=?',(structure[0],))
+                conn.execute('DELETE FROM kb_structure_versions WHERE parse_id=?',(version,))
+                for run in conn.execute("SELECT run_id FROM kb_index_runs WHERE parse_id=?", (version,)).fetchall():
+                    conn.execute("DELETE FROM kb_chunks WHERE run_id=?", (run[0],))
+                    conn.execute("DELETE FROM kb_chunk_sources WHERE run_id=?", (run[0],))
+                for table in ('kb_index_runs', 'kb_pages', 'kb_blocks', 'kb_identifiers'):
+                    conn.execute(f"DELETE FROM {table} WHERE parse_id=?", (version,))
+            conn.execute("DELETE FROM kb_parse_versions WHERE doc_id=?", (row['doc_id'],))
         cursor = conn.execute("DELETE FROM kb_docs WHERE kb_id=?", (kb_id,))
         conn.execute("DELETE FROM kb_kbs WHERE kb_id=?", (kb_id,))
     return cursor.rowcount
@@ -328,7 +358,21 @@ def recover_interrupted(user_id: str) -> None:
     with _transaction() as conn:
         conn.execute("""
             UPDATE kb_docs SET status='failed',sync_pending=1,error_msg='后端重启中断索引，请重新上传'
-            WHERE status='pending' AND kb_id IN (SELECT kb_id FROM kb_kbs WHERE user_id=?)""", (user_id,))
+            WHERE status='pending' AND active_parse_id=''
+              AND kb_id IN (SELECT kb_id FROM kb_kbs WHERE user_id=?)""", (user_id,))
+        conn.execute("""UPDATE kb_parse_versions SET status='interrupted',lease='',
+                        error='后端重启中断处理，可显式恢复'
+                        WHERE status IN ('queued','parsing','indexing') AND doc_id IN
+                        (SELECT d.doc_id FROM kb_docs d JOIN kb_kbs k ON k.kb_id=d.kb_id WHERE k.user_id=?)""",
+                     (user_id,))
+        conn.execute("""UPDATE kb_docs SET status='failed',error_msg='后端重启中断处理，可显式恢复'
+                        WHERE published_run_id='' AND active_parse_id IN
+                        (SELECT parse_id FROM kb_parse_versions WHERE status='interrupted')
+                        AND kb_id IN (SELECT kb_id FROM kb_kbs WHERE user_id=?)""", (user_id,))
+        conn.execute("""UPDATE kb_pages SET status='interrupted',error='后端重启中断解析'
+                        WHERE status='parsing' AND parse_id IN
+                        (SELECT p.parse_id FROM kb_parse_versions p JOIN kb_docs d ON d.doc_id=p.doc_id
+                         JOIN kb_kbs k ON k.kb_id=d.kb_id WHERE p.status='interrupted' AND k.user_id=?)""", (user_id,))
 
 
 def pending_kbs(user_id: str) -> list[str]:

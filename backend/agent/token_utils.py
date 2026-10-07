@@ -82,10 +82,11 @@ def request_tokens(messages: list[dict], tools=None) -> int:
 class RequestTokenCounter:
     """单轮完整聊天请求计数；模型匹配时调用 vLLM，其余情况保守估算。"""
 
-    def __init__(self, model: str, *, deadline=None, time_budget=8.0):
+    def __init__(self, model: str, *, deadline=None, time_budget=8.0, chat_template_kwargs=None):
         from agent.memory import config as C
         self.model = model
         self.deadline = deadline
+        self.chat_template_kwargs = dict(chat_template_kwargs or {})
         self.url = C.CHAT_TOKENIZER_URL.strip()
         self.api_key = C.CHAT_TOKENIZER_API_KEY
         self.timeout = max(.1, min(5, C.CHAT_TOKENIZER_TIMEOUT))
@@ -104,6 +105,8 @@ class RequestTokenCounter:
                for m in messages):
             reason = 'multimodal_estimate'
         payload = {'model': self.model, 'messages': messages, 'add_generation_prompt': True}
+        if self.chat_template_kwargs:
+            payload['chat_template_kwargs'] = self.chat_template_kwargs
         if tools:
             payload['tools'] = tools
         return self._count(payload, lambda: request_tokens(messages, tools), reason=reason)

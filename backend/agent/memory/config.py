@@ -188,6 +188,8 @@ CHAT_COMPACT_CALL_TIMEOUT = float(os.getenv("CHAT_COMPACT_CALL_TIMEOUT", "90"))
 CHAT_COMPACT_MAX_ATTEMPTS = int(os.getenv("CHAT_COMPACT_MAX_ATTEMPTS", "2"))
 CHAT_COMPACT_TARGET_RATIO = float(os.getenv("CHAT_COMPACT_TARGET_RATIO", "0.50"))
 CHAT_TURN_TIMEOUT = float(os.getenv("CHAT_TURN_TIMEOUT", "540"))
+CHAT_LLM_FIRST_RESPONSE_TIMEOUT = max(1, float(os.getenv('CHAT_LLM_FIRST_RESPONSE_TIMEOUT', '120')))
+CHAT_LLM_IDLE_TIMEOUT = max(1, float(os.getenv('CHAT_LLM_IDLE_TIMEOUT', '60')))
 # 近期原文投影不改变压缩触发阈值；最终输入目标不是模型硬上限。
 CHAT_RECENT_TOKENS = int(os.getenv('CHAT_RECENT_TOKENS', '4000'))
 CHAT_RECENT_MESSAGE_TOKENS = int(os.getenv('CHAT_RECENT_MESSAGE_TOKENS', '2000'))
@@ -198,7 +200,63 @@ CHAT_FINAL_REPAIR_TOKENS = int(os.getenv('CHAT_FINAL_REPAIR_TOKENS', '4000'))
 CHAT_DOCUMENT_BATCH_TOKENS = int(os.getenv('CHAT_DOCUMENT_BATCH_TOKENS', '8000'))
 CHAT_DOCUMENT_OUTPUT_TOKENS = int(os.getenv('CHAT_DOCUMENT_OUTPUT_TOKENS', '1024'))
 CHAT_MAX_OUTPUT_TOKENS = int(os.getenv("CHAT_MAX_OUTPUT_TOKENS", "8192"))
+CHAT_REASONING_MODEL = os.getenv('CHAT_REASONING_MODEL', '').strip()
+CHAT_REASONING_EFFORT = os.getenv('CHAT_REASONING_EFFORT', '').strip()
+if CHAT_REASONING_EFFORT and (not CHAT_REASONING_MODEL or CHAT_REASONING_EFFORT not in ('low', 'medium', 'xhigh')):
+    raise ValueError('CHAT_REASONING_EFFORT requires CHAT_REASONING_MODEL and low/medium/xhigh')
+
+
+def chat_reasoning_kwargs(model):
+    return {'reasoning_effort': CHAT_REASONING_EFFORT} if CHAT_REASONING_EFFORT and model == CHAT_REASONING_MODEL else {}
+
+
+CHAT_FINAL_MODEL = os.getenv('CHAT_FINAL_MODEL', '').strip()
+CHAT_FINAL_THINKING_TOKEN_BUDGET = int(os.getenv('CHAT_FINAL_THINKING_TOKEN_BUDGET', '0'))
+CHAT_FINAL_REPAIR_MODE = os.getenv('CHAT_FINAL_REPAIR_MODE', 'reduce_evidence').strip()
+if (CHAT_FINAL_THINKING_TOKEN_BUDGET < 0 or CHAT_FINAL_THINKING_TOKEN_BUDGET >= CHAT_MAX_OUTPUT_TOKENS
+        or CHAT_FINAL_REPAIR_MODE not in ('reduce_evidence', 'non_thinking')
+        or (CHAT_FINAL_THINKING_TOKEN_BUDGET or CHAT_FINAL_REPAIR_MODE == 'non_thinking') and not CHAT_FINAL_MODEL):
+    raise ValueError('CHAT_FINAL policy requires an explicit model, 0 <= thinking budget < output limit, and reduce_evidence/non_thinking repair mode')
+
+
+KB_ANSWER_REASONING_MODEL = os.getenv('KB_ANSWER_REASONING_MODEL', '').strip()
+KB_ANSWER_REASONING_EFFORT = os.getenv('KB_ANSWER_REASONING_EFFORT', '').strip()
+KB_ANSWER_MAX_OUTPUT_TOKENS = int(os.getenv('KB_ANSWER_MAX_OUTPUT_TOKENS', '0'))
+if (KB_ANSWER_REASONING_EFFORT not in ('', 'low', 'medium', 'xhigh')
+        or KB_ANSWER_MAX_OUTPUT_TOKENS < 0
+        or (KB_ANSWER_REASONING_EFFORT or KB_ANSWER_MAX_OUTPUT_TOKENS) and not KB_ANSWER_REASONING_MODEL):
+    raise ValueError('KB_ANSWER requires an explicit model, low/medium/xhigh or empty effort, and a nonnegative output limit')
+
+
+def kb_answer_settings(model):
+    if model == KB_ANSWER_REASONING_MODEL and (KB_ANSWER_REASONING_EFFORT or KB_ANSWER_MAX_OUTPUT_TOKENS):
+        return {'reasoning_effort': KB_ANSWER_REASONING_EFFORT,
+                'max_tokens': KB_ANSWER_MAX_OUTPUT_TOKENS or CHAT_MAX_OUTPUT_TOKENS}
+    return {}
+
+
+def chat_generation_extra(model, phase, *, kb_answer=False):
+    template = chat_reasoning_kwargs(model)
+    extra = {}
+    kb_settings = kb_answer_settings(model) if kb_answer and phase in ('final', 'final_repair') else {}
+    if kb_settings.get('reasoning_effort'):
+        template = {'reasoning_effort': kb_settings['reasoning_effort']}
+    if model == CHAT_FINAL_MODEL and phase in ('final', 'final_repair'):
+        if phase == 'final_repair' and CHAT_FINAL_REPAIR_MODE == 'non_thinking':
+            template = {'enable_thinking': False}
+        elif CHAT_FINAL_THINKING_TOKEN_BUDGET:
+            extra['thinking_token_budget'] = CHAT_FINAL_THINKING_TOKEN_BUDGET
+    if template:
+        extra['chat_template_kwargs'] = template
+    return extra
+
+
 CHAT_CONTEXT_SAFETY_TOKENS = int(os.getenv("CHAT_CONTEXT_SAFETY_TOKENS", "2048"))
+if KB_ANSWER_MAX_OUTPUT_TOKENS and KB_ANSWER_MAX_OUTPUT_TOKENS >= CHAT_CONTEXT_LENGTH - CHAT_CONTEXT_SAFETY_TOKENS:
+    raise ValueError('KB_ANSWER_MAX_OUTPUT_TOKENS must leave input space within CHAT_CONTEXT_LENGTH')
+if (kb_answer_settings(KB_ANSWER_REASONING_MODEL) and KB_ANSWER_REASONING_MODEL == CHAT_FINAL_MODEL
+        and CHAT_FINAL_THINKING_TOKEN_BUDGET >= kb_answer_settings(KB_ANSWER_REASONING_MODEL)['max_tokens']):
+    raise ValueError('CHAT_FINAL_THINKING_TOKEN_BUDGET must be smaller than the KB_ANSWER output limit')
 CHAT_TOKENIZER_URL = os.getenv('CHAT_TOKENIZER_URL', '')
 CHAT_TOKENIZER_MODEL = os.getenv('CHAT_TOKENIZER_MODEL', '')
 CHAT_TOKENIZER_API_KEY = os.getenv('CHAT_TOKENIZER_API_KEY', '')

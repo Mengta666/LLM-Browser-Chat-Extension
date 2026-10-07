@@ -1,5 +1,9 @@
 # 文档暂不进入仓库
-docs/
+docs/*
+!docs/PDF知识库.md
+
+# 本地改造计划
+/plans docs/
 
 # 本地测试代码、用例及验收报告
 /test/

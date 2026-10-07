@@ -86,8 +86,12 @@ def run(args, *, chat_id, request_id, attempt, upto_seq, client, model, counter,
     existing = jobs.request_progress(chat_id, request_id)
     if args.get('job_id') and not existing and not continuing:
         raise store.SessionError('document_resume_confirmation_required')
-    fp = history_index.fingerprint(json.dumps([1, INSTRUCTION, model, C.CHAT_DOCUMENT_BATCH_TOKENS,
-                                             C.CHAT_DOCUMENT_OUTPUT_TOKENS, C.CHAT_MAX_OUTPUT_TOKENS]))
+    template_kwargs = C.chat_reasoning_kwargs(model)
+    fingerprint_parts = [1, INSTRUCTION, model, C.CHAT_DOCUMENT_BATCH_TOKENS,
+                         C.CHAT_DOCUMENT_OUTPUT_TOKENS, C.CHAT_MAX_OUTPUT_TOKENS]
+    if template_kwargs:
+        fingerprint_parts.append(template_kwargs)
+    fp = history_index.fingerprint(json.dumps(fingerprint_parts))
     job, original = jobs.claim(chat_id, request_id, attempt, upto_seq, fingerprint=fp, **args)
     if job['status'] == 'completed':
         return _result(job, counter, min(2000, max_result_tokens))
@@ -105,6 +109,7 @@ def run(args, *, chat_id, request_id, attempt, upto_seq, client, model, counter,
         started = time.monotonic()
         response = client.chat.completions.create(model=model, messages=messages,
             stream=False, max_tokens=C.CHAT_MAX_OUTPUT_TOKENS,
+            **({'extra_body': {'chat_template_kwargs': template_kwargs}} if template_kwargs else {}),
             timeout=max(.1, min(C.CHAT_COMPACT_CALL_TIMEOUT, remaining - 1)))
         jobs.check(job)
         choice = response.choices[0]
@@ -118,6 +123,7 @@ def run(args, *, chat_id, request_id, attempt, upto_seq, client, model, counter,
         _log.info('document_analysis_call', session_id=chat_id, data={'request_id': request_id,
             'job_id': job['job_id'], 'reducing': reducing, 'input_tokens': measured, 'input_limit': _limit(counter),
             'output_tokens': output_tokens, 'elapsed_ms': elapsed,
+            'reasoning_effort': template_kwargs.get('reasoning_effort', 'upstream_default'),
             'usage': response.usage.model_dump() if response.usage else None})
         return choice.message.content, measured, output_tokens, elapsed
 

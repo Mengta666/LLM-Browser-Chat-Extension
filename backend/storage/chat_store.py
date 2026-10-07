@@ -49,7 +49,8 @@ def _get_conn() -> sqlite3.Connection:
                 columns = {row[1] for row in conn.execute('PRAGMA table_info(chat_messages)')}
                 indexed = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='history_blocks'").fetchone()
                 documents = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='document_jobs'").fetchone()
-                if columns and ('seq' not in columns or not indexed or not documents):
+                kb_runtime = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chat_kb_runtime'").fetchone()
+                if columns and ('seq' not in columns or not indexed or not documents or not kb_runtime):
                     backup = _DB_PATH.with_name(f'{_DB_PATH.stem}.migration-{uuid4().hex[:8]}.sqlite3')
                     with sqlite3.connect(str(backup)) as target:
                         conn.backup(target)
@@ -174,6 +175,8 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         history_index.archive_missing(conn)
         from storage import document_jobs
         document_jobs.init_schema(conn)
+        from storage import kb_runtime
+        kb_runtime.init_schema(conn)
 
 
 def ensure_session(chat_id: str, first_user_text: str = "") -> bool:
@@ -489,6 +492,8 @@ def get_request(chat_id: str, request_id: str) -> dict[str, Any] | None:
         result['messages'] = [dict(message) for message in conn.execute('SELECT message_id,seq,role,content,tools FROM chat_messages WHERE chat_id=? AND request_id=? ORDER BY seq', (chat_id, request_id))]
         from storage import history_index
         result['tool_steps'] = [json.loads(r['step_json']) for r in history_index.tool_runs(chat_id, request_id) if r['step_json'] != '{}']
+        from storage import kb_runtime
+        result['kb_progress'] = kb_runtime.progress(chat_id, request_id)
         from storage.document_jobs import request_progress
         result['document_analysis'] = request_progress(chat_id, request_id)
         from storage.chat_attachments import enrich

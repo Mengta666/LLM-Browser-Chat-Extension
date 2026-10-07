@@ -7,6 +7,7 @@ import time
 import re
 
 from fastapi.responses import JSONResponse, StreamingResponse
+from openai import APITimeoutError
 from starlette.concurrency import iterate_in_threadpool
 
 from agent.memory import chat_context as context
@@ -80,13 +81,15 @@ def handle(item):
                 yield {'choices': [{'delta': {'content': answer['content']}, 'index': 0}]}
             else:
                 check_active()
-                counter = RequestTokenCounter(item.model, deadline=turn_deadline)
+                counter = RequestTokenCounter(item.model, deadline=turn_deadline,
+                                              chat_template_kwargs=C.chat_reasoning_kwargs(item.model))
                 from search.tools import WEB_SEARCH_TOOL, KB_SEARCH_TOOL, KB_LIST_DOCUMENTS_TOOL, KB_TOOL_GUIDANCE
+                from search.kb_documents import KB_DOCUMENT_TOOLS
                 tools = []
                 if chat._SEARCH_ON or item.search_query.strip():
                     tools.append(WEB_SEARCH_TOOL)
                 if item.kb_id:
-                    tools.extend([KB_SEARCH_TOOL, KB_LIST_DOCUMENTS_TOOL])
+                    tools.extend([KB_SEARCH_TOOL, KB_LIST_DOCUMENTS_TOOL, *KB_DOCUMENT_TOOLS])
                 parts = [chat._CHAT_BASE_SYSTEM]
                 if item.continuation_of:
                     parts.append('本轮由用户点击继续生成：接着上一条被截断的回答补完，不从头重复。'
@@ -173,7 +176,7 @@ def handle(item):
                     from api import model_call
                     sent = assets.model_messages(messages, item.chat_id)
                     incoming = model_call.events(client, model=item.model, messages=sent,
-                        timeout=min(chat.CHAT_LLM_TIMEOUT, max(.1, deadline - time.monotonic() - min(final_answer.RESERVE_SECONDS, chat.CHAT_LLM_TIMEOUT))),
+                        timeout=C.CHAT_LLM_FIRST_RESPONSE_TIMEOUT, idle_timeout=C.CHAT_LLM_IDLE_TIMEOUT,
                         deadline=deadline, check_active=check_active, phase='answer', chat_id=item.chat_id,
                         request_id=item.request_id, input_tokens=context.check_budget(sent, counter=counter), count_meta=dict(counter.last),
                         max_tokens=C.CHAT_MAX_OUTPUT_TOKENS)
@@ -189,8 +192,8 @@ def handle(item):
                             if item.stream:
                                 yield {'choices': [{'delta': {'content': text}, 'index': 0}]}
                     except Exception as exc:
-                        from openai import APITimeoutError
-                        if not isinstance(exc, APITimeoutError) or full_text or time.monotonic() >= deadline:
+                        if (not isinstance(exc, APITimeoutError) or full_text
+                                or getattr(exc, 'received_progress', False) or time.monotonic() >= deadline):
                             raise
                         finish_reason = 'stop'
                     finally:
@@ -242,6 +245,8 @@ def handle(item):
         except Exception as exc:
             code = exc.code if isinstance(exc, (store.SessionError, context.jobs.CompactionError)) else (
                 'context_budget_exceeded' if isinstance(exc, context.ContextBudgetError) else
+                ('time_budget_exceeded' if getattr(exc, 'timeout_kind', None) == 'deadline' else 'model_timeout')
+                if isinstance(exc, APITimeoutError) else
                 'history_unavailable' if isinstance(exc, sqlite3.Error) else 'turn_failed')
             if code == 'turn_failed' and item.attachment_ids:
                 from openai import BadRequestError

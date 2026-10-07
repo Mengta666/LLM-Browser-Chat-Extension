@@ -1,8 +1,18 @@
 """本轮检索来源登记与稳定引用编号，不做语义复核。"""
 
 import hashlib
+import json
 from search.urls import normalize_web_url
 from search.excerpts import history_excerpt
+
+
+def kb_evidence_rows(payload):
+    documents = {d['ref']: d for d in payload.get('documents', [])}
+    for row in payload.get('evidence', []):
+        document = documents.get(row.get('doc_ref'), {})
+        yield {**{k: v for k, v in document.items() if k != 'ref'}, **row,
+               **({'warnings': list(dict.fromkeys([*document.get('warnings', []), *row.get('warnings', [])]))}
+                  if document.get('warnings') or row.get('warnings') else {})}
 
 
 class EvidenceLedger:
@@ -11,7 +21,9 @@ class EvidenceLedger:
         self.sources = {s["index"]: dict(s) for s in (initial_sources or [])}
         self.keys = {}
         for index, source in self.sources.items():
-            if not source.get('kb_id'):
+            if source.get('kb_id') and source.get('ledger_key'):
+                self.keys[source['ledger_key']] = index
+            elif not source.get('kb_id'):
                 for url in (source.get('url'), source.get('original_url')):
                     identity = normalize_web_url(url) if url else ''
                     if identity:
@@ -23,15 +35,19 @@ class EvidenceLedger:
             row = result if isinstance(result, dict) else vars(result)
             content = str(row.get("content", "") if row.get("context_status") else (row.get("content") or row.get("snippet") or ""))
             digest = hashlib.sha256(content.encode()).hexdigest()[:20]
-            is_kb = tool_name == "kb_search"
+            is_kb = tool_name in ("kb_search", "kb_read_document")
             original = row.get('url', '')
             final = row.get('final_url') or original
             identity = normalize_web_url(final)
-            key = (kb_id, row.get("doc_id"), row.get("index_run_id"), row.get("chunk_idx", row.get("chunk_id")),
-                   tuple(row.get("window_chunk_ids", [])), digest) if is_kb else ('web', identity or final)
+            key = json.dumps([kb_id, row.get("doc_id"), row.get("parse_id"), row.get("index_run_id"),
+                              row.get("chunk_idx", row.get("chunk_id")), row.get("locations", []),
+                              row.get("window_chunk_ids", []), digest], sort_keys=True) if is_kb else ('web', identity or final)
+            if is_kb and row.get('parse_id') and row.get('locations'):
+                locations = sorted((p['block_id'], p['start'], p['end']) for p in row['locations'])
+                key = json.dumps([kb_id, row.get('doc_id'), row['parse_id'], locations, digest], sort_keys=True)
             # 缺少文档 ID 的旧数据不能仅按同名文件合并。
             if is_kb and not row.get("doc_id"):
-                key += (self.next_index,)
+                key += str(self.next_index)
             index = self.keys.get(key)
             if index is None and not is_kb:
                 index = self.keys.get(('web', normalize_web_url(original)))
@@ -46,7 +62,12 @@ class EvidenceLedger:
                     "snippet": content[:200], "content": content, "questions": [],
                     **({"kb_id": kb_id, "doc_id": row.get("doc_id", ""),
                         "index_run_id": row.get("index_run_id", ""), "chunk_id": row.get("chunk_idx", row.get("chunk_id")),
-                        "window_chunk_ids": row.get("window_chunk_ids", []), "evidence_id": digest} if is_kb else {}),
+                        "window_chunk_ids": row.get("window_chunk_ids", []), "evidence_id": digest,
+                        "parse_id": row.get('parse_id', ''), "locations": row.get('locations', []),
+                        "structure_id":row.get('structure_id',''),"node_id":row.get('node_id',''),
+                        "node_path":row.get('node_path',[]),"bundle_id":row.get('bundle_id',''),
+                        "read_kind": row.get('read_kind', 'preview'), "warnings": row.get('warnings', []),
+                        "ledger_key": key} if is_kb else {}),
                 }
             source = self.sources[index]
             if not is_kb:

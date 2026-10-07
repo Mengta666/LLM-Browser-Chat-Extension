@@ -179,7 +179,7 @@ def tool_runs(chat_id, request_id):
         return [dict(r) for r in conn.execute('SELECT * FROM chat_tool_runs WHERE chat_id=? AND request_id=? ORDER BY attempt,ordinal', (chat_id, request_id))]
 
 
-def save_tool(chat_id, request_id, attempt, ordinal, call_id, name, arguments, result='', status='running', step=None, *, budget=None):
+def save_tool(chat_id, request_id, attempt, ordinal, call_id, name, arguments, result='', status='running', step=None, *, budget=None, kb_state=None):
     if not request_id:
         return
     conn = store._get_conn()
@@ -203,6 +203,9 @@ def save_tool(chat_id, request_id, attempt, ordinal, call_id, name, arguments, r
             (chat_id, request_id, attempt, ordinal, call_id, name, arguments, result, status, json.dumps(step or {}, ensure_ascii=False)))
         if budget:
             save_budget(conn, chat_id, request_id, budget.used, budget.calls, budget.read_ranges, budget.initial_text)
+        if kb_state is not None:
+            from storage import kb_runtime
+            kb_runtime.save(conn, chat_id, request_id, kb_state)
 
 
 def fingerprint(text):

@@ -18,14 +18,15 @@ class ContextBudgetError(Exception):
     pass
 
 
-def input_budget(counter=None):
+def input_budget(counter=None, *, output_tokens=None):
     window = min(C.CHAT_CONTEXT_LENGTH, counter.model_window) if counter and counter.model_window else C.CHAT_CONTEXT_LENGTH
-    return max(0, window - C.CHAT_MAX_OUTPUT_TOKENS - C.CHAT_CONTEXT_SAFETY_TOKENS)
+    output = C.CHAT_MAX_OUTPUT_TOKENS if output_tokens is None else output_tokens
+    return max(0, window - output - C.CHAT_CONTEXT_SAFETY_TOKENS)
 
 
-def check_budget(messages, tools=None, *, counter=None):
+def check_budget(messages, tools=None, *, counter=None, output_tokens=None):
     tokens = (counter or request_tokens)(messages, tools)
-    if tokens > input_budget(counter):
+    if tokens > input_budget(counter, output_tokens=output_tokens):
         raise ContextBudgetError('context_budget_exceeded')
     return tokens
 

@@ -1220,10 +1220,25 @@ document.addEventListener('DOMContentLoaded', async () => {
       const pending = progress && ['running', 'failed', 'interrupted'].includes(progress.status);
       const labels = { running: '正在处理当前提问…', cancelled: '本轮已停止，问题记录和已完成的压缩进度仍保留。',
         completed: '回答已保存。', partial: '已有回答已保存，可继续生成。', failed: '本轮处理失败。', interrupted: '本轮处理已中断。' };
+      const finalFailures = {
+        final_reasoning_budget_exhausted: '模型收尾耗尽输出额度：只有推理，没有正文。',
+        final_output_budget_exhausted: '模型收尾耗尽输出额度，未返回正文。',
+        final_empty_answer: '模型已停止生成，但没有返回正文。',
+        final_tool_call_rejected: '模型收尾仍提出工具调用；这些调用未执行。',
+        final_output_truncated: '模型正文被截断，未标记为完整回答。',
+        final_generation_timeout: '最终回答生成超时。',
+        final_connection_error: '最终回答阶段模型连接失败。',
+        final_policy_unsupported: '上游拒绝了收尾参数，请检查模型服务与代理配置。',
+        final_model_error: '最终回答阶段模型服务出错。',
+        final_response_incomplete: '模型响应流未完整结束。',
+        final_answer_unavailable: '模型未生成可用的最终回答。'
+      };
+      if (finalFailures[state.error_code]) labels.failed = finalFailures[state.error_code] + ' 已读资料和工具过程已保留，重试前会检查来源是否仍可访问。';
       if (state.status === 'running') labels.running = { reading: '正在读取原文片段…', generating: '正在生成回答…',
         finalizing: '正在根据已取得的证据生成最终回答…' }[state.phase] || labels.running;
       for (const step of state.tool_steps || []) updateEnhancementCard(container,
         step.status === 'running' && state.status !== 'running' ? { ...step, status: 'error', error: '步骤已中断，结果尚未确认' } : step);
+      if (state.kb_progress && state.status !== 'running') updateEnhancementCard(container, state.kb_progress);
       label.textContent = state.status === 'cancelled' ? labels.cancelled : pending ? compactionLabel(progress)
         : (labels[state.status] || '暂时无法确认处理状态。');
       if (state.document_analysis) label.textContent += '\n' + documentAnalysisLabel(state.document_analysis);
@@ -1427,7 +1442,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (reply) streamer.finalize(reply); else streamer.cancel();
         if (meta?.persisted && !error) {
           sessionSequences.set(key, meta.last_seq);
-          if (sources.length) renderSearchCitations(bubble, sources);
+          if (sources.length || bubble.dataset.invalidCitations) renderSearchCitations(bubble, sources);
           if (meta.status === 'partial') addPartialAnswer(bubble, base, chatId, body.request_id, meta.can_continue);
         } else {
           const status = meta?.status === 'cancelled' ? '本轮已停止，问题记录和已完成的压缩进度仍保留。' : meta?.context_compaction && meta.context_compaction.status !== 'completed'
@@ -1609,7 +1624,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             for (const s of step.sources) allSources.push(s);
           }
         }
-        if (allSources.length) {
+        if (allSources.length || bubble.dataset.invalidCitations) {
           renderSearchCitations(bubble, allSources);
         }
         if (m.status === 'partial') {
@@ -2026,7 +2041,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         card.appendChild(stepEl);
       }
       stepEl.className = 'enhancement-step running';
-      const label = isDocument ? '正在分片分析原文' : isHistory ? '正在回查会话历史' : step.type === 'web_search' ? '正在搜索' : step.type === 'kb_list_documents' ? '正在读取知识库目录' : '正在检索知识库';
+      const label = isDocument ? '正在分片分析原文' : isHistory ? '正在回查会话历史' : step.type === 'web_search' ? '正在搜索' : step.type === 'kb_list_documents' ? '正在读取知识库目录' : step.type === 'kb_read_document' ? '正在读取知识库正文' : '正在检索知识库';
       stepEl.innerHTML = `<span class="step-icon">${icon}</span><span class="step-text">${label}${step.query ? ` “${esc(step.query)}”` : ''}</span>`;
     } else if (step.status === 'done') {
       if (!stepEl) {
@@ -2035,8 +2050,54 @@ document.addEventListener('DOMContentLoaded', async () => {
         card.appendChild(stepEl);
       }
       stepEl.className = 'enhancement-step done';
+      if (step.type === 'citation_warning') {
+        bubbleEl.dataset.invalidCitations = JSON.stringify(step.invalid_indices || []);
+        stepEl.textContent = `⚠ 引用 ${(step.invalid_indices || []).map(i => `[${i}]`).join('、')} 未对应本次可见证据，未自动改引（不做语义核验）`;
+        return;
+      }
+      if (step.type === 'kb_progress') {
+        const reasons = {time_reserve: '已预留回答时间', tool_limit: '工具次数已到限', token_budget: '知识库额度已用尽',
+          decision_limit: '检索轮数已到限', model_call_limit: '模型调用次数已到限', no_progress: '连续步骤未新增材料、定位或需求进展',
+          tool_arguments_not_repaired: '连续工具参数纠错未成功，使用已取得资料收尾',
+          needs_assessed: '正在按问题整理资料', context_space_exhausted: '当前上下文空间不足，整理已取得资料'};
+        const pending = step.kb_pending || [];
+        const missing = pending.filter(p => p.required !== false).length;
+        const optional = pending.length - missing;
+        stepEl.textContent = `📚 ${reasons[step.kb_stop_reason] || '开始整理已取得的知识库资料'}${missing ? `；仍有 ${missing} 项读取缺口，回答将注明限制` : ''}${optional ? `；另有 ${optional} 段未读范围，可按需续读` : ''}`;
+        if (step.kb_read_coverage?.status === 'selected_reads_complete') stepEl.textContent += '；已选择的完整原文范围均已交付（不代表结论已核实）';
+        if (step.kb_goals?.length) {
+          const details = document.createElement('details');
+          const summary = document.createElement('summary');
+          summary.textContent = '查看各目标取证情况（非语义核验）';
+          details.append(summary);
+          for (const goal of step.kb_goals) {
+            const row = document.createElement('div');
+            row.textContent = `${goal.label}：${({provided:'所需片段已交付',partial:'片段未齐',located:'仅定位，待补读'})[goal.status] || goal.status}`;
+            details.append(row);
+          }
+          stepEl.append(details);
+        }
+        return;
+      }
       if (isDocument) {
         stepEl.textContent = '📄 ' + documentAnalysisLabel(step.document_analysis);
+        return;
+      }
+      if (step.type === 'kb_update_task') {
+        stepEl.classList.add('kb-result');
+        stepEl.textContent = step.status === 'running' ? '📚 正在梳理问题需求' : step.status === 'error'
+          ? `📚 需求更新失败：${step.error || '请查看工具记录'}` : '📚 已更新问题需求（不代表结论已核实）';
+        const details = document.createElement('details');
+        const summary = document.createElement('summary');
+        summary.textContent = `查看 ${step.kb_needs?.length || 0} 项需求`;
+        details.className = 'kb-catalog';
+        details.append(summary);
+        for (const need of step.kb_needs || []) {
+          const row = document.createElement('div');
+          row.textContent = `${need.id} ${need.question}：${({open:'待补充',ready:'模型认为可回答',unresolved:'尚未解决'})[need.status] || need.status}${need.missing ? `；缺少 ${need.missing}` : ''}`;
+          details.append(row);
+        }
+        stepEl.append(details);
         return;
       }
       if (isHistory) {
@@ -2058,7 +2119,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           : '⚠ 历史记录：旧版模型复核未完成';
         return;
       }
-      stepEl.classList.toggle('kb-result', step.type === 'kb_search' || step.type === 'kb_list_documents');
+      stepEl.classList.toggle('kb-result', ['kb_search', 'kb_list_documents', 'kb_read_document', 'kb_get_document_outline'].includes(step.type));
       if (step.type === 'kb_list_documents' && step.catalog) {
         const catalog = step.catalog;
         const counts = catalog.counts;
@@ -2082,13 +2143,15 @@ document.addEventListener('DOMContentLoaded', async () => {
         stepEl.append(heading, details);
         return;
       }
-      const label = step.type === 'web_search' ? '已搜索' : '已检索知识库';
+      const label = step.type === 'web_search' ? '已搜索' : step.type === 'kb_read_document' ? '已读取知识库页块（仅所列范围）' : step.type === 'kb_get_document_outline' ? '已读取文档目录（不代表正文）' : '已检索知识库';
       const count = step.result_count || 0;
       const outcomeText = {
         empty: '搜索完成，未找到匹配结果',
         empty_kb: '知识库没有文档',
         no_searchable_documents: '文档存在，暂无可检索文档',
         no_match: '检索完成，0 条匹配',
+        budget_exhausted: '本轮知识库预算不足，未继续读取',
+        version_changed: '索引已换版，本轮未混入新版本证据',
       }[step.outcome];
       let countText = ` · ${count} 项${step.type === 'web_search' && step.outcome === 'partial' ? '（部分引擎失败）' : ''}`;
       if (step.type === 'web_search' && step.reader) {
@@ -2103,7 +2166,15 @@ document.addEventListener('DOMContentLoaded', async () => {
       const counts = step.counts;
       const stateText = step.outcome === 'no_searchable_documents' && counts
         ? `（共 ${counts.total} 份，已索引 ${counts.indexed} 份，处理中 ${counts.pending} 份，失败 ${counts.failed} 份）` : '';
-      stepEl.innerHTML = `<span class="step-icon">${icon}</span><span class="step-text">${esc(outcomeText || label)} “${esc(step.query)}”${outcomeText ? esc(stateText) : countText}</span>`;
+      const requiredGaps = (step.kb_pending || []).filter(p => p.required !== false).length;
+      const optionalGaps = (step.kb_pending?.length || 0) - requiredGaps;
+      const gapText = (requiredGaps ? `；${requiredGaps} 项待补读/处理` : '') + (optionalGaps ? `；${optionalGaps} 段未读范围，可按需续读` : '');
+      stepEl.innerHTML = `<span class="step-icon">${icon}</span><span class="step-text">${esc(outcomeText || label)}${step.query ? ` “${esc(step.query)}”` : ''}${outcomeText ? esc(stateText) : countText}${esc(gapText)}</span>`;
+      if (step.kb_goals?.length) {
+        const progress = document.createElement('small');
+        progress.textContent = ` 已定位 ${step.kb_goals.length} 个内容目标，其中 ${step.kb_goals.filter(g => g.status === 'provided').length} 个已交付所需片段；不代表完整阅读或结论正确。`;
+        stepEl.append(progress);
+      }
     } else if (step.status === 'error') {
       if (!stepEl) {
         stepEl = document.createElement('div');
@@ -2112,7 +2183,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
       stepEl.className = 'enhancement-step error';
       const failed = step.outcome === 'error';
-      const label = failed ? (isHistory ? '会话历史回查失败' : step.type === 'web_search' ? '联网搜索失败' : '知识库查询失败') : '工具未执行';
+      const label = step.type === 'kb_update_task' ? '需求状态更新失败' : failed ? (isHistory ? '会话历史回查失败' : step.type === 'web_search' ? '联网搜索失败' : '知识库查询失败') : '工具未执行';
       stepEl.innerHTML = `<span class="step-icon">⚠</span><span class="step-text">${label}：${esc(step.error || '工具参数无效')}</span>`;
       stepEl.title = step.error || '工具参数无效';
     }
@@ -2121,7 +2192,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   // ─── 引用相关函数 ─────────────────────────────────────────
 
   function renderSearchCitations(bubbleEl, sources) {
-    if (!sources || !sources.length) return;
+    if ((!sources || !sources.length) && !bubbleEl.dataset.invalidCitations) return;
+    sources = sources || [];
     const entries = [...new Map(sources.map((source, i) => {
       const url = typeof source.url === 'string' ? source.url : '';
       let href = '';
@@ -2139,12 +2211,23 @@ document.addEventListener('DOMContentLoaded', async () => {
         fetchedAt: String(source.fetched_at || ''), extractedDate: String(source.extracted_date || ''),
         isKb: url.startsWith('kb://'), href,
         hasDocumentId: Boolean(source.doc_id),
+        kbSource: source,
         docKey: source.doc_id ? `${source.kb_id}/${source.doc_id}` : (url || `legacy-${index}`),
       }];
     })).values()];
     const byIndex = new Map(entries.map(source => [source.index, source]));
+    const invalid = new Set(JSON.parse(bubbleEl.dataset.invalidCitations || '[]'));
     const contentEl = bubbleEl.querySelector('.markdown-body');
     if (contentEl) {
+      for (const link of contentEl.querySelectorAll('a')) {
+        const match = /^\[(\d+)\]$/.exec(link.textContent);
+        if (match && invalid.has(Number(match[1]))) {
+          const label = document.createElement('span');
+          label.textContent = link.textContent;
+          label.title = '没有对应本次可见证据';
+          link.replaceWith(label);
+        }
+      }
       const walker = document.createTreeWalker(contentEl, NodeFilter.SHOW_TEXT, {
         acceptNode(node) {
           return node.parentElement.closest('a, code, pre, script, style, textarea, button, .katex, math, .search-citation')
@@ -2157,8 +2240,11 @@ document.addEventListener('DOMContentLoaded', async () => {
         const fragment = document.createDocumentFragment();
         let offset = 0;
         for (const match of node.textContent.matchAll(/\[(\d+)\]/g)) {
+          const before = node.textContent.slice(0, match.index);
+          const after = node.textContent.slice(match.index + match[0].length);
+          if (/\b[A-Za-z_]\w*\s*=\s*$/.test(before) || /"\s*:\s*$/.test(before) || /\[$/.test(before) || /^\]/.test(after)) continue;
           const source = byIndex.get(Number(match[1]));
-          if (!source) continue;
+          if (!source || invalid.has(Number(match[1]))) continue;
           fragment.append(document.createTextNode(node.textContent.slice(offset, match.index)));
           const citation = document.createElement(source.href ? 'a' : 'span');
           citation.className = 'search-citation' + (source.isKb ? ' kb-citation-inline' : '');
@@ -2169,6 +2255,10 @@ document.addEventListener('DOMContentLoaded', async () => {
             citation.target = '_blank';
             citation.rel = 'noopener';
           }
+          if (source.isKb && source.kbSource.parse_id) {
+            citation.style.cursor = 'pointer';
+            citation.addEventListener('click', () => showKbSource(source.kbSource));
+          }
           fragment.append(citation);
           offset = match.index + match[0].length;
         }
@@ -2178,6 +2268,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
       }
     }
+    if (!entries.length) return;
     const previousPanel = bubbleEl.querySelector(':scope > .search-sources-panel');
     const panel = document.createElement('div');
     panel.className = 'search-sources-panel';
@@ -2209,6 +2300,16 @@ document.addEventListener('DOMContentLoaded', async () => {
         title.className = 'kb-source-title';
         title.textContent = source.title;
         detail.append(title);
+        if (source.kbSource.parse_id) {
+          const open = document.createElement('button');
+          open.textContent = `查看页块来源 · ${(source.kbSource.locations || []).map(p => `第${p.page}页`).filter((v, i, a) => a.indexOf(v) === i).join('、')}`;
+          open.addEventListener('click', () => showKbSource(source.kbSource));
+          detail.append(open);
+        } else {
+          const legacy = document.createElement('small');
+          legacy.textContent = '旧索引：没有可靠页级定位';
+          detail.append(legacy);
+        }
         if (source.snippet) {
           const snippet = document.createElement('div');
           snippet.className = 'kb-source-snippet';
@@ -2260,6 +2361,84 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   // 5. 绑定各种交互事件
+  async function showKbSource(source) {
+    const dialog = document.createElement('dialog');
+    dialog.style.cssText = 'width:90%;max-height:90vh;overflow:auto;background:#1e293b;color:#eee;border:1px solid #64748b';
+    const close = document.createElement('button');
+    close.textContent = '关闭';
+    close.addEventListener('click', () => dialog.close());
+    dialog.addEventListener('close', () => dialog.remove());
+    const title = document.createElement('h3');
+    title.textContent = `${source.title} · ${source.parse_id}`;
+    dialog.append(close, title);
+    document.body.append(dialog);
+    dialog.showModal();
+    const base = `http://localhost:8000/v1/kb/${encodeURIComponent(source.kb_id)}/docs/${encodeURIComponent(source.doc_id)}`;
+    for (const location of source.locations || []) {
+      const heading = document.createElement('p');
+      heading.textContent = `物理页 ${location.page} · ${location.block_id} [${location.start},${location.end}) · 本轮提供范围（OCR 派生文本）`;
+      const text = document.createElement('pre');
+      text.style.whiteSpace = 'pre-wrap';
+      dialog.append(heading, text);
+      try {
+        const params = new URLSearchParams({parse_id: source.parse_id, block_id: location.block_id,
+          offset: location.start, end: location.end});
+        const response = await fetch(`${base}/read?${params}`);
+        if (!response.ok) throw new Error(`读取失败 HTTP ${response.status}`);
+        const data = await response.json();
+        const shown = data.locations?.[0];
+        if (shown?.printed_page) heading.textContent += ` · 印刷页码 ${shown.printed_page}`;
+        if (shown && shown.end < location.end) {
+          heading.textContent += ` · 当前仅显示 [${shown.start},${shown.end})，完整引用可查看原 PDF`;
+        }
+        text.textContent = data.content + (data.warnings?.length ? `\n\n警告：${data.warnings.join('；')}` : '');
+        if (data.related_blocks?.length > 1) {
+          const related = document.createElement('p');
+          related.textContent = `已确认的关联块：${data.related_blocks.join('、')}（未在本轮引用范围内的内容不代表模型已读）`;
+          dialog.append(related);
+        }
+        const original = document.createElement('a');
+        original.href = `${base}/file#page=${location.page}`;
+        original.target = '_blank';
+        original.rel = 'noopener';
+        original.textContent = '打开原 PDF 页';
+        dialog.append(original);
+        if (Array.isArray(location.bbox) && location.bbox.length === 4) {
+          const canvas = document.createElement('canvas');
+          canvas.style.width = '100%';
+          const image = new Image();
+          const pageResponse = await fetch(`${base}/pages/${location.page}.png?${new URLSearchParams({parse_id: source.parse_id})}`);
+          if (!pageResponse.ok) throw new Error(`原页图读取失败 HTTP ${pageResponse.status}`);
+          const pageUrl = URL.createObjectURL(await pageResponse.blob());
+          dialog.addEventListener('close', () => URL.revokeObjectURL(pageUrl), {once: true});
+          image.onload = () => {
+            canvas.width = image.naturalWidth; canvas.height = image.naturalHeight;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(image, 0, 0);
+            ctx.strokeStyle = '#f97316'; ctx.lineWidth = 4;
+            const [x1, y1, x2, y2] = location.bbox;
+            ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+            URL.revokeObjectURL(pageUrl);
+          };
+          image.onerror = () => {
+            const error = document.createElement('p');
+            error.textContent = '原页图加载失败，请重试或打开原 PDF；上方文字不是原页图。';
+            canvas.replaceWith(error);
+            URL.revokeObjectURL(pageUrl);
+          };
+          image.src = pageUrl;
+          dialog.append(canvas);
+        }
+      } catch (error) {
+        if (text.textContent) {
+          const warning = document.createElement('p');
+          warning.textContent = error.message;
+          dialog.append(warning);
+        } else text.textContent = error.message;
+      }
+    }
+  }
+
   getOrCreateCurrentChatId().catch(console.error);
 
   document.getElementById('sendBtn').addEventListener('click', () => {
@@ -2651,6 +2830,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       let desc = `⚠️ 即将执行: ${action.type}`;
       if (action.index != null) desc += ` → [${action.index}]`;
       if (thought) desc += `\n原因: ${thought}`;
+      if (action.params?.confirm_overwrite) desc += `\n字段“${action.params.material_label}”已有值。\n现值：${action.params.expected_prior}\n物料值：${action.params.text ?? action.params.option_text}\n是否允许替换？`;
       msgEl.textContent = desc;
       confirmDiv.appendChild(msgEl);
 
@@ -2763,6 +2943,11 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (!tab?.id) throw new Error('无法获取当前标签页');
       const { apiKey, modelName, safeApiUrl } = await resolveApiRequestConfig();
       await requireServerContext(safeApiUrl);
+      const kbId = window._kbBoundId || '';
+      if (kbId) {
+        const capability = await callAgentApi(safeApiUrl, '/v1/agent/capabilities', {}, apiKey);
+        if (capability.material_fill_version !== 1) throw new Error('后端尚未支持表单物料填写，请更新并重启后端');
+      }
       let llmParams = {};
       try {
         const stored = await chrome.storage.local.get(['agentLlmParams']);
@@ -2785,12 +2970,22 @@ document.addEventListener('DOMContentLoaded', async () => {
       let pageState = await run.observe();
       let response = await run.decide('/v1/agent/execute', {
         task, page_state: pageState, model: modelName || 'gpt-4o',
-        require_confirmation: [], task_image: taskImage || '', llm_params: llmParams
+        require_confirmation: [], task_image: taskImage || '', llm_params: llmParams,
+        kb_id: kbId, materials_version: 1
       });
 
-      while (response.status === 'action_required' || response.status === 'confirm_required') {
+      while (['action_required', 'confirm_required', 'observation_required'].includes(response.status)) {
         run.check();
         if (!ownsUI()) throw new Error('任务已被替换');
+        renderAgentMaterials(aiBubble, response.materials);
+        if (response.status === 'observation_required') {
+          statusText.textContent = '物料读取结束，正在重新观察字段';
+          pageState = await run.observe();
+          response = await run.decide('/v1/agent/resume', {
+            page_state: pageState, continuation_id: response.continuation_id
+          });
+          continue;
+        }
         agentState.currentStep = response.step;
         const action = response.action;
         if (!action?.action_id || action.observation_id !== pageState.observation_id) {
@@ -2832,6 +3027,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         response = await run.decide('/v1/agent/step', { page_state: pageState, action_result: result });
       }
       run.check();
+      renderAgentMaterials(aiBubble, response.materials);
       backendTerminal = ['completed', 'cancelled', 'error'].includes(response.status);
       if (response.status === 'completed') {
         statusText.textContent = response.success === false ? '任务未完成' : '任务完成';
@@ -2871,6 +3067,36 @@ document.addEventListener('DOMContentLoaded', async () => {
       aiBubble.querySelectorAll('.agent-confirm').forEach(element => element.remove());
       cancelBtn.remove();
       if (keepalivePort) { try { keepalivePort.disconnect(); } catch { /* 已断开 */ } }
+    }
+  }
+
+  function renderAgentMaterials(bubble, materials) {
+    if (!materials) return;
+    let panel = bubble.querySelector('.agent-materials');
+    if (!panel) {
+      panel = document.createElement('details'); panel.className = 'agent-materials';
+      bubble.appendChild(panel);
+    }
+    panel.replaceChildren();
+    const heading = document.createElement('summary');
+    const fields = materials.fields || [];
+    heading.textContent = `📚 字段物料：${fields.filter(f => f.fill_status === 'verified').length}/${fields.length} 已回读确认`;
+    panel.appendChild(heading);
+    const states = { available: '有来源', missing: '缺失', conflict: '冲突', ambiguous: '待澄清', pending: '正在取材', invalid: '来源失效' };
+    for (const field of fields) {
+      const row = document.createElement('div');
+      row.textContent = `${field.material_id || field.field_id} · ${field.entity} / ${field.label}：${states[field.status] || field.status}` +
+        (field.status === 'available' ? `\n原值：${field.raw_value}\n填充值：${field.value} · ${field.fill_status === 'verified' ? '已确认' : '未确认'}` : `\n${field.reason || ''}`);
+      row.style.whiteSpace = 'pre-wrap';
+      for (const source of field.sources || []) {
+        const evidence = document.createElement('div');
+        evidence.textContent = `来源：${source.title || source.doc_id} · KB${source.citation}\n${source.quote}`;
+        row.appendChild(evidence);
+      }
+      panel.appendChild(row);
+    }
+    if (materials.error) {
+      const error = document.createElement('div'); error.textContent = materials.error; panel.appendChild(error);
     }
   }
 
@@ -3132,7 +3358,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     btn.disabled = true;
     btn.textContent = '刷新中…';
     try {
-      const loaded = viewMode === 'trash' ? await loadTrash() : await loadKBs();
+      let loaded = viewMode === 'trash' ? await loadTrash() : await loadKBs();
+      if (loaded && viewMode !== 'trash' && currentKbId) loaded = await loadDocs(currentKbId);
       btn.textContent = loaded ? '↻ 刷新' : '刷新失败，重试';
     } finally {
       btn.disabled = false;
@@ -3230,11 +3457,16 @@ document.addEventListener('DOMContentLoaded', async () => {
   async function loadDocs(kb_id) {
     try {
       const loaded = await kbRequest(`/v1/kb/${kb_id}/docs`);
-      if (currentKbId !== kb_id) return;
+      if (currentKbId !== kb_id) return true;
       docs = loaded;
       renderDocList();
+      for (const doc of docs) {
+        if (['queued', 'parsing', 'indexing'].includes(doc.phase)) pollDocStatus(kb_id, doc.doc_id);
+      }
+      return true;
     } catch (err) {
       console.error('加载文档失败:', err);
+      return false;
     }
   }
 
@@ -3248,12 +3480,130 @@ document.addEventListener('DOMContentLoaded', async () => {
       return `
       <div class="doc-item" data-doc-id="${doc.doc_id}">
         <span class="doc-name">${escapeHtml(doc.filename)}</span>
-        <span class="doc-status ${doc.status}">${doc.status === 'pending' ? '⏳ 索引中' : doc.sync_pending ? (doc.status === 'failed' ? '❌ 索引失败，待清理' : '待同步') : statusIcon(doc.status)}</span>
-        <span class="doc-error">${escapeHtml(doc.sync_error || doc.error_msg || '')}</span>
+        <span class="doc-status">${escapeHtml(doc.phase ? ({queued: '已保存原文件，排队中', parsing: `解析 ${doc.completed_pages}/${doc.page_count} 页`, indexing: `索引 ${doc.indexed_chunks}/${doc.total_chunks} 片段`, published: '已发布可检索版本', failed: '处理失败，可恢复', interrupted: '处理已中断，可恢复', cancelled: '已取消，检查点保留'}[doc.phase] || doc.phase) + (doc.published_available && doc.phase !== 'published' ? '（旧版本仍可用）' : '') : doc.status === 'pending' ? '⏳ 索引中' : doc.sync_pending ? (doc.status === 'failed' ? '索引失败，待清理' : '待同步') : statusIcon(doc.status))}</span>
+        <span class="doc-error">${escapeHtml(doc.job_error || doc.sync_error || doc.error_msg || '')}</span>
+        ${doc.failed_page_count ? `<details class="doc-page-errors"><summary>${Number(doc.failed_page_count)} 页未完成</summary>${(doc.failed_pages || []).map(p => `<div>${escapeHtml(`物理页 ${p.page} · ${p.status} · ${p.attempts} 次尝试：${p.error}`)}</div>`).join('')}</details>` : ''}
+        ${doc.uncertain_page_count ? `<span class="doc-warning">${Number(doc.uncertain_page_count)} 页上游未提供截断判定；已解析不代表识别无遗漏</span>` : ''}
         <span class="doc-size">${(doc.file_bytes / 1024).toFixed(1)} KB</span>
         <button class="doc-delete" data-doc-id="${doc.doc_id}" ${btnDis}>${btnText}</button>
+        ${['failed', 'interrupted', 'cancelled'].includes(doc.phase) ? `<button class="doc-retry" data-doc-id="${doc.doc_id}">恢复处理</button>` : ''}
+        ${doc.phase === 'published' ? `<button class="doc-reparse" data-doc-id="${doc.doc_id}">重新解析</button><button class="doc-reindex" data-doc-id="${doc.doc_id}">重建索引</button>` : ''}
+        ${doc.published_structure_id ? `<button class="doc-outline" data-doc-id="${doc.doc_id}">层级目录 · ${Number(doc.structure_nodes)} 节点</button>` : doc.published_available ? '<small>尚无层级目录，可重建索引；原页块仍可读取</small>' : ''}
+        ${['queued', 'parsing', 'indexing'].includes(doc.phase) ? `<button class="doc-cancel" data-doc-id="${doc.doc_id}">取消处理</button>` : ''}
       </div>`;
     }).join('');
+  }
+
+  async function showDocumentTree(kbId, doc) {
+    const dialog = document.createElement('dialog');
+    dialog.className = 'kb-tree-dialog';
+    dialog.style.cssText = 'width:90%;max-height:90vh;overflow:auto;background:#1e293b;color:#eee;border:1px solid #64748b';
+    const close = document.createElement('button');
+    close.textContent = '关闭';
+    close.addEventListener('click', () => dialog.close());
+    dialog.addEventListener('close', () => dialog.remove());
+    const heading = document.createElement('h3');
+    heading.textContent = doc.filename;
+    const notice = document.createElement('p');
+    notice.textContent = '目录是导航，不表示已读取正文；OCR 与结构归属均可能有误。';
+    const tree = document.createElement('div');
+    const preview = document.createElement('section');
+    dialog.append(close, heading, notice, tree, preview);
+    document.body.append(dialog);
+    dialog.showModal();
+    const base = `/v1/kb/${encodeURIComponent(kbId)}/docs/${encodeURIComponent(doc.doc_id)}`;
+    const structure = doc.published_structure_id;
+    let readGeneration = 0;
+    async function readNode(node, continuation) {
+      const generation = ++readGeneration;
+      preview.textContent = '正在读取原文片段…';
+      try {
+        const target = continuation?.targets?.[0] || {node_id:node.node_id,structure_id:structure};
+        const params = new URLSearchParams(Object.entries(target).filter(([key]) => !['doc_id','mode'].includes(key)));
+        const value = await kbRequest(`${base}/read?${params}`);
+        if (!dialog.isConnected || generation !== readGeneration) return;
+        preview.replaceChildren();
+        const label = document.createElement('p');
+        label.textContent = `${node.title} · ${value.excerpt_truncated ? '本次仅提供片段，尚未读完' : '本次所选节点范围已返回'}（不代表模型已读或语义核验）`;
+        const text = document.createElement('pre');
+        text.style.cssText = 'white-space:pre-wrap;overflow-wrap:anywhere';
+        text.textContent = value.content;
+        preview.append(label,text);
+        for (const page of [...new Set((value.locations || []).map(p => p.page))]) {
+          const original = document.createElement('button');
+          original.textContent = `查看原页 ${page}`;
+          original.addEventListener('click', async () => {
+            original.disabled = true;
+            try {
+              const response = await fetch(`${API_BASE}${base}/pages/${page}.png?${new URLSearchParams({parse_id:value.parse_id})}`);
+              if (!response.ok) throw new Error(`HTTP ${response.status}`);
+              const url = URL.createObjectURL(await response.blob());
+              const image = document.createElement('img');
+              image.alt = `原 PDF 物理页 ${page}`;
+              image.style.width = '100%';
+              image.src = url;
+              image.addEventListener('load', () => URL.revokeObjectURL(url), {once:true});
+              dialog.addEventListener('close', () => URL.revokeObjectURL(url), {once:true});
+              if (dialog.isConnected && generation === readGeneration) preview.append(image);
+              else URL.revokeObjectURL(url);
+            } catch (error) { original.textContent = `原页加载失败：${error.message}`; }
+            finally { original.disabled = false; }
+          });
+          preview.append(original);
+        }
+        if (value.next_read) {
+          const next = document.createElement('button');
+          next.textContent = '继续读取下一段';
+          next.addEventListener('click', () => readNode(node,value.next_read));
+          preview.append(next);
+        }
+      } catch (error) {
+        if (dialog.isConnected && generation === readGeneration) preview.textContent = `读取失败：${error.message}`;
+      }
+    }
+    async function loadBranch(container, nodeId, offset = 0) {
+      const params = new URLSearchParams({view:'tree',structure_id:structure,offset,limit:10});
+      if (nodeId) params.set('node_id',nodeId);
+      try {
+        const result = await kbRequest(`${base}/outline?${params}`);
+        if (!dialog.isConnected) return;
+        for (const node of result.blocks) {
+          const row = document.createElement('details');
+          const summary = document.createElement('summary');
+          summary.textContent = `${node.title} · 第 ${node.page}–${node.end_page} 页 · ${node.kind}`;
+          const text = document.createElement('p');
+          text.textContent = `${node.preview || ''}（导航节选；依据：${node.basis}）`;
+          const read = document.createElement('button');
+          read.textContent = '读取此节点';
+          read.addEventListener('click', () => readNode(node));
+          const children = document.createElement('div');
+          children.style.paddingLeft = '12px';
+          row.append(summary,text,read,children);
+          let loaded = false;
+          row.addEventListener('toggle', () => {
+            if (row.open && !loaded && node.children) {
+              loaded = true;
+              loadBranch(children,node.node_id);
+            }
+          });
+          container.append(row);
+        }
+        if (result.next_offset != null) {
+          const more = document.createElement('button');
+          more.textContent = '加载更多目录项';
+          more.addEventListener('click', () => { more.remove(); loadBranch(container,nodeId,result.next_offset); });
+          container.append(more);
+        }
+      } catch (error) {
+        const failure = document.createElement('p');
+        failure.textContent = `目录加载失败：${error.message}`;
+        const retry = document.createElement('button');
+        retry.textContent = '重试加载目录';
+        retry.addEventListener('click', () => { failure.remove(); retry.remove(); loadBranch(container,nodeId,offset); });
+        if (dialog.isConnected) container.append(failure,retry);
+      }
+    }
+    await loadBranch(tree,null);
   }
 
   function statusIcon(status) {
@@ -3263,9 +3613,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     return status;
   }
 
+  const pollingDocs = new Set();
   async function pollDocStatus(kb_id, doc_id) {
-    const maxRetries = 60;
-    for (let i = 0; i < maxRetries; i++) {
+    const key = `${kb_id}/${doc_id}`;
+    if (pollingDocs.has(key)) return;
+    pollingDocs.add(key);
+    try {
+    let firstPoll = true;
+    while (firstPoll || currentKbId === kb_id) {
+      firstPoll = false;
       await new Promise(r => setTimeout(r, 2000));
       try {
         const data = await kbRequest(`/v1/kb/${kb_id}/docs/${doc_id}/status`);
@@ -3277,7 +3633,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           docs = docs.map(doc => doc.doc_id === doc_id ? {...doc, ...data} : doc);
           renderDocList();
         }
-        if ((data.status === 'indexed' || data.status === 'failed') && !data.sync_pending) {
+        if (data.phase ? !['queued', 'parsing', 'indexing'].includes(data.phase) : (data.status === 'indexed' || data.status === 'failed') && !data.sync_pending) {
           await loadDocs(kb_id);
           break;
         }
@@ -3286,9 +3642,28 @@ document.addEventListener('DOMContentLoaded', async () => {
         break;
       }
     }
+    } finally { pollingDocs.delete(key); }
   }
 
   document.getElementById('docList')?.addEventListener('click', async (e) => {
+    const outlineButton = e.target.closest('.doc-outline');
+    if (outlineButton) {
+      const kbId = currentKbId;
+      const doc = docs.find(d => d.doc_id === outlineButton.dataset.docId);
+      if (doc) await showDocumentTree(kbId, doc);
+      return;
+    }
+    const action = e.target.closest('.doc-retry, .doc-cancel, .doc-reparse, .doc-reindex');
+    if (action) {
+      action.disabled = true;
+      const kbId = currentKbId;
+      try {
+        const operation = action.classList.contains('doc-reparse') ? 'retry?reparse=true' : action.classList.contains('doc-reindex') ? 'retry?reindex=true' : action.classList.contains('doc-retry') ? 'retry' : 'cancel';
+        await kbRequest(`/v1/kb/${kbId}/docs/${action.dataset.docId}/${operation}`, {method: 'POST'});
+        await loadDocs(kbId);
+      } catch (error) { alert(error.message); action.disabled = false; }
+      return;
+    }
     const delBtn = e.target.closest('.doc-delete');
     if (delBtn) {
       e.stopPropagation();

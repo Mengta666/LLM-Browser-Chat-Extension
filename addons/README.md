@@ -5,8 +5,11 @@
 | 服务 | 用途 | 运行依赖 |
 | --- | --- | --- |
 | [web-reader](web-reader/README.md) | 公开网页 → 提取正文、日期与读取状态 | CPU、外网访问；不需要模型、embedding 或 Qdrant |
+| [pdf-parser](pdf-parser/README.md) | 单页图像 → 版面块、OCR、原始 JSON | PaddleOCR/PaddlePaddle＋独立 vLLM OCR 服务；后端接入尚未实施 |
 
 统一部署见 [deploy/README.md](../deploy/README.md)。已有 SearXNG 时只启用 `reader`；没有时可以同时启用 `search`，后者直接使用官方镜像。
+
+PDF 解析使用独立的 [Docker / WSL 部署入口](../deploy/pdf-parser/DOCKER.md)，另保留原生 Python 方式，不改变现有搜索增强 Compose。
 
 ## 维护约定
 

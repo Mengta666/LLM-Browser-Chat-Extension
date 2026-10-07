@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from agent.memory import vector as V
+from rag import kb_vectors as V
 from agent.memory.config import CHAT_USER_ID, INSTRUCT_KB, KB_CHUNK_OVERLAP, KB_CHUNK_SIZE, KB_SEARCH_TOP_K, MEMORY_TYPE_KB_CHUNK
 from observability.logger import get_logger
 from rag import chunker, parser
@@ -178,6 +178,8 @@ def delete_kb(kb_id: str) -> dict:
 
 def add_doc(kb_id: str, file_path: str | Path, filename: str, file_type: str,
             content_hash: str = "") -> dict[str, Any]:
+    if file_type == 'pdf':
+        return _add_pdf(kb_id, Path(file_path), filename, content_hash)
     path = Path(file_path)
     doc_id, run_id = f"doc_{uuid.uuid4().hex[:8]}", uuid.uuid4().hex
     with _kb_lock(kb_id):
@@ -248,15 +250,85 @@ def _process_doc(kb_id: str, doc_id: str, path: Path, file_type: str, run_id: st
 
 
 def list_docs(kb_id: str) -> list[dict[str, Any]]:
+    from storage.kb_document_store import progress
     _require_kb(kb_id, active=True)
-    return KS.list_docs(kb_id)
+    return [progress(doc) for doc in KS.list_docs(kb_id)]
 
 
 def get_doc_status(kb_id: str, doc_id: str) -> dict[str, Any]:
     kb, doc = KS.get_kb(kb_id), KS.get_doc(doc_id)
     if not kb or kb["user_id"] != CHAT_USER_ID or kb["deleted_at"] or not doc or doc["kb_id"] != kb_id or doc["deleted_at"]:
         return {"status": "not_found"}
-    return {key: doc[key] for key in ("status","error_msg","chunk_count","indexed_at","sync_pending","sync_error")}
+    from storage.kb_document_store import progress
+    return progress(doc)
+
+
+def _start_pdf(kb_id, doc_id, parse_id):
+    from rag.document_worker import run
+
+    def finish():
+        with _workers_guard:
+            _workers.discard((kb_id, doc_id, parse_id))
+
+    with _workers_guard:
+        _workers.add((kb_id, doc_id, parse_id))
+    try:
+        threading.Thread(target=run, args=(kb_id, doc_id, parse_id, finish, _kb_lock(kb_id)),
+                         daemon=True, name=f'kb-pdf-{doc_id}').start()
+    except Exception:
+        finish()
+        from storage.kb_document_store import stop
+        stop(kb_id, doc_id)
+        raise
+
+
+def _add_pdf(kb_id, path, filename, content_hash):
+    import hashlib
+    import shutil
+    from rag.document_worker import inspect_pdf, parse_config
+    from rag.document_structure import fingerprint
+    from rag.document_config import document_path
+    from storage import kb_document_store as DS
+
+    pages = inspect_pdf(path)
+    with path.open('rb') as source:
+        digest = hashlib.file_digest(source, 'sha256').hexdigest()
+    doc_id = f'doc_{uuid.uuid4().hex[:8]}'
+    target = document_path(doc_id, 'original.pdf')
+    with _kb_lock(kb_id):
+        target.parent.mkdir(parents=True, exist_ok=False)
+        shutil.move(str(path), str(target))
+        config = parse_config()
+        try:
+            parse_id = DS.create_pdf(kb_id, doc_id, filename, target, digest, pages, fingerprint(config), config)
+        except Exception:
+            target.unlink()
+            target.parent.rmdir()
+            raise
+        _start_pdf(kb_id, doc_id, parse_id)
+    return {'doc_id': doc_id, 'status': 'pending', 'filename': filename}
+
+
+def retry_document(kb_id, doc_id, *, reparse=False, reindex=False):
+    from storage import kb_document_store as DS
+    from rag.document_worker import parse_config
+    from rag.document_structure import fingerprint
+    with _kb_lock(kb_id):
+        if _has_worker(kb_id, doc_id):
+            raise KS.KBConflict('旧任务正在结束，请稍后重试')
+        config = parse_config()
+        if reparse and reindex:
+            raise ValueError('重新解析与仅重建索引不能同时指定')
+        parse_id = DS.restart(kb_id, doc_id, fingerprint(config), config, reparse=reparse, reindex=reindex)
+        _start_pdf(kb_id, doc_id, parse_id)
+    return {'ok': True, 'parse_id': parse_id}
+
+
+def cancel_document(kb_id, doc_id):
+    from storage import kb_document_store as DS
+    with _kb_lock(kb_id):
+        DS.stop(kb_id, doc_id)
+    return {'ok': True}
 
 
 def delete_doc(kb_id: str, doc_id: str) -> dict:
@@ -286,109 +358,14 @@ def _get_sibling_chunk(kb_id: str, doc_id: str, chunk_id: int,
     return admitted[0] if admitted else None
 
 
-def _recall_score(chunk: dict) -> float:
-    score = chunk.get("rerank_score")
-    return chunk.get("score", 0) if score is None else score
-
-
 def search_kb(kb_id: str, query: str, top_k: int = KB_SEARCH_TOP_K) -> list[dict[str, Any]]:
-    """检索 KB,返回 top-K chunks(带 doc/source/chunk_idx)。
-
-    流程: 粗召回(hybrid search) → rerank(可选) → 相关性过滤 → 日志
-    """
-    import time
-    from agent.memory.config import KB_RECALL_MIN_SCORE, KB_RERANK_ENABLED
-    from .reranker import rerank_chunks
-    from observability.logger import get_logger
-
-    start = time.time()
-    kb = KS.get_kb(kb_id)
-    if not kb or kb["user_id"] != CHAT_USER_ID or kb["deleted_at"] or kb["sync_action"]:
-        return []
-    query_vec = embed_query(query, INSTRUCT_KB)
-
-    top_k = max(1, min(int(top_k), 500))
-    results = []
-    raw_count = 0
-    for multiplier in (1, 3, 9):
-        limit = min(top_k * multiplier, 500)
-        candidates = V.search_memories(
-            query_vector=query_vec, query_text=query, top_k=limit, user_id=CHAT_USER_ID,
-            memory_type=MEMORY_TYPE_KB_CHUNK, kb_id=kb_id, include_invalid=False)
-        raw_count = len(candidates)
-        results = _admit_chunks(kb_id, candidates)[:top_k]
-        if len(results) >= top_k or raw_count < limit or limit == 500:
-            break
-
-    # Rerank（如果启用）
-    admitted_count = len(results)
-    diagnostics = {}
-    results = rerank_chunks(query, results, diagnostics=diagnostics)
-    scores = [_recall_score(chunk) for chunk in results]
-
-    # 相关性过滤
-    filtered = []
-    for chunk in results:
-        score = _recall_score(chunk)
-        if score >= KB_RECALL_MIN_SCORE:
-            filtered.append(chunk)
-
-    # 窗口扩展：为每个命中 chunk 附带前后 ±1 chunk
-    expanded = []
-    for chunk in filtered:
-        doc_id = chunk.get("doc_id", "")
-        chunk_id = chunk.get("chunk_id")
-        prev_id = chunk.get("prev_chunk_id")
-        next_id = chunk.get("next_chunk_id")
-
-        # 读取前后 chunk（同一文档内）
-        context_chunks = [chunk]  # 中心 chunk
-
-        if prev_id is not None:
-            prev_chunk = _get_sibling_chunk(kb_id, doc_id, prev_id, chunk.get('index_run_id', ''))
-            if prev_chunk:
-                context_chunks.insert(0, prev_chunk)
-
-        if next_id is not None:
-            next_chunk = _get_sibling_chunk(kb_id, doc_id, next_id, chunk.get('index_run_id', ''))
-            if next_chunk:
-                context_chunks.append(next_chunk)
-
-        # 拼接上下文
-        expanded_content = "\n".join([c.get("content", "") for c in context_chunks])
-        expanded_chunk = chunk.copy()
-        expanded_chunk["content"] = expanded_content
-        expanded_chunk["window_size"] = len(context_chunks)  # 标记扩展了几个 chunk
-        expanded_chunk["window_chunk_ids"] = [c.get("chunk_idx", c.get("chunk_id")) for c in context_chunks]
-        expanded.append(expanded_chunk)
-
-    expanded = _admit_chunks(kb_id, expanded)
-
-    # 日志
+    from rag.document_retrieval import search
     try:
-        _kb_log = get_logger("kb")
-        _kb_log.info("kb_search", data={
-            "kb_id": kb_id,
-            "query_head": query[:60],
-            "raw_count": raw_count,
-            "admitted_count": admitted_count,
-            "reranked_count": len(results),
-            "filtered_count": len(filtered),
-            "expanded_count": len(expanded),
-            "rerank_enabled": KB_RERANK_ENABLED,
-            "top_score": max(scores) if scores else None,
-            "min_score": min(scores) if scores else None,
-            "score_threshold": KB_RECALL_MIN_SCORE,
-            "filtered_top_score": max((_recall_score(c) for c in filtered), default=None),
-            **diagnostics,
-            "score_source": ("rerank" if results[0].get("rerank_score") is not None else "recall") if results else "none",
-            "avg_window": sum(c.get("window_size", 1) for c in expanded) / len(expanded) if expanded else 0,
-            "elapsed_ms": int((time.time() - start) * 1000)
-        })
-    except Exception:
-        pass
+        results, _ = search(kb_id, query)
+    except KS.KBNotFound:
+        return []
+    return results[:max(1, min(int(top_k), 500))]
 
-    return expanded
 
 
 

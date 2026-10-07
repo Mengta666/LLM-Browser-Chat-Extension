@@ -1,0 +1,12 @@
+**
+!addons/
+!addons/pdf-parser/
+!addons/pdf-parser/Dockerfile
+!addons/pdf-parser/requirements.txt
+!addons/pdf-parser/pdf_parser/
+!addons/pdf-parser/pdf_parser/*.py
+!deploy/
+!deploy/pdf-parser/
+!deploy/pdf-parser/manage.py
+!deploy/pdf-parser/check.py
+!deploy/pdf-parser/requirements-check.txt

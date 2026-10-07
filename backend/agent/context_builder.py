@@ -147,6 +147,11 @@ def build_messages(session: "AgentSession", page_state: PageState) -> list[dict[
     因此 token 随步数增长有上界（首项 + 最近 N 项 + 省略标记）。
     """
     parts = [f"## 任务\n{session.task}"]
+    system = SYSTEM_PROMPT
+    if session.kb_id:
+        from agent.materials import context, GUIDANCE
+        system += '\n## 知识库表单物料\n' + GUIDANCE + '\n取材值可以来自有引文的知识库；填写成功必须依据网页回读。'
+        parts.append(context(session))
 
     hist = render_history_block(session)
     if hist:
@@ -175,14 +180,14 @@ def build_messages(session: "AgentSession", page_state: PageState) -> list[dict[
 
     if image_blocks:
         return [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system},
             {"role": "user", "content": [
                 {"type": "text", "text": user_text},
                 *image_blocks,
             ]},
         ]
     return [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system},
         {"role": "user", "content": user_text},
     ]
 

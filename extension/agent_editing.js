@@ -135,7 +135,26 @@ function describeEditingTarget(observe = false) {
   };
   if (observe) {
     const s = state();
-    return { ...s, preview: s.success && kind !== 'none' && input.type !== 'password' ? value().slice(0, 120) : '' };
+    const current = node.tagName === 'SELECT' ? node.value :
+      s.success && kind !== 'none' && input.type !== 'password' ? value() : '';
+    const group = node.closest('fieldset');
+    const form = node.closest('form');
+    const row = node.closest('tr');
+    const hints = [...(node.labels || [])].map(label => label.textContent.trim());
+    for (const id of (node.getAttribute('aria-describedby') || '').split(/\s+/).filter(Boolean)) {
+      const hint = doc.getElementById(id)?.textContent?.trim();
+      if (hint) hints.push(hint);
+    }
+    if (row) hints.push(...[...row.querySelectorAll('th')].map(cell => cell.textContent.trim()));
+    return { ...s, preview: current.slice(0, 120), value_truncated: current.length > 120,
+      tag: node.tagName.toLowerCase(), type: node.getAttribute('type') || '', name: node.getAttribute('name') || '',
+      html_id: node.id || '', placeholder: node.getAttribute('placeholder') || '', aria_label: node.getAttribute('aria-label') || '',
+      form_context: [form?.id, form?.getAttribute('name'), form?.getAttribute('aria-label'),
+        group?.querySelector('legend')?.textContent?.trim()].filter(Boolean).join(' / ').slice(0, 400),
+      field_context: hints.join(' / ').slice(0, 600),
+      ...(node.tagName === 'SELECT' ? { selected_text: node.selectedOptions[0]?.textContent.trim() || '',
+        options: [...node.options].map(o => ({ text: o.textContent.trim(), value: o.value,
+          disabled: o.disabled || o.parentElement.tagName === 'OPTGROUP' && o.parentElement.disabled })) } : {}) };
   }
   return { call };
 }

@@ -1,0 +1,10 @@
+fastapi==0.141.1
+uvicorn==0.51.0
+pydantic==2.13.4
+httpx==0.28.1
+Pillow==12.3.0
+numpy==2.2.6
+paddleocr[doc-parser]==3.7.0
+paddlex==3.7.2
+# PaddlePaddle GPU 必须按 deploy/pdf-parser/README.md 从对应 CUDA wheel 源单独安装。
+# vLLM 必须使用另一虚拟环境。

@@ -13,7 +13,7 @@ from agent.memory.config import (
 )
 
 
-def rerank_chunks(query: str, chunks: list[dict[str, Any]], *, diagnostics: dict | None = None) -> list[dict[str, Any]]:
+def rerank_chunks(query: str, chunks: list[dict[str, Any]], *, diagnostics: dict | None = None, top_n: int | None = None) -> list[dict[str, Any]]:
     """对检索到的 chunks 进行精排。
 
     Args:
@@ -25,6 +25,7 @@ def rerank_chunks(query: str, chunks: list[dict[str, Any]], *, diagnostics: dict
     """
     if diagnostics is None:
         diagnostics = {}
+    top_n = KB_RERANK_TOP_K if top_n is None else top_n
     diagnostics.update(rerank_status="disabled" if not KB_RERANK_ENABLED else "no_candidates", fallback_reason=None)
     if not KB_RERANK_ENABLED or not chunks:
         return chunks
@@ -41,7 +42,7 @@ def rerank_chunks(query: str, chunks: list[dict[str, Any]], *, diagnostics: dict
             "model": KB_RERANK_MODEL,
             "query": query,
             "documents": documents,
-            "top_n": min(KB_RERANK_TOP_K, len(documents)),
+            "top_n": min(top_n, len(documents)),
         }
         headers = {
             "Authorization": f"Bearer {KB_RERANK_API_KEY}",
@@ -75,7 +76,7 @@ def rerank_chunks(query: str, chunks: list[dict[str, Any]], *, diagnostics: dict
             reranked.append(chunk_copy)
 
         diagnostics["rerank_status"] = "success"
-        return reranked[:KB_RERANK_TOP_K]
+        return reranked[:top_n]
 
     except Exception:
         diagnostics.update(rerank_status="fallback", fallback_reason=failure_reason)

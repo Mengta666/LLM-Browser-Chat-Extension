@@ -1,0 +1,4 @@
+**
+!deploy/
+!deploy/pdf-parser/
+!deploy/pdf-parser/requirements-vllm-cu128.txt

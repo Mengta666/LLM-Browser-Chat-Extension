@@ -1,0 +1,6 @@
+# 仅在已完成首次部署的常驻主机启用；models 仍为一次性任务。
+services:
+  ocr-vllm:
+    restart: unless-stopped
+  pdf-parser:
+    restart: unless-stopped

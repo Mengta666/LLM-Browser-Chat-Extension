@@ -9,7 +9,7 @@ chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(consol
 
 const MAX_LLM_BODY_BYTES = 25 * 1024 * 1024;
 const PAGE_REFRESH_ENDPOINT_PATH = '/api/pages/refresh_snapshot';
-const AGENT_ENDPOINT_PATHS = ['/v1/agent/execute', '/v1/agent/step', '/v1/agent/cancel', '/v1/agent/status'];
+const AGENT_ENDPOINT_PATHS = ['/v1/agent/execute', '/v1/agent/step', '/v1/agent/resume', '/v1/agent/capabilities', '/v1/agent/material-check', '/v1/agent/cancel', '/v1/agent/status'];
 
 // 会话历史 + 记忆管理 CRUD 的路径前缀(支持 GET/POST/PATCH/DELETE，仅本地/自定义后端）
 const BACKEND_API_PREFIXES = ['/v1/sessions', '/v1/memory'];
@@ -1352,6 +1352,9 @@ function serializeInteractive(allNodes, ctx) {
       date_format: attrs['data-date-format'] || attrs['format'] || attrs['expected_format'] || '',
       component: attrs['data-component-name'] || '',
       enabled: !isDisabled(node),
+      ...(node.editing ? { form_context: node.editing.form_context, field_context: node.editing.field_context,
+        value_truncated: node.editing.value_truncated, selected_text: node.editing.selected_text,
+        options: node.editing.options } : {}),
       ...(node.editing ? { editable: node.editing.editable, read_only: node.editing.readOnly,
         editor_type: node.editing.kind, focused: node.editing.focused } : {}),
       frame_id: node.frameId || '',
@@ -1499,7 +1502,7 @@ async function gatherAndConstructTarget(target, ctx, offset) {
     }));
   }
   const candidates = built.allNodes.filter(node => node.nodeType === NODE_TYPE.ELEMENT &&
-    (['INPUT', 'TEXTAREA'].includes(node.nodeName) ||
+    (['INPUT', 'TEXTAREA', 'SELECT'].includes(node.nodeName) ||
      ['true', '', 'plaintext-only'].includes(node.attributes.contenteditable) ||
      (node.attributes.class || '').split(/\s+/).includes('CodeMirror')));
   for (let i = 0; i < candidates.length; i += 20) {
@@ -1986,6 +1989,22 @@ async function handleAgentExecute(tabId, action, ctx = null) {
 
   try {
     // 元素点击/悬停走目标 session；页面级动作仍走根 session。
+    if (action.params?.material_id) {
+      let materialObject;
+      try {
+        materialObject = (await cdpSend(domTarget, 'DOM.resolveNode', { backendNodeId })).object?.objectId;
+        if (!materialObject) throw new Error('物料目标节点已失效');
+        const live = runtimeValue(await cdpSend(domTarget, 'Runtime.callFunctionOn', {
+          objectId: materialObject, functionDeclaration: AgentEditing.describeEditingTarget.toString(),
+          arguments: [{ value: true }], returnByValue: true,
+        }));
+        if (!live?.success || !action.params.material_identity ||
+            Object.entries(action.params.material_identity).some(([key, value]) => (live[key] || '') !== value))
+          return { success: false, stale: true, action_type: type, error: '字段名称或分组已变化，未写入旧物料，请重新观察' };
+      } finally {
+        if (materialObject) await cdpSend(domTarget, 'Runtime.releaseObject', { objectId: materialObject }).catch(() => {});
+      }
+    }
     if (['type', 'clear', 'focus', 'press_key'].includes(type)) await refocusTop(rootTarget);
     if (type === 'click') return { __via: 'cdp', ...(await doClick(domTarget, rootTarget, backendNodeId, action.index, vw, vh, elementEntry)) };
     if (type === 'type') return { __via: 'cdp', ...(await doType(domTarget, rootTarget, backendNodeId, action)) };
@@ -2139,6 +2158,8 @@ async function doType(domTarget, rootTarget, backendNodeId, action) {
     if (!state.editable) throw new Error('目标不是可编辑区域或处于只读状态，请选择可输入的元素');
     if (!state.multiline && /[\r\n]/.test(text)) throw new Error('单行控件不支持多行文本，未修改内容或发送 Enter');
     if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(text)) throw new Error('文本包含不支持的控制字符');
+    if (action.params?.material_id && (await editor.call('read')).value !== action.params.expected_prior)
+      throw Object.assign(new Error('取材后字段值已改变，未覆盖，请重新观察'), { stale: true });
     await editor.call('focus');
     const replace = action.params?.clear !== false;
     let expected = text;
@@ -2156,7 +2177,8 @@ async function doType(domTarget, rootTarget, backendNodeId, action) {
       else await typeChars(domTarget, text, () => editor.call('guard'));
     }
     await verifyEditorValue(editor, expected);
-    return { success: true, action_type: 'type', details: '已回读确认输入内容；未执行提交操作' };
+    return { success: true, action_type: 'type', details: '已回读确认输入内容；未执行提交操作',
+      ...(action.params?.material_id ? { material_verification: { material_id: action.params.material_id, matched: true } } : {}) };
   });
 }
 
@@ -2180,10 +2202,11 @@ async function doSelect(domTarget, rootTarget, backendNodeId, action, vw, vh, en
     if (typeof isNative !== 'boolean') return { success: false, action_type: 'select', error: '无法确认下拉控件类型' };
     if (isNative) {
       const response = await cdpSend({ ...target, _agentEffect: true }, 'Runtime.callFunctionOn', {
-        objectId, arguments: [{ value: optText }],
-        functionDeclaration: `function(t){
+        objectId, arguments: [{ value: optText }, { value: action.params?.material_id ? action.params.expected_prior : null }],
+        functionDeclaration: `function(t, prior){
           if(!this.isConnected)return {success:false,stale:true,error:'选择目标已脱离页面'};
           if(this.matches(':disabled'))return {success:false,error:'下拉框已禁用'};
+          if(prior!==null&&this.value!==prior)return {success:false,stale:true,error:'字段值已改变，未覆盖，请重新观察'};
           const o=Array.from(this.options).find(o=>o.textContent.trim().toLowerCase()===t.trim().toLowerCase());
           if(!o)return {success:false,error:'目标选项不存在'};
           if(o.disabled||(o.parentElement.tagName==='OPTGROUP'&&o.parentElement.disabled))return {success:false,error:'目标选项已禁用'};
@@ -2197,7 +2220,8 @@ async function doSelect(domTarget, rootTarget, backendNodeId, action, vw, vh, en
       });
       const result = response?.result?.value;
       if (typeof result?.success !== 'boolean') return { success: false, action_type: 'select', error: '无法确认选择结果' };
-      return { ...result, action_type: 'select', ...(result.success ? { details: `已确认选择"${optText}"` } : {}) };
+      return { ...result, action_type: 'select', ...(result.success ? { details: `已确认选择"${optText}"`,
+        ...(action.params?.material_id ? { material_verification: { material_id: action.params.material_id, matched: true } } : {}) } : {}) };
     }
   } finally {
     await cdpSend(target, 'Runtime.releaseObject', { objectId }).catch(() => {});

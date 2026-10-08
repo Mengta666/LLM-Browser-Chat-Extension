@@ -55,7 +55,7 @@ def wire_row(row):
     return {k:v for k,v in row.items() if k in (
         'citation', 'kb_id', 'doc_id', 'parse_id', 'index_run_id', 'document', 'content', 'locations',
         'need_ids', 'bundle_id', 'bundle_role', 'evidence_role', 'read_kind', 'warnings',
-        'excerpt_truncated', 'atomic', 'derived', 'pack_id', 'source_citations',
+        'excerpt_truncated', 'atomic', 'protected_raw', 'derived', 'pack_id', 'source_citations',
         'source_locations', 'raw_excerpts', 'missing', 'processed_archive_ranges')}
 
 

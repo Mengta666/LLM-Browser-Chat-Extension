@@ -33,6 +33,9 @@ class EvidenceLedger:
         numbered, sources = [], {}
         for result in results:
             row = result if isinstance(result, dict) else vars(result)
+            if tool_name in ('kb_search','kb_read_document'):
+                from storage.kb_text_store import annotate
+                row=annotate(row)
             content = str(row.get("content", "") if row.get("context_status") else (row.get("content") or row.get("snippet") or ""))
             digest = hashlib.sha256(content.encode()).hexdigest()[:20]
             is_kb = tool_name in ("kb_search", "kb_read_document")
@@ -67,6 +70,7 @@ class EvidenceLedger:
                         "structure_id":row.get('structure_id',''),"node_id":row.get('node_id',''),
                         "node_path":row.get('node_path',[]),"bundle_id":row.get('bundle_id',''),
                         "atomic":row.get('atomic',False),"node_kind":row.get('node_kind',''),
+                        "protected_raw":row.get('protected_raw',False),
                         "read_kind": row.get('read_kind', 'preview'), "warnings": row.get('warnings', []),
                         "ledger_key": key} if is_kb else {}),
                 }

@@ -273,7 +273,7 @@ Linux / macOS 使用 `backend/.venv/bin/python`。脚本只补齐 `.env` 中缺�
 | `QDRANT_MEMORY_COLLECTION` | 使用的集合名，未设置时为 `agent_memories` |
 | `KB_PDF_PARSER_URL` / `KB_PDF_PARSER_API_KEY` | 结构化 PDF 解析服务基址与 Bearer 密钥；见 [OCR 部署说明](deploy/pdf-parser/DOCKER.md) |
 | `KB_EMBEDDING_TOKENIZER_URL` | embedding 模型的 `/tokenize`；留空时从 embedding 地址推导 |
-| `KB_DOCUMENT_STORAGE` | 原 PDF 和逐页原始 JSON 目录，默认 `backend/agent/data/kb_documents` |
+| `KB_DOCUMENT_STORAGE` | 文档原件、PDF 逐页 JSON、文本解码档案目录，默认 `backend/agent/data/kb_documents` |
 
 知识库和长期记忆使用命名向量 `dense` / `text`，由不同的内容类型和标识区分。更换 embedding 模型或维度前应备份数据并规划重建索引；即使两个模型维度相同，也不能直接混用其向量。
 
@@ -285,9 +285,13 @@ Linux / macOS 使用 `backend/.venv/bin/python`。脚本只补齐 `.env` 中缺�
 4. 回到聊天，通过输入框旁的“知识库”按钮选择对应库。
 5. 提出文档中的具体问题，查看检索过程、回答及来源。
 
-支持 PDF、Markdown 和 UTF-8 文本，默认单文件上限为 50 MiB。新 PDF（包括扫描件）通过 PP-DocLayoutV3＋PaddleOCR-VL-1.6 逐页解析；未配置解析服务时不回退旧解析器。上传成功只代表文件已接收，完整解析和索引通过后才发布。
+支持 PDF、Markdown（`.md/.markdown`）和纯文本（`.txt`），默认单文件上限为 50 MiB。新 PDF（包括扫描件）通过 PP-DocLayoutV3＋PaddleOCR-VL-1.6 逐页解析；未配置解析服务时不回退旧解析器。文本在后端本地解析，不调用 OCR 或聊天模型。上传成功只代表文件已接收，完整解析和索引通过后才发布。
 
-PDF 原文件、页块、表格结构和字符来源范围会保留，向量库只存派生索引。取消后保留检查点；重启后需显式点击“恢复处理”。重新解析和仅重建索引分开，构建期间旧版本仍可查询。旧上传记录若未保留原文件，继续使用旧索引，但不能补造页级来源。
+所有新文档保留原文件，向量库只存派生索引。PDF 保留页块和坐标；文本另外保存不可变解码正文、行号和字符范围。取消后保留检查点；重启后需显式点击“恢复处理”。重新解析和仅重建索引分开，构建期间旧版本仍可查询。旧记录有完整原件时可“重新解析建立结构”；没有原件时仍可查询旧片段，但需重新上传才能获得精确原文定位，不会用片段拼造全文。
+
+Markdown 使用 `markdown-it-py` 解析标题、代码、列表、引用和表格，按标题级别建树；代码中的 `#` 不作为章节。TXT 按段落保序，仅对重复出现的明确章节/多级编号格式建立保守层级；普通日志、步骤编号和无标题文件不强行生成语义章节。来源弹窗显示原文行号与字符范围，支持相邻原文预览和原文件下载，不伪造 PDF 页码。预览按纯文本显示，不执行 HTML 或自动请求文档内链接/图片。
+
+文本默认严格 UTF-8，识别 UTF-8/UTF-16/UTF-32 BOM；非法编码会拒绝而非替换为乱码。确知编码后可配置 `KB_TEXT_FALLBACK_ENCODING`（如 `gb18030`）。`KB_TEXT_MAX_CHARS`、`KB_TEXT_MAX_BLOCKS` 和 `KB_TEXT_CONCURRENCY` 是资源上限，默认 1000 万字符、5 万块、2 个并发任务。实际分块使用 embedding 模型 `/tokenize`，包含文件名、章节和表头的完整输入不能超过 `KB_DOCUMENT_CHUNK_TOKENS`。
 
 新 PDF 索引还生成独立版本的层级目录：文档 → 章节 → 命题、证明、表格或段落组 → 公式。旧 PDF 点击“重建索引”即可从已保存的 OCR 构建，不必重新识别。文档列表的“层级目录”支持展开、按节点顺序阅读、续读和查看原页；没有可靠标题时保留段落组，不强行生成章节。
 

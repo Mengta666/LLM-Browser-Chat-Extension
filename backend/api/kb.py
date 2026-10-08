@@ -61,6 +61,8 @@ class KBListItem(BaseModel):
 
 
 class DocListItem(BaseModel):
+    original_available: bool = False
+    source_kind: str = 'legacy_chunk'
     doc_id: str
     filename: str
     file_type: str
@@ -89,6 +91,8 @@ class DocListItem(BaseModel):
 
 
 class DocStatusResponse(BaseModel):
+    original_available: bool = False
+    source_kind: str = 'legacy_chunk'
     status: str                     # pending / indexed / failed / not_found
     error_msg: str = ""
     chunk_count: int = 0
@@ -305,7 +309,26 @@ def document_read(kb_id: str, doc_id: str, block_id: str | None = None, parse_id
         result = read(kb_id=kb_id, **to_legacy(target))
         if len(result['content']) > 16000:
             result = trim_row(result, 16000)
-        return result
+        from storage.kb_text_store import annotate
+        return annotate(result)
+
+
+@router.get('/{kb_id}/docs/{doc_id}/text')
+def document_text(kb_id: str, doc_id: str, parse_id: str, offset: int = Query(0,ge=0),
+                  end: int | None = Query(None,ge=0)):
+    from storage import kb_document_store as DS, kb_text_store as TS
+    with _kb_errors():
+        doc, version=DS.resolve_version(kb_id,doc_id,parse_id)
+        if doc['file_type']=='pdf':
+            raise ValueError('PDF 请使用页块读取')
+        text,starts=TS.source(version['parse_id'])
+        requested=len(text) if end is None else end
+        if not 0<=offset<=requested<=len(text):
+            raise ValueError('原文字符范围超出边界')
+        stop=min(requested,offset+16000)
+        return {'doc_id':doc_id,'parse_id':parse_id,'content':text[offset:stop],'length':len(text),
+                **TS.location(starts,{'source_start':0},offset,stop),
+                'next_offset':stop if stop<requested else None,'truncated':stop<requested}
 
 
 @router.get('/{kb_id}/docs/{doc_id}/file')
@@ -314,10 +337,12 @@ def document_file(kb_id: str, doc_id: str):
     from rag.document_config import document_path
     with _kb_errors():
         doc = DS.document(kb_id, doc_id)
-        path = document_path(doc_id, 'original.pdf')
+        path = document_path(doc_id, 'original.' + doc['file_type'])
         if not doc['original_path'] or str(path) != doc['original_path'] or not path.is_file():
-            raise KS.KBNotFound('原 PDF 未保留')
-        return FileResponse(path, media_type='application/pdf', filename=doc['filename'], content_disposition_type='inline')
+            raise KS.KBNotFound('完整原文件未保留')
+        return FileResponse(path, media_type='application/pdf' if doc['file_type']=='pdf' else 'application/octet-stream',
+                            filename=doc['filename'], content_disposition_type='inline' if doc['file_type']=='pdf' else 'attachment',
+                            headers={'X-Content-Type-Options':'nosniff'})
 
 
 @router.get('/{kb_id}/docs/{doc_id}/pages/{page}.png')

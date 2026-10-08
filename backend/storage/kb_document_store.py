@@ -37,6 +37,17 @@ def create_pdf(kb_id, doc_id, filename, path, sha256, pages, fingerprint, config
         return _new_parse(conn, doc_id, pages, fingerprint, config)
 
 
+def create_text(kb_id,doc_id,filename,file_type,path,sha256,fingerprint,config):
+    with KS._transaction() as conn:
+        KS._owned_kb(conn,kb_id,CHAT_USER_ID,active=True)
+        if conn.execute("SELECT 1 FROM kb_docs WHERE kb_id=? AND content_hash=? AND deleted_at=''",(kb_id,sha256)).fetchone():
+            raise KS.KBConflict('相同内容文档已存在，失败文档请恢复处理')
+        conn.execute('''INSERT INTO kb_docs(doc_id,kb_id,filename,file_type,file_bytes,created_at,content_hash,original_path,sha256)
+                        VALUES(?,?,?,?,?,?,?,?,?)''',
+                     (doc_id,kb_id,filename,file_type,path.stat().st_size,now(),sha256,str(path),sha256))
+        return _new_parse(conn,doc_id,0,fingerprint,config)
+
+
 def _new_parse(conn, doc_id, pages, fingerprint, config):
     parse_id = "pv_" + uuid4().hex
     conn.execute("INSERT INTO kb_parse_versions(parse_id,doc_id,fingerprint,config_json,status,page_count,created_at,updated_at) VALUES(?,?,?,?,'queued',?,?,?)",
@@ -50,7 +61,7 @@ def restart(kb_id, doc_id, fingerprint, config, *, reparse=False, reindex=False)
     with KS._transaction() as conn:
         doc = owned(conn, kb_id, doc_id)
         if not doc['original_path']:
-            raise KS.KBConflict("旧文档没有保存原文件，请重新上传；不能补造页级来源")
+            raise KS.KBConflict("旧文档没有保存原文件，请重新上传；不能用片段补造完整来源")
         job = conn.execute("SELECT * FROM kb_parse_versions WHERE parse_id=?", (doc['active_parse_id'],)).fetchone()
         if job and job['status'] in ('queued', 'parsing', 'indexing'):
             raise KS.KBConflict("文档任务仍在运行")
@@ -109,6 +120,8 @@ def fail(parse_id, lease, error):
 
 
 def progress(doc):
+    doc={**doc,'original_available':bool(doc.get('original_path')),
+         'source_kind':('pdf_page' if doc['file_type']=='pdf' else 'text_span') if doc.get('published_parse_id') else 'legacy_chunk'}
     if not doc.get('active_parse_id'):
         return {**doc, 'legacy': True}
     with KS._transaction() as conn:
@@ -193,7 +206,9 @@ def save_structure(kb_id, doc_id, parse_id, lease, blocks):
 
 def prepare_index(kb_id, doc_id, parse_id, lease, fingerprint, config, chunks, structure_id=''):
     with KS._transaction() as conn:
-        _, job = current(conn, kb_id, doc_id, parse_id, lease)
+        doc, job = current(conn, kb_id, doc_id, parse_id, lease)
+        if doc['file_type']!='pdf' and not conn.execute('SELECT 1 FROM kb_text_sources WHERE parse_id=?',(parse_id,)).fetchone():
+            raise KS.KBConflict('完整文本检查点尚未保存')
         covered = [r[0] for r in conn.execute("SELECT page FROM kb_pages WHERE parse_id=? AND status IN ('parsed','blank') ORDER BY page", (parse_id,))]
         if covered != list(range(1, job['page_count'] + 1)):
             raise KS.KBConflict("解析页覆盖不完整")
@@ -246,7 +261,7 @@ def resolve_version(kb_id, doc_id, parse_id=None):
         doc = owned(conn, kb_id, doc_id)
         version = parse_id or doc['published_parse_id']
         if not version:
-            raise KS.KBConflict("旧索引未保存页块结构，不能提供页级定位")
+            raise KS.KBConflict("旧索引未保存原文结构，不能提供精确定位；有原文件时请重新解析，否则重新上传")
         row = conn.execute("SELECT * FROM kb_parse_versions WHERE parse_id=? AND doc_id=? AND EXISTS (SELECT 1 FROM kb_index_runs r WHERE r.parse_id=kb_parse_versions.parse_id AND r.status='published')", (version, doc_id)).fetchone()
         if not row:
             raise KS.KBNotFound("解析版本未发布或不属于此文档")

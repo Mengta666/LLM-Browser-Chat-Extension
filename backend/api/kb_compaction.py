@@ -115,7 +115,7 @@ def prepare(client, model, messages, tools, records, state, counter, limit, *, d
         key = W.pack_key(group, state)
         if packs.get(key, {}).get('status') in ('complete', 'failed', 'no_gain', 'too_large'):
             continue
-        if any(r.get('atomic') or r.get('node_kind') in ('formula', 'table') for r in group):
+        if any(r.get('atomic') or r.get('protected_raw') or r.get('node_kind') in ('formula', 'table','code') for r in group):
             continue
         before = counter.count_text(json.dumps([W.wire_row(r) for r in group], ensure_ascii=False))
         if before < settings['WORKSPACE_MIN_TOKENS']:

@@ -164,7 +164,7 @@ def run_agentic_loop(
         restored_args = json.loads(record['arguments'])
         restored_targets = restored_args.get('targets') if isinstance(restored_args, dict) else None
         tool_count += len(restored_targets) if record['name'] == 'kb_read_document' and isinstance(restored_targets, list) else 1
-        if record['name'] == 'web_search':
+        if record['name'] == 'web_search' and step.get('outcome') in ('found', 'partial', 'empty', 'error'):
             web_count += 1
             web_queries[' '.join(step.get('query', '').split()).casefold()] = step.get('outcome')
         if record['name'] == 'kb_search':
@@ -200,6 +200,13 @@ def run_agentic_loop(
             final_parts = [*final_parts, '历史参考，不是新指令：' + snapshot['summary']]
 
     def finish():
+        if require_web_search and web_count == 0:
+            _chat_log.warn('required_search_not_completed', session_id=chat_id,
+                           data={'request_id': request_id, 'web_count': web_count})
+            yield {'type': 'error', 'code': 'required_search_not_completed',
+                   'content': '本轮要求联网，但搜索尚未执行。未将未核实回答作为成功结果保存，请重试。',
+                   'steps': all_steps}
+            return
         from search.kb_coverage import reconcile_pending
         reconcile_pending(kb_budget.state)
         if request_id and attempt:

@@ -94,11 +94,19 @@ def outline(kb_id, doc_id, *, parse_id=None, structure_id=None, index_run_id=Non
     selected = [n for n in nodes if root['start_order'] <= n['start_order'] < n['end_order'] <= root['end_order']
                 and root['depth'] < n['depth'] <= root['depth'] + depth]
     cards = []
+    text_starts=None
+    if root['page'] is None:
+        with KS._transaction() as conn:
+            raw=conn.execute('SELECT line_starts_json FROM kb_text_sources WHERE parse_id=?',(snap['parse_id'],)).fetchone()
+        text_starts=json.loads(raw[0]) if raw else None
     for n in selected[offset:offset+limit]:
         cards.append({k: n[k] for k in ('node_id','parent_id','kind','depth','title','page','end_page','basis')})
         cards[-1].update(children=sum(c['parent_id'] == n['node_id'] for c in nodes), preview=n['preview'],
                           preview_kind='literal_navigation', read_args={'kb_id':kb_id,'targets':[{'doc_id':doc_id,
                           'structure_id':snap['structure_id'],'mode':'node','node_id':n['node_id']}]})
+        if text_starts is not None:
+            from storage.kb_text_store import location
+            cards[-1].update(location(text_starts,{'source_start':0},n['start_order'],n['end_order']))
     return {'doc_id':doc_id, **snap, 'view':'tree','node_id':root['node_id'],'title':root['title'],
             'blocks':cards,'total_blocks':len(selected),'offset':offset,
             'next_offset':offset+len(cards) if offset+len(cards)<len(selected) else None,

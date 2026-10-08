@@ -40,7 +40,7 @@ def bundles(kb_id, doc_id, snapshot, node_id, *, query='', sequential=False, cur
             proofs = {r['source_id'] for r in relations if r['kind'] in ('explains','proof_of') and r['target_id'] in statements | {n['node_id'] for n in targets}}
             targets = [n for n in nodes if n['node_id'] in proofs] + targets
         if not targets:
-            targets = [n for n in descendants if n['kind'] in ('statement','paragraph','table')] or [node]
+            targets = [n for n in descendants if n['kind'] in ('statement','paragraph','table','code','list','quote','html','metadata')] or [node]
         statement_ids = {node_id, *[n['node_id'] for n in descendants if n['kind']=='statement']}
         context_refs = [r for r in relations if r['target_id'] in statement_ids and r['basis']=='literal_statement_reference'
                         and known[r['source_id']]['kind']!='proof']
@@ -151,7 +151,8 @@ def bundles(kb_id, doc_id, snapshot, node_id, *, query='', sequential=False, cur
             'warnings':list(dict.fromkeys(w for s in segments for w in cache[s['block_id']]['warnings'])),
             'read_args':{'kb_id':kb_id,'targets':[{'doc_id':doc_id,'parse_id':snapshot['parse_id'],'mode':'range',
                 'block_id':s['block_id'],'offset':s['start'],'end':s['end']} for s in spans[:C.READ_MAX_TARGETS]]}})
-    return contextual + output
+    from storage.kb_text_store import annotate
+    return [annotate(row) for row in contextual + output]
 
 
 def route(kb_id, query, snapshots, *, doc_id=None, node_id=None, page=None, section_id=None, vector_nodes=(), expand=True):
@@ -173,7 +174,7 @@ def route(kb_id, query, snapshots, *, doc_id=None, node_id=None, page=None, sect
                 continue
             if n['kind']=='document' or (scope and not scope['start_order']<=n['start_order']<n['end_order']<=scope['end_order']):
                 continue
-            if page is not None and not n['page']<=page<=n['end_page']:
+            if page is not None and (n['page'] is None or not n['page']<=page<=n['end_page']):
                 continue
             if section_id and not any(p['block_id']==section_id for p in n['sources']) and not any(
                     a['attributes'].get('heading_block')==section_id and a['start_order']<=n['start_order']<n['end_order']<=a['end_order'] for a in nodes):

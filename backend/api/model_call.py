@@ -142,6 +142,7 @@ def events(client, *, model, messages, timeout, deadline=None, idle_timeout=None
             reasoning_chars += value['reasoning_chars']
             if value['finish_reason']:
                 finish = value['finish_reason']
+                info['upstream_finish_reason'] = finish
             if value['usage']:
                 usage = value['usage']
             for part in value['tool_calls']:
@@ -149,6 +150,27 @@ def events(client, *, model, messages, timeout, deadline=None, idle_timeout=None
                 item['id'] += part.get('id', '')
                 for key in ('name', 'arguments'):
                     item['function'][key] += part.get('function', {}).get(key, '')
+        # 部分兼容接口以 stop 结束完整工具调用；只规范化已获准且参数完整的调用。
+        if calls and finish == 'stop':
+            allowed = {t['function']['name'] for t in options.get('tools') or [] if t.get('type') == 'function'}
+            choice = options.get('tool_choice')
+            if choice == 'none':
+                allowed = set()
+            elif isinstance(choice, dict):
+                allowed &= {choice.get('function', {}).get('name')}
+            ids = set()
+            for call in calls.values():
+                function = call['function']
+                if not call['id'] or call['id'] in ids or function['name'] not in allowed:
+                    raise SessionError('model_response_incomplete', 502)
+                ids.add(call['id'])
+                try:
+                    arguments = json.loads(function['arguments'])
+                except (ValueError, TypeError):
+                    raise SessionError('model_response_incomplete', 502) from None
+                if not isinstance(arguments, dict):
+                    raise SessionError('model_response_incomplete', 502)
+            finish = 'tool_calls'
         if not finish or calls and finish not in ('tool_calls', 'length'):
             raise SessionError('model_response_incomplete', 502)
         if calls and finish == 'tool_calls' and any(not c['id'] or not c['function']['name'] for c in calls.values()):

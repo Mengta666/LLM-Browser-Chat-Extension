@@ -70,7 +70,8 @@ def _parse_pdf(path: Path) -> str:
 
 def _read_text(path: Path) -> str:
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        from rag.text_source import decode
+        text, _ = decode(path.read_bytes())
     except Exception as exc:
         raise ValueError(f"文件读取失败: {exc}") from exc
 

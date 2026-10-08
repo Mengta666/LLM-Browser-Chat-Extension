@@ -174,6 +174,19 @@ def build_chunks(blocks, filename, counter):
     for block in blocks:
         key = formula_links.get(block['block_id'], block['structure'].get('paragraph_id', block['block_id']))
         groups.setdefault(key, []).append(block)
+    if blocks and blocks[0]['page'] is None:
+        packed=[]
+        for members in groups.values():
+            b=members[0]
+            if b['structure'].get('index_excluded'):
+                continue
+            if (packed and b['kind']=='text' and packed[-1][0]['kind']=='text'
+                    and b['section_id']==packed[-1][0]['section_id']
+                    and counter.count('\n'.join(p['text'] for p in [*packed[-1],*members]))<=C.CHUNK_TOKENS//2):
+                packed[-1].extend(members)
+            else:
+                packed.append(list(members))
+        groups={g[0]['block_id']:g for g in packed}
     for members in groups.values():
         formulas = [b for b in members if b['kind'] == 'display_formula']
         if formulas and len(members) > 1:
@@ -209,7 +222,10 @@ def build_chunks(blocks, filename, counter):
         heading = by_id.get(block.get('section_id'), {})
         record = by_id.get(block.get('parent_id'), {})
         member_ids = {member['block_id'] for member in members}
-        prefix = f"文档：{filename}\n物理页：{block['page']}\n"
+        prefix = f"文档：{filename}\n" + (f"物理页：{block['page']}\n" if block['page'] is not None else '')
+        if block['page'] is None:
+            path=[by_id[i]['text'].strip() for i in block['structure'].get('section_path',[]) if i in by_id]
+            prefix += '章节路径：'+' > '.join(path)+'\n' if path else ''
         if block['kind'] == 'image':
             prefix += '图片区域的 OCR 文字，不代表箭头或空间关系：\n'
         if block['kind'] == 'metadata':
@@ -235,6 +251,8 @@ def build_chunks(blocks, filename, counter):
                     starts[0] = 0
                     units = [(a, b, None, None) for a, b in zip(starts, starts[1:] + [len(block['text'])])]
         for start, end, row_start, row_end in units:
+            if block['page'] is None and row_start in structure.get('header_rows',[]) and len(row_ranges)>len(structure['header_rows']):
+                continue
             context = prefix + (f"表格首行：{header}\n" if header and row_start else '')
             inherited_rows = sorted({c['row'] for c in structure.get('cells', []) if row_start is not None
                                      and c['row'] < row_start < c['row'] + c['rowspan'] and c['row'] not in structure['header_rows']})
@@ -243,7 +261,7 @@ def build_chunks(blocks, filename, counter):
                 context += f"合并单元格来源行：{block['text'][a:b]}\n"
             if counter.count(context) >= C.CHUNK_TOKENS // 2:
                 # 检索前缀不是原文，不允许它挤走整段证据；来源仍保存完整章节关系。
-                context = f"物理页：{block['page']}\n"
+                context = f"物理页：{block['page']}\n" if block['page'] is not None else ''
             offset = start
             while offset < end:
                 lo, hi = offset, min(end, offset + C.CHUNK_TOKENS * 8)
@@ -256,6 +274,14 @@ def build_chunks(blocks, filename, counter):
                     else:
                         hi = mid - 1
                 if lo == offset:
+                    raise ValueError('embedding_chunk_budget_too_small')
+                if block['page'] is None and lo<end:
+                    boundaries=[offset+m.end() for m in re.finditer(r'\r\n|\r|\n|[。！？；]|[.!?;](?=\s)',block['text'][offset:lo])]
+                    if boundaries:
+                        lo=boundaries[-1]
+                while lo>offset and counter.count(context+block['text'][offset:lo])>C.CHUNK_TOKENS:
+                    lo-=1
+                if lo==offset:
                     raise ValueError('embedding_chunk_budget_too_small')
                 sources = [{'block_id': member['block_id'], 'start': max(offset, begin) - begin,
                             'end': min(lo, stop) - begin, 'row_start': row_start, 'row_end': row_end}
@@ -273,7 +299,8 @@ def build_chunks(blocks, filename, counter):
                 if '表格说明：' in context:
                     sources.extend({'block_id': extra['block_id'], 'start': 0, 'end': len(extra['text'])} for extra in context_blocks)
                 text = context + block['text'][offset:lo]
-                chunks.append({'kind': block['kind'], 'text': text, 'token_count': counter.count(text), 'sources': sources})
+                chunks.append({'kind': block['kind'], 'text': text, 'token_count': counter.count(text), 'sources': sources,
+                               'node_id':block['structure'].get('node_id','')})
                 offset = lo
     return chunks
 

@@ -19,7 +19,7 @@ _common = {'kb_id': {'type': 'string'}, **P.DOCUMENT,
 
 KB_DOCUMENT_TOOLS = [
     {'type': 'function', 'function': {'name': 'kb_get_document_outline',
-     'description': '浏览已发布 PDF 的跨页结构。新版默认 view=tree，使用 node_id 展开子节点；旧版无树时回退 sections。view=sections 返回旧章节入口，view=blocks 返回逐块目录。返回 source_ref=O编号，仅支持已展示的标题、层级和页码，可用于 structure 需求的 outline_refs；不是正文 citations，不支持正文结论。offset 为分页位置，next_offset 非空表示未列全。返回的 doc_id、structure_id、node_id 可用于 mode=node 读取正文。',
+     'description': '浏览已发布 PDF/Markdown/TXT 的结构。PDF 按页，文本按原文块与字符范围，不虚构页码。新版默认 view=tree，使用 node_id 展开子节点；旧版无树回退 sections。view=blocks 返回逐块目录。source_ref=O编号仅支持已展示标题/层级/位置，可用于 structure 需求的 outline_refs，不是正文 citations。offset 为分页位置，next_offset 非空表示未列全。doc_id、structure_id、node_id 可用于 mode=node 读取正文。',
      'parameters': {'type': 'object', 'properties': {**_common, 'view': {'type': 'string', 'enum': ['tree', 'sections', 'blocks']}, 'limit': {'type': 'integer', 'minimum': 1, 'maximum': 20}},
                     'required': ['kb_id'], 'oneOf': [{'required': ['doc_id']}, {'required': ['doc_name']}],
                     'additionalProperties': False}}},
@@ -306,6 +306,8 @@ def complete_unit(row, *, exact=False):
 
 
 def render(rows, meta):
+    from storage.kb_text_store import annotate
+    rows=[annotate(row) for row in rows]
     evidence, documents, refs = [], [], {}
     common_warnings = {}
     for row in rows:
@@ -317,7 +319,7 @@ def render(rows, meta):
         if outline.get('view') == 'tree':
             outline = {k:v for k,v in outline.items() if k not in ('title','notice','has_more')}
             outline['blocks'] = [{k:v for k,v in b.items() if k in
-                ('node_id','parent_id','depth','kind','title','page','end_page','children')} for b in outline['blocks']]
+                ('node_id','parent_id','depth','kind','title','page','end_page','children','location_kind','source_start','source_end','line_start','line_end')} for b in outline['blocks']]
         if outline.get('view') == 'sections':
             outline = {**outline, 'blocks': [{k: v for k, v in b.items()
                         if k != 'kind' and not (k == 'section_id' and not v)
@@ -358,7 +360,7 @@ def render(rows, meta):
                          'locations': [{k:v for k,v in p.items() if k not in ('bbox', 'block_length') and v is not None}
                                                                      for p in row.get('locations', [])],
                          'content': row.get('content', ''),
-                         **({k:row[k] for k in ('node_kind','bundle_id','bundle_role','evidence_role','need_ids','read_kind','atomic') if row.get(k)}),
+                         **({k:row[k] for k in ('node_kind','bundle_id','bundle_role','evidence_role','need_ids','read_kind','atomic','protected_raw') if row.get(k)}),
                          **({'path':[row['node_path'][-1]]} if row.get('node_path') else {}),
                          **({'sampled':True,'unit_source_count':row['unit_source_count']} if row.get('sampled') else {}),
                          **({'scope_limited':True} if row.get('scope_limited') else {}),
@@ -423,7 +425,8 @@ def trim_row(row, length):
                 'structure_id':row['structure_id'],'mode':'node','node_id':row['node_id'],
                 'cursor':next_cursor,'block_offset':next_offset}]}
             row['complete'] = False
-    return row
+    from storage.kb_text_store import annotate
+    return annotate(row)
 
 
 class TurnKBBudget:
@@ -636,7 +639,7 @@ class TurnKBBudget:
                     if source.get('parse_id'):
                         resolve_scope({k:source[k] for k in ('kb_id','doc_id','parse_id')},self.state['versions'])
                     rows.append({'citation':ref,'content':source['content'], 'document':source['title'],
-                        **{k:source[k] for k in ('kb_id','doc_id','parse_id','index_run_id','locations','warnings','atomic','node_kind','bundle_id') if k in source},
+                        **{k:source[k] for k in ('kb_id','doc_id','parse_id','index_run_id','locations','warnings','atomic','protected_raw','node_kind','bundle_id') if k in source},
                         'read_kind':source.get('read_kind','preview'),'need_ids':need_ids})
                 selected = []
                 for row in rows:
@@ -663,7 +666,12 @@ class TurnKBBudget:
                 if len(named) == 1:
                     args = {**args, 'doc_id': named[0]['doc_id']}
                 elif len(named) > 1:
-                    raise ValueError('当前问题指明多份或同名文档，请分别指定 doc_id/doc_name 检索；不能用无文档范围的结果混答')
+                    query='\n'.join([args.get('query',''),*args.get('questions',[])])
+                    selected_names=[d for d in named if d['filename'] in query]
+                    if len(selected_names)==1:
+                        args={**args,'doc_id':selected_names[0]['doc_id']}
+                    else:
+                        raise ValueError('当前问题指明多份或同名文档。每次调用请在参数顶层指定 doc_id 或 doc_name；每次只查一份，重名须选 doc_id。不能用无文档范围的结果混答')
             if name == 'kb_read_document' and len(parse(name, args)['targets']) > self.settings['READ_MAX_TARGETS']:
                 raise ValueError(f"targets 最多 {self.settings['READ_MAX_TARGETS']} 项")
             rows, meta = execute(name, args, self.state['versions'])

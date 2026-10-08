@@ -40,7 +40,8 @@ def _ensure_tables() -> None:
     with _transaction() as conn:
         old_columns = {r["name"] for r in conn.execute("PRAGMA table_info(kb_docs)")}
         page_columns = {r['name'] for r in conn.execute('PRAGMA table_info(kb_pages)')}
-        if old_columns and ("published_structure_id" not in old_columns or (page_columns and 'error' not in page_columns)):
+        text_migration = not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='kb_text_sources'").fetchone()
+        if old_columns and (text_migration or "published_structure_id" not in old_columns or (page_columns and 'error' not in page_columns)):
             backup = Path(MEMORY_DB_PATH).with_name(
                 f"{Path(MEMORY_DB_PATH).stem}.kb-lifecycle-{uuid4().hex[:8]}.sqlite3")
             with closing(sqlite3.connect(str(backup))) as target:
@@ -325,7 +326,7 @@ def finish_purge(kb_id: str) -> int:
                 for run in conn.execute("SELECT run_id FROM kb_index_runs WHERE parse_id=?", (version,)).fetchall():
                     conn.execute("DELETE FROM kb_chunks WHERE run_id=?", (run[0],))
                     conn.execute("DELETE FROM kb_chunk_sources WHERE run_id=?", (run[0],))
-                for table in ('kb_index_runs', 'kb_pages', 'kb_blocks', 'kb_identifiers'):
+                for table in ('kb_index_runs', 'kb_pages', 'kb_blocks', 'kb_identifiers', 'kb_text_sources'):
                     conn.execute(f"DELETE FROM {table} WHERE parse_id=?", (version,))
             conn.execute("DELETE FROM kb_parse_versions WHERE doc_id=?", (row['doc_id'],))
         cursor = conn.execute("DELETE FROM kb_docs WHERE kb_id=?", (kb_id,))

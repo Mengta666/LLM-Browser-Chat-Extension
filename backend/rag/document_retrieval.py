@@ -11,7 +11,7 @@ from rag.document_structure import identifiers
 from rag.embedder import embed_query
 from rag.reranker import rerank_chunks
 from rag.retrieval_trace import record_stage
-from storage import kb_store as KS, kb_document_store as DS
+from storage import kb_store as KS, kb_document_store as DS, kb_text_store as TS
 from observability.logger import get_logger
 
 
@@ -84,12 +84,14 @@ def outline(kb_id, doc_id, parse_id=None, page=None, offset=0, limit=20, section
         result = HS.outline(kb_id,doc_id,parse_id=parse_id,structure_id=structure_id,index_run_id=index_run_id,
                             node_id=node_id,offset=offset,limit=limit,depth=depth)
         doc, _ = DS.resolve_version(kb_id,doc_id,result['parse_id'])
-        return {**result,'filename':doc['filename']}
+        return {**result,'filename':doc['filename'],'source_kind':'pdf_page' if doc['file_type']=='pdf' else 'text_span'}
     if view not in ('blocks', 'sections') or node_id:
         raise ValueError('view 必须为 blocks/sections/tree；node_id 仅用于 tree')
     if structure_id or index_run_id:
         parse_id = HS.snapshot(kb_id,doc_id,parse_id=parse_id,structure_id=structure_id,index_run_id=index_run_id)['parse_id']
     doc, version = DS.resolve_version(kb_id, doc_id, parse_id)
+    if page is not None and doc['file_type']!='pdf':
+        raise ValueError('文本文件没有物理页；请使用节点、块或字符范围')
     with KS._transaction() as conn:
         condition, params = 'parse_id=?', [version['parse_id']]
         if page is not None:
@@ -113,10 +115,11 @@ def outline(kb_id, doc_id, parse_id=None, page=None, offset=0, limit=20, section
             rows = conn.execute(f'SELECT block_id,page,kind,section_id,json_extract(structure_json,\'$.formula_label\') AS formula_number,length(text) AS length,substr(text,1,100) AS preview FROM kb_blocks WHERE {condition} ORDER BY page,ordinal LIMIT ? OFFSET ?',
                                 (*params, limit, offset)).fetchall()
     return {'doc_id': doc_id, 'filename': doc['filename'], 'parse_id': version['parse_id'],
+            'source_kind':'pdf_page' if doc['file_type']=='pdf' else 'text_span',
             'page_count': version['page_count'], 'parsed_pages': version['completed_pages'],
             'view': view, 'blocks': [dict(r) for r in rows], 'total_blocks': total,
             'offset': offset, 'next_offset': offset + len(rows) if offset + len(rows) < total else None,
-            'notice': '目录预览不是全文；OCR 为派生结果，可能存在识别错误。'}
+            'notice': '目录预览不是全文；PDF 的 OCR 为派生结果，文本文件按原文字符定位。'}
 
 
 def read(kb_id, doc_id, parse_id=None, page=None, block_id=None, offset=0, end=None, row_start=None, row_end=None,
@@ -140,6 +143,8 @@ def read(kb_id, doc_id, parse_id=None, page=None, block_id=None, offset=0, end=N
                 'locations':[s for p in parts for s in p['locations']], 'next_read':None,
                 'node_source_starts':[p['node_source_start'] for p in parts], 'complete':True}
     doc, version = DS.resolve_version(kb_id, doc_id, parse_id)
+    if doc['file_type']!='pdf' and (page is not None or formula_number is not None):
+        raise ValueError('文本文件不支持物理页或 PDF 公式编号定位；请使用节点、块或字符范围')
     if sum(bool(v) for v in (block_id, formula_number)) > 1:
         raise ValueError('block_id 与 formula_number 不能混用')
     if include_related and (not block_id or offset or end is not None or row_start is not None or row_end is not None):
@@ -212,9 +217,14 @@ def read(kb_id, doc_id, parse_id=None, page=None, block_id=None, offset=0, end=N
         end = len(text) if end is None else end
         if not 0 <= offset <= end <= len(text):
             raise ValueError('字符范围超出边界')
-        next_block = conn.execute('SELECT block_id,page FROM kb_blocks WHERE parse_id=? AND (page>? OR (page=? AND ordinal>?)) ORDER BY page,ordinal LIMIT 1',
-                                  (version['parse_id'], block['page'], block['page'], block['ordinal'])).fetchone()
+        if block['page'] is None:
+            next_block = conn.execute('SELECT block_id,page FROM kb_blocks WHERE parse_id=? AND ordinal>? ORDER BY ordinal LIMIT 1',
+                                      (version['parse_id'],block['ordinal'])).fetchone()
+        else:
+            next_block = conn.execute('SELECT block_id,page FROM kb_blocks WHERE parse_id=? AND (page>? OR (page=? AND ordinal>?)) ORDER BY page,ordinal LIMIT 1',
+                                      (version['parse_id'], block['page'], block['page'], block['ordinal'])).fetchone()
         p = conn.execute('SELECT warnings_json,truncated,printed_page FROM kb_pages WHERE parse_id=? AND page=?', (version['parse_id'], block['page'])).fetchone()
+        p = p or {'warnings_json':'[]','truncated':0,'printed_page':None}
         from rag.document_layout import STATEMENT, statement_context
         related = structure.get('related_blocks', structure.get('formula_members', []))
         if include_related or STATEMENT.match(text):
@@ -224,6 +234,8 @@ def read(kb_id, doc_id, parse_id=None, page=None, block_id=None, offset=0, end=N
     location = {'block_id': block['block_id'], 'page': block['page'], 'start': offset, 'end': end,
                 'block_length': len(text), 'bbox': json.loads(block['bbox_json']), 'row_start': row_start, 'row_end': row_end,
                 'printed_page': p['printed_page']}
+    if structure.get('location_kind')=='text_span':
+        location['location_kind']='text_span'
     continuation = ({'block_id': block['block_id'], 'offset': end} if end < len(text)
                     else {'block_id': next_block['block_id'], 'offset': 0} if next_block else None)
     result = {'kb_id': kb_id, 'doc_id': doc_id, 'source': doc['filename'], 'parse_id': version['parse_id'],
@@ -236,11 +248,12 @@ def read(kb_id, doc_id, parse_id=None, page=None, block_id=None, offset=0, end=N
         if offset or end != len(text) or row_start is not None:
             raise ValueError('关联展开不能与字符或行范围混用')
         others = [read(kb_id, doc_id, version['parse_id'], block_id=bid) for bid in result['related_blocks'] if bid != block_id]
-        parts = sorted([result, *others], key=lambda r: (r['locations'][0]['page'], int(r['locations'][0]['block_id'].split('B')[-1])))
+        parts = sorted([result, *others], key=lambda r: (r['locations'][0]['page'] or 0,
+            r['structure']['source_start'] if r['locations'][0]['page'] is None else int(r['locations'][0]['block_id'].split('B')[-1])))
         result = {**result, 'content': '\n'.join(p['content'] for p in parts),
                   'segments': [s for p in parts for s in p['segments']], 'locations': [s for p in parts for s in p['locations']],
                   'warnings': list(dict.fromkeys(w for p in parts for w in p['warnings'])), 'next_read': parts[-1]['next_read']}
-    return result
+    return TS.annotate(result)
 
 
 def hydrate(kb_id, hits, snapshots=None):
@@ -263,7 +276,7 @@ def hydrate(kb_id, hits, snapshots=None):
             rows = conn.execute('''SELECT s.*,b.text,b.page,b.bbox_json,b.kind,b.section_id,b.parent_id,b.structure_json,
                 p.printed_page,p.warnings_json,c.kind AS chunk_kind,c.node_id,c.text AS index_text FROM kb_chunk_sources s
                 JOIN kb_blocks b ON b.parse_id=s.parse_id AND b.block_id=s.block_id
-                JOIN kb_pages p ON p.parse_id=b.parse_id AND p.page=b.page
+                LEFT JOIN kb_pages p ON p.parse_id=b.parse_id AND p.page=b.page
                 JOIN kb_chunks c ON c.run_id=s.run_id AND c.chunk_idx=s.chunk_idx
                 WHERE s.run_id=? AND s.chunk_idx=? ORDER BY b.page,b.ordinal,s.start''',
                                 (hit['index_run_id'], hit['chunk_idx'])).fetchall()
@@ -272,18 +285,19 @@ def hydrate(kb_id, hits, snapshots=None):
             segments = [{'block_id': r['block_id'], 'page': r['page'], 'start': r['start'], 'end': r['end'],
                          'block_length': len(r['text']), 'bbox': json.loads(r['bbox_json']),
                          'printed_page': r['printed_page'],
+                         **({'location_kind':'text_span'} if r['page'] is None else {}),
                          'row_start': r['row_start'], 'row_end': r['row_end'], 'text': r['text'][r['start']:r['end']]} for r in rows]
             primary = next((r for r in rows if r['kind'] == r['chunk_kind'] and r['block_id'] not in (r['section_id'], r['parent_id'])), rows[0])
             output.append({**hit, 'kb_id': kb_id, **snap, 'source': doc['filename'],
                            'node_id': rows[0]['node_id'], 'navigation': rows[0]['chunk_kind']=='navigation',
                            'content': rows[0]['index_text'] if rows[0]['chunk_kind']=='navigation' else '\n'.join(s['text'] for s in segments), 'segments': segments,
-                           'warnings': list(dict.fromkeys(w for r in rows for w in json.loads(r['warnings_json']))),
+                           'warnings': list(dict.fromkeys(w for r in rows for w in json.loads(r['warnings_json'] or '[]'))),
                            'related_blocks': json.loads(primary['structure_json']).get('related_blocks', []),
                            'context_source_ids': list(dict.fromkeys(i for r in rows for i in json.loads(r['structure_json']).get('context_blocks', []))),
                            'locations': [{k: v for k, v in s.items() if k != 'text'} for s in segments],
                            'read_kind': 'preview', 'read_args': {'kb_id': kb_id, 'doc_id': hit['doc_id'],
                                'parse_id': snap['parse_id'], 'block_id': primary['block_id'], 'offset': primary['start']}})
-    return output
+    return [TS.annotate(row) for row in output]
 
 
 def search(kb_id, query, *, doc_id=None, page=None, section_id=None, node_id=None, snapshots=None):

@@ -2312,12 +2312,12 @@ document.addEventListener('DOMContentLoaded', async () => {
         detail.append(title);
         if (source.kbSource.parse_id) {
           const open = document.createElement('button');
-          open.textContent = `查看页块来源 · ${(source.kbSource.locations || []).map(p => `第${p.page}页`).filter((v, i, a) => a.indexOf(v) === i).join('、')}`;
+          open.textContent = `查看原文来源 · ${(source.kbSource.locations || []).map(p => p.location_kind === 'text_span' ? `行${p.line_start}–${p.line_end}` : `第${p.page}页`).filter((v, i, a) => a.indexOf(v) === i).join('、')}`;
           open.addEventListener('click', () => showKbSource(source.kbSource));
           detail.append(open);
         } else {
           const legacy = document.createElement('small');
-          legacy.textContent = '旧索引：没有可靠页级定位';
+          legacy.textContent = '旧索引：未保留可回查的原文位置，需重新上传建立结构';
           detail.append(legacy);
         }
         if (source.snippet) {
@@ -2386,7 +2386,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     const base = `http://localhost:8000/v1/kb/${encodeURIComponent(source.kb_id)}/docs/${encodeURIComponent(source.doc_id)}`;
     for (const location of source.locations || []) {
       const heading = document.createElement('p');
-      heading.textContent = `物理页 ${location.page} · ${location.block_id} [${location.start},${location.end}) · 本轮提供范围（OCR 派生文本）`;
+      const isText = location.location_kind === 'text_span';
+      heading.textContent = isText
+        ? `行 ${location.line_start}–${location.line_end} · 原文字符 [${location.source_start},${location.source_end}) · 本轮提供范围`
+        : `物理页 ${location.page} · ${location.block_id} [${location.start},${location.end}) · 本轮提供范围（OCR 派生文本）`;
       const text = document.createElement('pre');
       text.style.whiteSpace = 'pre-wrap';
       dialog.append(heading, text);
@@ -2399,7 +2402,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         const shown = data.locations?.[0];
         if (shown?.printed_page) heading.textContent += ` · 印刷页码 ${shown.printed_page}`;
         if (shown && shown.end < location.end) {
-          heading.textContent += ` · 当前仅显示 [${shown.start},${shown.end})，完整引用可查看原 PDF`;
+          heading.textContent += ` · 当前仅显示块内 [${shown.start},${shown.end})，完整引用可下载原文件`;
         }
         text.textContent = data.content + (data.warnings?.length ? `\n\n警告：${data.warnings.join('；')}` : '');
         if (data.related_blocks?.length > 1) {
@@ -2408,11 +2411,34 @@ document.addEventListener('DOMContentLoaded', async () => {
           dialog.append(related);
         }
         const original = document.createElement('a');
-        original.href = `${base}/file#page=${location.page}`;
+        original.href = `${base}/file${isText ? '' : `#page=${location.page}`}`;
         original.target = '_blank';
         original.rel = 'noopener';
-        original.textContent = '打开原 PDF 页';
+        original.textContent = isText ? '下载完整原文件' : '打开原 PDF 页';
         dialog.append(original);
+        if (isText) {
+          const context = document.createElement('button');
+          context.textContent = '查看相邻原文（不代表模型已读）';
+          context.addEventListener('click', async () => {
+            context.disabled = true;
+            try {
+              const offset = Math.max(0, location.source_start - 500);
+              const response = await fetch(`${base}/text?${new URLSearchParams({parse_id:source.parse_id,offset})}`);
+              if (!response.ok) throw new Error(`HTTP ${response.status}`);
+              const result = await response.json();
+              const preview = document.createElement('pre');
+              preview.style.cssText = 'white-space:pre-wrap;overflow-wrap:anywhere';
+              const points = Array.from(result.content);
+              const a = Math.max(0, location.source_start - offset), b = Math.min(points.length, location.source_end - offset);
+              const mark = document.createElement('mark');
+              mark.textContent = points.slice(a,b).join('');
+              preview.append(document.createTextNode(`行 ${result.line_start}–${result.line_end}（${result.truncated ? '局部预览' : '至文件末尾'}）\n`),
+                document.createTextNode(points.slice(0,a).join('')),mark,document.createTextNode(points.slice(b).join('')));
+              context.after(preview);
+            } catch (error) { context.textContent = `读取失败：${error.message}`; context.disabled = false; }
+          });
+          dialog.append(context);
+        }
         if (Array.isArray(location.bbox) && location.bbox.length === 4) {
           const canvas = document.createElement('canvas');
           canvas.style.width = '100%';
@@ -3490,7 +3516,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       return `
       <div class="doc-item" data-doc-id="${doc.doc_id}">
         <span class="doc-name">${escapeHtml(doc.filename)}</span>
-        <span class="doc-status">${escapeHtml(doc.phase ? ({queued: '已保存原文件，排队中', parsing: `解析 ${doc.completed_pages}/${doc.page_count} 页`, indexing: `索引 ${doc.indexed_chunks}/${doc.total_chunks} 片段`, published: '已发布可检索版本', failed: '处理失败，可恢复', interrupted: '处理已中断，可恢复', cancelled: '已取消，检查点保留'}[doc.phase] || doc.phase) + (doc.published_available && doc.phase !== 'published' ? '（旧版本仍可用）' : '') : doc.status === 'pending' ? '⏳ 索引中' : doc.sync_pending ? (doc.status === 'failed' ? '索引失败，待清理' : '待同步') : statusIcon(doc.status))}</span>
+        <span class="doc-status">${escapeHtml(doc.phase ? ({queued: '已保存原文件，排队中', parsing: doc.file_type === 'pdf' ? `解析 ${doc.completed_pages}/${doc.page_count} 页` : '正在解析文本结构', indexing: `索引 ${doc.indexed_chunks}/${doc.total_chunks} 片段`, published: '已发布可检索版本', failed: '处理失败，可恢复', interrupted: '处理已中断，可恢复', cancelled: '已取消，检查点保留'}[doc.phase] || doc.phase) + (doc.published_available && doc.phase !== 'published' ? '（旧版本仍可用）' : '') : doc.status === 'pending' ? '⏳ 索引中' : doc.sync_pending ? (doc.status === 'failed' ? '索引失败，待清理' : '待同步') : statusIcon(doc.status))}</span>
         <span class="doc-error">${escapeHtml(doc.job_error || doc.sync_error || doc.error_msg || '')}</span>
         ${doc.failed_page_count ? `<details class="doc-page-errors"><summary>${Number(doc.failed_page_count)} 页未完成</summary>${(doc.failed_pages || []).map(p => `<div>${escapeHtml(`物理页 ${p.page} · ${p.status} · ${p.attempts} 次尝试：${p.error}`)}</div>`).join('')}</details>` : ''}
         ${doc.uncertain_page_count ? `<span class="doc-warning">${Number(doc.uncertain_page_count)} 页上游未提供截断判定；已解析不代表识别无遗漏</span>` : ''}
@@ -3498,6 +3524,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         <button class="doc-delete" data-doc-id="${doc.doc_id}" ${btnDis}>${btnText}</button>
         ${['failed', 'interrupted', 'cancelled'].includes(doc.phase) ? `<button class="doc-retry" data-doc-id="${doc.doc_id}">恢复处理</button>` : ''}
         ${doc.phase === 'published' ? `<button class="doc-reparse" data-doc-id="${doc.doc_id}">重新解析</button><button class="doc-reindex" data-doc-id="${doc.doc_id}">重建索引</button>` : ''}
+        ${doc.legacy ? (doc.original_available ? `<button class="doc-reparse" data-doc-id="${doc.doc_id}">重新解析建立结构</button>` : '<small>旧片段无完整原文件，重新上传可建立结构与原文定位</small>') : ''}
         ${doc.published_structure_id ? `<button class="doc-outline" data-doc-id="${doc.doc_id}">层级目录 · ${Number(doc.structure_nodes)} 节点</button>` : doc.published_available ? '<small>尚无层级目录，可重建索引；原页块仍可读取</small>' : ''}
         ${['queued', 'parsing', 'indexing'].includes(doc.phase) ? `<button class="doc-cancel" data-doc-id="${doc.doc_id}">取消处理</button>` : ''}
       </div>`;
@@ -3515,7 +3542,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const heading = document.createElement('h3');
     heading.textContent = doc.filename;
     const notice = document.createElement('p');
-    notice.textContent = '目录是导航，不表示已读取正文；OCR 与结构归属均可能有误。';
+    notice.textContent = doc.file_type === 'pdf' ? '目录是导航，不表示已读取正文；OCR 与结构归属均可能有误。' : '目录按文本语法或保守规则建立，不表示模型已读；文本位置使用后端 Unicode 字符范围。';
     const tree = document.createElement('div');
     const preview = document.createElement('section');
     dialog.append(close, heading, notice, tree, preview);
@@ -3539,7 +3566,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         text.style.cssText = 'white-space:pre-wrap;overflow-wrap:anywhere';
         text.textContent = value.content;
         preview.append(label,text);
-        for (const page of [...new Set((value.locations || []).map(p => p.page))]) {
+        for (const page of [...new Set((value.locations || []).map(p => p.page).filter(p => Number.isInteger(p)))]) {
           const original = document.createElement('button');
           original.textContent = `查看原页 ${page}`;
           original.addEventListener('click', async () => {
@@ -3580,7 +3607,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         for (const node of result.blocks) {
           const row = document.createElement('details');
           const summary = document.createElement('summary');
-          summary.textContent = `${node.title} · 第 ${node.page}–${node.end_page} 页 · ${node.kind}`;
+          summary.textContent = `${node.title} · ${node.page == null ? `原文行 ${node.line_start}–${node.line_end}` : `第 ${node.page}–${node.end_page} 页`} · ${node.kind}`;
           const text = document.createElement('p');
           text.textContent = `${node.preview || ''}（导航节选；依据：${node.basis}）`;
           const read = document.createElement('button');

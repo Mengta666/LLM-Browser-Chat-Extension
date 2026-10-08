@@ -9,10 +9,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 from rag import kb_vectors as V
-from agent.memory.config import CHAT_USER_ID, INSTRUCT_KB, KB_CHUNK_OVERLAP, KB_CHUNK_SIZE, KB_SEARCH_TOP_K, MEMORY_TYPE_KB_CHUNK
+from agent.memory.config import CHAT_USER_ID, KB_SEARCH_TOP_K
 from observability.logger import get_logger
-from rag import chunker, parser
-from rag.embedder import embed_query, embed_texts
 from storage import kb_store as KS
 
 _log = get_logger("kb")
@@ -25,10 +23,6 @@ _recovery_thread = None
 
 
 class KBSyncUnavailable(RuntimeError):
-    pass
-
-
-class IndexCancelled(RuntimeError):
     pass
 
 
@@ -180,73 +174,9 @@ def add_doc(kb_id: str, file_path: str | Path, filename: str, file_type: str,
             content_hash: str = "") -> dict[str, Any]:
     if file_type == 'pdf':
         return _add_pdf(kb_id, Path(file_path), filename, content_hash)
-    path = Path(file_path)
-    doc_id, run_id = f"doc_{uuid.uuid4().hex[:8]}", uuid.uuid4().hex
-    with _kb_lock(kb_id):
-        KS.create_doc(doc_id, kb_id, filename, file_type, path.stat().st_size, _now_iso(),
-                      content_hash, index_run_id=run_id, user_id=CHAT_USER_ID)
-        with _workers_guard:
-            _workers.add((kb_id, doc_id, run_id))
-        worker = threading.Thread(target=_process_doc, args=(kb_id,doc_id,path,file_type,run_id),
-                                  daemon=True, name=f"kb-doc-{doc_id}")
-        try:
-            worker.start()
-        except Exception:
-            with _workers_guard:
-                _workers.discard((kb_id, doc_id, run_id))
-            KS.fail_index(kb_id, doc_id, run_id, "无法启动索引，请重新上传")
-            raise
-    return {"doc_id": doc_id, "status": "pending", "filename": filename}
-
-
-def _process_doc(kb_id: str, doc_id: str, path: Path, file_type: str, run_id: str) -> None:
-    def check_current():
-        if not KS.index_is_current(kb_id, doc_id, run_id, CHAT_USER_ID):
-            raise IndexCancelled("索引任务已失效")
-
-    try:
-        check_current()
-        text = parser.parse(path, file_type)
-        chunks = chunker.chunk_document(text, KB_CHUNK_SIZE, KB_CHUNK_OVERLAP)
-        if not chunks:
-            raise ValueError("文档没有可索引的文本")
-        check_current()
-        vectors = embed_texts([c["text"] for c in chunks], batch_size=32)
-        if len(vectors) != len(chunks):
-            raise ValueError("向量数量与片段数量不一致")
-        check_current()
-        filename = KS.get_doc(doc_id)["filename"]
-        items = [{
-            "content": chunk["text"], "vector": vector, "memory_type": MEMORY_TYPE_KB_CHUNK,
-            "user_id": CHAT_USER_ID, "kb_id": kb_id, "doc_id": doc_id, "index_run_id": run_id,
-            "source": filename, "chunk_idx": i, "chunk_id": i,
-            "prev_chunk_id": i - 1 if i else None,
-            "next_chunk_id": i + 1 if i + 1 < len(chunks) else None, "valid": False,
-        } for i, (chunk, vector) in enumerate(zip(chunks, vectors))]
-        V.batch_insert_memories(items, batch_size=64, before_batch=check_current)
-        with _kb_lock(kb_id):
-            check_current()
-            if not V.kb_index_complete(user_id=CHAT_USER_ID, kb_id=kb_id, doc_id=doc_id,
-                                       index_run_id=run_id, expected=len(chunks)):
-                raise ValueError("索引片段不完整")
-            V.set_kb_chunks_valid(user_id=CHAT_USER_ID, kb_id=kb_id, doc_id=doc_id,
-                                 index_run_id=run_id, valid=True)
-            if not KS.publish_index(kb_id, doc_id, run_id, len(chunks), _now_iso(), CHAT_USER_ID):
-                raise IndexCancelled("发布条件已失效")
-    except Exception as exc:
-        KS.fail_index(kb_id, doc_id, run_id,
-                      "索引已取消，请重新上传" if isinstance(exc, IndexCancelled)
-                      else f"索引失败（{type(exc).__name__}），请重新上传")
-        _log.warn("kb_index_failed", data={"kb_id": kb_id, "doc_id": doc_id, "error_type": type(exc).__name__})
-    finally:
-        try:
-            with _kb_lock(kb_id):
-                with _workers_guard:
-                    _workers.discard((kb_id, doc_id, run_id))
-                if KS.get_kb(kb_id):
-                    _sync_kb_locked(kb_id)
-        finally:
-            path.unlink(missing_ok=True)
+    if file_type in ('md','markdown','txt'):
+        return _add_text(kb_id,Path(file_path),filename,file_type)
+    raise ValueError('不支持的文件类型')
 
 
 def list_docs(kb_id: str) -> list[dict[str, Any]]:
@@ -263,8 +193,11 @@ def get_doc_status(kb_id: str, doc_id: str) -> dict[str, Any]:
     return progress(doc)
 
 
-def _start_pdf(kb_id, doc_id, parse_id):
-    from rag.document_worker import run
+def _start_document(kb_id, doc_id, parse_id):
+    if KS.get_doc(doc_id)['file_type']=='pdf':
+        from rag.document_worker import run
+    else:
+        from rag.text_worker import run
 
     def finish():
         with _workers_guard:
@@ -274,7 +207,7 @@ def _start_pdf(kb_id, doc_id, parse_id):
         _workers.add((kb_id, doc_id, parse_id))
     try:
         threading.Thread(target=run, args=(kb_id, doc_id, parse_id, finish, _kb_lock(kb_id)),
-                         daemon=True, name=f'kb-pdf-{doc_id}').start()
+                         daemon=True, name=f'kb-document-{doc_id}').start()
     except Exception:
         finish()
         from storage.kb_document_store import stop
@@ -305,8 +238,35 @@ def _add_pdf(kb_id, path, filename, content_hash):
             target.unlink()
             target.parent.rmdir()
             raise
-        _start_pdf(kb_id, doc_id, parse_id)
+        _start_document(kb_id, doc_id, parse_id)
     return {'doc_id': doc_id, 'status': 'pending', 'filename': filename}
+
+
+def _add_text(kb_id,path,filename,file_type):
+    import hashlib
+    import shutil
+    from rag.text_source import decode
+    from rag.text_structure import config
+    from rag.document_structure import fingerprint
+    from rag.document_config import document_path
+    from storage import kb_document_store as DS
+    data=path.read_bytes()
+    decode(data)
+    digest=hashlib.sha256(data).hexdigest()
+    doc_id='doc_'+uuid.uuid4().hex[:8]
+    target=document_path(doc_id,'original.'+file_type)
+    with _kb_lock(kb_id):
+        target.parent.mkdir(parents=True,exist_ok=False)
+        shutil.move(str(path),str(target))
+        cfg=config(file_type)
+        try:
+            parse_id=DS.create_text(kb_id,doc_id,filename,file_type,target,digest,fingerprint(cfg),cfg)
+        except Exception:
+            target.unlink()
+            target.parent.rmdir()
+            raise
+        _start_document(kb_id,doc_id,parse_id)
+    return {'doc_id':doc_id,'status':'pending','filename':filename}
 
 
 def retry_document(kb_id, doc_id, *, reparse=False, reindex=False):
@@ -316,11 +276,16 @@ def retry_document(kb_id, doc_id, *, reparse=False, reindex=False):
     with _kb_lock(kb_id):
         if _has_worker(kb_id, doc_id):
             raise KS.KBConflict('旧任务正在结束，请稍后重试')
-        config = parse_config()
+        doc=DS.document(kb_id,doc_id)
+        if doc['file_type']=='pdf':
+            config = parse_config()
+        else:
+            from rag.text_structure import config as text_config
+            config=text_config(doc['file_type'])
         if reparse and reindex:
             raise ValueError('重新解析与仅重建索引不能同时指定')
         parse_id = DS.restart(kb_id, doc_id, fingerprint(config), config, reparse=reparse, reindex=reindex)
-        _start_pdf(kb_id, doc_id, parse_id)
+        _start_document(kb_id, doc_id, parse_id)
     return {'ok': True, 'parse_id': parse_id}
 
 

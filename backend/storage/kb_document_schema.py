@@ -15,7 +15,7 @@ def migrate(conn):
             raw_path TEXT NOT NULL, warnings_json TEXT NOT NULL, truncated INTEGER,
             PRIMARY KEY(parse_id,page))""",
         """CREATE TABLE IF NOT EXISTS kb_blocks (
-            parse_id TEXT NOT NULL, block_id TEXT NOT NULL, page INTEGER NOT NULL,
+            parse_id TEXT NOT NULL, block_id TEXT NOT NULL, page INTEGER,
             ordinal INTEGER NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL,
             bbox_json TEXT NOT NULL, structure_json TEXT NOT NULL,
             section_id TEXT NOT NULL DEFAULT '', parent_id TEXT NOT NULL DEFAULT '',
@@ -51,7 +51,7 @@ def migrate(conn):
             kind TEXT NOT NULL, ordinal INTEGER NOT NULL, depth INTEGER NOT NULL,
             title TEXT NOT NULL, preview TEXT NOT NULL, basis TEXT NOT NULL,
             start_order INTEGER NOT NULL, end_order INTEGER NOT NULL,
-            page INTEGER NOT NULL, end_page INTEGER NOT NULL, attributes_json TEXT NOT NULL,
+            page INTEGER, end_page INTEGER, attributes_json TEXT NOT NULL,
             PRIMARY KEY(structure_id,node_id))""",
         """CREATE TABLE IF NOT EXISTS kb_node_sources (
             structure_id TEXT NOT NULL, node_id TEXT NOT NULL, ordinal INTEGER NOT NULL,
@@ -66,8 +66,22 @@ def migrate(conn):
         "CREATE INDEX IF NOT EXISTS idx_kb_node_source_block ON kb_node_sources(structure_id,block_id)",
         "CREATE INDEX IF NOT EXISTS idx_kb_relations_target ON kb_node_relations(structure_id,target_id,kind)",
     ]
+    for table in ('kb_blocks', 'kb_document_nodes'):
+        columns = list(conn.execute(f'PRAGMA table_info({table})'))
+        if any(r['name'] == 'page' and r['notnull'] for r in columns):
+            create = next(s for s in statements if s.startswith(f'CREATE TABLE IF NOT EXISTS {table} ('))
+            conn.execute(create.replace(f'IF NOT EXISTS {table}', f'{table}_text_migration'))
+            names = ','.join(r['name'] for r in columns)
+            conn.execute(f'INSERT INTO {table}_text_migration ({names}) SELECT {names} FROM {table}')
+            if conn.execute(f'SELECT count(*) FROM {table}').fetchone()[0] != conn.execute(f'SELECT count(*) FROM {table}_text_migration').fetchone()[0]:
+                raise ValueError('document_migration_count_mismatch')
+            conn.execute(f'DROP TABLE {table}')
+            conn.execute(f'ALTER TABLE {table}_text_migration RENAME TO {table}')
     for statement in statements:
         conn.execute(statement)
+    conn.execute('''CREATE TABLE IF NOT EXISTS kb_text_sources (
+        parse_id TEXT PRIMARY KEY, text_path TEXT NOT NULL, text_sha256 TEXT NOT NULL,
+        encoding TEXT NOT NULL, char_count INTEGER NOT NULL, line_starts_json TEXT NOT NULL)''')
     columns = {r['name'] for r in conn.execute('PRAGMA table_info(kb_pages)')}
     for name, definition in {'error': "TEXT NOT NULL DEFAULT ''", 'attempts': 'INTEGER NOT NULL DEFAULT 0'}.items():
         if name not in columns:

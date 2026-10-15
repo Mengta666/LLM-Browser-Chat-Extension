@@ -15,6 +15,20 @@ from storage import kb_store as KS, kb_document_store as DS, kb_text_store as TS
 from observability.logger import get_logger
 
 
+class ReadRangeError(ValueError):
+    code = 'kb_range_out_of_bounds'
+
+    def __init__(self, message, kb_id, doc_id, snapshot, block_id, length, row_count=None):
+        super().__init__(message)
+        target = {'doc_id':doc_id, **snapshot, 'mode':'block', 'block_id':block_id}
+        self.details = {'valid_range':{'offset':0, 'end':length},
+                        'repair_read':{'kb_id':kb_id, 'targets':[target]},
+                        'resolution_ranges':[[doc_id,snapshot['parse_id'],block_id,0,length]],
+                        'notice':'原请求未执行、未自动裁剪。核对范围后重新指定，或显式使用 repair_read 读取整块。'}
+        if row_count is not None:
+            self.details['valid_rows'] = {'row_start':0, 'row_end':row_count}
+
+
 def formula_numbers(query):
     number = r'[（(]?\s*[0-9]+(?:[.\-][0-9]+)*[a-z]?\s*[)）]?'
     pattern = rf'(?:公式|方程|不等式|式|equations?|eqs?\.?)[\s:：]*({number}(?:\s*(?:[,，、和及与&]|and)\s*(?:公式|式)?\s*{number})*)'
@@ -87,13 +101,36 @@ def outline(kb_id, doc_id, parse_id=None, page=None, offset=0, limit=20, section
         return {**result,'filename':doc['filename'],'source_kind':'pdf_page' if doc['file_type']=='pdf' else 'text_span'}
     if view not in ('blocks', 'sections') or node_id:
         raise ValueError('view 必须为 blocks/sections/tree；node_id 仅用于 tree')
-    if structure_id or index_run_id:
-        parse_id = HS.snapshot(kb_id,doc_id,parse_id=parse_id,structure_id=structure_id,index_run_id=index_run_id)['parse_id']
+    snap = HS.snapshot(kb_id,doc_id,parse_id=parse_id,structure_id=structure_id,index_run_id=index_run_id)
+    parse_id = snap['parse_id']
     doc, version = DS.resolve_version(kb_id, doc_id, parse_id)
     if page is not None and doc['file_type']!='pdf':
         raise ValueError('文本文件没有物理页；请使用节点、块或字符范围')
+    section_nodes = {}
+    if snap['structure_id'] and (view == 'sections' or section_id):
+        nodes, _ = HS.load(snap['structure_id'])
+        if nodes and nodes[0]['attributes'].get('review_range_version'):
+            selected = [n for n in nodes if n['kind'] == 'section' and (page is None or n['page'] <= page <= n['end_page'])]
+            if section_id:
+                scope = HS.reviewed_section(snap['structure_id'], section_id)
+                known = {n['node_id']: n for n in nodes}
+                selected = [n for n in selected if n['node_id'] == scope['node_id'] or HS.descendant(n, scope['node_id'], known)]
+            entries = [{'section_id': n['node_id'], 'node_id': n['node_id'], 'kind': 'section', 'title': n['title'],
+                        'page': n['page'], 'end_page': n['end_page'], 'preview': n['preview'],
+                        'role': 'section_heading', 'review_status': n['attributes']['review_status'],
+                        'declared_level': n['attributes']['declared_level'],
+                        'read_args': {'kb_id':kb_id,'targets':[{'doc_id':doc_id,'structure_id':snap['structure_id'],'mode':'node','node_id':n['node_id']}]}}
+                       for n in selected]
+            return {'doc_id':doc_id,'filename':doc['filename'],**snap,'source_kind':'pdf_page', 'view':'sections',
+                    'blocks':entries[offset:offset+limit],'total_blocks':len(entries),'offset':offset,
+                    'next_offset':offset+limit if offset+limit<len(entries) else None,
+                    'notice':'范围级章节导航；模型推断未作语义核验，请按 node_id 读取。'}
+    if view == 'sections' and snap['structure_id']:
+        nodes, _ = HS.load(snap['structure_id'])
+        section_nodes = {n['attributes']['heading_block']: n for n in nodes
+                         if n['kind'] == 'section' and n['attributes'].get('heading_block')}
     with KS._transaction() as conn:
-        condition, params = 'parse_id=?', [version['parse_id']]
+        condition, params = 'structure_id=? AND parse_id=?', [snap['structure_id'], version['parse_id']]
         if page is not None:
             condition += ' AND page=?'
             params.append(page)
@@ -103,18 +140,19 @@ def outline(kb_id, doc_id, parse_id=None, page=None, offset=0, limit=20, section
         if view == 'sections':
             from rag.document_layout import HEADINGS
             condition += " AND json_extract(structure_json,'$.index_excluded') IS NULL"
-            items = [dict(r) for r in conn.execute(f'SELECT block_id,page,kind,section_id,substr(text,1,100) AS preview FROM kb_blocks WHERE {condition} ORDER BY page,ordinal', params)]
-            entries = [r for r in items if r['kind'] in HEADINGS]
+            items = [dict(r) for r in conn.execute(f'SELECT block_id,page,kind,section_id,substr(text,1,100) AS preview FROM kb_resolved_blocks WHERE {condition} ORDER BY page,ordinal', params)]
+            entries = [r for r in items if r['block_id'] in section_nodes] if section_nodes else [r for r in items if r['kind'] in HEADINGS]
             if not entries:
                 entries = list({r['page']: r for r in reversed(items)}.values())[::-1]
-            rows = [{**r, 'end_page': entries[i+1]['page'] if i+1 < len(entries) else page or version['page_count']}
+            rows = [{**r, 'end_page': section_nodes[r['block_id']]['end_page'] if r['block_id'] in section_nodes
+                     else entries[i+1]['page'] if i+1 < len(entries) else page or version['page_count']}
                     for i, r in enumerate(entries)]
             total, rows = len(rows), rows[offset:offset+limit]
         else:
-            total = conn.execute(f'SELECT count(*) FROM kb_blocks WHERE {condition}', params).fetchone()[0]
-            rows = conn.execute(f'SELECT block_id,page,kind,section_id,json_extract(structure_json,\'$.formula_label\') AS formula_number,length(text) AS length,substr(text,1,100) AS preview FROM kb_blocks WHERE {condition} ORDER BY page,ordinal LIMIT ? OFFSET ?',
+            total = conn.execute(f'SELECT count(*) FROM kb_resolved_blocks WHERE {condition}', params).fetchone()[0]
+            rows = conn.execute(f'SELECT block_id,page,kind,section_id,json_extract(structure_json,\'$.formula_label\') AS formula_number,length(text) AS length,substr(text,1,100) AS preview FROM kb_resolved_blocks WHERE {condition} ORDER BY page,ordinal LIMIT ? OFFSET ?',
                                 (*params, limit, offset)).fetchall()
-    return {'doc_id': doc_id, 'filename': doc['filename'], 'parse_id': version['parse_id'],
+    return {'doc_id': doc_id, 'filename': doc['filename'], **snap,
             'source_kind':'pdf_page' if doc['file_type']=='pdf' else 'text_span',
             'page_count': version['page_count'], 'parsed_pages': version['completed_pages'],
             'view': view, 'blocks': [dict(r) for r in rows], 'total_blocks': total,
@@ -126,10 +164,55 @@ def read(kb_id, doc_id, parse_id=None, page=None, block_id=None, offset=0, end=N
          section_id=None, formula_number=None, include_related=False, structure_id=None, index_run_id=None,
          node_id=None, cursor=0, block_offset=0):
     from storage import kb_structure_store as HS
-    snap = None
-    if node_id or structure_id or index_run_id:
-        snap = HS.snapshot(kb_id,doc_id,parse_id=parse_id,structure_id=structure_id,index_run_id=index_run_id)
-        parse_id = snap['parse_id']
+    snap = HS.snapshot(kb_id,doc_id,parse_id=parse_id,structure_id=structure_id,index_run_id=index_run_id)
+    parse_id = snap['parse_id']
+    if section_id and snap['structure_id']:
+        section = HS.reviewed_section(snap['structure_id'], section_id)
+        if section:
+            if node_id or include_related:
+                raise ValueError('范围级章节不能混用节点或关联展开')
+            sources = section['sources']
+            blocks = {b['block_id']:b for b in DS.blocks(parse_id, structure_id=snap['structure_id'])}
+            if formula_number is not None:
+                nodes, _ = HS.load(snap['structure_id'])
+                known = {n['node_id']:n for n in nodes}
+                matches = [n for n in nodes if n['kind']=='formula' and n['attributes']['number']==str(formula_number)
+                           and HS.descendant(n,section['node_id'],known) and (page is None or n['page']==page)]
+                if len(matches)!=1:
+                    raise KS.KBConflict('章节内公式不存在或不唯一')
+                sources = matches[0]['sources']
+            if block_id:
+                if block_id not in blocks:
+                    raise KS.KBNotFound('指定页块不存在')
+                if formula_number is not None or row_end is not None and row_start is None:
+                    raise ValueError('块与公式不能混用；row_end 需要 row_start')
+                requested_start = offset
+                requested_end = len(blocks[block_id]['text']) if end is None else end
+                if row_start is not None:
+                    if offset or end is not None:
+                        raise ValueError('行定位与字符定位不能混用')
+                    ranges = blocks[block_id]['structure'].get('row_ranges', [])
+                    row_end = row_start+1 if row_end is None else row_end
+                    if not 0 <= row_start < row_end <= len(ranges):
+                        raise ValueError('表格行范围超出边界')
+                    requested_start, requested_end = ranges[row_start][0], ranges[row_end-1][1]
+                from rag.structure_projection import merged
+                spans = merged([s for s in sources if s['block_id']==block_id])
+                if not any(s['start']<=requested_start<=requested_end<=s['end'] for s in spans):
+                    raise ValueError('指定字符范围超出章节，不会自动扩大读取范围')
+                if row_start is not None:
+                    return read(kb_id,doc_id,**snap,block_id=block_id,row_start=row_start,row_end=row_end,page=page)
+                return read(kb_id,doc_id,**snap,block_id=block_id,offset=offset,end=requested_end,page=page)
+            if offset or end is not None or row_start is not None or row_end is not None:
+                raise ValueError('章节读取请使用 node_id 续读；字符/表格行定位需指定块')
+            if page is None and formula_number is None:
+                return read(kb_id,doc_id,**snap,node_id=section['node_id'],cursor=cursor,block_offset=block_offset)
+            parts = [read(kb_id,doc_id,**snap,block_id=s['block_id'],offset=s['start'],end=s['end'])
+                     for s in sources if page is None or blocks[s['block_id']]['page']==page]
+            if not parts:
+                raise KS.KBNotFound('章节内没有符合范围的正文')
+            return {**parts[0],'content':'\n'.join(p['content'] for p in parts),'segments':[s for p in parts for s in p['segments']],
+                    'locations':[s for p in parts for s in p['locations']],'next_read':None}
     if node_id:
         if any((block_id,page,section_id,formula_number,include_related,offset,end is not None,row_start is not None,row_end is not None)):
             raise ValueError('节点读取不能混用其他定位方式')
@@ -157,7 +240,7 @@ def read(kb_id, doc_id, parse_id=None, page=None, block_id=None, offset=0, end=N
         if offset or end is not None or row_start is not None or row_end is not None:
             raise ValueError('字符或表格行范围必须同时指定 block_id；page 单独使用时按页读取')
         with KS._transaction() as conn:
-            condition, params = 'parse_id=?', [version['parse_id']]
+            condition, params = 'structure_id=? AND parse_id=?', [snap['structure_id'], version['parse_id']]
             if page is not None:
                 condition += ' AND page=?'
                 params.append(page)
@@ -167,17 +250,17 @@ def read(kb_id, doc_id, parse_id=None, page=None, block_id=None, offset=0, end=N
             if formula_number is not None:
                 condition += " AND kind='display_formula' AND json_extract(structure_json,'$.formula_label')=?"
                 params.append(str(formula_number))
-                formulas = conn.execute(f'SELECT block_id,structure_json FROM kb_blocks WHERE {condition}', params).fetchall()
+                formulas = conn.execute(f'SELECT block_id,structure_json FROM kb_resolved_blocks WHERE {condition}', params).fetchall()
                 if not formulas:
                     # 旧发布版本未持久化公式关系，按原坐标关联；不改写旧解析档案。
-                    labels = conn.execute("SELECT block_id,page,bbox_json,section_id FROM kb_blocks WHERE parse_id=? AND kind='formula_number' AND trim(text, ' ()（）' || char(9) || char(10) || char(13))=?",
-                                          (version['parse_id'], str(formula_number))).fetchall()
+                    labels = conn.execute("SELECT block_id,page,bbox_json,section_id FROM kb_resolved_blocks WHERE structure_id=? AND parse_id=? AND kind='formula_number' AND trim(text, ' ()（）' || char(9) || char(10) || char(13))=?",
+                                          (snap['structure_id'], version['parse_id'], str(formula_number))).fetchall()
                     for label in labels:
                         if (page is not None and label['page'] != page) or (section_id and label['section_id'] != section_id):
                             continue
                         box = json.loads(label['bbox_json'])
                         matches = []
-                        for body in conn.execute("SELECT block_id,bbox_json FROM kb_blocks WHERE parse_id=? AND page=? AND kind='display_formula'", (version['parse_id'], label['page'])):
+                        for body in conn.execute("SELECT block_id,bbox_json FROM kb_resolved_blocks WHERE structure_id=? AND parse_id=? AND page=? AND kind='display_formula'", (snap['structure_id'], version['parse_id'], label['page'])):
                             a = json.loads(body['bbox_json'])
                             if a and box and abs((box[1]+box[3])-(a[1]+a[3])) <= max(box[3]-box[1],a[3]-a[1]):
                                 matches.append(body['block_id'])
@@ -187,21 +270,21 @@ def read(kb_id, doc_id, parse_id=None, page=None, block_id=None, offset=0, end=N
                     raise KS.KBConflict('公式编号不唯一，请用 page 或 section_id 限定：' + ','.join(r['block_id'] for r in formulas[:10]))
                 ids = json.loads(formulas[0]['structure_json'])['formula_members'] if formulas else []
             elif page is not None or section_id:
-                ids = [r[0] for r in conn.execute(f'SELECT block_id FROM kb_blocks WHERE {condition} ORDER BY page,ordinal', params)]
+                ids = [r[0] for r in conn.execute(f'SELECT block_id FROM kb_resolved_blocks WHERE {condition} ORDER BY page,ordinal', params)]
             else:
                 raise ValueError('必须指定页、块、章节或公式编号')
         if not ids:
             raise KS.KBNotFound('指定公式编号未在该文档范围内找到' if formula_number is not None else '指定页不存在或没有正文块')
-        parts = [read(kb_id, doc_id, version['parse_id'], block_id=bid) for bid in ids]
+        parts = [read(kb_id, doc_id, **snap, block_id=bid) for bid in ids]
         return {**parts[0], 'content': '\n'.join(p['content'] for p in parts),
                 'segments': [s for p in parts for s in p['segments']],
                 'locations': [s for p in parts for s in p['locations']], 'next_read': parts[-1]['next_read'],
                 'warnings': list(dict.fromkeys(w for p in parts for w in p['warnings']))}
     with KS._transaction() as conn:
         if block_id:
-            block = conn.execute('SELECT * FROM kb_blocks WHERE parse_id=? AND block_id=?', (version['parse_id'], block_id)).fetchone()
+            block = conn.execute('SELECT * FROM kb_resolved_blocks WHERE structure_id=? AND parse_id=? AND block_id=?', (snap['structure_id'], version['parse_id'], block_id)).fetchone()
         else:
-            block = conn.execute('SELECT * FROM kb_blocks WHERE parse_id=? AND page=? ORDER BY ordinal LIMIT 1', (version['parse_id'], page)).fetchone()
+            block = conn.execute('SELECT * FROM kb_resolved_blocks WHERE structure_id=? AND parse_id=? AND page=? ORDER BY ordinal LIMIT 1', (snap['structure_id'], version['parse_id'], page)).fetchone()
         if not block or (page is not None and block['page'] != page):
             raise KS.KBNotFound('指定页块不存在；空白页没有正文块')
         structure = json.loads(block['structure_json'])
@@ -212,24 +295,24 @@ def read(kb_id, doc_id, parse_id=None, page=None, block_id=None, offset=0, end=N
             ranges = structure.get('row_ranges', [])
             row_end = row_end if row_end is not None else row_start + 1
             if not 0 <= row_start < row_end <= len(ranges):
-                raise ValueError('表格行范围超出边界')
+                raise ReadRangeError('表格行范围超出边界', kb_id, doc_id, snap, block['block_id'], len(text), len(ranges))
             offset, end = ranges[row_start][0], ranges[row_end - 1][1]
         end = len(text) if end is None else end
         if not 0 <= offset <= end <= len(text):
-            raise ValueError('字符范围超出边界')
+            raise ReadRangeError('字符范围超出边界', kb_id, doc_id, snap, block['block_id'], len(text))
         if block['page'] is None:
-            next_block = conn.execute('SELECT block_id,page FROM kb_blocks WHERE parse_id=? AND ordinal>? ORDER BY ordinal LIMIT 1',
-                                      (version['parse_id'],block['ordinal'])).fetchone()
+            next_block = conn.execute('SELECT block_id,page FROM kb_resolved_blocks WHERE structure_id=? AND parse_id=? AND ordinal>? ORDER BY ordinal LIMIT 1',
+                                      (snap['structure_id'],version['parse_id'],block['ordinal'])).fetchone()
         else:
-            next_block = conn.execute('SELECT block_id,page FROM kb_blocks WHERE parse_id=? AND (page>? OR (page=? AND ordinal>?)) ORDER BY page,ordinal LIMIT 1',
-                                      (version['parse_id'], block['page'], block['page'], block['ordinal'])).fetchone()
+            next_block = conn.execute('SELECT block_id,page FROM kb_resolved_blocks WHERE structure_id=? AND parse_id=? AND (page>? OR (page=? AND ordinal>?)) ORDER BY page,ordinal LIMIT 1',
+                                      (snap['structure_id'],version['parse_id'], block['page'], block['page'], block['ordinal'])).fetchone()
         p = conn.execute('SELECT warnings_json,truncated,printed_page FROM kb_pages WHERE parse_id=? AND page=?', (version['parse_id'], block['page'])).fetchone()
         p = p or {'warnings_json':'[]','truncated':0,'printed_page':None}
         from rag.document_layout import STATEMENT, statement_context
         related = structure.get('related_blocks', structure.get('formula_members', []))
-        if include_related or STATEMENT.match(text):
-            candidates = conn.execute("SELECT block_id,kind,text FROM kb_blocks WHERE parse_id=? AND section_id=? AND json_extract(structure_json,'$.index_excluded') IS NULL ORDER BY page,ordinal",
-                                      (version['parse_id'], block['section_id'])).fetchall()
+        if (include_related or STATEMENT.match(text)) and not structure.get('review_range_version'):
+            candidates = conn.execute("SELECT block_id,kind,text FROM kb_resolved_blocks WHERE structure_id=? AND parse_id=? AND section_id=? AND json_extract(structure_json,'$.index_excluded') IS NULL ORDER BY page,ordinal",
+                                      (snap['structure_id'],version['parse_id'], block['section_id'])).fetchall()
             related = statement_context(candidates, block_id) or related
     location = {'block_id': block['block_id'], 'page': block['page'], 'start': offset, 'end': end,
                 'block_length': len(text), 'bbox': json.loads(block['bbox_json']), 'row_start': row_start, 'row_end': row_end,
@@ -238,18 +321,19 @@ def read(kb_id, doc_id, parse_id=None, page=None, block_id=None, offset=0, end=N
         location['location_kind']='text_span'
     continuation = ({'block_id': block['block_id'], 'offset': end} if end < len(text)
                     else {'block_id': next_block['block_id'], 'offset': 0} if next_block else None)
-    result = {'kb_id': kb_id, 'doc_id': doc_id, 'source': doc['filename'], 'parse_id': version['parse_id'],
+    result = {'kb_id': kb_id, 'doc_id': doc_id, 'source': doc['filename'], **snap,
             'content': text[offset:end], 'locations': [location],
             'segments': [{**location, 'text': text[offset:end]}], 'read_kind': 'read',
             'warnings': json.loads(p['warnings_json']), 'parser_truncated': p['truncated'],
             'structure': structure, 'related_blocks': related,
-            'next_read': {**{'kb_id': kb_id, 'doc_id': doc_id, 'parse_id': version['parse_id']}, **continuation} if continuation else None}
+            'next_read': {'kb_id': kb_id, 'doc_id': doc_id, **{k:v for k,v in snap.items() if v}, **continuation} if continuation else None}
     if include_related:
         if offset or end != len(text) or row_start is not None:
             raise ValueError('关联展开不能与字符或行范围混用')
-        others = [read(kb_id, doc_id, version['parse_id'], block_id=bid) for bid in result['related_blocks'] if bid != block_id]
+        others = [read(kb_id, doc_id, **snap, block_id=bid) for bid in result['related_blocks'] if bid != block_id]
         parts = sorted([result, *others], key=lambda r: (r['locations'][0]['page'] or 0,
-            r['structure']['source_start'] if r['locations'][0]['page'] is None else int(r['locations'][0]['block_id'].split('B')[-1])))
+            r['structure']['source_start'] if r['locations'][0]['page'] is None else
+            r['structure'].get('logical_order', int(r['locations'][0]['block_id'].split('B')[-1]))))
         result = {**result, 'content': '\n'.join(p['content'] for p in parts),
                   'segments': [s for p in parts for s in p['segments']], 'locations': [s for p in parts for s in p['locations']],
                   'warnings': list(dict.fromkeys(w for p in parts for w in p['warnings'])), 'next_read': parts[-1]['next_read']}
@@ -275,7 +359,8 @@ def hydrate(kb_id, hits, snapshots=None):
                 continue
             rows = conn.execute('''SELECT s.*,b.text,b.page,b.bbox_json,b.kind,b.section_id,b.parent_id,b.structure_json,
                 p.printed_page,p.warnings_json,c.kind AS chunk_kind,c.node_id,c.text AS index_text FROM kb_chunk_sources s
-                JOIN kb_blocks b ON b.parse_id=s.parse_id AND b.block_id=s.block_id
+                JOIN kb_index_runs r ON r.run_id=s.run_id
+                JOIN kb_resolved_blocks b ON b.structure_id=r.structure_id AND b.parse_id=s.parse_id AND b.block_id=s.block_id
                 LEFT JOIN kb_pages p ON p.parse_id=b.parse_id AND p.page=b.page
                 JOIN kb_chunks c ON c.run_id=s.run_id AND c.chunk_idx=s.chunk_idx
                 WHERE s.run_id=? AND s.chunk_idx=? ORDER BY b.page,b.ordinal,s.start''',
@@ -296,7 +381,7 @@ def hydrate(kb_id, hits, snapshots=None):
                            'context_source_ids': list(dict.fromkeys(i for r in rows for i in json.loads(r['structure_json']).get('context_blocks', []))),
                            'locations': [{k: v for k, v in s.items() if k != 'text'} for s in segments],
                            'read_kind': 'preview', 'read_args': {'kb_id': kb_id, 'doc_id': hit['doc_id'],
-                               'parse_id': snap['parse_id'], 'block_id': primary['block_id'], 'offset': primary['start']}})
+                               **{k:v for k,v in snap.items() if v}, 'block_id': primary['block_id'], 'offset': primary['start']}})
     return [TS.annotate(row) for row in output]
 
 
@@ -318,6 +403,12 @@ def search(kb_id, query, *, doc_id=None, page=None, section_id=None, node_id=Non
     numbers = formula_numbers(query)
     if section_id and not doc_id:
         raise ValueError('section_id 必须同时指定 doc_id')
+    if section_id:
+        section = HS.reviewed_section(snapshots[doc_id]['structure_id'], section_id)
+        if section:
+            if node_id and node_id != section['node_id']:
+                raise ValueError('章节与节点定位不能冲突')
+            node_id, section_id = section['node_id'], None
     with KS._transaction() as conn:
         KS._owned_kb(conn, kb_id, CHAT_USER_ID, active=True)
         if doc_id:
@@ -346,7 +437,8 @@ def search(kb_id, query, *, doc_id=None, page=None, section_id=None, node_id=Non
                   c.chunk_idx,c.kind AS chunk_kind,c.text AS content FROM kb_docs d
                   JOIN kb_chunks c ON c.run_id={run_expr}
                   JOIN kb_chunk_sources s ON s.run_id=c.run_id AND s.chunk_idx=c.chunk_idx
-                  JOIN kb_blocks b ON b.parse_id=s.parse_id AND b.block_id=s.block_id '''
+                  JOIN kb_index_runs r ON r.run_id=s.run_id
+                  JOIN kb_resolved_blocks b ON b.structure_id=r.structure_id AND b.parse_id=s.parse_id AND b.block_id=s.block_id '''
         exact = []
         metadata = []
         formulas = []
@@ -461,7 +553,7 @@ def search(kb_id, query, *, doc_id=None, page=None, section_id=None, node_id=Non
                 raise KS.KBNotFound('指定节点不存在于当前文档结构版本')
             allowed = node['sources']
         elif section_id:
-            allowed = [{'block_id':b['block_id'],'start':0,'end':len(b['text'])} for b in DS.blocks(snapshots[doc_id]['parse_id'])
+            allowed = [{'block_id':b['block_id'],'start':0,'end':len(b['text'])} for b in DS.blocks(snapshots[doc_id]['parse_id'], structure_id=snapshots[doc_id]['structure_id'])
                        if b['block_id']==section_id or b['section_id']==section_id or section_id in b['structure'].get('section_path',[])]
         scoped = []
         for hit in results:
@@ -508,8 +600,8 @@ def restrict_identifiers(hits, targets):
         has_target = False
         with KS._transaction() as conn:
             for segment in hit.get('segments', []):
-                block = conn.execute('SELECT text,section_id,parent_id,structure_json FROM kb_blocks WHERE parse_id=? AND block_id=?',
-                                     (hit['parse_id'], segment['block_id'])).fetchone()
+                block = conn.execute('SELECT text,section_id,parent_id,structure_json FROM kb_resolved_blocks WHERE structure_id=? AND parse_id=? AND block_id=?',
+                                     (hit.get('structure_id',''), hit['parse_id'], segment['block_id'])).fetchone()
                 entries = identifiers(block['text'])
                 heading_ids = {r[0] for r in conn.execute('SELECT value FROM kb_identifiers WHERE parse_id=? AND block_id=?',
                                                          (hit['parse_id'], block['section_id']))} if block['section_id'] != segment['block_id'] else set()
@@ -560,6 +652,7 @@ def restrict_identifiers(hits, targets):
         hit['locations'] = [{k: v for k, v in s.items() if k != 'text'} for s in selected]
         if selected:
             primary = next((s for s in selected if s['block_id'] == hit.get('read_args', {}).get('block_id')), selected[0])
-            hit['read_args'] = {'kb_id': hit['kb_id'], 'doc_id': hit['doc_id'], 'parse_id': hit['parse_id'],
+            hit['read_args'] = {'kb_id': hit['kb_id'], 'doc_id': hit['doc_id'],
+                                **{k:hit[k] for k in ('parse_id','structure_id','index_run_id') if hit.get(k)},
                                 'block_id': primary['block_id'], 'offset': primary['start'], 'end': primary['end']}
     return [hit for hit in hits if hit.get('content')]

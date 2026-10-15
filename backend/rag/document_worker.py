@@ -112,8 +112,7 @@ def parse_page(image, page, check, deadline):
 
 
 def run(kb_id, doc_id, parse_id, finish, publish_lock):
-    from rag import kb_vectors as V
-    lease, run_id, published, current_page = None, None, False, None
+    lease, current_page = None, None
     try:
         with _slots:
             lease = DS.claim(kb_id, doc_id, parse_id)
@@ -140,7 +139,6 @@ def run(kb_id, doc_id, parse_id, finish, publish_lock):
                 with Path(saved_pages[0]['raw_path']).open(encoding='utf-8') as saved:
                     parser_identity = json.load(saved).get('versions')
             with fitz.open(source) as pdf:
-                bookmarks = pdf.get_toc()
                 for number in range(1, len(pdf) + 1):
                     check()
                     if number in completed:
@@ -167,65 +165,48 @@ def run(kb_id, doc_id, parse_id, finish, publish_lock):
                     current_page = None
                     _log.info('kb_pdf_page', data={'doc_id': doc_id, 'page': number, 'blocks': len(blocks),
                                                  'elapsed_ms': result.get('elapsed_ms'), 'truncated': result.get('truncated')})
+                from rag.document_features import pdf_features
+                features, bookmarks = pdf_features(pdf, DS.pages(parse_id))
             check()
             from rag import document_hierarchy as H
             from storage import kb_structure_store as HS
             config = {'chunker': 5, 'tokens': C.CHUNK_TOKENS, 'model': os.getenv('EMBEDDING_MODEL'),
                       'base_url': os.getenv('EMBEDDING_BASE_URL'), 'tokenizer_url': C.TOKENIZER_URL}
             stored_blocks = DS.blocks(parse_id)
-            if doc['published_parse_id'] != parse_id:
-                stored_blocks = link_document(stored_blocks, DS.pages(parse_id))
-                DS.save_structure(kb_id, doc_id, parse_id, lease, stored_blocks)
             if sum(len(b['text']) for b in stored_blocks) > 10_000_000:
                 raise ValueError('document_text_limit_exceeded')
             structure_config = {'version': H.VERSION, 'max_chars': C.UNIT_MAX_CHARS,
-                                'preview_chars': C.NODE_PREVIEW_CHARS, 'proof_passage_chars':C.PROOF_PASSAGE_CHARS, 'bookmarks': bookmarks}
-            structure = HS.prepare(kb_id, doc_id, parse_id, lease, structure_config)
+                                'projection_version': 1, 'features_version': 1, 'preview_chars': C.NODE_PREVIEW_CHARS,
+                                'proof_passage_chars':C.PROOF_PASSAGE_CHARS, 'bookmarks': bookmarks}
+            from storage import kb_structure_review_store as RS
+            with KS._transaction() as conn:
+                retained = conn.execute("SELECT review_id FROM kb_structure_publications WHERE structure_id=? AND status='published'", (doc['published_structure_id'],)).fetchone()
+            review = RS.get(kb_id,doc_id,retained['review_id']) if retained and doc['published_parse_id']==parse_id else None
+            structure = ({'structure_id':doc['published_structure_id'],'status':'published'} if review else
+                         HS.prepare(kb_id, doc_id, parse_id, lease, structure_config))
             if structure['status'] == 'building':
+                stored_blocks = link_document(stored_blocks, DS.pages(parse_id), bookmarks, features)
                 nodes, relations, quality = H.build(stored_blocks, title=doc['filename'], bookmarks=bookmarks,
                     max_chars=C.UNIT_MAX_CHARS, preview_chars=C.NODE_PREVIEW_CHARS,
                     proof_passage_chars=C.PROOF_PASSAGE_CHARS, check=check)
-                HS.save(kb_id, doc_id, parse_id, lease, structure['structure_id'], nodes, relations, quality)
+                HS.save(kb_id, doc_id, parse_id, lease, structure['structure_id'], nodes, relations, quality, stored_blocks)
+            stored_blocks = DS.blocks(parse_id, structure_id=structure['structure_id'])
             config['structure_id'] = structure['structure_id']
             counter = EmbeddingCounter(check)
             try:
-                chunks = build_chunks(stored_blocks, doc['filename'], counter)
+                if review:
+                    from rag import structure_projection as P
+                    nodes, _ = HS.load(structure['structure_id'])
+                    chunks = P.chunks(stored_blocks,review['result'],nodes,doc['filename'],counter)
+                    config['range_chunker'] = P.VERSION
+                else:
+                    chunks = build_chunks(stored_blocks, doc['filename'], counter)
                 chunks.extend(HS.navigation_chunks(structure['structure_id'], counter.count, C.CHUNK_TOKENS))
             finally:
                 counter.session.close()
             if not chunks:
                 raise ValueError('no_indexable_text')
-            run_info = DS.prepare_index(kb_id, doc_id, parse_id, lease, fingerprint(config), config, chunks, structure['structure_id'])
-            run_id = run_info['run_id']
-            count = run_info['indexed_count']
-            while count < run_info['chunk_count']:
-                check()
-                batch = DS.index_chunks(run_id, count)
-                vectors = embed_texts([c['text'] for c in batch], batch_size=32,
-                                     timeout=max(.1, min(120, deadline - time.monotonic())))
-                if len(vectors) != len(batch):
-                    raise ValueError('embedding_count_mismatch')
-                items = [{'content': c['text'], 'vector': vector, 'memory_type': MEMORY_TYPE_KB_CHUNK,
-                          'user_id': CHAT_USER_ID, 'kb_id': kb_id, 'doc_id': doc_id, 'index_run_id': run_id,
-                          'source': doc['filename'], 'chunk_idx': c['chunk_idx'], 'chunk_id': c['chunk_idx'],
-                          'valid': False} for c, vector in zip(batch, vectors)]
-                V.batch_insert_memories(items, before_batch=check)
-                count += len(batch)
-                DS.advance_index(kb_id, doc_id, parse_id, lease, run_id, count)
-            with publish_lock:
-                check()
-                if not V.kb_index_complete(user_id=CHAT_USER_ID, kb_id=kb_id, doc_id=doc_id,
-                                           index_run_id=run_id, expected=count):
-                    raise ValueError('incomplete_vector_index')
-                V.set_kb_chunks_valid(user_id=CHAT_USER_ID, kb_id=kb_id, doc_id=doc_id, index_run_id=run_id, valid=True)
-                DS.publish(kb_id, doc_id, parse_id, lease, run_id)
-                published = True
-                if doc['published_run_id'] and doc['published_run_id'] != run_id:
-                    try:
-                        V.set_kb_chunks_valid(user_id=CHAT_USER_ID, kb_id=kb_id, doc_id=doc_id,
-                                             index_run_id=doc['published_run_id'], valid=False)
-                    except Exception:
-                        _log.warn('kb_retired_index_cleanup_pending', data={'doc_id': doc_id})
+            publish_index(kb_id, doc_id, parse_id, lease, doc, config, chunks, check, deadline, publish_lock)
     except Exception as exc:
         if lease:
             detail = str(exc)[:150] if isinstance(exc, (ValueError, KS.KBConflict, TimeoutError)) else type(exc).__name__
@@ -249,10 +230,49 @@ def run(kb_id, doc_id, parse_id, finish, publish_lock):
         _log.warn('kb_document_failed', data={'doc_id': doc_id, 'parse_id': parse_id, 'error_type': type(exc).__name__,
                                             'error_code': str(exc)[:150] if isinstance(exc, (ValueError, TimeoutError)) else ''})
     finally:
+        finish()
+
+
+def publish_index(kb_id, doc_id, parse_id, lease, doc, config, chunks, check, deadline, publish_lock, *, review_id=None):
+    from rag import kb_vectors as V
+    run_id, published = None, False
+    try:
+        run_info = DS.prepare_index(kb_id, doc_id, parse_id, lease, fingerprint(config), config, chunks, config['structure_id'])
+        run_id = run_info['run_id']
+        count = run_info['indexed_count']
+        while count < run_info['chunk_count']:
+            check()
+            batch = DS.index_chunks(run_id, count)
+            vectors = embed_texts([c['text'] for c in batch], batch_size=32,
+                                 timeout=max(.1, min(120, deadline - time.monotonic())))
+            if len(vectors) != len(batch):
+                raise ValueError('embedding_count_mismatch')
+            items = [{'content': c['text'], 'vector': vector, 'memory_type': MEMORY_TYPE_KB_CHUNK,
+                      'user_id': CHAT_USER_ID, 'kb_id': kb_id, 'doc_id': doc_id, 'index_run_id': run_id,
+                      'source': doc['filename'], 'chunk_idx': c['chunk_idx'], 'chunk_id': c['chunk_idx'],
+                      'valid': False} for c, vector in zip(batch, vectors)]
+            V.batch_insert_memories(items, before_batch=check)
+            count += len(batch)
+            DS.advance_index(kb_id, doc_id, parse_id, lease, run_id, count)
+        with publish_lock:
+            check()
+            if not V.kb_index_complete(user_id=CHAT_USER_ID, kb_id=kb_id, doc_id=doc_id, index_run_id=run_id, expected=count):
+                raise ValueError('incomplete_vector_index')
+            V.set_kb_chunks_valid(user_id=CHAT_USER_ID, kb_id=kb_id, doc_id=doc_id, index_run_id=run_id, valid=True)
+            if review_id:
+                DS.publish(kb_id, doc_id, parse_id, lease, run_id, review_id=review_id)
+            else:
+                DS.publish(kb_id, doc_id, parse_id, lease, run_id)
+            published = True
+            if doc['published_run_id'] and doc['published_run_id'] != run_id:
+                try:
+                    V.set_kb_chunks_valid(user_id=CHAT_USER_ID, kb_id=kb_id, doc_id=doc_id,
+                                         index_run_id=doc['published_run_id'], valid=False)
+                except Exception:
+                    _log.warn('kb_retired_index_cleanup_pending', data={'doc_id': doc_id})
+    finally:
         if run_id and not published:
             try:
-                V.set_kb_chunks_valid(user_id=CHAT_USER_ID, kb_id=kb_id, doc_id=doc_id,
-                                     index_run_id=run_id, valid=False)
+                V.set_kb_chunks_valid(user_id=CHAT_USER_ID, kb_id=kb_id, doc_id=doc_id, index_run_id=run_id, valid=False)
             except Exception:
                 _log.warn('kb_staging_cleanup_pending', data={'doc_id': doc_id})
-        finish()

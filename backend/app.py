@@ -76,10 +76,14 @@ if _modules_failed:
 
 @app.on_event("shutdown")
 async def _on_shutdown():
+    from api import chat_tasks
+    chat_tasks.stop()
     from storage.chat_attachments import stop_cleanup
     stop_cleanup()
     if "kb" in _modules_loaded:
         from rag import kb
+        from storage.kb_structure_review_store import interrupt_running
+        interrupt_running()
         kb.stop_recovery()
     uptime = int((time.monotonic() - _start_ts))
     _log.info("app_shutdown", data={"uptime_seconds": uptime, "pid": os.getpid()})
@@ -89,10 +93,14 @@ async def _on_shutdown():
 def _init_chat_sessions():
     from storage import chat_store
     chat_store._get_conn()
+    from api import chat_tasks
+    chat_tasks.start()
     from storage.chat_attachments import start_cleanup
     start_cleanup()
     if "kb" in _modules_loaded:
         from rag import kb
+        from storage.kb_structure_review_store import interrupt_running
+        interrupt_running()
         kb.start_recovery()
 
 

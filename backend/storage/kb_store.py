@@ -41,7 +41,11 @@ def _ensure_tables() -> None:
         old_columns = {r["name"] for r in conn.execute("PRAGMA table_info(kb_docs)")}
         page_columns = {r['name'] for r in conn.execute('PRAGMA table_info(kb_pages)')}
         text_migration = not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='kb_text_sources'").fetchone()
-        if old_columns and (text_migration or "published_structure_id" not in old_columns or (page_columns and 'error' not in page_columns)):
+        structure_migration = not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='kb_structure_blocks'").fetchone()
+        review_migration = not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='kb_structure_reviews'").fetchone()
+        review_columns = {r['name'] for r in conn.execute('PRAGMA table_info(kb_structure_reviews)')}
+        publication_migration = not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='kb_structure_publications'").fetchone()
+        if old_columns and (publication_migration or text_migration or structure_migration or review_migration or (review_columns and 'request_id' not in review_columns) or "published_structure_id" not in old_columns or (page_columns and 'error' not in page_columns)):
             backup = Path(MEMORY_DB_PATH).with_name(
                 f"{Path(MEMORY_DB_PATH).stem}.kb-lifecycle-{uuid4().hex[:8]}.sqlite3")
             with closing(sqlite3.connect(str(backup))) as target:
@@ -313,6 +317,9 @@ def finish_purge(kb_id: str) -> int:
         from rag.document_config import document_path
         import shutil
         for row in conn.execute("SELECT doc_id,original_path FROM kb_docs WHERE kb_id=?", (kb_id,)).fetchall():
+            conn.execute('DELETE FROM kb_structure_review_batches WHERE review_id IN (SELECT review_id FROM kb_structure_reviews WHERE doc_id=?)', (row['doc_id'],))
+            conn.execute('DELETE FROM kb_structure_reviews WHERE doc_id=?', (row['doc_id'],))
+            conn.execute('DELETE FROM kb_structure_publications WHERE doc_id=?', (row['doc_id'],))
             if row['original_path']:
                 folder = document_path(row['doc_id'])
                 if folder.exists():
@@ -320,7 +327,7 @@ def finish_purge(kb_id: str) -> int:
             versions = [r[0] for r in conn.execute("SELECT parse_id FROM kb_parse_versions WHERE doc_id=?", (row['doc_id'],))]
             for version in versions:
                 for structure in conn.execute('SELECT structure_id FROM kb_structure_versions WHERE parse_id=?',(version,)).fetchall():
-                    for table in ('kb_node_relations','kb_node_sources','kb_document_nodes'):
+                    for table in ('kb_node_relations','kb_node_sources','kb_document_nodes','kb_structure_blocks'):
                         conn.execute(f'DELETE FROM {table} WHERE structure_id=?',(structure[0],))
                 conn.execute('DELETE FROM kb_structure_versions WHERE parse_id=?',(version,))
                 for run in conn.execute("SELECT run_id FROM kb_index_runs WHERE parse_id=?", (version,)).fetchall():
@@ -357,6 +364,9 @@ def list_deleted_kbs(user_id: str) -> list[dict[str, Any]]:
 
 def recover_interrupted(user_id: str) -> None:
     with _transaction() as conn:
+        conn.execute("""UPDATE kb_structure_publications SET status='interrupted',error='后端重启中断发布，可显式恢复'
+                        WHERE status IN ('queued','running') AND kb_id IN
+                        (SELECT kb_id FROM kb_kbs WHERE user_id=?)""", (user_id,))
         conn.execute("""
             UPDATE kb_docs SET status='failed',sync_pending=1,error_msg='后端重启中断索引，请重新上传'
             WHERE status='pending' AND active_parse_id=''

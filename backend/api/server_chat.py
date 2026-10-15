@@ -6,16 +6,15 @@ import sqlite3
 import time
 import re
 
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 from openai import APITimeoutError
-from starlette.concurrency import iterate_in_threadpool
 
 from agent.memory import chat_context as context
 from agent.memory import config as C
 from agent.token_utils import RequestTokenCounter
 from storage import chat_store as store
 from storage import chat_attachments as assets
-from api import final_answer
+from api import final_answer, chat_tasks
 
 
 def handle(item):
@@ -53,8 +52,6 @@ def handle(item):
             identity['attachment_ids'] = item.attachment_ids
         digest = hashlib.sha256(json.dumps(identity, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
         retry_json = json.dumps(item.model_dump(), ensure_ascii=False)
-        turn = store.begin_turn(item.chat_id, item.request_id, digest, item.expected_last_seq, user_text, retry_json,
-                                continuation_of=item.continuation_of, attachment_ids=item.attachment_ids)
         current = {'role': 'user', 'content': ([{'type': 'text', 'text': user_text or '请分析这张图片'},
                     *[{'type': 'chat_attachment', 'attachment_id': identity} for identity in item.attachment_ids]]
                     if item.attachment_ids else user_text)}
@@ -66,7 +63,7 @@ def handle(item):
     except Exception:
         return JSONResponse(status_code=503, content={'error': {'code': 'history_unavailable'}})
 
-    def events():
+    def events(turn):
         saved = turn['status'] in ('completed', 'partial')
         finish_reason = 'stop'
         error_message = ''
@@ -267,37 +264,29 @@ def handle(item):
         finally:
             if not saved:
                 try:
-                    store.fail_turn(item.chat_id, item.request_id, turn['attempt'], 'stream_interrupted', interrupted=True)
+                    store.fail_turn(item.chat_id, item.request_id, turn['attempt'], 'task_execution_incomplete')
                 except Exception:
                     pass
 
-    if item.stream:
-        async def stream():
-            source = events()
-            try:
-                async for event in iterate_in_threadpool(source):
-                    yield chat._sse(event)
-                yield 'data: [DONE]\n\n'
-            finally:
-                source.close()
-                try:
-                    store.fail_turn(item.chat_id, item.request_id, turn['attempt'], 'stream_interrupted', interrupted=True)
-                except Exception:
-                    pass
-        return StreamingResponse(stream(), media_type='text/event-stream')
-    answer = ''
-    steps = []
-    meta = None
-    for event in events():
-        if event.get('error'):
-            code = event['error']['code']
+    try:
+        turn = chat_tasks.submit(item.chat_id, item.request_id, digest,
+            lambda: store.begin_turn(item.chat_id, item.request_id, digest, item.expected_last_seq, user_text,
+                retry_json, continuation_of=item.continuation_of, attachment_ids=item.attachment_ids), events)
+        if item.stream:
+            return chat_tasks.subscribe(item.chat_id, item.request_id, turn['attempt'])
+        state = chat_tasks.wait_result(item.chat_id, item.request_id, turn['attempt'])
+        if not state or state['status'] not in ('completed', 'partial'):
+            code = state['error_code'] if state else 'request_not_found'
             status = 413 if code == 'context_budget_exceeded' else 503 if code == 'history_unavailable' else 502
-            return JSONResponse(status_code=status, content=event)
-        for choice in event.get('choices', []):
-            answer += choice.get('delta', {}).get('content') or ''
-        if event.get('enhancement_step'):
-            steps.append(event['enhancement_step'])
-        meta = event.get('session_meta', meta)
-    return JSONResponse(content={'choices': [{'message': {'role': 'assistant', 'content': answer},
-                                             'finish_reason': meta['finish_reason']}],
-                                 'session_meta': meta, 'enhancement_steps': steps})
+            return JSONResponse(status_code=status, content={'error': {'code': code}, 'session_meta': state})
+        answer = next(m for m in state['messages'] if m['role'] == 'assistant')
+        return JSONResponse(content={'choices': [{'message': {'role': 'assistant', 'content': answer['content']},
+            'finish_reason': state['finish_reason']}], 'enhancement_steps': state['tool_steps'],
+            'session_meta': {**state, 'persisted': True}})
+    except store.SessionError as exc:
+        payload = {'error': {'code': exc.code}}
+        if exc.code == 'context_compaction_pending':
+            payload['context_compaction'] = store.compaction_progress(store.get_compaction(item.chat_id))
+        return JSONResponse(status_code=exc.status, content=payload)
+    except sqlite3.Error:
+        return JSONResponse(status_code=503, content={'error': {'code': 'history_unavailable'}})

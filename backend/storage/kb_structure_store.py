@@ -20,9 +20,15 @@ def prepare(kb_id, doc_id, parse_id, lease, config):
         return {'structure_id': structure_id, 'status': 'building'}
 
 
-def save(kb_id, doc_id, parse_id, lease, structure_id, nodes, relations, quality):
+def save(kb_id, doc_id, parse_id, lease, structure_id, nodes, relations, quality, blocks=None):
     from rag.document_hierarchy import validate
-    validate(nodes, relations, DS.blocks(parse_id))
+    original = DS.blocks(parse_id)
+    if blocks is not None:
+        if ({b['block_id']: (b['text'], b['page'], b['bbox']) for b in blocks}
+                != {b['block_id']: (b['text'], b['page'], b['bbox']) for b in original}
+                or len(blocks) != len(original)):
+            raise ValueError('structure_projection_changed_original')
+    validate(nodes, relations, blocks if blocks is not None else original)
     with KS._transaction() as conn:
         DS.current(conn, kb_id, doc_id, parse_id, lease)
         version = conn.execute('SELECT * FROM kb_structure_versions WHERE structure_id=? AND parse_id=?', (structure_id, parse_id)).fetchone()
@@ -30,6 +36,12 @@ def save(kb_id, doc_id, parse_id, lease, structure_id, nodes, relations, quality
             raise KS.KBConflict('结构任务不存在')
         if version['status'] in ('ready', 'published'):
             return
+        if json.loads(version['config_json']).get('projection_version') and blocks is None:
+            raise ValueError('missing_structure_projection')
+        if blocks is not None:
+            conn.executemany('INSERT INTO kb_structure_blocks VALUES(?,?,?,?,?,?)',
+                [(structure_id,b['block_id'],b['ordinal'],b['section_id'],b['parent_id'],
+                  json.dumps(b['structure'],ensure_ascii=False)) for b in blocks])
         for node in nodes:
             conn.execute('INSERT INTO kb_document_nodes VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                 (structure_id, *[node[k] for k in ('node_id','parent_id','kind','ordinal','depth','title','preview','basis','start_order','end_order','page','end_page')],
@@ -83,6 +95,25 @@ def load(structure_id):
     return rows, relations
 
 
+def descendant(node, root_id, known):
+    while node['parent_id']:
+        if node['parent_id'] == root_id:
+            return True
+        node = known[node['parent_id']]
+    return False
+
+
+def reviewed_section(structure_id, section_id):
+    nodes, _ = load(structure_id)
+    if not nodes or not nodes[0]['attributes'].get('review_range_version'):
+        return None
+    matches = [n for n in nodes if n['kind'] == 'section' and (n['node_id'] == section_id
+               or n['attributes']['heading_anchor'] == section_id)]
+    if not matches:
+        raise KS.KBNotFound('范围级章节请使用当前目录返回的 section_id/node_id；旧章节引用需同时指定旧结构版本')
+    return matches[0]
+
+
 def outline(kb_id, doc_id, *, parse_id=None, structure_id=None, index_run_id=None, node_id=None, offset=0, limit=20, depth=1):
     snap = snapshot(kb_id, doc_id, parse_id=parse_id, structure_id=structure_id, index_run_id=index_run_id)
     if not snap['structure_id']:
@@ -91,8 +122,11 @@ def outline(kb_id, doc_id, *, parse_id=None, structure_id=None, index_run_id=Non
     root = next((n for n in nodes if n['node_id'] == node_id), None) if node_id else nodes[0]
     if not root:
         raise KS.KBNotFound('节点不存在于当前结构版本')
-    selected = [n for n in nodes if root['start_order'] <= n['start_order'] < n['end_order'] <= root['end_order']
+    known = {n['node_id']: n for n in nodes}
+    selected = [n for n in nodes if descendant(n, root['node_id'], known)
                 and root['depth'] < n['depth'] <= root['depth'] + depth]
+    if nodes[0]['attributes'].get('review_range_version'):
+        selected.sort(key=lambda n: (n['start_order'], n['depth'], n['ordinal']))
     cards = []
     text_starts=None
     if root['page'] is None:
@@ -104,6 +138,9 @@ def outline(kb_id, doc_id, *, parse_id=None, structure_id=None, index_run_id=Non
         cards[-1].update(children=sum(c['parent_id'] == n['node_id'] for c in nodes), preview=n['preview'],
                           preview_kind='literal_navigation', read_args={'kb_id':kb_id,'targets':[{'doc_id':doc_id,
                           'structure_id':snap['structure_id'],'mode':'node','node_id':n['node_id']}]})
+        if n['kind']=='section' and 'parent_status' in n['attributes']:
+            cards[-1].update({k:n['attributes'][k] for k in ('parent_status','boundary_status','issues','declared_level')})
+        cards[-1].update({k:n['attributes'][k] for k in ('role','review_status','declared_level','ownership','reason') if k in n['attributes']})
         if text_starts is not None:
             from storage.kb_text_store import location
             cards[-1].update(location(text_starts,{'source_start':0},n['start_order'],n['end_order']))
@@ -118,7 +155,7 @@ def navigation_chunks(structure_id, counter, token_limit):
     known = {n['node_id']: n for n in nodes}
     chunks = []
     for node in nodes:
-        if node['kind'] == 'paragraph':
+        if node['kind'] in ('paragraph', 'header', 'footer'):
             continue
         path, parent = [], node
         while parent:

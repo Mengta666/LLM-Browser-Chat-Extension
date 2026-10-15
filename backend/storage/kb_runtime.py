@@ -52,6 +52,12 @@ def progress(chat_id, request_id):
     needs = state.get('needs', [])
     if reason == 'no_progress' and needs and all(n['status'] in ('ready', 'unresolved') for n in needs) and not coverage['missing_scope_count']:
         reason = 'needs_assessed'
+    conn = store._get_conn()
+    with store._lock:
+        request = conn.execute('SELECT status,phase FROM chat_turns WHERE chat_id=? AND request_id=?',
+                               (chat_id, request_id)).fetchone()
     return {'type': 'kb_progress', 'status': 'done', 'kb_stop_reason': reason,
+            'request_phase': request['phase'] if request else '',
+            'request_status': request['status'] if request else '', 'restored': True,
             'kb_pending': state['pending'], 'kb_read_coverage': coverage,
             'kb_workspace': workspace_progress(state)}

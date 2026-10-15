@@ -1146,6 +1146,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (data?.server_context !== true || data.protocol_version !== 1) {
       throw new Error('后端会话协议不兼容，请更新本项目后端；不再支持直接连接模型接口。');
     }
+    if (data.chat_background_tasks_version !== 1 || data.chat_event_stream_version !== 1) {
+      throw new Error('请重启已更新的后端，以启用聊天断线续接。');
+    }
     return data;
   }
 
@@ -1213,6 +1216,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     const cancel = addRequestCancel(container, base, chatId, requestId, state => update(state));
     cancel.hidden = true;
     let observedRequest = null;
+    let recovering = null;
+    let recoveredBubble = null;
+    let recoveredText = '';
+    let recoveredBody = null;
     const update = state => {
       if (observedRequest && ['cancelled', 'completed', 'partial'].includes(observedRequest.status)
           && state.status === 'running') return;
@@ -1234,6 +1241,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         final_answer_unavailable: '模型未生成可用的最终回答。'
       };
       if (finalFailures[state.error_code]) labels.failed = finalFailures[state.error_code] + ' 已读资料和工具过程已保留，重试前会检查来源是否仍可访问。';
+      if (['backend_restarted', 'backend_shutdown'].includes(state.error_code)) labels.interrupted = '后端已重启或停止；已完成步骤保留，可手动恢复本次提问。';
       if (state.status === 'running') labels.running = { reading: '正在读取原文片段…', generating: '正在生成回答…',
         finalizing: '正在根据已取得的证据生成最终回答…' }[state.phase] || labels.running;
       for (const step of state.tool_steps || []) updateEnhancementCard(container,
@@ -1253,9 +1261,43 @@ document.addEventListener('DOMContentLoaded', async () => {
           update(result);
           if (currentChatId === chatId && ['completed', 'partial'].includes(result.status)) await resumeSession(chatId);
         });
+        if (!recovering) {
+          recovering = new AbortController();
+          const activeRecovery = recovering;
+          resolveApiRequestConfig().then(settings => {
+            if (settings.safeApiUrl !== base) throw new Error('后端地址已改变，请切回原地址恢复');
+            return ChatTransport.follow({
+              stateUrl: buildBackendEndpointUrl(base, `/v1/sessions/${encodeURIComponent(chatId)}/requests/${encodeURIComponent(requestId)}`),
+              headers: settings.apiKey ? { Authorization: `Bearer ${settings.apiKey}` } : {},
+              signal: activeRecovery.signal,
+              onConnection: status => { if (status === 'reconnecting') label.textContent = '连接已断开，正在恢复进度；后端任务未取消。'; },
+              onEvent: async event => {
+                if (!container.isConnected || currentChatId !== chatId) { activeRecovery.abort(); return; }
+                if (event.request_snapshot) {
+                  update(event.request_snapshot);
+                  if (['completed', 'partial'].includes(event.request_snapshot.status)) await resumeSession(chatId);
+                } else if (event.enhancement_step) {
+                  updateEnhancementCard(container, event.enhancement_step);
+                } else if (event.choices?.some(choice => choice.delta?.content)) {
+                  recoveredBubble ||= createMessageNode('ai');
+                  if (!recoveredBody) {
+                    recoveredBody = document.createElement('div'); recoveredBody.className = 'markdown-body';
+                    recoveredBubble.appendChild(recoveredBody);
+                  }
+                  recoveredText += event.choices.map(choice => choice.delta?.content || '').join('');
+                  renderMarkdownInto(recoveredBody, recoveredText, { streaming: true });
+                } else if (event.heartbeat) {
+                  label.textContent = {finalizing:'正在根据已取得的资料生成回答…',reading:'正在读取资料…',generating:'正在处理当前提问…'}[event.heartbeat.phase] || '后端仍在处理当前提问…';
+                }
+              }
+            });
+          }).catch(error => { if (container.isConnected) label.textContent = error.message; })
+            .finally(() => { if (recovering === activeRecovery) recovering = null; });
+        }
       } else if (observedRequest && !observedRequest.live) {
         releaseChatRequest(observedRequest, state.status);
       }
+      if (state.status !== 'running') recovering?.abort();
     };
     const refresh = async () => {
       if (!container.isConnected || currentChatId !== chatId) return;
@@ -1263,7 +1305,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         const state = await callBackendApi(buildBackendEndpointUrl(base,
           `/v1/sessions/${encodeURIComponent(chatId)}/requests/${encodeURIComponent(requestId)}`));
         update(state);
-        if (state.status === 'running') setTimeout(refresh, 3000);
+        if (state.status === 'running' && !recovering) setTimeout(refresh, 3000);
       } catch { /* 状态读取失败时保留手动检查入口。 */ }
     };
     setTimeout(refresh, 0);
@@ -1432,11 +1474,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     scrollToBottom('instant');
     await new Promise(resolve => {
       let request = null;
+      const connection = new AbortController();
       const finish = (error = '') => {
         if (done) return;
         done = true;
-        clearTimeout(timer);
-        chrome.runtime.onMessage.removeListener(listener);
+        connection.abort();
         releaseChatRequest(request, meta?.status || 'interrupted');
         progressLabel.remove();
         if (reply) streamer.finalize(reply); else streamer.cancel();
@@ -1474,19 +1516,40 @@ document.addEventListener('DOMContentLoaded', async () => {
         } else if (msg.type === 'LLM_ERROR') finish(msg.error);
         else if (msg.type === 'LLM_DONE') finish();
       };
-      const timer = setTimeout(() => finish('等待超时，请检查后端状态'), 605000);
       request = bindChatRequest(base, chatId, body.request_id, async state => {
         meta = { ...state, persisted: ['completed', 'partial'].includes(state.status) };
         finish();
         if (meta.persisted && currentChatId === chatId) await resumeSession(chatId);
       }, true);
-      chrome.runtime.onMessage.addListener(listener);
       const headers = { 'Content-Type': 'application/json' };
       if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
-      chrome.runtime.sendMessage({ type: 'CALL_LLM_STREAM', msgId, url: `${base}/chat/completions`,
-        options: { method: 'POST', headers, body: JSON.stringify(body) } }, () => {
-          if (chrome.runtime.lastError) finish(chrome.runtime.lastError.message);
-        });
+      const emit = (type, values = {}) => listener({ type, msgId, ...values });
+      ChatTransport.follow({ submitUrl: `${base}/chat/completions`, body, headers, signal: connection.signal,
+        stateUrl: buildBackendEndpointUrl(base, `/v1/sessions/${encodeURIComponent(chatId)}/requests/${encodeURIComponent(body.request_id)}`),
+        onConnection: state => {
+          progressLabel.textContent = state === 'reconnecting' ? '连接已断开，正在恢复进度；后端任务未取消。' : '已连接，正在处理…';
+        },
+        onEvent: event => {
+          if (event.request_snapshot) {
+            const state = event.request_snapshot;
+            meta = { ...state, persisted: ['completed', 'partial'].includes(state.status) };
+            if (meta.persisted) {
+              reply = state.messages.find(m => m.role === 'assistant')?.content || '';
+              sources = (state.tool_steps || []).flatMap(step => step.sources || []);
+              for (const step of state.tool_steps || []) updateEnhancementCard(bubble, step);
+            }
+            finish();
+            return;
+          }
+          if (event.session_meta) emit('LLM_SESSION_META', { session_meta: event.session_meta });
+          if (event.context_compaction) emit('LLM_CONTEXT_COMPACTION', { progress: event.context_compaction });
+          if (event.document_analysis) emit('LLM_DOCUMENT_ANALYSIS', { progress: event.document_analysis });
+          if (event.enhancement_step) emit('LLM_ENHANCEMENT_STEP', { step: event.enhancement_step });
+          if (event.heartbeat) progressLabel.textContent = {finalizing:'正在根据已取得的资料生成回答…',reading:'正在读取资料…',generating:'正在处理当前提问…'}[event.heartbeat.phase] || '后端仍在处理当前提问…';
+          if (event.error) { emit('LLM_ERROR', { error: event.error.message || event.error.code }); return; }
+          for (const choice of event.choices || []) if (choice.delta?.content) emit('LLM_CHUNK', { chunk: choice.delta.content });
+        }
+      }).then(() => { if (!done) finish('连接已结束，正在检查请求状态'); }).catch(error => finish(error.message));
     });
   }
 
@@ -2065,10 +2128,14 @@ document.addEventListener('DOMContentLoaded', async () => {
           decision_limit: '检索轮数已到限', model_call_limit: '模型调用次数已到限', no_progress: '连续步骤未新增材料、定位或需求进展',
           tool_arguments_not_repaired: '连续工具参数纠错未成功，使用已取得资料收尾',
           needs_assessed: '正在按问题整理资料', context_space_exhausted: '当前上下文空间不足，整理已取得资料'};
-        const pending = step.kb_pending || [];
+        const invalid = (step.kb_pending || []).filter(p => p.error_kind === 'invalid_location').length;
+        const pending = (step.kb_pending || []).filter(p => p.error_kind !== 'invalid_location');
         const missing = pending.filter(p => p.required !== false).length;
         const optional = pending.length - missing;
-        stepEl.textContent = `📚 ${reasons[step.kb_stop_reason] || '开始整理已取得的知识库资料'}${missing ? `；仍有 ${missing} 项读取缺口，回答将注明限制` : ''}${optional ? `；另有 ${optional} 段未读范围，可按需续读` : ''}`;
+        const restoredLabel = step.restored ? (step.request_status === 'running' && step.request_phase === 'finalizing'
+          ? '正在根据已取得的资料生成回答' : '已恢复本轮资料读取记录（不代表已进入回答阶段）') : null;
+        stepEl.textContent = `📚 ${restoredLabel || reasons[step.kb_stop_reason] || '开始整理已取得的知识库资料'}${missing ? `；仍有 ${missing} 项读取缺口` : ''}${optional ? `；另有 ${optional} 段未读范围，可按需续读` : ''}`;
+        if (invalid) stepEl.textContent += `；${invalid} 项定位参数错误（不是未读正文）`;
         if (step.kb_read_coverage?.status === 'selected_reads_complete') stepEl.textContent += '；已选择的完整原文范围均已交付（不代表结论已核实）';
         if (step.kb_workspace?.version) {
           const w = step.kb_workspace;
@@ -2176,9 +2243,11 @@ document.addEventListener('DOMContentLoaded', async () => {
       const counts = step.counts;
       const stateText = step.outcome === 'no_searchable_documents' && counts
         ? `（共 ${counts.total} 份，已索引 ${counts.indexed} 份，处理中 ${counts.pending} 份，失败 ${counts.failed} 份）` : '';
-      const requiredGaps = (step.kb_pending || []).filter(p => p.required !== false).length;
-      const optionalGaps = (step.kb_pending?.length || 0) - requiredGaps;
-      const gapText = (requiredGaps ? `；${requiredGaps} 项待补读/处理` : '') + (optionalGaps ? `；${optionalGaps} 段未读范围，可按需续读` : '');
+      const invalidGaps = (step.kb_pending || []).filter(p => p.error_kind === 'invalid_location').length;
+      const readablePending = (step.kb_pending || []).filter(p => p.error_kind !== 'invalid_location');
+      const requiredGaps = readablePending.filter(p => p.required !== false).length;
+      const optionalGaps = readablePending.length - requiredGaps;
+      const gapText = (requiredGaps ? `；${requiredGaps} 项待补读/处理` : '') + (optionalGaps ? `；${optionalGaps} 段未读范围，可按需续读` : '') + (invalidGaps ? `；${invalidGaps} 项定位参数错误（不是未读正文）` : '');
       stepEl.innerHTML = `<span class="step-icon">${icon}</span><span class="step-text">${esc(outcomeText || label)}${step.query ? ` “${esc(step.query)}”` : ''}${outcomeText ? esc(stateText) : countText}${esc(gapText)}</span>`;
       if (step.kb_goals?.length) {
         const progress = document.createElement('small');
@@ -2194,8 +2263,11 @@ document.addEventListener('DOMContentLoaded', async () => {
       stepEl.className = 'enhancement-step error';
       const failed = step.outcome === 'error';
       const label = step.type === 'kb_update_task' ? '需求状态更新失败' : failed ? (isHistory ? '会话历史回查失败' : step.type === 'web_search' ? '联网搜索失败' : '知识库查询失败') : '工具未执行';
-      stepEl.innerHTML = `<span class="step-icon">⚠</span><span class="step-text">${label}：${esc(step.error || '工具参数无效')}</span>`;
-      stepEl.title = step.error || '工具参数无效';
+      const itemErrors = (step.items || []).filter(item => item.error).map(item => item.error +
+        (item.valid_range ? `（合法字符范围 [${item.valid_range.offset}, ${item.valid_range.end})）` : ''));
+      const errorText = step.error || itemErrors.join('；') || '工具参数无效';
+      stepEl.innerHTML = `<span class="step-icon">⚠</span><span class="step-text">${label}：${esc(errorText)}</span>`;
+      stepEl.title = errorText;
     }
   }
 
@@ -2475,7 +2547,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
-  getOrCreateCurrentChatId().catch(console.error);
 
   document.getElementById('sendBtn').addEventListener('click', () => {
     if (chatUpload?.chatId === currentChatId || (_chatRequest?.chatId === currentChatId && (_chatRequest.status === 'running' || _chatRequest.stopping))) {
@@ -3236,9 +3307,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     // 不再需要旧的捕获阶段拦截（否则会与 handleSend 重复触发）。
   })();
 
-  // ═══════════════════════════════════════════════════════════════════
-  // 操作录制模块（存入知识库）
-  // ═══════════════════════════════════════════════════════════════════
+  const savedChat = await chrome.storage.session.get([CURRENT_CHAT_ID_KEY]);
+  if (savedChat[CURRENT_CHAT_ID_KEY] && !currentChatId && !_sendingLock) {
+    await resumeSession(savedChat[CURRENT_CHAT_ID_KEY]);
+  }
 });
 
 
@@ -3607,7 +3679,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         for (const node of result.blocks) {
           const row = document.createElement('details');
           const summary = document.createElement('summary');
-          summary.textContent = `${node.title} · ${node.page == null ? `原文行 ${node.line_start}–${node.line_end}` : `第 ${node.page}–${node.end_page} 页`} · ${node.kind}`;
+          const roles = {document_title:'文档总标题',section_heading:'正文章节',toc:'印刷目录',front_matter:'前置材料',header:'页眉',footer:'页脚',unknown:'角色未确定'};
+          const state = node.review_status ? ` · ${node.review_status === 'unresolved' ? '待复核' : '模型推断，未作语义核验'}` : '';
+          const level = node.declared_level != null ? ` · 章节级别 ${node.declared_level}` : '';
+          summary.textContent = `${node.title} · ${node.page == null ? `原文行 ${node.line_start}–${node.line_end}` : `第 ${node.page}–${node.end_page} 页`} · ${roles[node.role] || node.kind}${level}${state}`;
           const text = document.createElement('p');
           text.textContent = `${node.preview || ''}（导航节选；依据：${node.basis}）`;
           const read = document.createElement('button');
@@ -3641,6 +3716,70 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
     }
     await loadBranch(tree,null);
+    if (doc.file_type === 'pdf') {
+      const reviews = document.createElement('details');
+      const label = document.createElement('summary');
+      label.textContent = '结构分析与显式发布';
+      const area = document.createElement('div');
+      reviews.append(label, area);
+      dialog.insertBefore(reviews, tree);
+      async function refreshReviews() {
+        area.textContent = '正在查询结构任务…';
+        try {
+          const tasks = await kbRequest(`${base}/structure-reviews`);
+          if (!dialog.isConnected) return;
+          area.replaceChildren();
+          const help = document.createElement('p');
+          help.textContent = '仅展示已创建的分析任务，不自动调用模型。发布会更新正式目录和向量索引；旧版本保留。模型推断不代表结构必然正确。';
+          area.append(help);
+          for (const task of tasks) {
+            const row = document.createElement('div');
+            const title = document.createElement('p');
+            const phases = {completed:'已完成',not_started:'未开始',published:'已发布',queued:'排队中',running:'进行中',failed:'失败',cancelled:'已取消',interrupted:'已中断'};
+            title.textContent = `${task.updated_at} · 分析 ${phases[task.status] || task.status} · 发布 ${phases[task.publication_status] || task.publication_status}`;
+            const inspect = document.createElement('button');
+            inspect.textContent = '查看结构建议';
+            inspect.addEventListener('click', async () => {
+              try {
+                const value = await kbRequest(`${base}/structure-review/${encodeURIComponent(task.review_id)}`);
+                const text = document.createElement('pre');
+                text.style.cssText = 'white-space:pre-wrap;overflow-wrap:anywhere';
+                text.textContent = JSON.stringify(value.result, null, 2);
+                preview.replaceChildren(text);
+              } catch (error) { title.textContent = `加载失败：${error.message}`; }
+            });
+            row.append(title, inspect);
+            if (task.publishable && !['published','queued','running'].includes(task.publication_status)) {
+              const publish = document.createElement('button');
+              publish.textContent = task.publication_status === 'not_started' ? '发布此结构' : '恢复发布';
+              publish.addEventListener('click', async () => {
+                if (!confirm('将此结构建议发布为正式目录并重建向量索引？保留原文和旧版本，不调用聊天模型。')) return;
+                publish.disabled = true;
+                try {
+                  const value = await kbRequest(`${base}/structure-review/${encodeURIComponent(task.review_id)}/publish`, {
+                    method:'POST', body:JSON.stringify({expected_run_id:doc.published_run_id})});
+                  title.textContent = `发布状态：${value.status}。请刷新进度；发布完成后重新打开目录查看新版本。`;
+                  pollDocStatus(kbId,doc.doc_id);
+                } catch (error) { title.textContent = `发布失败：${error.message}`; }
+                finally { publish.disabled = false; }
+              });
+              row.append(publish);
+            } else if (task.status === 'completed' && task.publication_status === 'not_started') {
+              const stale = document.createElement('small');
+              stale.textContent = '协议或正式结构基线已变化，仅供历史查看，不能直接发布。';
+              row.append(stale);
+            }
+            area.append(row);
+          }
+          if (!tasks.length) area.append(document.createTextNode('尚无结构分析任务。'));
+          const refresh = document.createElement('button');
+          refresh.textContent = '刷新发布进度';
+          refresh.addEventListener('click', refreshReviews);
+          area.append(refresh);
+        } catch (error) { area.textContent = `查询失败：${error.message}`; }
+      }
+      reviews.addEventListener('toggle', () => { if (reviews.open) refreshReviews(); });
+    }
   }
 
   function statusIcon(status) {

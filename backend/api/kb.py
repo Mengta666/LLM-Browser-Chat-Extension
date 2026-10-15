@@ -11,6 +11,7 @@ import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Annotated
+from uuid import UUID
 
 from fastapi import APIRouter, File, HTTPException, UploadFile, Query
 from fastapi.responses import FileResponse, Response
@@ -34,7 +35,8 @@ def _kb_errors():
     except KB.KBSyncUnavailable as exc:
         raise HTTPException(503, str(exc)) from exc
     except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
+        detail = {'code':exc.code, 'message':str(exc), **exc.details} if hasattr(exc, 'details') else str(exc)
+        raise HTTPException(400, detail) from exc
 
 
 # ─── Models ───────────────────────────────────────────────────────
@@ -61,6 +63,7 @@ class KBListItem(BaseModel):
 
 
 class DocListItem(BaseModel):
+    published_run_id: str = ''
     original_available: bool = False
     source_kind: str = 'legacy_chunk'
     doc_id: str
@@ -91,6 +94,7 @@ class DocListItem(BaseModel):
 
 
 class DocStatusResponse(BaseModel):
+    published_run_id: str = ''
     original_available: bool = False
     source_kind: str = 'legacy_chunk'
     status: str                     # pending / indexed / failed / not_found
@@ -313,6 +317,21 @@ def document_read(kb_id: str, doc_id: str, block_id: str | None = None, parse_id
         return annotate(result)
 
 
+@router.get('/{kb_id}/docs/{doc_id}/search')
+def search_document(kb_id: str, doc_id: str, query: str = Query(min_length=1, max_length=2000),
+                    page: int | None = Query(None, ge=1), section_id: str | None = None,
+                    node_id: str | None = None, structure_id: str | None = None, index_run_id: str | None = None):
+    from rag.document_retrieval import search
+    from storage.kb_structure_store import snapshot
+    from search.kb_documents import trim_row
+    with _kb_errors():
+        snap = snapshot(kb_id, doc_id, structure_id=structure_id, index_run_id=index_run_id)
+        rows, meta = search(kb_id, query, doc_id=doc_id, page=page, section_id=section_id,
+                            node_id=node_id, snapshots={doc_id:snap})
+        return {'results':[trim_row(r, 2000) if len(r['content'])>2000 else r for r in rows], 'meta':meta,
+                **snap, 'notice':'检索预览不是已读正文或语义核验；使用返回的定位继续读取。'}
+
+
 @router.get('/{kb_id}/docs/{doc_id}/text')
 def document_text(kb_id: str, doc_id: str, parse_id: str, offset: int = Query(0,ge=0),
                   end: int | None = Query(None,ge=0)):
@@ -329,6 +348,75 @@ def document_text(kb_id: str, doc_id: str, parse_id: str, offset: int = Query(0,
         return {'doc_id':doc_id,'parse_id':parse_id,'content':text[offset:stop],'length':len(text),
                 **TS.location(starts,{'source_start':0},offset,stop),
                 'next_offset':stop if stop<requested else None,'truncated':stop<requested}
+
+
+class StructureReviewRequest(BaseModel):
+    model_config={'extra':'forbid'}
+    request_id: UUID
+
+
+class StructurePublishRequest(BaseModel):
+    model_config = {'extra': 'forbid'}
+    expected_run_id: str = Field(min_length=1, max_length=100)
+
+
+@router.post('/{kb_id}/docs/{doc_id}/structure-review/{review_id}/publish')
+def publish_structure_review(kb_id: str, doc_id: str, review_id: str, request: StructurePublishRequest):
+    from rag.structure_publication import start
+    with _kb_errors():
+        return start(kb_id, doc_id, review_id, request.expected_run_id)
+
+
+@router.get('/{kb_id}/docs/{doc_id}/structure-review/{review_id}/publication')
+def get_structure_publication(kb_id: str, doc_id: str, review_id: str):
+    from rag.structure_publication import get
+    with _kb_errors():
+        return get(kb_id, doc_id, review_id)
+
+
+@router.get('/{kb_id}/docs/{doc_id}/structure-reviews')
+def list_structure_reviews(kb_id: str, doc_id: str):
+    from storage import kb_document_store as DS
+    from rag.structure_review_protocol import VERSION
+    with _kb_errors(), KS._transaction() as conn:
+        doc = DS.owned(conn, kb_id, doc_id)
+        rows = [dict(r) for r in conn.execute('''SELECT r.review_id,r.status,r.updated_at,r.structure_id,
+            json_extract(r.result_json,'$.schema_version') AS result_version,
+            coalesce(p.status,'not_started') AS publication_status,p.run_id
+            FROM kb_structure_reviews r LEFT JOIN kb_structure_publications p ON p.review_id=r.review_id
+            WHERE r.kb_id=? AND r.doc_id=? ORDER BY r.created_at DESC LIMIT 20''', (kb_id, doc_id))]
+        for row in rows:
+            row['publishable'] = (row['status']=='completed' and row['result_version']==VERSION
+                                  and row['structure_id']==doc['published_structure_id'])
+        return rows
+
+
+@router.post('/{kb_id}/docs/{doc_id}/structure-review')
+def start_structure_review(kb_id: str, doc_id: str, request: StructureReviewRequest | None = None):
+    from rag.document_structure_review import start
+    with _kb_errors():
+        return start(kb_id, doc_id,request_id=str(request.request_id) if request else '')
+
+
+@router.get('/{kb_id}/docs/{doc_id}/structure-review/{review_id}')
+def get_structure_review(kb_id: str, doc_id: str, review_id: str):
+    from storage.kb_structure_review_store import get
+    with _kb_errors():
+        return get(kb_id, doc_id, review_id)
+
+
+@router.post('/{kb_id}/docs/{doc_id}/structure-review/{review_id}/cancel')
+def cancel_structure_review(kb_id: str, doc_id: str, review_id: str):
+    from storage.kb_structure_review_store import cancel
+    with _kb_errors():
+        return cancel(kb_id, doc_id, review_id)
+
+
+@router.post('/{kb_id}/docs/{doc_id}/structure-review/{review_id}/resume')
+def resume_structure_review(kb_id: str, doc_id: str, review_id: str):
+    from rag.document_structure_review import start
+    with _kb_errors():
+        return start(kb_id, doc_id, review_id)
 
 
 @router.get('/{kb_id}/docs/{doc_id}/file')

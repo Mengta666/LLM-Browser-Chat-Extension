@@ -50,7 +50,8 @@ def _get_conn() -> sqlite3.Connection:
                 indexed = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='history_blocks'").fetchone()
                 documents = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='document_jobs'").fetchone()
                 kb_runtime = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chat_kb_runtime'").fetchone()
-                if columns and ('seq' not in columns or not indexed or not documents or not kb_runtime):
+                events = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chat_request_events'").fetchone()
+                if columns and ('seq' not in columns or not indexed or not documents or not kb_runtime or not events):
                     backup = _DB_PATH.with_name(f'{_DB_PATH.stem}.migration-{uuid4().hex[:8]}.sqlite3')
                     with sqlite3.connect(str(backup)) as target:
                         conn.backup(target)
@@ -71,6 +72,8 @@ def _get_conn() -> sqlite3.Connection:
 
 def _init_schema(conn: sqlite3.Connection) -> None:
     with conn:
+        from storage import chat_events
+        chat_events.init_schema(conn)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS chat_sessions (

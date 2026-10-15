@@ -109,6 +109,7 @@ def stop(kb_id, doc_id):
                      (now(), doc['active_parse_id']))
         conn.execute("UPDATE kb_docs SET status='failed',error_msg='已取消，可恢复' WHERE doc_id=? AND published_run_id=''", (doc_id,))
         conn.execute("UPDATE kb_pages SET status='interrupted',error='用户取消' WHERE parse_id=? AND status='parsing'", (doc['active_parse_id'],))
+        conn.execute("UPDATE kb_structure_publications SET status='cancelled',error='用户取消，可显式恢复',updated_at=? WHERE doc_id=? AND status IN ('queued','running')", (now(), doc_id))
 
 
 def fail(parse_id, lease, error):
@@ -187,10 +188,17 @@ def pages(parse_id):
         return [dict(r) for r in conn.execute("SELECT * FROM kb_pages WHERE parse_id=? ORDER BY page", (parse_id,))]
 
 
-def blocks(parse_id, page=None):
+def blocks(parse_id, page=None, *, structure_id=None):
     with KS._transaction() as conn:
-        rows = conn.execute("SELECT * FROM kb_blocks WHERE parse_id=?" + (" AND page=?" if page else "") + " ORDER BY page,ordinal",
-                            (parse_id, page) if page else (parse_id,)).fetchall()
+        table = 'kb_blocks' if structure_id is None else 'kb_resolved_blocks'
+        condition, params = 'parse_id=?', [parse_id]
+        if structure_id is not None:
+            condition += ' AND structure_id=?'
+            params.append(structure_id)
+        if page is not None:
+            condition += ' AND page=?'
+            params.append(page)
+        rows = conn.execute(f'SELECT * FROM {table} WHERE {condition} ORDER BY page,ordinal', params).fetchall()
     return [{**dict(r), 'structure': json.loads(r['structure_json']), 'bbox': json.loads(r['bbox_json'])} for r in rows]
 
 
@@ -239,9 +247,14 @@ def advance_index(kb_id, doc_id, parse_id, lease, run_id, count):
         conn.execute("UPDATE kb_index_runs SET indexed_count=? WHERE run_id=? AND parse_id=? AND status='building'", (count, run_id, parse_id))
 
 
-def publish(kb_id, doc_id, parse_id, lease, run_id):
+def publish(kb_id, doc_id, parse_id, lease, run_id, *, review_id=None):
     with KS._transaction() as conn:
-        current(conn, kb_id, doc_id, parse_id, lease)
+        doc, _ = current(conn, kb_id, doc_id, parse_id, lease)
+        if review_id:
+            publication = conn.execute("SELECT * FROM kb_structure_publications WHERE review_id=? AND doc_id=? AND parse_id=? AND status='running'",
+                                       (review_id, doc_id, parse_id)).fetchone()
+            if not publication or publication['expected_run_id'] != doc['published_run_id']:
+                raise KS.KBConflict('发布基线已变化，不能覆盖更新后的版本')
         row = conn.execute("SELECT * FROM kb_index_runs WHERE run_id=? AND parse_id=? AND status='building'", (run_id, parse_id)).fetchone()
         if not row or row['indexed_count'] != row['chunk_count'] or not row['chunk_count']:
             raise KS.KBConflict("索引未完成，不能发布")
@@ -254,6 +267,9 @@ def publish(kb_id, doc_id, parse_id, lease, run_id):
         conn.execute("UPDATE kb_parse_versions SET status='published',lease='',error='',updated_at=? WHERE parse_id=?", (now(), parse_id))
         conn.execute("UPDATE kb_docs SET published_parse_id=?,published_run_id=?,index_run_id=?,published_structure_id=?,status='indexed',chunk_count=?,indexed_at=?,error_msg='',sync_pending=0,sync_error='' WHERE doc_id=?",
                      (parse_id, run_id, run_id, row['structure_id'], row['chunk_count'], now(), doc_id))
+        if review_id:
+            conn.execute("UPDATE kb_structure_publications SET status='published',structure_id=?,run_id=?,error='',updated_at=? WHERE review_id=?",
+                         (row['structure_id'], run_id, now(), review_id))
 
 
 def resolve_version(kb_id, doc_id, parse_id=None):

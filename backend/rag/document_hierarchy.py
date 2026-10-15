@@ -4,17 +4,17 @@ import hashlib
 import json
 import re
 import unicodedata
-from difflib import SequenceMatcher
+from copy import deepcopy
 
-from rag.document_layout import HEADINGS, MARGINS, STATEMENT
+from rag.document_layout import MARGINS, STATEMENT
+from rag.document_sections import heading_level
 
-VERSION = 3
+VERSION = 8
 PROOF = re.compile(r'(?:^|(?<=[。；;\n]))\s*(?:(?:现在|下面|以下|接着|再|首先|其次)\s*)?'
                    r'(?:证明(?:\s|[：:。]|命题|定理|引理|第|不等式|公式|[（(])|证(?:\s+|[：:。．.])|'
                    r'Proof\b|We\s+(?:now\s+)?prove\b)', re.I)
 CONDITION = re.compile(r'若|如果|假设|设\s|满足|当|条件|对于|属于|\b(?:if|assum|provided|where|let|for any)\b|∈|\\in\b', re.I)
 TARGET = re.compile(r'(?:不等式|公式|等式|式|equation|inequality|eq\.?)\s*[（(]?\s*(\d+(?:\.\d+)*[a-z]?)', re.I)
-NUMBER = re.compile(r'^\s*(\d+(?:\.\d+)*)(?:[.、．\s]|$)')
 PROOF_END = re.compile(r'(?:证毕|证明完毕|(?:由此|由是|故|即|遂)得证)[。．.]?|'
                        r'\b(?:Q\.?E\.?D\.?|this completes the proof|the proof is complete)\b[.]?|[□∎]', re.I)
 STATEMENT_REF = re.compile(r'(?:命题|定理|引理|推论|proposition|theorem|lemma|corollary)\s*'
@@ -43,35 +43,32 @@ def statement_key(text):
     return kind,number
 
 
-def heading_level(text):
-    match = NUMBER.match(re.sub(r'^\s*§\s*', '', text))
-    if match:
-        return match[1].count('.') + 1, 'numbering'
-    if re.match(r'^\s*(?:第[一二三四五六七八九十百\d]+[篇部章]|PART\b|CHAPTER\b|[IVXLCDM]+\.)', text, re.I):
-        return 1, 'numbering'
-    if re.match(r'^\s*(?:第[一二三四五六七八九十百\d]+节|[一二三四五六七八九十]+、)', text):
-        return 2, 'numbering'
-    if re.fullmatch(r'\s*(?:摘要|摘\s*要|参考文献|结论|致谢|abstract|references|conclusions?|acknowledg[e]?ments?)\s*',text,re.I):
-        return 1, 'explicit_section_name'
-    return None, 'layout'
-
-
-def build(blocks, *, title, bookmarks=(), max_chars=4000, preview_chars=120, proof_passage_chars=600, check=lambda: None):
-    usable = [b for b in blocks if b['kind'] not in MARGINS and not b.get('structure', {}).get('index_excluded') and b['text'].strip()]
+def build(blocks, *, title, bookmarks=(), max_chars=4000, preview_chars=120, proof_passage_chars=600, check=lambda: None, review=None):
+    from rag import document_sections as S
+    if review is None and any(b.get('structure', {}).get('hierarchy_version') != S.VERSION for b in blocks):
+        blocks = S.assign(deepcopy(blocks), bookmarks)
+    usable = [b for b in blocks if b['text'] and (review is not None or
+              b['kind'] not in MARGINS and not b.get('structure', {}).get('index_excluded') and b['text'].strip())]
     if not usable:
         raise ValueError('no_structure_content')
     atoms = []
+    if review is not None:
+        from rag.structure_projection import boundaries, contains
+        cuts = boundaries(review)
     for block in usable:
         check()
         starts = sorted({0, *[m.start() for m in PROOF.finditer(block['text']) if block['text'][:m.start()].strip()],
                          *[m.end() for m in PROOF_END.finditer(block['text']) if block['text'][m.end():].strip()]})
+        if review is not None:
+            starts = sorted(set(starts) | set(cuts.get(block['block_id'], [])) - {len(block['text'])})
         for start, end in zip(starts, starts[1:] + [len(block['text'])]):
             atoms.append({'block': block, 'start': start, 'end': end, 'text': block['text'][start:end]})
     nodes, relations = [], []
     def add(kind, parent, start, end, label, basis, **attrs):
         node_id = 'N' + hashlib.sha256(json.dumps([kind, parent, atoms[start]['block']['block_id'],
             atoms[start]['start'], end, label], ensure_ascii=False).encode()).hexdigest()[:16]
-        source = [{'block_id': a['block']['block_id'], 'start': a['start'], 'end': a['end']} for a in atoms[start:end]]
+        source = [{'block_id': a['block']['block_id'], 'start': a['start'], 'end': a['end']} for k, a in enumerate(atoms[start:end], start)
+                  if review is None or kind not in ('paragraph','proof','statement','table','formula') or k not in excluded]
         parent_node = next((n for n in nodes if n['node_id'] == parent), None)
         node = {'node_id': node_id, 'parent_id': parent, 'kind': kind, 'ordinal': len(nodes),
                 'depth': parent_node['depth'] + 1 if parent_node else 0, 'title': label,
@@ -81,48 +78,55 @@ def build(blocks, *, title, bookmarks=(), max_chars=4000, preview_chars=120, pro
                 'attributes': attrs, 'sources': source}
         nodes.append(node)
         return node
-    root = add('document', '', 0, len(atoms), title, 'document')
+    root = add('document', '', 0, len(atoms), (review['document']['title'] or title) if review else title, 'document')
     headings = []
-    sizes = []
     for i, a in enumerate(atoms):
-        block, text = a['block'], a['text']
-        if a['start'] or block['kind'] not in HEADINGS or block['kind']=='doc_title' or STATEMENT.match(text) or PROOF.match(text):
-            continue
-        level, basis = heading_level(text)
-        for mark in bookmarks:
-            if mark[2] == block['page'] and SequenceMatcher(None, re.sub(r'\s+', '', mark[1]).casefold(), re.sub(r'\s+', '', text).casefold()).ratio() >= .85:
-                level, basis = mark[0], 'bookmark'
-                break
-        box = block.get('bbox')
-        size = (box[3] - box[1]) / max(1, text.count('\n') + 1) if box else 0
-        if size:
-            sizes.append(size)
-        headings.append([i, level, basis, size])
-    clusters = []
-    for size in sorted(sizes, reverse=True):
-        if not any(abs(size - v) <= .12 * max(size, v) for v in clusters):
-            clusters.append(size)
-    for item in headings:
-        if item[1] is None:
-            item[1] = min(range(len(clusters)), key=lambda j: abs(clusters[j] - item[3])) + 1 if item[3] and clusters else 1
-    levels = {v: i + 1 for i, v in enumerate(sorted({h[1] for h in headings}))}
-    stack, sections = [], {}
-    for hi, (start, level, basis, _) in enumerate(headings):
-        level = levels[level]
-        while stack and stack[-1][0] >= level:
-            stack.pop()
-        end = next((h[0] for h in headings[hi+1:] if levels[h[1]] <= level), len(atoms))
-        node = add('section', stack[-1][1]['node_id'] if stack else root['node_id'], start, end,
-                   atoms[start]['text'].strip()[:240], basis, heading_block=atoms[start]['block']['block_id'])
-        stack.append((level, node))
+        h = a['block']['structure'].get('section_heading')
+        if review is None and not a['start'] and h:
+            headings.append((i, h))
+    starts = {h['block_id']: i for i, h in headings}
+    sections, by_heading = {}, {}
+    for start, h in headings:
+        end = starts.get(h['end_heading'], len(atoms))
+        parent = by_heading.get(h['parent_heading'], root)
+        node = add('section', parent['node_id'], start, end,
+                   atoms[start]['text'].strip()[:240], h['basis'], heading_block=h['block_id'],
+                   **{k: v for k, v in h.items() if k not in ('block_id', 'basis')})
         sections[start] = node
+        by_heading[h['block_id']] = node
+    excluded, heading_atoms, margins = set(), set(), set()
+    if review is not None:
+        for section in review['nodes']:
+            selected = [i for i, a in enumerate(atoms) if contains(section['sources'], a)]
+            heading_atoms.update(i for i, a in enumerate(atoms) if contains(section['heading_sources'], a))
+            node = add('section', by_heading.get(section['parent_anchor'], root)['node_id'], min(selected), max(selected)+1,
+                       section['title'], 'model_review', role='section_heading', review_range_version=1,
+                       review_status=section['status'], declared_level=section['section_level'],
+                       heading_anchor=section['heading_anchor'], evidence_refs=section['evidence_refs'],
+                       reason=section['basis'], heading_sources=section['heading_sources'],
+                       uncertain_sources=section['uncertain_sources'])
+            node['sources'] = deepcopy(section['sources'])
+            sections[min(selected)] = node
+            by_heading[section['heading_anchor']] = node
+        for material in review['materials']:
+            selected = [i for i, a in enumerate(atoms) if contains(material['sources'], a)]
+            if material['ownership'] == 'exclusive':
+                excluded.update(selected)
+                if material['role'] in ('header','footer'):
+                    margins.update(selected)
+            node = add(material['role'], root['node_id'], min(selected), max(selected)+1, material['title'],
+                       'model_review', role=material['role'], review_status=material['status'],
+                       ownership=material['ownership'], reason=material['reason'], evidence_refs=material['evidence_refs'])
+            node['sources'] = deepcopy(material['sources'])
+        root['attributes'].update(review_range_version=1, semantics_verified=False)
     def parent_at(i):
-        matching = [n for n in sections.values() if n['start_order'] <= i < n['end_order']]
+        matching = [n for n in sections.values() if n['start_order'] <= i < n['end_order']
+                    and (review is None or contains(n['sources'], atoms[i]))]
         return max(matching, key=lambda n: n['depth']) if matching else root
     units, i, last_statement = [], 0, None
     while i < len(atoms):
         check()
-        if i in sections:
+        if i in sections or i in heading_atoms or i in excluded:
             last_statement = None
             i += 1
             continue
@@ -132,7 +136,11 @@ def build(blocks, *, title, bookmarks=(), max_chars=4000, preview_chars=120, pro
         is_proof = bool(PROOF.match(a['text']))
         kind = 'statement' if is_statement else 'proof' if is_proof else 'table' if a['block']['kind'] == 'table' else 'paragraph'
         j, length = i + 1, len(a['text'])
-        while j < len(atoms) and j not in sections and parent_at(j)['node_id'] == parent['node_id']:
+        while (j < len(atoms) and j not in sections and j not in heading_atoms
+               and (j in margins and j < parent['end_order'] or j not in excluded and parent_at(j)['node_id'] == parent['node_id'])):
+            if j in margins:
+                j += 1
+                continue
             if kind == 'proof' and PROOF_END.search(atoms[j-1]['text']):
                 break
             following = atoms[j]
@@ -160,6 +168,8 @@ def build(blocks, *, title, bookmarks=(), max_chars=4000, preview_chars=120, pro
     for proof in [n for n in units if n['kind']=='proof']:
         start, length = proof['start_order'], 0
         for i in range(start,proof['end_order']):
+            if i in excluded:
+                continue
             atom = atoms[i]
             # 只在实质性叙述之前分段；短连接语、紧随的公式和编号留在同一段。
             boundary = (i>start and length>=proof_passage_chars and atom['block']['kind'] not in ('display_formula','formula_number')
@@ -169,23 +179,29 @@ def build(blocks, *, title, bookmarks=(), max_chars=4000, preview_chars=120, pro
                 start, length = i,0
             length += len(atom['text'])
         add('paragraph',proof['node_id'],start,proof['end_order'],atoms[start]['text'].strip().split('\n')[0][:100],'proof_passage')
-        narrative = [a for a in atoms[proof['start_order']:proof['end_order']]
-                     if a['block']['kind'] not in ('display_formula','formula_number','table','image')
+        narrative = [a for k, a in enumerate(atoms[proof['start_order']:proof['end_order']], proof['start_order'])
+                     if k not in excluded and a['block']['kind'] not in ('display_formula','formula_number','table','image')
                      and len(re.sub(r'\$.*?\$', '', a['text'], flags=re.S).strip())>=8]
         if len(narrative)>=2 and len(narrative)<len(proof['sources']):
             guide = add('paragraph',proof['node_id'],proof['start_order'],proof['end_order'],
                         '证明叙述导览（公式需另读）','proof_route',full_node_id=proof['node_id'])
             guide['sources'] = [{'block_id':a['block']['block_id'],'start':a['start'],'end':a['end']} for a in narrative]
             guide['preview'] = ' '.join(a['text'].strip() for a in narrative)[:preview_chars]
-    formulas = []
+    formulas, formula_blocks = [], set()
     for i, a in enumerate(atoms):
         s = a['block'].get('structure', {})
-        if a['block']['kind'] != 'display_formula' or not s.get('formula_label'):
+        if a['block']['kind'] != 'display_formula' or not s.get('formula_label') or i in excluded or i in heading_atoms:
             continue
+        if a['block']['block_id'] in formula_blocks:
+            continue
+        formula_blocks.add(a['block']['block_id'])
         owner = next((n for n in units if n['start_order'] <= i < n['end_order']), parent_at(i))
         formula = add('formula', owner['node_id'], i, i+1, '公式 (' + str(s['formula_label']) + ')', 'formula_label', number=str(s['formula_label']))
         members = set(s.get('formula_members', []))
-        formula['sources'] = [{'block_id': b['block_id'], 'start': 0, 'end': len(b['text'])} for b in usable if b['block_id'] in members] or formula['sources']
+        formula['sources'] = ([{'block_id': at['block']['block_id'], 'start': at['start'], 'end': at['end']}
+                              for k, at in enumerate(atoms) if at['block']['block_id'] in members and k not in excluded
+                              and parent_at(k)['node_id'] == parent_at(i)['node_id']] if review else
+                              [{'block_id': b['block_id'], 'start': 0, 'end': len(b['text'])} for b in usable if b['block_id'] in members]) or formula['sources']
         formula['end_page'] = max(b['page'] for b in usable if b['block_id'] in {p['block_id'] for p in formula['sources']})
         formulas.append(formula)
         if owner['kind'] == 'statement':
@@ -240,7 +256,9 @@ def build(blocks, *, title, bookmarks=(), max_chars=4000, preview_chars=120, pro
     relations = list(unique.values())
     validate(nodes, relations, blocks)
     return nodes, relations, {'nodes': len(nodes), 'sections': len(sections), 'units': len(units),
-        'source_blocks': len(usable), 'unresolved_hierarchy': sum(h[2] == 'layout' for h in headings),
+        'source_blocks': len(usable), 'unresolved_hierarchy': sum(h.get('parent_status') != 'supported' for _, h in headings),
+        'recovered_headings': sum(h.get('candidate_origin') not in ('title','paragraph_title','section_title') for _, h in headings),
+        'hierarchy_issues': [{'block_id':h['block_id'],'issues':h['issues']} for _,h in headings if h.get('issues')],
         'semantic_verified': False, 'warnings': ['结构为导航推断，关联不等于语义核验；无明确边界的内容保留段落组。']}
 
 
@@ -263,6 +281,17 @@ def validate(nodes, relations, blocks):
         for span in node['sources']:
             if not 0 <= span['start'] < span['end'] <= len(source[span['block_id']]['text']):
                 raise ValueError('invalid_structure_source')
+        if node['kind']=='section' and not node['attributes'].get('review_range_version') and all(b.get('structure',{}).get('hierarchy_version') for b in blocks):
+            heading = node['attributes']['heading_block']
+            expected = {b['block_id']:len(b['text']) for b in blocks if heading in b['structure'].get('section_path',[])
+                        and b['kind'] not in MARGINS and not b['structure'].get('index_excluded') and b['text'].strip()}
+            covered = {}
+            for span in node['sources']:
+                if span['start'] != covered.get(span['block_id'],0):
+                    raise ValueError('section_source_gap_or_overlap')
+                covered[span['block_id']] = span['end']
+            if covered != expected:
+                raise ValueError('section_source_projection_mismatch')
     for relation in relations:
         if relation['source_id'] not in known or relation['target_id'] not in known or not relation['evidence']:
             raise ValueError('invalid_structure_relation')

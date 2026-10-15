@@ -33,7 +33,7 @@ def bundles(kb_id, doc_id, snapshot, node_id, *, query='', sequential=False, cur
     targets = [node]
     context_refs = []
     if not sequential and node['kind'] in ('document','section','statement'):
-        descendants = [n for n in nodes if node['start_order'] <= n['start_order'] < n['end_order'] <= node['end_order'] and n['node_id'] != node_id]
+        descendants = [n for n in nodes if HS.descendant(n, node_id, known)]
         targets = [n for n in descendants if n['kind'] == 'formula' and known[n['parent_id']]['kind']=='statement']
         if intent['proof']:
             statements = {node_id, *[n['node_id'] for n in descendants if n['kind'] == 'statement']}
@@ -49,7 +49,7 @@ def bundles(kb_id, doc_id, snapshot, node_id, *, query='', sequential=False, cur
     def segment(span):
         bid = span['block_id']
         if bid not in cache:
-            cache[bid] = read(kb_id,doc_id,snapshot['parse_id'],block_id=bid)
+            cache[bid] = read(kb_id,doc_id,**snapshot,block_id=bid)
         original = cache[bid]
         return {**original['segments'][0], **span, 'text': original['content'][span['start']:span['end']]}
     for target in targets:
@@ -172,7 +172,7 @@ def route(kb_id, query, snapshots, *, doc_id=None, node_id=None, page=None, sect
         for n in nodes:
             if n['basis']=='proof_route':
                 continue
-            if n['kind']=='document' or (scope and not scope['start_order']<=n['start_order']<n['end_order']<=scope['end_order']):
+            if n['kind'] in ('document','header','footer') or (scope and n['node_id'] != scope['node_id'] and not HS.descendant(n, scope['node_id'], known)):
                 continue
             if page is not None and (n['page'] is None or not n['page']<=page<=n['end_page']):
                 continue

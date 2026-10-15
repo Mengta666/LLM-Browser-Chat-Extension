@@ -27,19 +27,29 @@ def record(state, kb_id, items):
             if position not in scope.setdefault('read_positions', []):
                 scope['read_positions'].append(position)
         scope['error'] = item.get('error') if item['delivery'] == 'failed' else None
+        scope['error_kind'] = item.get('error_kind')
+        scope['resolution_ranges'] = item.get('resolution_ranges', [])
+        scope['repair_read'] = item.get('repair_read')
     reconcile(state)
 
 
 def reconcile(state):
     for scope in state.get('read_scopes', []):
+        if scope.get('error') in ('字符范围超出边界', '表格行范围超出边界'):
+            scope['error_kind'] = 'invalid_location'
         unread = [p for span in scope['requested_ranges'] for p in coverage.missing(span, state['ranges'])]
         scope['unread_ranges'] = unread
-        scope['status'] = 'failed' if scope['error'] else 'partial' if unread else 'complete'
+        if scope.get('error_kind') == 'invalid_location':
+            spans = scope.get('resolution_ranges', [])
+            resolved = spans and not any(coverage.missing(s, state['ranges']) for s in spans)
+            scope['status'] = 'resolved' if resolved else 'invalid'
+        else:
+            scope['status'] = 'failed' if scope['error'] else 'partial' if unread else 'complete'
 
 
 def pending(state):
     reconcile(state)
-    return [s for s in state.get('read_scopes', []) if s['required'] and s['status'] != 'complete']
+    return [s for s in state.get('read_scopes', []) if s['required'] and s['status'] not in ('complete','invalid','resolved')]
 
 
 def next_read(state, kb_id, limit):
@@ -74,9 +84,12 @@ def next_read(state, kb_id, limit):
 def report(state):
     gaps = pending(state)
     scopes = sorted(state.get('read_scopes', []), key=lambda s:not (s['required'] and s['status']!='complete'))
-    return {'status':'partial' if gaps else 'selected_reads_complete' if any(s['required'] for s in scopes)
+    invalid = [s for s in scopes if s['status'] == 'invalid']
+    return {'status':'partial' if gaps else 'invalid_selection' if invalid else 'selected_reads_complete' if any(s['required'] and s['status']=='complete' for s in scopes)
             else 'preview_only' if scopes else 'not_requested',
             'semantics_verified':False, 'missing_scope_count':len(gaps),
+            'invalid_scope_count':len(invalid),
+            'invalid_scopes':[{'target':s['target'], 'error':s['error'], 'repair_read':s.get('repair_read')} for s in invalid[:8]],
             'scope_count':len(scopes), 'required_scope_count':sum(s['required'] for s in scopes),
             'scopes':[{'id':s['id'],'need_ids':s['need_ids'],'target':s['target'],'required':s['required'],
                        'status':s['status'],'unread_chars':coverage.covered_chars(s['unread_ranges']),

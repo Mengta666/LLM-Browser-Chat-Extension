@@ -113,7 +113,8 @@ def execute(name, args, versions=None):
                 if target['mode'] in ('page', 'section', 'block', 'related'):
                     units = []
                     for span in row['segments']:
-                        original = R.read(args['kb_id'], row['doc_id'], row['parse_id'], block_id=span['block_id'])
+                        original = R.read(args['kb_id'], row['doc_id'], block_id=span['block_id'],
+                                          **{k:row[k] for k in ('parse_id','structure_id','index_run_id') if row.get(k)})
                         structure = original.get('structure', {})
                         if target['mode'] in ('page', 'section') and structure.get('index_excluded'):
                             continue
@@ -142,7 +143,9 @@ def execute(name, args, versions=None):
                               'mode': target['mode'], 'available_blocks': len(available)})
             except (KS.KBNotFound, KS.KBConflict, ValueError) as exc:
                 del rows[target_start:]
-                items.append({'target_index': index, 'outcome': 'error', 'error': str(exc), 'target': target})
+                items.append({'target_index': index, 'outcome': 'error', 'error': str(exc), 'target': target,
+                              'error_kind':'invalid_location' if isinstance(exc, ValueError) else 'read_failure',
+                              'error_code':getattr(exc, 'code', 'kb_read_failed'), **getattr(exc, 'details', {})})
         return rows, {'outcome': 'read' if rows else 'error', 'items': items}
     if name == 'kb_get_document_outline':
         scoped = resolve_scope(args, versions)
@@ -236,8 +239,9 @@ def complete_unit(row, *, exact=False):
     segments, seen, atomic = [], set(), bool(row.get('formula_number'))
     read_args = row.get('read_args')
     related = row.get('related_blocks', [])
+    snapshot = {k:row[k] for k in ('parse_id','structure_id','index_run_id') if row.get(k)}
     for span in row.get('segments', []):
-        block = R.read(row['kb_id'], row['doc_id'], row['parse_id'], block_id=span['block_id'])
+        block = R.read(row['kb_id'], row['doc_id'], **snapshot, block_id=span['block_id'])
         primary = (read_args['targets'][0] if read_args and 'targets' in read_args else read_args) or {}
         if primary.get('block_id') == span['block_id']:
             related = block.get('related_blocks', related)
@@ -257,12 +261,12 @@ def complete_unit(row, *, exact=False):
             atomic = True
             members = structure.get('formula_members') or structure['related_blocks']
             wanted = [part for member in members for part in
-                      R.read(row['kb_id'], row['doc_id'], row['parse_id'], block_id=member)['segments']]
+                      R.read(row['kb_id'], row['doc_id'], **snapshot, block_id=member)['segments']]
             if read_args and 'targets' not in read_args and read_args.get('block_id') == span['block_id']:
-                read_args = P.read_entry(row['kb_id'], doc_id=row['doc_id'], parse_id=row['parse_id'],
+                read_args = P.read_entry(row['kb_id'], doc_id=row['doc_id'], **snapshot,
                                          block_id=span['block_id'], include_related=True)
         for extra in structure.get('context_blocks', []):
-            wanted += R.read(row['kb_id'], row['doc_id'], row['parse_id'], block_id=extra)['segments']
+            wanted += R.read(row['kb_id'], row['doc_id'], **snapshot, block_id=extra)['segments']
         for item in wanted:
             key = item['block_id'], item['start'], item['end']
             if key not in seen:
@@ -295,7 +299,7 @@ def complete_unit(row, *, exact=False):
                 for span in conditions:
                     key = span['block_id'],span['start'],span['end']
                     if key not in seen:
-                        extra += R.read(row['kb_id'],row['doc_id'],row['parse_id'],block_id=span['block_id'],offset=span['start'],end=span['end'])['segments']
+                        extra += R.read(row['kb_id'],row['doc_id'],**snapshot,block_id=span['block_id'],offset=span['start'],end=span['end'])['segments']
                         seen.add(key)
                 segments = extra + segments
                 atomic = True
@@ -319,7 +323,8 @@ def render(rows, meta):
         if outline.get('view') == 'tree':
             outline = {k:v for k,v in outline.items() if k not in ('title','notice','has_more')}
             outline['blocks'] = [{k:v for k,v in b.items() if k in
-                ('node_id','parent_id','depth','kind','title','page','end_page','children','location_kind','source_start','source_end','line_start','line_end')} for b in outline['blocks']]
+                ('node_id','parent_id','depth','kind','title','page','end_page','children','location_kind','source_start','source_end','line_start','line_end',
+                 'parent_status','boundary_status','issues','declared_level')} for b in outline['blocks']]
         if outline.get('view') == 'sections':
             outline = {**outline, 'blocks': [{k: v for k, v in b.items()
                         if k != 'kind' and not (k == 'section_id' and not v)
@@ -515,6 +520,7 @@ class TurnKBBudget:
             'named_documents': self.state.get('named_documents', []),
             'stop_reason': self.state['stop_reason']}, ensure_ascii=False) +
             '\n只修复与当前问题有关的失败参数或缺失证据；相同错误不要重复。自然下一块只是导航，不要求通读。'
+            '\ninvalid_location 是未执行的非法位置，不是尚未读取的正文。核对 valid_range/valid_rows 后重试，或显式使用 repair_read；不得猜测长度或认定错误范围已读完。'
             'not_provided 表示已找到的候选未完整纳入；按当前问题需要使用 read_args 补读，不要求把所有搜索候选读完，也不要用标题替代必要正文或断言没有资料。'
             'proof_route 是非连续叙述导览，read_args 续读导览；需要完整公式推导时使用 full_read 连续原文入口，不把导览当全文。'
             '只问概述或关键步骤时，先读齐各需求的叙述；仅在必要条件或关键步骤缺失时补读相应原文，不默认演算全部公式。'
@@ -873,7 +879,9 @@ class TurnKBBudget:
         for item in meta.get('items', []):
             if item['outcome'] == 'error' or item['target_index'] not in successful:
                 pending.append({'reason': item.get('error', 'not_provided'), 'target': item['target'],
-                                'required': item['outcome'] == 'error' or item['target']['mode'] not in ('page', 'section')})
+                                **{k:item[k] for k in ('error_kind','error_code','repair_read','resolution_ranges') if k in item},
+                                'required': item.get('error_kind') != 'invalid_location' and
+                                    (item['outcome'] == 'error' or item['target']['mode'] not in ('page', 'section'))})
         for row in selected:
             if name != 'kb_read_document' and row.get('excerpt_truncated') and row.get('next_read'):
                 pending.append({'reason': 'excerpt_truncated', 'required': False, 'read_args': P.read_entry(**row['next_read'])})
@@ -918,7 +926,7 @@ class TurnKBBudget:
                 self.state['questions'].append(entry['question'])
             pending.extend({'reason': 'missing_formula', 'formula_number': number, 'doc_id': args.get('doc_id'),
                             'doc_name': args.get('doc_name')} for number in entry.get('missing_formula_numbers', []))
-        if meta.get('outcome') == 'error' and meta.get('error_code') != 'kb_unavailable':
+        if meta.get('outcome') == 'error' and not meta.get('items') and meta.get('error_code') != 'kb_unavailable':
             self.record_error(name, args, meta.get('error', '读取失败'), error_code=meta.get('error_code'), need_id=meta.get('need_id'))
         else:
             # 只清除本次确实完成的定位，未尝试的其他缺口保留。

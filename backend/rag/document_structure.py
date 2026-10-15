@@ -196,14 +196,18 @@ def build_chunks(blocks, filename, counter):
                 members.append(previous)
             members.sort(key=lambda b: b['ordinal'])
     # 标题与其下的首页信息形成元信息入口；保留各原块来源，不猜测作者字段值。
-    metadata = []
+    metadata, active_metadata = [], None
     for members in groups.values():
         first = members[0]
         if first['kind'] == 'doc_title':
             metadata.append(list(members))
-        elif (metadata and len(metadata[-1]) < 4 and first['kind'] == 'text'
-              and first['page'] == metadata[-1][0]['page'] and first['section_id'] == metadata[-1][0]['block_id']):
-            metadata[-1].extend(members)
+            active_metadata = metadata[-1]
+        elif (active_metadata is not None and len(active_metadata) < 4 and first['kind'] == 'text'
+              and first['page'] == active_metadata[0]['page']
+              and first['section_id'] in ('', active_metadata[0]['block_id'])):
+            active_metadata.extend(members)
+        else:
+            active_metadata = None
     chunks = []
     for group in metadata:
         if group[0]['page'] == 1:

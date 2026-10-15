@@ -11,8 +11,8 @@ def split_node(row):
         return []
     with KS._transaction() as conn:
         blocks = {b['block_id']: b for b in conn.execute(
-            'SELECT block_id,kind,structure_json FROM kb_blocks WHERE parse_id=? AND block_id IN (SELECT value FROM json_each(?))',
-            (row['parse_id'], json.dumps(list({s['block_id'] for s in spans}))))}
+            'SELECT block_id,kind,structure_json FROM kb_resolved_blocks WHERE structure_id=? AND parse_id=? AND block_id IN (SELECT value FROM json_each(?))',
+            (row.get('structure_id',''), row['parse_id'], json.dumps(list({s['block_id'] for s in spans}))))}
     groups, current, length, linked = [], [], 0, set()
     for index, span in enumerate(spans):
         block = blocks[span['block_id']]

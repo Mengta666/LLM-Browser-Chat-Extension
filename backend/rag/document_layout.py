@@ -80,7 +80,9 @@ def table_structure(rows):
             'cell_coordinates': 'not_provided'}
 
 
-def link_document(blocks, pages):
+def link_document(blocks, pages, bookmarks=(), features=None):
+    from rag.document_features import enrich, reading_order
+    blocks = reading_order(enrich(blocks, features or {}), pages)
     dimensions = {p['page']: (p['width'], p['height']) for p in pages}
     by_page = defaultdict(list)
     for b in blocks:
@@ -91,22 +93,21 @@ def link_document(blocks, pages):
         repeated.update({re.sub(r'\s+', '', b['text']) for b in items if b['bbox']
                          and (b['bbox'][3] < height * .12 or b['bbox'][1] > height * .88)
                          and 2 <= len(b['text']) <= 120})
-    section_path, previous = [], None
     for number, items in sorted(by_page.items()):
-        width, height = dimensions[number]
+        height = dimensions[number][1]
         for b in items:
             s = b['structure']
             box = b['bbox']
             if b['kind'] in MARGINS or (box and repeated[re.sub(r'\s+', '', b['text'])] >= 3
                                       and (box[3] < height * .12 or box[1] > height * .88)):
                 s['index_excluded'] = 'repeated_margin'
-            if b['kind'] in HEADINGS and not s.get('index_excluded'):
-                label = re.match(r'^\s*(\d+(?:\.\d+)*)[.、\s]', b['text'])
-                level = label[1].count('.') + 1 if label else 1
-                section_path = section_path[:level - 1] + [b['block_id']]
-            if section_path:
-                b['section_id'] = section_path[-1]
-                s['section_path'] = list(section_path)
+    from rag.document_sections import assign
+    assign(blocks, bookmarks, pages=pages)
+    previous = None
+    for number, items in sorted(by_page.items()):
+        width, height = dimensions[number]
+        for b in items:
+            s, box = b['structure'], b['bbox']
             if b['kind'] in ('inline_formula', 'formula') and box:
                 for text in items:
                     a = text['bbox']
@@ -117,6 +118,8 @@ def link_document(blocks, pages):
                             and a[0] <= box[0] <= box[2] <= a[2] and a[1] <= box[1] <= box[3] <= a[3]):
                         s['index_excluded'] = 'duplicate_inline_formula'
                         s['duplicate_of'] = text['block_id']
+                        s['section_path'] = []
+                        b['section_id'] = ''
                         break
             if b['kind'] == 'table':
                 previous_table = max((v['ordinal'] for v in items if v['ordinal'] < b['ordinal'] and v['kind'] == 'table'), default=-1)

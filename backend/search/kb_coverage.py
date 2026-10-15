@@ -43,6 +43,13 @@ def reconcile_pending(state):
     pending = []
     for original in state.get('pending', []):
         item = copy.deepcopy(original)
+        if item.get('reason') in ('字符范围超出边界', '表格行范围超出边界'):
+            item['error_kind'] = 'invalid_location'
+        if item.get('error_kind') == 'invalid_location':
+            spans = item.get('resolution_ranges', [])
+            if spans and not any(missing(s, state.get('ranges', [])) for s in spans):
+                continue
+            item['required'] = False
         if (state.get('settings', {}).get('EXECUTION_MODE') == 'task' and 'required' not in item
                 and item.get('reason') == 'not_provided' and 'question' in item
                 and item.get('read_args') and 'target' not in item and 'goal_id' not in item):

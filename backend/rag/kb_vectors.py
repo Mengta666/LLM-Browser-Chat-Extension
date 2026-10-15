@@ -20,7 +20,8 @@ def search_memories(query_vector, *, page=None, section_id=None, dense_k=None, s
             expr = ('CASE d.doc_id ' + ' '.join('WHEN ? THEN ?' for _ in overrides) + ' ELSE d.published_run_id END') if overrides else 'd.published_run_id'
             rows = conn.execute(f'''SELECT DISTINCT d.doc_id,s.run_id AS published_run_id,s.chunk_idx FROM kb_docs d
             JOIN kb_chunk_sources s ON s.run_id={expr}
-            JOIN kb_blocks b ON b.parse_id=s.parse_id AND b.block_id=s.block_id
+            JOIN kb_index_runs ir ON ir.run_id=s.run_id
+            JOIN kb_resolved_blocks b ON b.structure_id=ir.structure_id AND b.parse_id=s.parse_id AND b.block_id=s.block_id
             WHERE d.kb_id=? AND d.deleted_at='' AND d.status='indexed' AND d.sync_pending=0
               AND (? IS NULL OR b.page=?) AND (? IS NULL OR d.doc_id=?)
               AND (? IS NULL OR b.section_id=? OR b.block_id=? OR EXISTS

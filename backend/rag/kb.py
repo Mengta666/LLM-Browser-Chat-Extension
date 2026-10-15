@@ -193,11 +193,12 @@ def get_doc_status(kb_id: str, doc_id: str) -> dict[str, Any]:
     return progress(doc)
 
 
-def _start_document(kb_id, doc_id, parse_id):
-    if KS.get_doc(doc_id)['file_type']=='pdf':
-        from rag.document_worker import run
-    else:
-        from rag.text_worker import run
+def _start_document(kb_id, doc_id, parse_id, run=None):
+    if run is None:
+        if KS.get_doc(doc_id)['file_type']=='pdf':
+            from rag.document_worker import run
+        else:
+            from rag.text_worker import run
 
     def finish():
         with _workers_guard:
@@ -277,6 +278,13 @@ def retry_document(kb_id, doc_id, *, reparse=False, reindex=False):
         if _has_worker(kb_id, doc_id):
             raise KS.KBConflict('旧任务正在结束，请稍后重试')
         doc=DS.document(kb_id,doc_id)
+        if not reparse and not reindex:
+            with KS._transaction() as conn:
+                publication = conn.execute("SELECT review_id,expected_run_id FROM kb_structure_publications WHERE doc_id=? AND parse_id=? AND status IN ('failed','cancelled','interrupted') ORDER BY created_at DESC LIMIT 1",
+                                           (doc_id,doc['active_parse_id'])).fetchone()
+            if publication:
+                from rag.structure_publication import start
+                return start(kb_id,doc_id,publication['review_id'],publication['expected_run_id'])
         if doc['file_type']=='pdf':
             config = parse_config()
         else:

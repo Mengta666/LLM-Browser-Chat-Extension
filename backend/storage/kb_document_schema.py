@@ -3,6 +3,23 @@
 
 def migrate(conn):
     statements = [
+        """CREATE TABLE IF NOT EXISTS kb_structure_publications (
+            review_id TEXT PRIMARY KEY, kb_id TEXT NOT NULL, doc_id TEXT NOT NULL, parse_id TEXT NOT NULL,
+            expected_run_id TEXT NOT NULL, result_hash TEXT NOT NULL, config_json TEXT NOT NULL,
+            status TEXT NOT NULL, structure_id TEXT NOT NULL DEFAULT '', run_id TEXT NOT NULL DEFAULT '',
+            error TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""",
+        """CREATE TABLE IF NOT EXISTS kb_structure_reviews (
+            review_id TEXT PRIMARY KEY, kb_id TEXT NOT NULL, doc_id TEXT NOT NULL,
+            parse_id TEXT NOT NULL, structure_id TEXT NOT NULL, fingerprint TEXT NOT NULL,
+            config_json TEXT NOT NULL, status TEXT NOT NULL, lease TEXT NOT NULL DEFAULT '',
+            request_id TEXT NOT NULL DEFAULT '',
+            checkpoint_json TEXT NOT NULL DEFAULT '{}', result_json TEXT NOT NULL DEFAULT '{}',
+            error TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            UNIQUE(doc_id, fingerprint))""",
+        """CREATE TABLE IF NOT EXISTS kb_structure_review_batches (
+            review_id TEXT NOT NULL, batch_no INTEGER NOT NULL, input_hash TEXT NOT NULL,
+            input_json TEXT NOT NULL, output_json TEXT NOT NULL, metrics_json TEXT NOT NULL,
+            PRIMARY KEY(review_id,batch_no))""",
         """CREATE TABLE IF NOT EXISTS kb_parse_versions (
             parse_id TEXT PRIMARY KEY, doc_id TEXT NOT NULL, fingerprint TEXT NOT NULL,
             config_json TEXT NOT NULL, status TEXT NOT NULL, lease TEXT NOT NULL DEFAULT '',
@@ -65,6 +82,10 @@ def migrate(conn):
         "CREATE INDEX IF NOT EXISTS idx_kb_nodes_span ON kb_document_nodes(structure_id,start_order,end_order)",
         "CREATE INDEX IF NOT EXISTS idx_kb_node_source_block ON kb_node_sources(structure_id,block_id)",
         "CREATE INDEX IF NOT EXISTS idx_kb_relations_target ON kb_node_relations(structure_id,target_id,kind)",
+        """CREATE TABLE IF NOT EXISTS kb_structure_blocks (
+            structure_id TEXT NOT NULL, block_id TEXT NOT NULL, ordinal INTEGER NOT NULL,
+            section_id TEXT NOT NULL, parent_id TEXT NOT NULL, structure_json TEXT NOT NULL,
+            PRIMARY KEY(structure_id,block_id))""",
     ]
     for table in ('kb_blocks', 'kb_document_nodes'):
         columns = list(conn.execute(f'PRAGMA table_info({table})'))
@@ -79,6 +100,18 @@ def migrate(conn):
             conn.execute(f'ALTER TABLE {table}_text_migration RENAME TO {table}')
     for statement in statements:
         conn.execute(statement)
+    review_columns={r['name'] for r in conn.execute('PRAGMA table_info(kb_structure_reviews)')}
+    if 'request_id' not in review_columns:
+        conn.execute("ALTER TABLE kb_structure_reviews ADD COLUMN request_id TEXT NOT NULL DEFAULT ''")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_kb_review_request ON kb_structure_reviews(doc_id,request_id) WHERE request_id!=''")
+    conn.execute('''CREATE VIEW IF NOT EXISTS kb_resolved_blocks AS
+        SELECT v.structure_id,b.parse_id,b.block_id,b.page,coalesce(p.ordinal,b.ordinal) AS ordinal,
+            b.kind,b.text,b.bbox_json,coalesce(p.structure_json,b.structure_json) AS structure_json,
+            coalesce(p.section_id,b.section_id) AS section_id,coalesce(p.parent_id,b.parent_id) AS parent_id
+        FROM kb_structure_versions v JOIN kb_blocks b ON b.parse_id=v.parse_id
+        LEFT JOIN kb_structure_blocks p ON p.structure_id=v.structure_id AND p.block_id=b.block_id
+        UNION ALL SELECT '',parse_id,block_id,page,ordinal,kind,text,bbox_json,structure_json,section_id,parent_id
+        FROM kb_blocks''')
     conn.execute('''CREATE TABLE IF NOT EXISTS kb_text_sources (
         parse_id TEXT PRIMARY KEY, text_path TEXT NOT NULL, text_sha256 TEXT NOT NULL,
         encoding TEXT NOT NULL, char_count INTEGER NOT NULL, line_starts_json TEXT NOT NULL)''')

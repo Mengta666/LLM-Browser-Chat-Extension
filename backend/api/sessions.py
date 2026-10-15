@@ -35,13 +35,20 @@ def list_sessions() -> dict[str, Any]:
 def capabilities():
     from storage.chat_attachments import capabilities as attachment_capabilities
     return {'server_context': True, 'protocol_version': 1, 'resumable_compaction': True,
+            'chat_background_tasks_version': 1, 'chat_event_stream_version': 1,
             'context_state_schema': 2, 'history_index_version': 1, 'document_analysis_version': 1,
-            'kb_structure_version': 1, 'kb_evidence_bundles_version': 1,
+            'kb_structure_version': 1, 'kb_section_projection_version': 1, 'kb_heading_signals_version': 4,
+            'kb_structure_shadow_version': 7,
+            'kb_structure_publication_version': 1,
+            'kb_structure_global_encoding_version': 1,
+            'kb_structure_task_version': 1,
+            'kb_evidence_bundles_version': 1,
             'kb_task_evidence_version': 1,
             'kb_evidence_organization_version': 1,
             'kb_retrieval_trace_version': 1,
             'kb_continuous_passages_version': 1,
             'kb_read_delivery_version': 2,
+            'kb_read_error_recovery_version': 1,
             'kb_selected_read_queue_version': 1,
             'chat_generation_timeout_version': 1,
             'chat_reasoning_effort_version': 1,
@@ -79,6 +86,15 @@ def get_request(chat_id: str, request_id: str):
     if not result:
         raise HTTPException(404, 'request_not_found')
     return result
+
+
+@router.get('/{chat_id}/requests/{request_id}/events')
+def request_events(chat_id: str, request_id: str, attempt: int = Query(ge=1), after: int = Query(0, ge=0)):
+    from api import chat_tasks
+    try:
+        return chat_tasks.subscribe(chat_id, request_id, attempt, after)
+    except CS.SessionError as exc:
+        raise HTTPException(exc.status, exc.code)
 
 
 @router.get("/{chat_id}/messages")

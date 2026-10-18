@@ -156,6 +156,7 @@
       record.finishing = true;
       this.serial(record.run.tabId, async () => {
         const result = { ...record.result, action_id: record.action.action_id,
+          ...(record.action.type === 'click' ? { click_effects: { press_sent: false, release_confirmed: false, ...record.clickEffects } } : {}),
           execution_state: record.result.success ? 'completed' : record.dispatched ? 'partial' : 'not_dispatched' };
         if (record.effectError) {
           record.unknown = true;

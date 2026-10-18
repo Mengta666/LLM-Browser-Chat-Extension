@@ -1016,6 +1016,12 @@ document.addEventListener('DOMContentLoaded', async () => {
   function updateSendButton() {
     const button = document.getElementById('sendBtn');
     if (!button) return;
+    if (agentState.active) {
+      button.textContent = agentState.status === 'stopping' ? '正在停止…' : '■ 停止';
+      button.title = '停止当前自动化；已发出的操作不会回滚';
+      button.disabled = agentState.status === 'stopping';
+      return;
+    }
     if (chatUpload?.chatId === currentChatId) {
       button.textContent = chatUpload.controller.signal.aborted ? '正在停止…' : '■ 停止';
       button.title = '停止图片上传，不提交聊天';
@@ -2549,6 +2555,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
 
   document.getElementById('sendBtn').addEventListener('click', () => {
+    if (agentState.active) { agentState.stop?.(); return; }
     if (chatUpload?.chatId === currentChatId || (_chatRequest?.chatId === currentChatId && (_chatRequest.status === 'running' || _chatRequest.stopping))) {
       stopChatRequest();
     } else handleSend();
@@ -2866,7 +2873,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       actionEl.className = 'agent-action';
       let actionDesc = `🔧 [步骤${step}] ${action.type}`;
       if (action.index != null) actionDesc += ` → [${action.index}]`;
-      if (action.params?.text) actionDesc += ` (文本: "${action.params.text.slice(0, 20)}")`;
+      if (action.params?.text) actionDesc += ` (文本长度: ${action.params.text.length})`;
       if (action.params?.direction) actionDesc += ` (${action.params.direction})`;
       if (action.params?.key) actionDesc += ` (${action.params.key})`;
       actionEl.textContent = actionDesc;
@@ -2875,10 +2882,18 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     if (result) {
       const resultEl = document.createElement('div');
-      resultEl.className = result.success ? 'agent-result-success' : 'agent-result-fail';
+      const unconfirmed = ['not_satisfied', 'unknown'].includes(result.verification?.status) ||
+        (result.target_probe && result.target_probe.clear !== true);
+      resultEl.className = result.success && !unconfirmed ? 'agent-result-success' : 'agent-result-fail';
       resultEl.textContent = result.success
-        ? `✓ ${result.details || '成功'}`
+        ? `${unconfirmed ? '⚠' : '✓'} ${result.details || '操作已返回'}`
         : `✗ ${result.error || '失败'}`;
+      if (result.verification?.kind) {
+        const label = { satisfied: '局部条件已确认', not_satisfied: '局部条件尚未满足', unknown: '局部结果尚不能确认' }[result.verification.status];
+        resultEl.textContent += result.verification.reason === 'invalid_expectation'
+          ? `；附加验证条件无效：${result.verification.details || '未核实局部结果'}`
+          : `；${label}（${result.verification.kind}）`;
+      }
       stepDiv.appendChild(resultEl);
     }
 
@@ -2937,7 +2952,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       let desc = `⚠️ 即将执行: ${action.type}`;
       if (action.index != null) desc += ` → [${action.index}]`;
       if (thought) desc += `\n原因: ${thought}`;
-      if (action.params?.confirm_overwrite) desc += `\n字段“${action.params.material_label}”已有值。\n现值：${action.params.expected_prior}\n物料值：${action.params.text ?? action.params.option_text}\n是否允许替换？`;
+      if (action.params?.confirm_overwrite) desc += `\n字段“${action.params.material_label}”已有值。\n${action.params.expected_prior_complete === false ? '现值预览（非全文，执行前会校验完整值）' : '现值'}：${action.params.expected_prior}\n物料值：${action.params.text ?? action.params.option_text}\n是否允许替换？`;
       msgEl.textContent = desc;
       confirmDiv.appendChild(msgEl);
 
@@ -3022,10 +3037,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     const statusText = document.createElement('span');
     statusText.textContent = '🤖 正在准备自动化任务…';
     header.appendChild(statusText);
-    const cancelBtn = document.createElement('button');
-    cancelBtn.className = 'agent-btn-cancel';
-    cancelBtn.textContent = '⏹ 停止';
-    header.appendChild(cancelBtn);
     aiBubble.appendChild(header);
     scrollToBottom();
 
@@ -3034,14 +3045,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     let stopRequested = false;
     let backendTerminal = false;
     let taskFailed = false;
-    cancelBtn.onclick = () => {
+    agentState.stop = () => {
+      if (!ownsUI() || stopRequested) return;
       stopRequested = true;
-      cancelBtn.disabled = true;
-      cancelBtn.textContent = '正在停止…';
       statusText.textContent = '正在停止后续动作并释放输入…';
       if (ownsUI()) agentState.status = 'stopping';
+      updateSendButton();
       if (run) run.stop().catch(() => {});
     };
+    updateSendButton();
 
     try {
       keepalivePort = chrome.runtime.connect({ name: 'agent-keepalive' });
@@ -3051,9 +3063,13 @@ document.addEventListener('DOMContentLoaded', async () => {
       const { apiKey, modelName, safeApiUrl } = await resolveApiRequestConfig();
       await requireServerContext(safeApiUrl);
       const kbId = window._kbBoundId || '';
+      const interactionCapability = await callAgentApi(safeApiUrl, '/v1/agent/capabilities', {}, apiKey);
+      if (interactionCapability.interaction_version !== 1 || interactionCapability.action_verification_version !== 1 || interactionCapability.autonomous_recovery_version !== 1) {
+        throw new Error('点击诊断协议不匹配，请重启新后端并重新加载扩展');
+      }
       if (kbId) {
         const capability = await callAgentApi(safeApiUrl, '/v1/agent/capabilities', {}, apiKey);
-        if (capability.material_fill_version !== 1) throw new Error('后端尚未支持表单物料填写，请更新并重启后端');
+        if (capability.material_fill_version !== 1 || capability.task_workspace_version !== 2 || capability.field_verification_version !== 1 || capability.field_snapshot_version !== 1 || capability.field_read_version !== 1) throw new Error('字段核实协议不匹配，请更新并重启后端，同时重新加载扩展');
       }
       let llmParams = {};
       try {
@@ -3067,26 +3083,26 @@ document.addEventListener('DOMContentLoaded', async () => {
         api: (path, body) => callAgentApi(safeApiUrl, path, body, apiKey),
         annotate: page => AgentObservation.annotate(page),
         status: (state, text) => {
-          if (!ownsUI()) return;
+          if (!ownsUI() || stopRequested) return;
           agentState.status = state;
           statusText.textContent = text;
         }
-      });
+      }, { interactionVersion: 1, verificationVersion: 1, recoveryVersion: 1 });
       if (stopRequested) { await run.stop(); run.check(); }
       await run.start();
       let pageState = await run.observe();
       let response = await run.decide('/v1/agent/execute', {
         task, page_state: pageState, model: modelName || 'gpt-4o',
         require_confirmation: [], task_image: taskImage || '', llm_params: llmParams,
-        kb_id: kbId, materials_version: 1
+        kb_id: kbId, materials_version: 1, task_workspace_version: 2
       });
 
       while (['action_required', 'confirm_required', 'observation_required'].includes(response.status)) {
         run.check();
         if (!ownsUI()) throw new Error('任务已被替换');
-        renderAgentMaterials(aiBubble, response.materials);
+        renderAgentMaterials(aiBubble, response.materials, response.task_workspace);
         if (response.status === 'observation_required') {
-          statusText.textContent = '物料读取结束，正在重新观察字段';
+          statusText.textContent = response.progress || '资料处理完成，正在重新观察页面';
           pageState = await run.observe();
           response = await run.decide('/v1/agent/resume', {
             page_state: pageState, continuation_id: response.continuation_id
@@ -3105,14 +3121,15 @@ document.addEventListener('DOMContentLoaded', async () => {
         renderAgentStepInBubble(aiBubble, response.step, response.thought, action, null);
         const result = await run.execute(action);
         run.check();
-        renderAgentStepInBubble(aiBubble, response.step, null, null, result);
 
         // 等稳仅帮助减少瞬时变化；只有后续成功的新观察才允许推进。
         await run.wait(waitForPageSettle(tab.id), 5000).catch(error => {
           if (error.code !== 'timeout') throw error;
         });
         run.check();
-        const nextPage = await run.observe();
+        let nextPage = await run.observe();
+        nextPage = await run.verify(action, result, nextPage);
+        renderAgentStepInBubble(aiBubble, response.step, null, null, result);
         if (!nextPage.active_popup) {
           const inlineGroup = detectInlineGroup(pageState.interactive_elements || [], nextPage.interactive_elements || []);
           if (inlineGroup) {
@@ -3134,7 +3151,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         response = await run.decide('/v1/agent/step', { page_state: pageState, action_result: result });
       }
       run.check();
-      renderAgentMaterials(aiBubble, response.materials);
+      renderAgentMaterials(aiBubble, response.materials, response.task_workspace);
       backendTerminal = ['completed', 'cancelled', 'error'].includes(response.status);
       if (response.status === 'completed') {
         statusText.textContent = response.success === false ? '任务未完成' : '任务完成';
@@ -3170,15 +3187,15 @@ document.addEventListener('DOMContentLoaded', async () => {
       } else if (!taskFailed && (stopRequested || run?.abort.signal.aborted && !backendTerminal)) {
         statusText.textContent = stopRequested ? '已停止；已发出的操作不会回滚' : '任务已结束';
       }
-      if (ownsUI()) Object.assign(agentState, { active: false, status: 'idle' });
+      if (ownsUI()) Object.assign(agentState, { active: false, status: 'idle', stop: null });
       aiBubble.querySelectorAll('.agent-confirm').forEach(element => element.remove());
-      cancelBtn.remove();
+      updateSendButton();
       if (keepalivePort) { try { keepalivePort.disconnect(); } catch { /* 已断开 */ } }
     }
   }
 
-  function renderAgentMaterials(bubble, materials) {
-    if (!materials) return;
+  function renderAgentMaterials(bubble, materials, workspace) {
+    if (!materials && !workspace) return;
     let panel = bubble.querySelector('.agent-materials');
     if (!panel) {
       panel = document.createElement('details'); panel.className = 'agent-materials';
@@ -3186,9 +3203,28 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
     panel.replaceChildren();
     const heading = document.createElement('summary');
-    const fields = materials.fields || [];
-    heading.textContent = `📚 字段物料：${fields.filter(f => f.fill_status === 'verified').length}/${fields.length} 已回读确认`;
+    const fields = materials?.fields || [];
+    heading.textContent = `📚 任务资料：${workspace?.source_count || 0} 条来源 · ${workspace?.artifacts?.length || 0} 份成果` +
+      (fields.length ? ` · 填写 ${fields.filter(f => f.fill_status === 'verified').length}/${fields.length} 已回读` : '');
     panel.appendChild(heading);
+    for (const artifact of workspace?.artifacts || []) {
+      const row = document.createElement('div');
+      const state = artifact.status !== 'available' ? '来源失效' : artifact.missing?.length ? '仍有缺项' : '可复用';
+      const origin = {verbatim:'原文摘取',assembled:'原文组合',user_input:'用户原文',derived:'整理稿'}[artifact.origin] || '派生成果';
+      row.textContent = `${artifact.id} · ${artifact.subject} / ${artifact.purpose}：${state}（${origin}）`;
+      if (artifact.length_constraint) {
+        const limit = artifact.length_constraint;
+        row.textContent += ` · 限长稿 ${limit.actual_length}/${limit.max_length}，原稿 ${limit.source_artifact_id} 保留`;
+      }
+      if (artifact.field_intent) row.textContent += ` · 待填字段：${artifact.field_intent.field_label}；内容范围：${artifact.field_intent.scope}`;
+      panel.appendChild(row);
+    }
+    if (workspace?.evidence_view?.archived_count != null) {
+      const view = workspace.evidence_view;
+      const row = document.createElement('div');
+      row.textContent = `已归档 ${view.archived_count} 个证据单元；当前可见原文 ${view.raw_citations?.length || 0} 个、派生摘要 ${view.derived_citations?.length || 0} 个。归档不代表当前已读，也不代表页面操作完成。`;
+      panel.appendChild(row);
+    }
     const states = { available: '有来源', missing: '缺失', conflict: '冲突', ambiguous: '待澄清', pending: '正在取材', invalid: '来源失效' };
     for (const field of fields) {
       const row = document.createElement('div');
@@ -3202,8 +3238,41 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
       panel.appendChild(row);
     }
-    if (materials.error) {
-      const error = document.createElement('div'); error.textContent = materials.error; panel.appendChild(error);
+    if (materials?.error || workspace?.error) {
+      const error = document.createElement('div'); error.textContent = workspace?.error || materials.error; panel.appendChild(error);
+    }
+    for (const failure of workspace?.pending_saves || []) {
+      const row = document.createElement('div');
+      row.textContent = `成果待修正：${failure.subject || ''} / ${failure.purpose || ''} · ${failure.error}；${failure.hint}`;
+      panel.appendChild(row);
+    }
+    for (const repair of workspace?.pending_length_repairs || []) {
+      const row = document.createElement('div');
+      row.textContent = `${repair.field_label}：原稿 ${repair.artifact_id} 长度 ${repair.actual_length}，字段上限 ${repair.max_length}（UTF-16）；` +
+        (repair.status === 'prepared' ? `精简稿 ${repair.result_artifact_id} 已生成，待填写回读` : '正在精简待填内容，原稿保留，尚未写入');
+      panel.appendChild(row);
+    }
+    for (const repair of workspace?.pending_content_repairs || []) {
+      const row = document.createElement('div');
+      row.textContent = `${repair.field_label}：` + (repair.status === 'prepared'
+        ? `待填稿 ${repair.result_artifact_id} 已生成，待填写回读`
+        : repair.status === 'blocked' ? '连续修稿未通过，此字段未完成，未继续写入'
+        : '正在按字段整理内容、检查重复；原资料保留，未写入');
+      panel.appendChild(row);
+    }
+    const reviewStates = {pending:'待独立语义审核，未放行填写', approved:'审核通过，待填写回读',
+      resolved:'审核通过且已回读', needs_revision:'需要修稿，未放行填写', uncertain:'依据不足，待澄清',
+      blocked:'修稿次数已到上限，此字段未完成', error:'审核未完成，不代表内容不合格'};
+    for (const review of workspace?.field_reviews || []) {
+      const row = document.createElement('div');
+      row.textContent = `${review.field_label} · ${review.artifact_id}：${reviewStates[review.status] || review.status}` +
+        (review.cached ? '（复用已有审核）' : '') + (review.error ? `；${review.error}` : '');
+      for (const issue of review.issues || []) {
+        const detail = document.createElement('div');
+        detail.textContent = `${(issue.draft_ids || []).join('、')} ${(issue.ranges || []).map(r => `[${r[0]},${r[1]})`).join('、')}：${issue.reason}；修改要求：${issue.required_change}`;
+        row.appendChild(detail);
+      }
+      panel.appendChild(row);
     }
   }
 

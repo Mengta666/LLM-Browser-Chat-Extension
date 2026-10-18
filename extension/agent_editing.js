@@ -54,6 +54,13 @@ function describeEditingTarget(observe = false) {
     const active = input.getRootNode().activeElement;
     return active === input || kind === 'contenteditable' && input.contains(active);
   };
+  const validity = (element) => {
+    const violations = element.validity ? ['valueMissing', 'typeMismatch', 'patternMismatch', 'tooLong', 'tooShort',
+      'rangeUnderflow', 'rangeOverflow', 'stepMismatch', 'badInput', 'customError'].filter(key => element.validity[key]) : [];
+    if (kind === 'native' && element.maxLength >= 0 && element.value.length > element.maxLength) violations.push('tooLong');
+    if (kind === 'native' && element.value && element.minLength > element.value.length) violations.push('tooShort');
+    return { valid: violations.length === 0, violations: [...new Set(violations)] };
+  };
   const state = () => {
     if (!root.isConnected || !input.isConnected || kind === 'contenteditable' && !root.isContentEditable || cm &&
         (wrapper.CodeMirror !== cm || cm.getInputField() !== input)) {
@@ -83,10 +90,32 @@ function describeEditingTarget(observe = false) {
       return after.success && after.focused ? after : { success: false, stale: after.stale, error: '未能确认目标焦点，未继续输入' };
     }
     if (kind === 'none') return { success: false, error: '目标不是支持的编辑区域，请选择标记为可输入的元素' };
-    if (operation === 'read') return { ...s, value: value() };
+    if (operation === 'read') return { ...s, value: value(), ...validity(input),
+      rich_text: kind === 'contenteditable' && !!root.querySelector('a,img,table,strong,b,em,i,u,ul,ol,pre,code,[style]') };
+    if (operation === 'validate') {
+      if (kind !== 'native') return { success: true, valid: true, violations: [] };
+      const probe = input.cloneNode(false);
+      probe.value = arg;
+      const result = validity(probe);
+      if (probe.value !== arg) return { success: true, valid: false, violations: ['valueSanitized'] };
+      return { success: true, ...result };
+    }
     if (!s.editable) return { success: false, error: '目标不可编辑或只读，未修改内容' };
     if (!s.focused) return { success: false, error: '编辑焦点已转移，未继续输入' };
     if (operation === 'guard') return s;
+    if (operation === 'guard_value' || operation === 'replace') {
+      if (value() !== arg.prior) return { success: false, stale: true, error: '字段完整原值已改变，未覆盖，请重新观察' };
+      if (operation === 'guard_value') return s;
+      if (kind === 'native') {
+        const prototype = input.tagName === 'TEXTAREA' ? win.HTMLTextAreaElement.prototype : win.HTMLInputElement.prototype;
+        Object.getOwnPropertyDescriptor(prototype, 'value').set.call(input, arg.text);
+        input.dispatchEvent(new win.Event('input', { bubbles: true }));
+        input.dispatchEvent(new win.Event('change', { bubbles: true }));
+      } else if (cm) {
+        cm.operation(() => cm.replaceRange(arg.text, { line: 0, ch: 0 }, cm.posFromIndex(arg.prior.length), '+input'));
+      } else return { success: false, error: '此编辑器不支持同步替换' };
+      return state();
+    }
     if (operation === 'insert_cm') {
       if (!cm) return { success: false, error: '目标不是已确认的 CodeMirror 编辑器' };
       if (cm.listSelections().length !== 1) return { success: false, error: '多光标输入暂不支持，未写入' };
@@ -147,6 +176,8 @@ function describeEditingTarget(observe = false) {
     }
     if (row) hints.push(...[...row.querySelectorAll('th')].map(cell => cell.textContent.trim()));
     return { ...s, preview: current.slice(0, 120), value_truncated: current.length > 120,
+      ...(kind !== 'none' && input.type !== 'password' || node.tagName === 'SELECT' ? { snapshot_value: current } : {}),
+      value_attribute: node.getAttribute('value') || '',
       tag: node.tagName.toLowerCase(), type: node.getAttribute('type') || '', name: node.getAttribute('name') || '',
       html_id: node.id || '', placeholder: node.getAttribute('placeholder') || '', aria_label: node.getAttribute('aria-label') || '',
       form_context: [form?.id, form?.getAttribute('name'), form?.getAttribute('aria-label'),
@@ -159,5 +190,38 @@ function describeEditingTarget(observe = false) {
   return { call };
 }
 
-globalThis.AgentEditing = { describeEditingTarget };
+function selectNativeTarget(params, readOnly) {
+  if (!this.isConnected) return { success: false, stale: true, error: '选择目标已脱离页面' };
+  if (this.multiple) return { success: false, error: '单项选择不能用于多选控件' };
+  if (this.matches(':disabled')) return { success: false, error: '下拉框已禁用' };
+  if (params.material_id && !(readOnly && params.expected_prior_complete === false) &&
+      (typeof params.expected_prior !== 'string' || this.value !== params.expected_prior))
+    return { success: false, stale: true, error: '字段值已改变，未覆盖，请重新观察' };
+  const matches = [...this.options].filter(o => o.textContent.trim() === params.option_text);
+  if (matches.length !== 1) return { success: false, error: '目标选项不存在或不唯一，未进行模糊选择' };
+  const option = matches[0];
+  const identity = () => ({ index: option.index, text: option.textContent.trim(), value: option.value });
+  const expected = params.expected_option || identity();
+  if (Object.entries(expected).some(([key, value]) => identity()[key] !== value))
+    return { success: false, stale: true, error: '目标选项身份已变化，请重新观察' };
+  if (option.disabled || option.parentElement.tagName === 'OPTGROUP' && option.parentElement.disabled)
+    return { success: false, error: '目标选项已禁用' };
+  if (!readOnly) {
+    const probe = this.cloneNode(true);
+    probe.selectedIndex = option.index;
+    if (!probe.validity.valid) return { success: false, valid: false, error: '目标选项不满足字段约束，未修改' };
+    this.selectedIndex = option.index;
+    this.dispatchEvent(new Event('input', { bubbles: true }));
+    this.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+  if (!this.isConnected || !this.contains(option) || Object.entries(expected).some(([key, value]) => identity()[key] !== value))
+    return { success: false, stale: true, error: '选择目标被替换或选项变化，请重新观察' };
+  const matched = option.selected && this.selectedIndex === expected.index && this.value === expected.value;
+  const valid = this.validity.valid;
+  return { success: matched && valid, matched, valid, value: this.selectedOptions[0]?.textContent.trim() || '',
+    option: { index: this.selectedIndex, text: this.selectedOptions[0]?.textContent.trim() || '', value: this.value },
+    ...(matched && valid ? {} : { error: matched ? '选项已匹配但字段校验未通过' : '当前选项与目标不符，未确认成功' }) };
+}
+
+globalThis.AgentEditing = { describeEditingTarget, selectNativeTarget };
 if (typeof module !== 'undefined') module.exports = globalThis.AgentEditing;

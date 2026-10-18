@@ -44,7 +44,9 @@
     async start() {
       try {
         const probe = await this.control('probe');
-        if (probe?.protocol_version !== 2) throw new Error('协议不匹配');
+        if (probe?.protocol_version !== 2 || (this.limits.interactionVersion && probe.interaction_version !== this.limits.interactionVersion) ||
+            (this.limits.verificationVersion && probe.action_verification_version !== this.limits.verificationVersion) ||
+            (this.limits.recoveryVersion && probe.autonomous_recovery_version !== this.limits.recoveryVersion)) throw new Error('协议不匹配');
       } catch (error) {
         if (error.code === 'cancelled') throw error;
         throw Object.assign(new Error('无法确认扩展后台通信或协议版本，请在扩展管理页重新加载扩展，并关闭后重新打开侧边栏'), { code: 'protocol_mismatch' });
@@ -66,6 +68,7 @@
     async sleep(ms) { return this.wait(new Promise(r => setTimeout(r, ms)), ms + 1000); }
 
     async observe() {
+      this.io.status('observing', '正在观察页面');
       const deadline = Math.min(this.deadline, Date.now() + this.limits.recovery);
       let attempt = 0;
       while (Date.now() < deadline) {
@@ -93,7 +96,21 @@
       throw new Error('页面观察持续失败，已达到自动恢复时间预算；未使用旧观察继续操作');
     }
 
+    async verify(action, result, page) {
+      const deadline = Math.min(this.deadline, Date.now() + (this.limits.verify ?? 2500));
+      let verification = AgentVerification.evaluate(action.expectation, page);
+      while (result.success && verification.status === 'not_satisfied' && Date.now() < deadline) {
+        this.io.status('verifying', '正在只读核实操作结果；不会重复点击');
+        await this.sleep(Math.min(300, deadline - Date.now()));
+        page = await this.observe();
+        verification = AgentVerification.evaluate(action.expectation, page);
+      }
+      result.verification = verification;
+      return page;
+    }
+
     async decide(path, body) {
+      this.io.status('deciding', '正在根据最新页面决定下一步');
       const deadline = Math.min(this.deadline, Date.now() + this.limits.decision);
       const request = { ...body, session_id: this.sessionId, protocol_version: 2,
         request_id: this.id('decision'), budget_ms: Math.max(1, deadline - Date.now()) };
@@ -119,6 +136,7 @@
     }
 
     async execute(action) {
+      this.io.status('executing', '正在执行单步操作');
       this.check();
       if (action.params?.material_id) {
         const validation = await this.wait(this.io.api('/v1/agent/material-check', {

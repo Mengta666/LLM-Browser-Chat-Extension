@@ -1,4 +1,4 @@
-importScripts('shared.js', 'agent_execution.js', 'agent_editing.js');
+importScripts('shared.js', 'agent_execution.js', 'agent_editing.js', 'agent_click.js', 'agent_verification.js');
 
 const agentExecution = new AgentExecution.Controller({
   read: async tabId => (await chrome.storage.session.get(`agentExecution:${tabId}`))[`agentExecution:${tabId}`],
@@ -439,7 +439,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type !== 'AGENT_CONTROL') return;
   Promise.resolve().then(async () => {
     const { tabId, sessionId, command } = request;
-    if (command === 'probe') return { protocol_version: 2 };
+    if (command === 'probe') return { protocol_version: 2, interaction_version: 1, action_verification_version: 1, autonomous_recovery_version: 1 };
     if (command === 'start') return agentExecution.start(tabId, sessionId);
     if (command === 'cancel') return agentExecution.cancel(tabId, sessionId);
     if (command === 'status') return agentExecution.status(tabId, sessionId, request.actionId);
@@ -588,11 +588,17 @@ function cdpSend(target, method, params, timeoutMs) {
   try { if (ctx && !releasing) ctx.check(); } catch (error) { return Promise.reject(error); }
   const isEffect = effect || method.startsWith('Input.') || ['DOM.focus', 'DOM.scrollIntoViewIfNeeded', 'Page.navigate', 'Page.bringToFront'].includes(method);
   if (ctx && !releasing && isEffect) ctx.dispatched = true;
+  if (ctx && method === 'DOM.scrollIntoViewIfNeeded') ctx.clickEffects = { ...ctx.clickEffects, scrolled: true };
+  if (ctx && method === 'Input.dispatchMouseEvent') {
+    const key = { mouseMoved: 'pointer_moved', mousePressed: 'press_sent', mouseReleased: 'release_sent' }[params?.type];
+    if (key) ctx.clickEffects = { ...ctx.clickEffects, [key]: true };
+  }
   const cmdPromise = new Promise((resolve, reject) => {
     chrome.debugger.sendCommand(debugTarget, method, params || {}, (result) => {
       const err = chrome.runtime.lastError;
       if (err) { reject(new Error(`${method}: ${err.message}`)); return; }
       if (ctx && isEffect && result?.exceptionDetails) { reject(new Error(`${method}: 页面输入脚本执行异常`)); return; }
+      if (ctx && method === 'Input.dispatchMouseEvent' && params?.type === 'mouseReleased') ctx.clickEffects.release_confirmed = true;
       resolve(result);
     });
   });
@@ -1121,7 +1127,8 @@ function isVisibleCss(node) {
   if (!snap) return false;
   const cs = snap.computedStyles || {};
   if (cs.display === 'none' || cs.visibility === 'hidden' || cs.visibility === 'collapse') return false;
-  if (cs.opacity !== undefined && cs.opacity !== '' && parseFloat(cs.opacity) <= 0) return false;
+  const transparentControl = node.checkable?.control_kind && ['INPUT', 'LABEL'].includes(node.nodeName);
+  if (!transparentControl && cs.opacity !== undefined && cs.opacity !== '' && parseFloat(cs.opacity) <= 0) return false;
   for (let p = node.parent; p; p = p.parent) {
     const style = p.snapshot && p.snapshot.computedStyles;
     if (style && (style.display === 'none' || parseFloat(style.opacity) === 0)) return false;
@@ -1164,7 +1171,7 @@ function interactionSource(node) {
   if (node.nodeType !== NODE_TYPE.ELEMENT) return '';
   const tag = (node.nodeName || '').toLowerCase();
   if (tag === 'html' || tag === 'body') return '';
-  if (isDisabled(node) || node.ax?.properties?.hidden === true) return '';
+  if (node.ax?.properties?.hidden === true) return '';
   if (node.editing?.proxy) return '';
   if (node.editing?.kind === 'codemirror5') return 'editor';
   if (hasExplicitClick(node)) return 'click';
@@ -1175,14 +1182,14 @@ function interactionSource(node) {
   const attrs = node.attributes || {};
   // label：有 for → F（避免双触发）；否则含表单控件后代 → T
   if (tag === 'label') {
-    if (attrs.for !== undefined) return '';
+    if (attrs.for !== undefined) return node.checkable ? 'form-wrapper' : '';
     if (hasFormControlDescendant(node, 2)) return 'form-wrapper';
   }
   // span 含表单控件后代 → T
   if (tag === 'span' && hasFormControlDescendant(node, 2)) return 'form-wrapper';
   // AX properties：disabled/hidden → F；focusable/editable/settable/checked/expanded/pressed/selected/required/keyshortcuts → T
   const axp = (node.ax && node.ax.properties) || {};
-  if (axp.disabled === true || axp.hidden === true) return '';
+  if (axp.hidden === true) return '';
   for (const p of ['focusable', 'editable', 'settable', 'checked', 'expanded', 'pressed', 'selected', 'required', 'keyshortcuts']) {
     if (axp[p] === true || (axp[p] !== undefined && axp[p] !== false && p in axp)) return 'ax';
   }
@@ -1322,6 +1329,8 @@ function serializeInteractive(allNodes, ctx) {
     const box = node.absolutePosition || (node.snapshot && node.snapshot.bounds) || null;
     const el = {
       id,
+      node_ref: AgentVerification.nodeRef(node),
+      target_key: AgentVerification.targetKey(node),
       tag,
       type: attrs.type || '',
       role: attrs.role || (node.ax && node.ax.role) || '',
@@ -1337,7 +1346,12 @@ function serializeInteractive(allNodes, ctx) {
       title: attrs.title || '',
       html_id: attrs.id || '',                          // HTML id 属性(避免与 selector_index 的 id 混淆)
       alt: attrs.alt || '',
-      checked: attrs.checked !== undefined ? String(attrs.checked) : '',
+      checked: node.checkable?.checked ?? (typeof node.ax?.properties?.checked === 'boolean' ? node.ax.properties.checked : null),
+      indeterminate: node.checkable?.indeterminate ?? (node.ax?.properties?.checked === 'mixed'),
+      state_source: node.checkable?.state_source || (node.ax?.properties?.checked !== undefined ? 'accessibility' : 'unknown'),
+      control_kind: node.checkable?.control_kind || '',
+      control_label: node.checkable?.control_label || '',
+      control_key: node.checkable?.control_path ? `${node.frameId || ''}/${node.checkable.control_path}` : '',
       aria_expanded: attrs['aria-expanded'] || '',
       aria_checked: attrs['aria-checked'] || '',
       disabled: attrs.disabled !== undefined ? String(attrs.disabled) : '',
@@ -1353,8 +1367,9 @@ function serializeInteractive(allNodes, ctx) {
       component: attrs['data-component-name'] || '',
       enabled: !isDisabled(node),
       ...(node.editing ? { form_context: node.editing.form_context, field_context: node.editing.field_context,
+        field_snapshot: node.editing.field_snapshot,
         value_truncated: node.editing.value_truncated, selected_text: node.editing.selected_text,
-        options: node.editing.options } : {}),
+        options: node.editing.options, value_attribute: node.editing.value_attribute } : {}),
       ...(node.editing ? { editable: node.editing.editable, read_only: node.editing.readOnly,
         editor_type: node.editing.kind, focused: node.editing.focused } : {}),
       frame_id: node.frameId || '',
@@ -1390,6 +1405,7 @@ function serializeInteractive(allNodes, ctx) {
       targetId: node.targetId || null,
       framePath,
       independentDescendants,
+      fieldSnapshot: node.editing?.field_snapshot,
     };
   }
   return { elements, indexMap };
@@ -1502,7 +1518,8 @@ async function gatherAndConstructTarget(target, ctx, offset) {
     }));
   }
   const candidates = built.allNodes.filter(node => node.nodeType === NODE_TYPE.ELEMENT &&
-    (['INPUT', 'TEXTAREA', 'SELECT'].includes(node.nodeName) ||
+    (['INPUT', 'TEXTAREA', 'SELECT', 'LABEL'].includes(node.nodeName) ||
+     ['checkbox', 'radio', 'switch'].includes(node.attributes.role) ||
      ['true', '', 'plaintext-only'].includes(node.attributes.contenteditable) ||
      (node.attributes.class || '').split(/\s+/).includes('CodeMirror')));
   for (let i = 0; i < candidates.length; i += 20) {
@@ -1511,11 +1528,25 @@ async function gatherAndConstructTarget(target, ctx, offset) {
       try {
         objectId = (await cdpSend(target, 'DOM.resolveNode', { backendNodeId: node.backendNodeId })).object?.objectId;
         if (!objectId) return;
+        if (node.nodeName === 'LABEL' || ['checkbox', 'radio'].includes(node.attributes.type) ||
+            ['checkbox', 'radio', 'switch'].includes(node.attributes.role)) {
+          node.checkable = runtimeValue(await cdpSend(target, 'Runtime.callFunctionOn', {
+            objectId, functionDeclaration: AgentClick.describeCheckable.toString(), returnByValue: true,
+          }));
+        }
+        if (node.nodeName === 'LABEL') return;
         const info = runtimeValue(await cdpSend(target, 'Runtime.callFunctionOn', {
           objectId, functionDeclaration: AgentEditing.describeEditingTarget.toString(),
           arguments: [{ value: true }], returnByValue: true,
         }));
-        if (info?.success) node.editing = info;
+        if (info?.success) {
+          if (typeof info.snapshot_value === 'string') {
+            info.field_snapshot = { id: crypto.randomUUID(), digest: await fieldValueDigest(info.snapshot_value),
+              length: info.snapshot_value.length, format: 'text-v1' };
+            delete info.snapshot_value;
+          }
+          node.editing = info;
+        }
       } catch { /* 探测失败不猜测能力；实际动作会再次解析和校验。 */ }
       finally { if (objectId) await cdpSend(target, 'Runtime.releaseObject', { objectId }).catch(() => {}); }
     }));
@@ -1552,6 +1583,11 @@ async function managedAgentObserve(request) {
   return handleAgentObserve(request.tabId, !!request.includeScreenshot, 0, token);
 }
 
+async function fieldValueDigest(value) {
+  const bytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(bytes), b => b.toString(16).padStart(2, '0')).join('');
+}
+
 async function documentIdentity(target) {
   const tree = await cdpSend(target, 'Page.getFrameTree', {});
   const frame = tree?.frameTree?.frame;
@@ -1574,6 +1610,7 @@ async function handleAgentObserve(tabId, includeScreenshot = false, retry = 0, t
   const allNodes = built.allNodes;
   let pending = built.pendingCrossOrigin;
   let iframeCount = 0;
+  let observationComplete = true;
 
   // 递归处理跨源 iframe：frameId → 子 target/session → 构子树 → 挂到宿主节点。
   const st = _oopif.get(tabId);
@@ -1581,18 +1618,19 @@ async function handleAgentObserve(tabId, includeScreenshot = false, retry = 0, t
     const nextPending = [];
     for (const pc of pending) {
       token?.check();
-      if (iframeCount >= MAX_IFRAMES) break;
+      if (iframeCount >= MAX_IFRAMES) { observationComplete = false; break; }
       const child = await resolveChildTarget(tabId, pc.frameId);
-      if (!child) continue;
+      if (!child) { observationComplete = false; continue; }
       iframeCount++;
       try {
         const sub = await gatherAndConstructTarget(
           { tabId, sessionId: child.sessionId }, { sessionId: child.sessionId, targetId: child.targetId }, pc.offset);
         // 挂接：子树根挂到宿主 iframe 节点下。
         if (sub.built.root) { sub.built.root.parent = pc.hostNode; pc.hostNode.children.push(sub.built.root); }
+        else observationComplete = false;
         for (const n of sub.built.allNodes) allNodes.push(n);
         for (const np of sub.built.pendingCrossOrigin) nextPending.push(np);
-      } catch { /* 子 frame 失败跳过（对齐 browser-use 子帧失败不致命）*/ }
+      } catch { observationComplete = false; }
     }
     pending = nextPending;
   }
@@ -1604,6 +1642,43 @@ async function handleAgentObserve(tabId, includeScreenshot = false, retry = 0, t
   applyBoundingBoxFilter(allNodes);   // 先剔除被父按钮包含的冗余后代
   applyPaintOrderFilter(allNodes);
   const { elements, indexMap } = serializeInteractive(allNodes, { sessionId: null, targetId: null });
+  const byRef = new Map(allNodes.map(n => [AgentVerification.nodeRef(n), n]));
+  const previousMap = await loadTabState(STATE_KEYS.indexMap, tabId);
+  const previousPopups = new Set(previousMap?.epoch === epoch && previousMap.documentEpoch === documentEpoch
+    ? previousMap.layoutPopupRefs || [] : []);
+  for (const node of allNodes) {
+    if (previousPopups.has(AgentVerification.nodeRef(node)) && ['fixed', 'absolute'].includes(node.snapshot?.computedStyles?.position)) {
+      node.overlay = { detection: 'layout_history', inferred: true };
+    }
+  }
+  const overlayCandidates = allNodes.filter(n => n.isVisible && n.nodeType === NODE_TYPE.ELEMENT &&
+    !['HTML', 'BODY', 'INPUT', 'BUTTON', 'SELECT', 'TEXTAREA', 'IFRAME'].includes(n.nodeName) &&
+    ['fixed', 'absolute'].includes(n.snapshot?.computedStyles?.position) &&
+    elements.some(e => { const child = byRef.get(e.node_ref); return child !== n && isAncestorOrSelf(n, child); }))
+    .sort((a, b) => (b.snapshot?.paintOrder || 0) - (a.snapshot?.paintOrder || 0)).slice(0, 64);
+  for (let i = 0; i < overlayCandidates.length; i += 8) {
+    await Promise.all(overlayCandidates.slice(i, i + 8).map(async node => {
+      token?.check();
+      const probeTarget = { tabId, ...(node.sessionId ? { sessionId: node.sessionId } : {}) };
+      const r = node.viewportRect;
+      const probes = elements.flatMap(el => {
+        const child = byRef.get(el.node_ref), box = child?.viewportRect;
+        if (!box || child.frameId !== node.frameId || isAncestorOrSelf(node, child) || isAncestorOrSelf(child, node)) return [];
+        const x = box.x + box.width / 2, y = box.y + box.height / 2;
+        return x >= r.x && x <= r.x + r.width && y >= r.y && y <= r.y + r.height ? [{ id: el.id, x, y }] : [];
+      }).slice(0, 12);
+      let objectId;
+      try {
+        objectId = (await cdpSend(probeTarget, 'DOM.resolveNode', { backendNodeId: node.backendNodeId })).object?.objectId;
+        if (objectId) node.overlay = runtimeValue(await cdpSend(probeTarget, 'Runtime.callFunctionOn', {
+          objectId, functionDeclaration: AgentVerification.inspectOverlay.toString(), arguments: [{ value: probes }], returnByValue: true,
+        })) || node.overlay;
+      } catch { /* 只添加本轮已获得的候选证据，探测失败不改变动作权限。 */ }
+      finally { if (objectId) await cdpSend(probeTarget, 'Runtime.releaseObject', { objectId }).catch(() => {}); }
+    }));
+  }
+  const popups = AgentVerification.collectPopups(allNodes, elements);
+  const layoutPopupRefs = popups.filter(p => p.detection.startsWith('layout_')).map(p => p.ref);
   const extras = await pageExtrasProbe(target);
   token?.check();
   if (token && (!extras.url || !extras.viewport)) throw new Error('页面基本信息暂不可用，请重新观察');
@@ -1628,9 +1703,9 @@ async function handleAgentObserve(tabId, includeScreenshot = false, retry = 0, t
     token.check();
     if (documentEpoch !== await documentIdentity(target)) throw new Error('页面已重载，请重新观察');
     await agentExecution.publishObservation(token, () => saveTabState(STATE_KEYS.indexMap, tabId,
-      { epoch, map: indexMap, observationId: token.id, documentEpoch }, true));
+      { epoch, map: indexMap, observationId: token.id, documentEpoch, layoutPopupRefs }, true));
   } else {
-    await saveTabState(STATE_KEYS.indexMap, tabId, { epoch, map: indexMap });
+    await saveTabState(STATE_KEYS.indexMap, tabId, { epoch, map: indexMap, documentEpoch, layoutPopupRefs });
   }
 
   // 路径铁证：在 SW 控制台打印，确认走的是 CDP 观察（区分新旧路径）。
@@ -1654,7 +1729,9 @@ async function handleAgentObserve(tabId, includeScreenshot = false, retry = 0, t
     text_content_summary: extras.text_content_summary || '',
     forms: extras.forms || [],
     device_pixel_ratio: dpr,
-    active_popup: extras.active_popup || null,
+    popups,
+    observation_complete: observationComplete && pending.length === 0,
+    active_popup: popups.filter(p => p.visible).sort((a, b) => (b.paint_order || 0) - (a.paint_order || 0))[0] || extras.active_popup || null,
   };
   return { pageState };
 }
@@ -1887,7 +1964,7 @@ async function typeChars(target, text, guard = null) {
 }
 
 // 命中目标本身或非独立的后代才可点击；检测异常交给动作层报告，不绕过遮挡。
-async function checkOcclusion(target, backendNodeId, x, y, independentDescendants = []) {
+async function inspectClickTarget(target, backendNodeId, x, y, independentDescendants = []) {
   const rn = await cdpSend(target, 'DOM.resolveNode', { backendNodeId });
   const objectId = rn?.object?.objectId;
   if (!objectId) throw new Error('点击目标已失效，请重新观察');
@@ -1901,38 +1978,32 @@ async function checkOcclusion(target, backendNodeId, x, y, independentDescendant
     const box = await cdpSend(target, 'DOM.getBoxModel', { backendNodeId });
     const q = box?.model?.border;
     if (!q || q.length !== 8) throw new Error('无法确认点击目标的命中区域');
-    const fn = `function(x,y,q,...independent){
-      if(!this.isConnected || this.matches(':disabled') || this.closest('button:disabled,[inert],[aria-disabled="true"]')) return false;
-      const r=this.getBoundingClientRect();
-      const left=Math.min(q[0],q[2],q[4],q[6]), top=Math.min(q[1],q[3],q[5],q[7]);
-      const width=Math.max(q[0],q[2],q[4],q[6])-left, height=Math.max(q[1],q[3],q[5],q[7])-top;
-      if(width<=0||height<=0||r.width<=0||r.height<=0) return false;
-      const lx=r.x+(x-left)*r.width/width, ly=r.y+(y-top)*r.height/height;
-      const doc=this.ownerDocument;
-      let at=doc.elementFromPoint(lx,ly);
-      while(at && at.shadowRoot){
-        const inner=at.shadowRoot.elementFromPoint(lx,ly);
-        if(!inner || inner===at) break;
-        at=inner;
-      }
-      if(!at) return false;
-      if(independent.some(child=>child===at||child.contains(at))) return false;
-      if(this===at || this.contains(at)) return true;
-      if(this.tagName==='INPUT' && this.labels){
-        return Array.from(this.labels).some(label=>label===at||label.contains(at));
-      }
-      return this.tagName==='LABEL' && this.control===at;
-    }`;
     const value = runtimeValue(await cdpSend(target, 'Runtime.callFunctionOn', {
-      objectId, functionDeclaration: fn,
+      objectId, functionDeclaration: AgentClick.inspectPoint.toString(),
       arguments: [{ value: x }, { value: y }, { value: q }, ...childObjects.map(objectId => ({ objectId }))], returnByValue: true,
     }));
-    if (typeof value !== 'boolean') throw new Error('无法确认点击目标是否被遮挡');
-    return !value;
+    if (typeof value?.ok !== 'boolean') return { ok: false, reason: 'unsupported_hit_test' };
+    return value;
   } finally {
     await Promise.all([objectId, ...childObjects].map(objectId =>
       cdpSend(target, 'Runtime.releaseObject', { objectId }).catch(() => {})));
   }
+}
+
+async function checkOcclusion(target, backendNodeId, x, y, independentDescendants = []) {
+  return !(await inspectClickTarget(target, backendNodeId, x, y, independentDescendants)).ok;
+}
+
+async function readCheckableState(target, backendNodeId) {
+  let objectId;
+  try {
+    objectId = (await cdpSend(target, 'DOM.resolveNode', { backendNodeId })).object?.objectId;
+    if (!objectId) return null;
+    return runtimeValue(await cdpSend(target, 'Runtime.callFunctionOn', {
+      objectId, functionDeclaration: AgentClick.describeCheckable.toString(), returnByValue: true,
+    }));
+  } catch { return null; }
+  finally { if (objectId) await cdpSend(target, 'Runtime.releaseObject', { objectId }).catch(() => {}); }
 }
 
 // finally 重聚焦顶层（防点击开了新 tab/dialog 卡住）。daw.py:1026。
@@ -1952,7 +2023,7 @@ async function handleAgentExecute(tabId, action, ctx = null) {
     const map = await loadTabState(STATE_KEYS.indexMap, tabId);
     if (!map || map.observationId !== action.observation_id || map.epoch !== await getSessionEpoch(tabId)
         || map.documentEpoch !== await documentIdentity(rootTarget)) {
-      return { success: false, stale: true, action_type: type, error: '观察版本或页面文档已失效' };
+      return { success: false, stale: true, error_code: 'target_stale', action_type: type, error: '观察版本或页面文档已失效' };
     }
     ctx.check();
   }
@@ -1973,7 +2044,7 @@ async function handleAgentExecute(tabId, action, ctx = null) {
   let domTarget = rootTarget;
   if (needsEl || (optElActions.includes(type) && action.index != null)) {
     const r = await resolveIndex(tabId, action.index);
-    if (r.stale) return { __via: 'cdp', success: false, stale: true, action_type: type, error: `编号 ${action.index} 已失效（需重新观察）` };
+    if (r.stale) return { __via: 'cdp', success: false, stale: true, error_code: 'target_stale', action_type: type, error: `编号 ${action.index} 已失效（需重新观察）` };
     if (!r.stale) {
       elementEntry = r.entry;
       backendNodeId = r.entry.backendNodeId;
@@ -1989,7 +2060,10 @@ async function handleAgentExecute(tabId, action, ctx = null) {
 
   try {
     // 元素点击/悬停走目标 session；页面级动作仍走根 session。
-    if (action.params?.material_id) {
+    if (action.params?.material_id || type === 'read_field') {
+      if (action.params.field_snapshot && ['id', 'digest', 'length', 'format'].some(k => action.params.field_snapshot[k] !== elementEntry?.fieldSnapshot?.[k])) {
+        return { success: false, stale: true, action_type: type, error: '字段快照与当前观察不匹配，请重新观察' };
+      }
       let materialObject;
       try {
         materialObject = (await cdpSend(domTarget, 'DOM.resolveNode', { backendNodeId })).object?.objectId;
@@ -2001,13 +2075,23 @@ async function handleAgentExecute(tabId, action, ctx = null) {
         if (!live?.success || !action.params.material_identity ||
             Object.entries(action.params.material_identity).some(([key, value]) => (live[key] || '') !== value))
           return { success: false, stale: true, action_type: type, error: '字段名称或分组已变化，未写入旧物料，请重新观察' };
+        if (type === 'select' && action.params.field_snapshot) {
+          const snapshot = action.params.field_snapshot;
+          if (typeof live.snapshot_value !== 'string' || live.snapshot_value.length !== snapshot.length ||
+              await fieldValueDigest(live.snapshot_value) !== snapshot.digest)
+            return { success: false, stale: true, action_type: type, error: '字段完整原值已改变，未覆盖，请重新观察' };
+          action = { ...action, params: { ...action.params, expected_prior: live.snapshot_value } };
+        }
       } finally {
         if (materialObject) await cdpSend(domTarget, 'Runtime.releaseObject', { objectId: materialObject }).catch(() => {});
       }
     }
     if (['type', 'clear', 'focus', 'press_key'].includes(type)) await refocusTop(rootTarget);
     if (type === 'click') return { __via: 'cdp', ...(await doClick(domTarget, rootTarget, backendNodeId, action.index, vw, vh, elementEntry)) };
+    if (type === 'inspect_target') return await inspectTarget(domTarget, backendNodeId, action.index, vw, vh, elementEntry);
     if (type === 'type') return { __via: 'cdp', ...(await doType(domTarget, rootTarget, backendNodeId, action)) };
+    if (type === 'verify_field') return { __via: 'cdp', ...(await doVerifyField(domTarget, rootTarget, backendNodeId, action, vw, vh, elementEntry)) };
+    if (type === 'read_field') return { __via: 'cdp', ...(await doReadField(domTarget, backendNodeId, action)) };
     if (type === 'clear') return { __via: 'cdp', ...(await doClear(domTarget, backendNodeId, action.index)) };
     if (type === 'select') return { __via: 'cdp', ...(await doSelect(domTarget, rootTarget, backendNodeId, action, vw, vh, elementEntry)) };
     if (type === 'hover') return { __via: 'cdp', ...(await doHover(domTarget, rootTarget, backendNodeId, vw, vh, elementEntry)) };
@@ -2048,9 +2132,9 @@ async function handleAgentExecute(tabId, action, ctx = null) {
     return { __via: 'cdp', success: false, action_type: type, error: `不支持的动作: ${type}` };
   } catch (e) {
     // 对齐 browser-use：动作失败转 ActionResult(error) 让 LLM 换招，不抛终止。
-    return { __via: 'cdp', success: false, action_type: type, error: (e && e.message) || String(e) };
+    return { __via: 'cdp', success: false, action_type: type, error_code: 'execution_error', error: (e && e.message) || String(e) };
   } finally {
-    await refocusTop(rootTarget);
+    if (!['verify_field', 'read_field', 'inspect_target'].includes(type)) await refocusTop(rootTarget);
   }
 }
 
@@ -2063,17 +2147,22 @@ async function doClick(domTarget, rootTarget, backendNodeId, index, vw, vh, entr
   await cdpSend(domTarget, 'DOM.scrollIntoViewIfNeeded', { backendNodeId });
   await sleep(50);
   const geometry = await getActionGeometry(domTarget, backendNodeId, entry);
-  if (!geometry) return { success: false, action_type: 'click', error: '目标没有有效几何，未执行点击' };
+  if (!geometry) return { success: false, action_type: 'click', error_code: 'no_geometry', error: '目标没有有效几何，未执行点击' };
+  const before = await readCheckableState(domTarget, backendNodeId);
   const checks = [...geometry.frames, { target: domTarget, backendNodeId, offset: geometry.offset,
     independentDescendants: entry?.independentDescendants }];
+  const diagnostics = [];
   for (const pt of clickPointsFromQuads(geometry.quads, vw, vh)) {
     let blocked = false;
     // 移动鼠标可能触发菜单或遮罩，移动后再确认一次命中。
     for (let round = 0; round < 2; round++) {
       for (const check of checks) {
-        if (await checkOcclusion(check.target, check.backendNodeId,
+        const inspection = await inspectClickTarget(check.target, check.backendNodeId,
           (pt.x - check.offset.x) / check.offset.sx, (pt.y - check.offset.y) / check.offset.sy,
-          check.independentDescendants)) {
+          check.independentDescendants);
+        if (!inspection.ok) {
+          diagnostics.push({ ...inspection, layer: check === checks.at(-1) ? 'target' : 'frame',
+            backend_node_id: check.backendNodeId, round, point: pt });
           blocked = true;
           break;
         }
@@ -2090,9 +2179,57 @@ async function doClick(domTarget, rootTarget, backendNodeId, index, vw, vh, entr
     // OOPIF 由自己的会话投递真实事件；顶层坐标只用于视口与各级遮挡检查。
     await dispatchRealClick(domTarget, (pt.x - geometry.offset.x) / geometry.offset.sx,
       (pt.y - geometry.offset.y) / geometry.offset.sy);
-    return { success: true, action_type: 'click', details: `已向[${index}]派发一次真实点击，请结合后续页面状态确认结果` };
+    let verification = null;
+    if (before) {
+      let after = await readCheckableState(domTarget, backendNodeId);
+      const deadline = Date.now() + 800;
+      while (after && before.checked === after.checked && before.indeterminate === after.indeterminate && Date.now() < deadline) {
+        domTarget._agentAction?.check();
+        await sleep(100);
+        after = await readCheckableState(domTarget, backendNodeId);
+      }
+      verification = { before: { checked: before.checked, indeterminate: before.indeterminate },
+        after: after ? { checked: after.checked, indeterminate: after.indeterminate } : null,
+        status: !after || after.checked === null ? 'unknown' :
+          before.checked !== after.checked || before.indeterminate !== after.indeterminate ? 'changed' : 'unchanged' };
+    }
+    const stateNote = verification ? verification.status === 'changed'
+      ? `；已回读选中状态 ${verification.before.checked} → ${verification.after.checked}`
+      : verification.status === 'unknown' ? '；控件状态暂不可确认，请重新观察，不要直接重放点击'
+      : '；尚未观察到选中状态变化，请先核实，不要直接重复点击' : '，请结合后续页面状态确认结果';
+    return { success: true, action_type: 'click', control_verification: verification,
+      details: `已向[${index}]派发一次真实点击${stateNote}` };
   }
-  return { success: false, action_type: 'click', error: '目标被遮挡、不可操作或不在可点击视口内；未执行点击，请重新观察' };
+  const code = diagnostics.at(-1)?.reason || 'outside_viewport';
+  const errors = { occluded: '点击位置被其他元素遮挡', independent_control: '点击位置命中了另一个独立控件',
+    disabled: '目标或其祖先已禁用', not_visible: '目标不可见', outside_viewport: '目标不在可点击视口内',
+    target_stale: '目标已失效', no_geometry: '目标没有有效几何', unsupported_hit_test: '当前结构无法完成命中检查' };
+  return { success: false, action_type: 'click', error_code: code,
+    click_diagnostic: { target_index: index, frame_id: entry?.frameId || '', sampled_points: diagnostics.length, checks: diagnostics.slice(-8) },
+    error: `${errors[code] || '无法确认点击目标'}；未派发点击，请重新观察` };
+}
+
+async function inspectTarget(domTarget, backendNodeId, index, vw, vh, entry) {
+  const geometry = await getActionGeometry(domTarget, backendNodeId, entry);
+  const checks = geometry ? [...geometry.frames, { target: domTarget, backendNodeId, offset: geometry.offset,
+    independentDescendants: entry?.independentDescendants }] : [];
+  const diagnostics = [];
+  for (const point of geometry ? clickPointsFromQuads(geometry.quads, vw, vh) : []) {
+    let clear = true;
+    for (const check of checks) {
+      const hit = await inspectClickTarget(check.target, check.backendNodeId,
+        (point.x - check.offset.x) / check.offset.sx, (point.y - check.offset.y) / check.offset.sy, check.independentDescendants);
+      if (!hit.ok) { diagnostics.push(hit); clear = false; break; }
+    }
+    if (clear) return { success: true, action_type: 'inspect_target', target_probe: { clear: true, status: 'hittable' },
+      details: `已只读确认[${index}]存在可命中位置；未移动鼠标、点击或提交，执行前仍须检查` };
+  }
+  const reason = diagnostics.at(-1)?.reason || (geometry ? 'outside_viewport' : 'no_geometry');
+  const unknown = ['unsupported_hit_test', 'target_stale'].includes(reason);
+  return { success: true, action_type: 'inspect_target', target_probe: { clear: unknown ? null : false,
+      status: unknown ? 'unknown' : 'not_hittable', reason },
+    click_diagnostic: { frame_id: entry?.frameId || '', checks: diagnostics.slice(-8) },
+    details: `只读检查已完成：[${index}]${unknown ? '当前命中状态未知' : '当前采样位置未命中目标'}（${reason}）；未执行任何输入` };
 }
 
 async function withEditingTarget(target, backendNodeId, actionType, perform) {
@@ -2133,18 +2270,58 @@ async function verifyEditorValue(editor, expected) {
   // 只等待编辑器处理 input，不重写内容，也不把代理 textarea 当作完整文档。
   for (let i = 0; i < 6; i++) {
     const result = await editor.call('read');
-    if (result.value === (result.kind === 'contenteditable' ? expected.replace(/\u00a0/g, ' ') : expected)) return;
+    if (result.value === (result.kind === 'contenteditable' ? expected.replace(/\u00a0/g, ' ') : expected)) return result;
     if (i < 5) await sleep(50);
   }
   throw new Error('回读内容与预期不符，未重放输入；请依据新观察确认已写入的内容');
 }
 
-async function clearEditor(target, editor) {
+function materialVerification(action, result) {
+  return action.params?.material_id ? { material_verification: {
+    material_id: action.params.material_id, artifact_id: action.params.artifact_id,
+    matched: result.matched, valid: result.valid, value: result.value,
+    ...(result.option ? { option: result.option } : {}),
+  } } : {};
+}
+
+async function doVerifyField(domTarget, rootTarget, backendNodeId, action, vw, vh, entry) {
+  if (!action.params?.material_id) return { success: false, error: '只读核实需要有效物料绑定' };
+  if (action.params.expected_option) return doSelect(domTarget, rootTarget, backendNodeId, action, vw, vh, entry);
+  return withEditingTarget(domTarget, backendNodeId, 'verify_field', async editor => {
+    const result = await editor.call('read');
+    const expected = String(action.params.text ?? '').replace(/\r\n?/g, '\n');
+    const priorMatches = action.params.expected_prior_complete === false ||
+      result.value === String(action.params.expected_prior ?? '').replace(/\r\n?/g, '\n');
+    const matched = result.value === expected && priorMatches;
+    return { success: matched && result.valid, action_type: 'verify_field',
+      ...(matched && result.valid ? { details: '已只读核实当前值、字段约束与物料绑定；未输入或提交' }
+        : { stale: !matched, error: matched ? '当前值不满足字段约束' : '当前值已变化或与新物料不符，未修改' }),
+      ...materialVerification(action, { ...result, matched }) };
+  });
+}
+
+async function doReadField(target, backendNodeId, action) {
+  return withEditingTarget(target, backendNodeId, 'read_field', async editor => {
+    const result = await editor.call('read'), snapshot = action.params.field_snapshot;
+    if (!snapshot || result.value.length !== snapshot.length || await fieldValueDigest(result.value) !== snapshot.digest)
+      return { success: false, stale: true, error: '字段在观察后已变化，未返回混合版本，请重新观察' };
+    const chars = Array.from(result.value), offset = action.params.offset, limit = action.params.limit;
+    if (!Number.isInteger(offset) || offset < 0 || offset > chars.length || !Number.isInteger(limit) || limit < 1 || limit > 4000)
+      return { success: false, error: '字段读取范围无效，未截断或改写请求位置' };
+    const end = Math.min(offset + limit, chars.length);
+    return { success: true, action_type: 'read_field', details: `已只读字段字符 [${offset},${end}) / ${chars.length}；未输入或提交`,
+      field_read: { field_ref: action.params.field_ref, snapshot, content: chars.slice(offset,end).join(''),
+        offset, end, total_chars: chars.length, next_offset: end < chars.length ? end : null, rich_text: result.rich_text } };
+  });
+}
+
+async function clearEditor(target, editor, prior = null) {
   const state = await editor.call('guard');
   if ((await editor.call('read')).value === '') return;
   if (state.kind === 'native') await editor.call('set_native', '');
   else {
     await editor.call('select_all');
+    if (prior !== null) await editor.call('guard_value', { prior });
     await editor.call('guard');
     await dispatchSpecialKey(target, 'Backspace', []);
   }
@@ -2158,17 +2335,39 @@ async function doType(domTarget, rootTarget, backendNodeId, action) {
     if (!state.editable) throw new Error('目标不是可编辑区域或处于只读状态，请选择可输入的元素');
     if (!state.multiline && /[\r\n]/.test(text)) throw new Error('单行控件不支持多行文本，未修改内容或发送 Enter');
     if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(text)) throw new Error('文本包含不支持的控制字符');
-    if (action.params?.material_id && (await editor.call('read')).value !== action.params.expected_prior)
-      throw Object.assign(new Error('取材后字段值已改变，未覆盖，请重新观察'), { stale: true });
-    await editor.call('focus');
+    const priorRead = await editor.call('read');
+    if (action.params?.preserve_field_format && priorRead.rich_text)
+      return { success: false, error: '字段包含格式结构，未执行可能丢失格式的全文替换' };
+    const prior = priorRead.value;
+    if (action.params?.material_id) {
+      const snapshot = action.params.field_snapshot;
+      const unchanged = snapshot ? prior.length === snapshot.length && await fieldValueDigest(prior) === snapshot.digest
+        : prior === action.params.expected_prior;
+      if (!unchanged) throw Object.assign(new Error('字段完整原值已改变，未覆盖，请重新观察'), { stale: true });
+    }
     const replace = action.params?.clear !== false;
     let expected = text;
-    if (state.direct) {
+    if (!replace) {
+      await editor.call('focus');
+      expected = (await editor.call('expected', text)).value;
+    }
+    const candidate = await editor.call('validate', expected);
+    if (!candidate.valid) return { success: false, action_type: 'type', valid: false,
+      error: '目标内容不满足字段约束，未修改：' + candidate.violations.join(', ') };
+    if (action.params?.material_id && prior === expected) {
+      const result = await verifyEditorValue(editor, expected);
+      return { success: result.valid, action_type: 'type', details: '完整现值已与成果一致，只读核实，未重复输入',
+        ...materialVerification(action, { ...result, matched: true }) };
+    }
+    await editor.call('focus');
+    if (action.params?.material_id && replace && ['native', 'codemirror5'].includes(state.kind)) {
+      await editor.call('replace', { prior, text });
+    } else if (state.direct) {
       if (!replace) throw new Error('日期/数值选择控件只支持完整替换');
       await editor.call('set_native', text);
     } else {
-      if (replace) await clearEditor(domTarget, editor);
-      else expected = (await editor.call('expected', text)).value;
+      if (action.params?.material_id) await editor.call('guard_value', { prior });
+      if (replace) await clearEditor(domTarget, editor, action.params?.material_id ? prior : null);
       if (state.kind === 'codemirror5') await editor.call('insert_cm', text);
       else if (state.kind === 'contenteditable') {
         await editor.call('guard');
@@ -2176,9 +2375,11 @@ async function doType(domTarget, rootTarget, backendNodeId, action) {
       }
       else await typeChars(domTarget, text, () => editor.call('guard'));
     }
-    await verifyEditorValue(editor, expected);
-    return { success: true, action_type: 'type', details: '已回读确认输入内容；未执行提交操作',
-      ...(action.params?.material_id ? { material_verification: { material_id: action.params.material_id, matched: true } } : {}) };
+    const result = await verifyEditorValue(editor, expected);
+    return { success: result.valid, action_type: 'type',
+      ...(result.valid ? { details: '已回读确认内容及字段有效性；未执行提交操作' }
+        : { error: '内容已写入，但字段校验未通过；未提交，也未自动回滚：' + result.violations.join(', ') }),
+      ...materialVerification(action, { ...result, matched: true }) };
   });
 }
 
@@ -2201,37 +2402,26 @@ async function doSelect(domTarget, rootTarget, backendNodeId, action, vw, vh, en
     const isNative = await cdpSend(target, 'Runtime.callFunctionOn', { objectId, functionDeclaration: 'function(){return this.tagName==="SELECT";}', returnByValue: true }).then(r => r?.result?.value);
     if (typeof isNative !== 'boolean') return { success: false, action_type: 'select', error: '无法确认下拉控件类型' };
     if (isNative) {
-      const response = await cdpSend({ ...target, _agentEffect: true }, 'Runtime.callFunctionOn', {
-        objectId, arguments: [{ value: optText }, { value: action.params?.material_id ? action.params.expected_prior : null }],
-        functionDeclaration: `function(t, prior){
-          if(!this.isConnected)return {success:false,stale:true,error:'选择目标已脱离页面'};
-          if(this.matches(':disabled'))return {success:false,error:'下拉框已禁用'};
-          if(prior!==null&&this.value!==prior)return {success:false,stale:true,error:'字段值已改变，未覆盖，请重新观察'};
-          const o=Array.from(this.options).find(o=>o.textContent.trim().toLowerCase()===t.trim().toLowerCase());
-          if(!o)return {success:false,error:'目标选项不存在'};
-          if(o.disabled||(o.parentElement.tagName==='OPTGROUP'&&o.parentElement.disabled))return {success:false,error:'目标选项已禁用'};
-          this.selectedIndex=o.index;
-          this.dispatchEvent(new Event('input',{bubbles:true}));
-          this.dispatchEvent(new Event('change',{bubbles:true}));
-          if(!this.isConnected||!this.contains(o))return {success:false,stale:true,error:'选择后目标被替换，请重新观察'};
-          return o.selected&&this.value===o.value?{success:true}:{success:false,error:'回读选中项不符，选择未生效'};
-        }`,
+      const response = await cdpSend({ ...target, _agentEffect: action.type !== 'verify_field' }, 'Runtime.callFunctionOn', {
+        objectId, arguments: [{ value: action.params }, { value: action.type === 'verify_field' }],
+        functionDeclaration: AgentEditing.selectNativeTarget.toString(),
         returnByValue: true,
       });
       const result = response?.result?.value;
       if (typeof result?.success !== 'boolean') return { success: false, action_type: 'select', error: '无法确认选择结果' };
-      return { ...result, action_type: 'select', ...(result.success ? { details: `已确认选择"${optText}"`,
-        ...(action.params?.material_id ? { material_verification: { material_id: action.params.material_id, matched: true } } : {}) } : {}) };
+      return { ...result, action_type: action.type, ...materialVerification(action, result),
+        ...(result.success ? { details: `${action.type === 'verify_field' ? '只读核实' : '已确认选择'} ${JSON.stringify(result.option)}；字段校验通过` } : {}) };
     }
   } finally {
     await cdpSend(target, 'Runtime.releaseObject', { objectId }).catch(() => {});
   }
+  if (action.type === 'verify_field') return { success: false, error: '只读选项核实只支持原生下拉' };
   // 自定义下拉:点触发器展开,等,再在弹层里精确文本匹配点击(不用子串,防 wrong-click)
   const opened = await doClick(target, rootTarget, backendNodeId, action.index, vw, vh, entry);
   if (!opened.success) return { ...opened, action_type: 'select' };
   await sleep(500);
   const found = await cdpSend({ ...target, _agentEffect: true }, 'Runtime.evaluate', {
-    expression: `(()=>{const t=${JSON.stringify(optText.toLowerCase().trim())};const items=document.querySelectorAll('[role="option"],[role="listbox"] li,.ant-select-item,.el-select-dropdown__item,[class*="option"],[class*="menu-item"],[class*="dropdown"] li');for(const it of items){if((it.textContent||'').toLowerCase().trim()===t){const r=it.getBoundingClientRect();it.click();return {x:r.x+r.width/2,y:r.y+r.height/2};}}return null;})()`,
+    expression: `(()=>{const t=${JSON.stringify(optText)};const items=[...document.querySelectorAll('[role="option"],[role="listbox"] li,.ant-select-item,.el-select-dropdown__item,[class*="option"],[class*="menu-item"],[class*="dropdown"] li')].filter(it=>(it.textContent||'').trim()===t&&it.getBoundingClientRect().width>0&&it.getBoundingClientRect().height>0);if(items.length!==1)return null;const it=items[0],r=it.getBoundingClientRect();it.click();return {x:r.x+r.width/2,y:r.y+r.height/2};})()`,
     returnByValue: true,
   }).then(r => r && r.result && r.result.value).catch(() => null);
   if (found) return { success: true, action_type: 'select', details: `已向选项"${optText}"派发点击，请结合新观察确认选择结果` };

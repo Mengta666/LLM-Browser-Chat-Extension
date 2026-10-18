@@ -14,6 +14,7 @@ import threading
 from typing import Any, Optional
 
 from pydantic import BaseModel
+from agent.task_workspace import initial_state as task_initial_state
 
 
 class AgentStatus(str, Enum):
@@ -32,6 +33,8 @@ class PageAction(BaseModel):
     type: str  # click, type, select, scroll, hover, focus, clear, press_key, wait, navigate, task_complete
     index: Optional[int] = None          # 目标元素编号（data-agent-id）；无需元素的动作为 None
     params: dict[str, Any] = {}
+    expectation: dict[str, Any] = {}
+    target_label: str = ''
 
 
 class ActionResult(BaseModel):
@@ -44,7 +47,14 @@ class ActionResult(BaseModel):
     timestamp: int = 0
     stale: bool = False                  # 编号失效（页面已重渲染）→ 需重新观察，不计失败
     material_verification: Optional[dict[str, Any]] = None
+    field_read: Optional[dict[str, Any]] = None
     state_changes: Optional[dict[str, Any]] = None
+    error_code: str = ""
+    click_diagnostic: Optional[dict[str, Any]] = None
+    click_effects: Optional[dict[str, bool]] = None
+    control_verification: Optional[dict[str, Any]] = None
+    verification: Optional[dict[str, Any]] = None
+    target_probe: Optional[dict[str, Any]] = None
 
 
 class PageState(BaseModel):
@@ -58,6 +68,8 @@ class PageState(BaseModel):
     document_height: int = 0
     scrollable_container: Optional[dict[str, Any]] = None
     active_popup: Optional[dict[str, Any]] = None
+    popups: list[dict[str, Any]] = []
+    observation_complete: bool = False
     page_fingerprint: Optional[dict[str, Any]] = None
     is_loading: bool = False
     focused_element: Optional[str] = None
@@ -132,8 +144,10 @@ class AgentSession:
     llm_params: dict[str, Any] = field(default_factory=dict)
     kb_id: str = ""
     material_state: dict[str, Any] = field(default_factory=dict)
+    task_state: dict[str, Any] = field(default_factory=task_initial_state)
     material_continuation: str = ""
     material_observation_id: str = ""
+    recovery_state: dict[str, Any] = field(default_factory=dict)
 
     # 长期记忆(分层):
     # - resident_preferences: 常驻用户偏好,每步无条件注入 prompt(首步检索一次)。

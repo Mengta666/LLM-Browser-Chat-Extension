@@ -26,6 +26,7 @@ class AgentExecuteRequest(BaseModel):
     llm_params: dict[str, Any] = {}
     kb_id: str = ''
     materials_version: int = 0
+    task_workspace_version: int = 0
 
 
 class AgentStepRequest(BaseModel):
@@ -78,8 +79,8 @@ def _decide(item, initial=False, resume=False):
     if initial and not item.task.strip():
         raise HTTPException(400, 'task 不能为空')
     if initial and item.kb_id:
-        if item.materials_version != 1:
-            raise HTTPException(409, '知识库物料协议不匹配，请重新加载扩展')
+        if item.materials_version != 1 or item.task_workspace_version != 2:
+            raise HTTPException(409, '任务工作区协议不匹配，请同时更新后端并重新加载扩展')
         from agent.materials import validate_kb
         from storage.kb_store import KBNotFound, KBConflict
         try:
@@ -162,6 +163,18 @@ def agent_execute(item: AgentExecuteRequest):
 @router.post('/capabilities')
 def agent_capabilities():
     return {'protocol_version': 2, 'materials_version': 1, 'material_fill_version': 1,
+            'task_workspace_version': 2,
+            'field_verification_version': 1,
+            'artifact_composition_version': 1,
+            'field_snapshot_version': 1,
+            'field_read_version': 1,
+            'field_length_repair_version': 1,
+            'field_content_version': 1,
+            'field_review_version': 1,
+            'interaction_version': 1,
+            'action_verification_version': 1,
+            'autonomous_recovery_version': 1,
+            'interaction_feedback_version': 2,
             'restart_resume': False}
 
 
@@ -214,8 +227,8 @@ def agent_status(item: AgentStatusRequest):
 @router.post('/cancel')
 def agent_cancel(item: AgentCancelRequest):
     try:
-        loop.cancel_session(item.session_id)
+        with loop._sessions_lock:
+            loop.cancel_session(item.session_id)
+            return loop._build_response(loop.get_session(item.session_id))
     except RuntimeError as exc:
         raise HTTPException(503, '取消记录暂时无法保存') from exc
-    with loop._sessions_lock:
-        return loop._build_response(loop.get_session(item.session_id))

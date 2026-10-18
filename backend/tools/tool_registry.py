@@ -8,6 +8,6 @@ context_builder 的 system prompt 里说明。
 # LLM 可输出的页面动作类型。由前端执行 DOM 操作。task_complete 单独处理（终止）。
 ALLOWED_ACTION_TYPES: set[str] = {
     "click", "type", "select", "scroll", "scroll_to_element", "hover",
-    "focus", "clear", "press_key", "wait", "navigate",
+    "focus", "clear", "press_key", "wait", "navigate", "verify_field", "read_field", "inspect_target",
 }
 

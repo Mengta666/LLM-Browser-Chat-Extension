@@ -6,6 +6,7 @@ from search import kb_coverage as coverage
 
 
 def prepare(rows, target, kb_id):
+    """按分页游标和块内偏移准备读取结果，生成下一页入口并保留原文位置。"""
     cursor, offset = target.get('cursor', 0), target.get('block_offset', 0)
     if not 0 <= cursor <= len(rows) or (cursor == len(rows) and offset):
         raise ValueError('续读游标超出目标范围，请复用 next_read')
@@ -17,6 +18,7 @@ def prepare(rows, target, kb_id):
         if skip > len(row['content']) or (skip and row.get('atomic')):
             raise ValueError('续读位置超出范围或拆分了原子单元，请复用 next_read')
         parts, remaining = [], skip
+        # 续读偏移基于拼接后的正文，跨片段时还需扣除片段之间的换行符。
         for span in row['segments']:
             if remaining >= len(span['text']):
                 remaining -= len(span['text']) + 1
@@ -35,6 +37,7 @@ def prepare(rows, target, kb_id):
 
 
 def resume(row, chars=0):
+    """将已经交付的字符数转换为可精确续接的读取参数。"""
     if 'read_target' in row:
         if row['read_target']['mode'] in ('block','range') and len(row['segments']) == 1:
             span = row['segments'][0]
@@ -60,6 +63,7 @@ def resume(row, chars=0):
 
 
 def progress(item, rows, *, details=False):
+    """比较请求范围和实际交付范围，返回读取覆盖、缺口及可选详细账本。"""
     result = {k:v for k,v in item.items() if not k.startswith('_') and k != 'target'}
     if item['outcome'] == 'error':
         return {**result, 'delivery':'failed', 'provided_blocks':0, 'partial':True,
@@ -68,6 +72,7 @@ def progress(item, rows, *, details=False):
     selected = [r for r in rows if r.get('target_index') == item['target_index']]
     required = [s for r in units for s in coverage.row_ranges(r)]
     delivered = [s for r in selected for s in coverage.row_ranges(r)]
+    # 用实际交付范围计算覆盖率，检索命中但被结果预算截掉的正文仍算未读。
     unread = [part for s in required for part in coverage.missing(s, delivered)]
     total, missing = coverage.covered_chars(required), coverage.covered_chars(unread)
     result.update(delivery='complete' if not missing else 'partial' if total > missing else 'not_provided',

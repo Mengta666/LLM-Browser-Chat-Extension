@@ -1,17 +1,21 @@
-(() => {
+(/** 封装并导出自动化运行器与受限等待工具。 */ () => {
+  /** 为异步等待设置超时和取消监听，结束时统一清理监听与定时器。 */
   function bounded(promise, ms, signal) {
-    return new Promise((resolve, reject) => {
+    return new Promise(/** 连接异步结果、超时和取消信号。 */ (resolve, reject) => {
+      /** 将取消信号转换为带取消错误码的等待失败。 */
       const abort = () => done(reject, Object.assign(new Error('任务已停止'), { code: 'cancelled' }));
       let timer;
+      /** 清理等待资源后，通过指定回调完成或拒绝等待。 */
       const done = (fn, value) => { clearTimeout(timer); signal?.removeEventListener('abort', abort); fn(value); };
-      timer = setTimeout(() => done(reject, Object.assign(new Error('等待超时'), { code: 'timeout' })), Math.max(1, ms));
-      Promise.resolve(promise).then(value => done(resolve, value), error => done(reject, error));
+      timer = setTimeout(/** 超时后清理资源并拒绝等待。 */ () => done(reject, Object.assign(new Error('等待超时'), { code: 'timeout' })), Math.max(1, ms));
+      Promise.resolve(promise).then(/** 传递成功结果并清理等待资源。 */ value => done(resolve, value), /** 传递原异常并清理等待资源。 */ error => done(reject, error));
       signal?.addEventListener('abort', abort, { once: true });
       if (signal?.aborted) abort();
     });
   }
 
   class Run {
+    /** 保存会话、标签页和通信接口，初始化阶段预算及任务提交状态。 */
     constructor(sessionId, tabId, io, limits = {}) {
       this.sessionId = sessionId; this.tabId = tabId; this.io = io;
       this.limits = { total: 3600000, observe: 30000, recovery: 90000, action: 120000,
@@ -21,16 +25,20 @@
       this.startSubmitted = false; this.startAcknowledged = false;
       this.pendingActionId = null; this.backendSubmitted = false;
     }
+    /** 检查任务是否已取消或超过总时间预算。 */
     check() {
       if (this.abort.signal.aborted) throw Object.assign(new Error('任务已停止'), { code: 'cancelled' });
       if (Date.now() >= this.deadline) throw new Error('任务超过总时间预算，未完成');
     }
+    /** 生成当前会话内递增且带用途前缀的请求标识。 */
     id(prefix) { return `${this.sessionId}:${prefix}:${++this.sequence}`; }
+    /** 在阶段预算和总预算的较小值内等待，并在前后检查任务有效性。 */
     async wait(promise, ms) {
       this.check();
       const result = await bounded(promise, Math.min(ms, this.deadline - Date.now()), this.abort.signal);
       this.check(); return result;
     }
+    /** 向扩展后台发送带会话信息的消息，校验响应并传播受控错误。 */
     async message(type, data = {}, timeout = 5000, stopping = false) {
       if (!stopping) this.check();
       const promise = this.io.message({ ...data, type, tabId: this.tabId, sessionId: this.sessionId });
@@ -38,9 +46,11 @@
       if (!response?.ok) throw Object.assign(new Error(response?.error || '浏览器后台无响应'), { code: response?.code });
       return response;
     }
+    /** 通过控制消息通道发送任务命令并返回后台控制结果。 */
     async control(command, data = {}, stopping = false) {
       return (await this.message('AGENT_CONTROL', { command, ...data }, 5000, stopping)).result;
     }
+    /** 核对后台协议版本，再请求建立当前会话的浏览器执行环境。 */
     async start() {
       try {
         const probe = await this.control('probe');
@@ -57,16 +67,20 @@
       if (response?.protocol_version !== 2) throw new Error('请重新加载扩展以启用自动化协议 v2');
       this.startAcknowledged = true;
     }
+    /** 取消本地等待，并独立通知扩展后台及已提交的后端任务停止。 */
     async stop() {
       this.abort.abort();
+      // 取消本地等待后，仍需独立通知扩展后台和后端，不能复用已中止的信号。
       const results = await Promise.allSettled([
         ...(this.startSubmitted ? [this.control('cancel', {}, true)] : []),
         ...(this.backendSubmitted ? [bounded(this.io.api('/v1/agent/cancel', { session_id: this.sessionId }), 5000)] : []),
       ]);
       return results;
     }
-    async sleep(ms) { return this.wait(new Promise(r => setTimeout(r, ms)), ms + 1000); }
+    /** 在任务取消及总预算约束下等待指定间隔。 */
+    async sleep(ms) { return this.wait(new Promise(/** 通过定时器提供可受任务预算约束的等待。 */ r => setTimeout(r, ms)), ms + 1000); }
 
+    /** 获取并标注最新页面，校验观察身份，在恢复预算内重试可恢复失败。 */
     async observe() {
       this.io.status('observing', '正在观察页面');
       const deadline = Math.min(this.deadline, Date.now() + this.limits.recovery);
@@ -96,9 +110,11 @@
       throw new Error('页面观察持续失败，已达到自动恢复时间预算；未使用旧观察继续操作');
     }
 
+    /** 依据最新观察核对动作预期，必要时只读刷新页面直到满足或预算耗尽。 */
     async verify(action, result, page) {
       const deadline = Math.min(this.deadline, Date.now() + (this.limits.verify ?? 2500));
       let verification = AgentVerification.evaluate(action.expectation, page);
+      // 页面更新可能晚于输入完成；这里只刷新观察，不再次派发已有副作用的动作。
       while (result.success && verification.status === 'not_satisfied' && Date.now() < deadline) {
         this.io.status('verifying', '正在只读核实操作结果；不会重复点击');
         await this.sleep(Math.min(300, deadline - Date.now()));
@@ -109,9 +125,11 @@
       return page;
     }
 
+    /** 使用固定请求标识提交模型决策，响应丢失时查询状态并在预算内恢复。 */
     async decide(path, body) {
       this.io.status('deciding', '正在根据最新页面决定下一步');
       const deadline = Math.min(this.deadline, Date.now() + this.limits.decision);
+      // 整个恢复过程复用请求标识，使丢失响应后的状态查询或重提交仍对应同一次决策。
       const request = { ...body, session_id: this.sessionId, protocol_version: 2,
         request_id: this.id('decision'), budget_ms: Math.max(1, deadline - Date.now()) };
       let submit = true;
@@ -135,6 +153,7 @@
       throw new Error('模型决策超过时间预算，任务未完成');
     }
 
+    /** 验证物料来源后执行一次动作，超时后只查询原动作状态以避免重复输入。 */
     async execute(action) {
       this.io.status('executing', '正在执行单步操作');
       this.check();
@@ -170,6 +189,7 @@
       }
     }
 
+    /** 登记任务关闭并等待资源收尾，无法确认完成时返回明确的不安全状态。 */
     async finish() {
       this.abort.abort();
       if (!this.startSubmitted) return { state: 'not_started', safe: true };
@@ -178,7 +198,7 @@
         let closed = await this.control('end', {}, true);
         const deadline = Date.now() + 5000;
         while (closed?.reason === 'action_pending' && Date.now() < deadline) {
-          await new Promise(resolve => setTimeout(resolve, 100));
+          await new Promise(/** 在收尾状态查询之间短暂等待。 */ resolve => setTimeout(resolve, 100));
           const state = await this.control('status', {}, true);
           if (state.safe || state.state === 'unknown') break;
         }

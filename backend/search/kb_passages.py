@@ -6,6 +6,7 @@ from storage import kb_store as KS
 
 
 def split_node(row):
+    """按连续原文范围分页节点内容，保留关联公式等需要完整交付的片段。"""
     spans = row.get('segments', [])
     if not spans:
         return []

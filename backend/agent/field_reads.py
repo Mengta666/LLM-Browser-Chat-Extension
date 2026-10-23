@@ -8,6 +8,7 @@ IDENTITY_KEYS = ('tag', 'type', 'name', 'html_id', 'placeholder', 'aria_label', 
 
 
 def identity(page, element):
+    """构造字段读取的身份，防止跨页面、跨节点拼接读取结果。"""
     return {'tab_id': page.tab_id, 'document_epoch': page.document_epoch,
             'frame_id': element.get('frame_id', ''),
             'node_id': element.get('backend_node_id', element.get('id')),
@@ -15,6 +16,7 @@ def identity(page, element):
 
 
 def prepare(session, page, action, args):
+    """验证字段及续读快照，将读取范围和目标身份写入待执行动作。"""
     element = next((e for e in page.interactive_elements if e.get('id') == action.index), None)
     if (not element or element.get('type') in ('password', 'hidden', 'file')
             or element.get('editor_type') not in ('native', 'contenteditable', 'codemirror5')):
@@ -41,6 +43,7 @@ def prepare(session, page, action, args):
 
 
 def record(session, action, result):
+    """校验字段读取回执并合并连续片段，全文摘要一致后才标记读取完整。"""
     if action.type != 'read_field' or not result.success or result.stale or result.execution_state != 'completed':
         return
     data = result.field_read or {}
@@ -63,6 +66,7 @@ def record(session, action, result):
         return
     row['segments'][start] = text
     cursor, pieces = 0, []
+    # 只合并从零开始的连续区间，跳过重叠部分；遇到缺口时不能将分段读取标记为完整。
     for offset, part in sorted(row['segments'].items()):
         if offset > cursor:
             break
@@ -83,6 +87,7 @@ def record(session, action, result):
 
 
 def compose(session, field_ref, edits):
+    """按原文范围应用不重叠的局部替换，返回新全文、依赖成果及原文保护信息。"""
     row = session.task_state.get('field_reads', {}).get(field_ref) if isinstance(field_ref, str) else None
     if not row or not row['complete']:
         raise ValueError('局部修改需要完整读齐同一 field_ref；按 next_offset 继续读取，不能把预览当全文')
@@ -110,6 +115,7 @@ def compose(session, field_ref, edits):
         changes.append((start, end, replacement['content']))
         parents.append(replacement['id'])
     changes.sort()
+    # 原文游标和输出游标分开推进，替换片段变长或变短时仍能追溯对应的原文范围。
     parts, cursor, output_cursor, output_edits = [], 0, 0, []
     for start, end, replacement in changes:
         if start < cursor:

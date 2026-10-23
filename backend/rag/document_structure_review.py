@@ -23,6 +23,7 @@ _workers = set()
 _lock = threading.Lock()
 
 def settings():
+    """读取并校验结构审阅模型、接口和预算参数，生成任务配置指纹。"""
     mode = os.getenv('KB_STRUCTURE_MODE', 'rules')
     if mode not in ('rules', 'shadow'):
         raise ValueError('第一批 KB_STRUCTURE_MODE 仅支持 rules/shadow，不支持发布模型结构')
@@ -54,10 +55,12 @@ def settings():
 
 
 def digest(value):
+    """计算结构化输入的稳定摘要，用于审阅窗口及配置身份校验。"""
     return hashlib.sha256(json.dumps(value,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
 
 
 def anchors(blocks,pages,limit):
+    """从原文块和页面信息提取有限的结构锚点，保留来源引用。"""
     dimensions={p['page']:(p['width'],p['height']) for p in pages}
     result=[]
     for b in blocks:
@@ -82,12 +85,14 @@ def anchors(blocks,pages,limit):
 
 
 def messages(payload, repair='',system=SYSTEM):
+    """将审阅窗口和可选协议修复提示转换为模型消息。"""
     wire=G.wire_payload(payload) if payload['window_id']=='global' else payload
     return [{'role':'system','content':system+('\n上次输出协议错误：'+repair+'。path 是字段路径，missing 需补齐字段，extra_forbidden 需移除多余字段；按已给契约修正，重新返回完整结果，不猜测未提供的锚点、不输出解释。' if repair else '')},
             {'role':'user','content':json.dumps(wire,ensure_ascii=False)}]
 
 
 def output_load(window,counter):
+    """估算结构审阅窗口所需的输出额度，辅助拆分超限窗口。"""
     items=[]
     for a in window['anchors']:
         items.append({'anchors':[a['id']],'role':'section_heading','parent_section':a['id'],
@@ -97,6 +102,7 @@ def output_load(window,counter):
 
 
 def start(kb_id,doc_id,review_id=None,*,request_id=''):
+    """创建或续接结构审阅任务，获得租约后启动后台分析。"""
     cfg=settings()
     if cfg['mode']!='shadow' or not cfg['base_url'] or not cfg['model']:
         raise ValueError('请显式配置 KB_STRUCTURE_MODE=shadow 及独立模型地址、名称')
@@ -128,11 +134,13 @@ def start(kb_id,doc_id,review_id=None,*,request_id=''):
 
 
 def run(kb_id,doc_id,review_id,lease,cfg):
+    """分窗口执行结构分析并保存检查点，完成全局整理后保存建议但不自动发布。"""
     from observability.logger import get_logger
     log=get_logger('kb')
     deadline=time.monotonic()+cfg['task_timeout']
     metrics=[]
     def check():
+        """确认审阅租约、文档归属和任务期限仍然有效。"""
         if time.monotonic()>=deadline:
             raise TimeoutError('review_task_timeout')
         with KS._transaction() as conn:
@@ -151,6 +159,7 @@ def run(kb_id,doc_id,review_id,lease,cfg):
             with OpenAI(base_url=cfg['base_url'],api_key=os.getenv('KB_STRUCTURE_API_KEY') or 'none',max_retries=0,
                         http_client=httpx.Client(trust_env=False,follow_redirects=False)) as client:
                 def invoke(window,active,validator,system,planned_output,allow_split):
+                    """复用窗口检查点或调用模型，验证结构协议并按预算决定修复或拆分。"""
                     nonlocal metrics
                     input_hash=digest(window);active=active or {'attempts':[]}
                     metrics=[a['metrics'] for a in active['attempts'] if 'metrics' in a]

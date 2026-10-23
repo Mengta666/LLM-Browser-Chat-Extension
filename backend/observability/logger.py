@@ -24,6 +24,7 @@ class StructuredLogger:
     """结构化日志器：写入 JSONL 文件 + 内存环形缓存。"""
 
     def __init__(self, channel: str, max_memory_entries: int = 1000):
+        """初始化日志通道及有容量上限的内存日志缓存。"""
         self.channel = channel
         self._memory: deque[dict[str, Any]] = deque(maxlen=max_memory_entries)
 
@@ -35,6 +36,7 @@ class StructuredLogger:
         data: Optional[dict[str, Any]] = None,
         duration_ms: Optional[int] = None,
     ) -> dict[str, Any]:
+        """构造结构化日志并同时写入文件和内存缓存，返回该条记录。"""
         entry = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "channel": self.channel,
@@ -49,15 +51,19 @@ class StructuredLogger:
         return entry
 
     def info(self, event: str, **kwargs) -> dict[str, Any]:
+        """以普通信息级别记录事件。"""
         return self.log("info", event, **kwargs)
 
     def warn(self, event: str, **kwargs) -> dict[str, Any]:
+        """以警告级别记录事件。"""
         return self.log("warn", event, **kwargs)
 
     def error(self, event: str, **kwargs) -> dict[str, Any]:
+        """以错误级别记录事件。"""
         return self.log("error", event, **kwargs)
 
     def debug(self, event: str, **kwargs) -> dict[str, Any]:
+        """以调试级别记录事件。"""
         return self.log("debug", event, **kwargs)
 
     def query(
@@ -80,6 +86,7 @@ class StructuredLogger:
         return results[-limit:]
 
     def _write_file(self, entry: dict[str, Any]) -> None:
+        """按 UTC 日期选择 JSONL 文件并追加一条日志。"""
         date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         filepath = LOG_DIR / f"{self.channel}_{date_str}.jsonl"
         try:

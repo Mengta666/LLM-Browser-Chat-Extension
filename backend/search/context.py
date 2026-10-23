@@ -9,6 +9,7 @@ from .excerpts import history_excerpt
 
 
 def render_evidence(rows, meta):
+    """将来源片段及读取状态渲染为带引用编号的工具证据文本。"""
     if meta.get('reader'):
         meta['reader']['included_count'] = sum(r.get('content_source') == 'page' and
             r.get('context_status') == 'included' for r in rows)
@@ -29,6 +30,7 @@ def render_evidence(rows, meta):
 
 
 def fit_request(messages, tools, contexts, target=None, *, counter=None):
+    """测量完整模型请求，按优先级缩减联网证据直至满足上下文预算。"""
     count_tokens = counter or request_tokens
     count = count_tokens(messages, tools)
     limit = chat_context.input_budget(counter) if target is None else min(target, chat_context.input_budget(counter))
@@ -58,6 +60,7 @@ def fit_request(messages, tools, contexts, target=None, *, counter=None):
 
 
 def is_context_rejection(exc):
+    """识别上游因上下文或输入 token 超限而拒绝请求的错误。"""
     if getattr(exc, 'status_code', None) not in (400, 413, 422):
         return False
     body = getattr(exc, 'body', None)
@@ -75,6 +78,7 @@ def is_context_rejection(exc):
 
 
 def sync_source_context(steps, contexts):
+    """把实际保留的联网正文和覆盖信息同步到工具步骤记录。"""
     for step in steps:
         context = contexts.get(step.get('tool_call_id'))
         if not context:

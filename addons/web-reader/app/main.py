@@ -23,6 +23,7 @@ class ExtractRequest(BaseModel):
 
 @asynccontextmanager
 async def lifespan(application):
+    """启动时校验服务密钥并初始化读取任务的并发限制。"""
     key = os.environ.get("WEB_READER_API_KEY", "").strip()
     if len(key) < 32 or not key.isascii():
         raise RuntimeError("WEB_READER_API_KEY must be at least 32 ASCII characters")
@@ -42,10 +43,12 @@ app = FastAPI(title="Browser Agent Web Reader", version=VERSION, lifespan=lifesp
 
 @app.get("/health")
 async def health():
+    """返回服务存活状态，不访问外部网络。"""
     return {"status": "ok", "service": "web-reader", "version": VERSION, "api_version": "v1"}
 
 
 async def run_job(request, args):
+    """在隔离子进程中读取网页，并在超时或客户端断开时回收子进程。"""
     context = multiprocessing.get_context("spawn")
     receiver, sender = context.Pipe(duplex=False)
     process = context.Process(target=worker, args=(sender, args.url, args.timeout_seconds,
@@ -83,6 +86,7 @@ async def run_job(request, args):
 
 @app.post("/v1/extract")
 async def extract(request: Request):
+    """完成鉴权与请求校验，获取并发名额后执行网页提取并释放名额。"""
     authorization = request.headers.get("Authorization", "")
     if not hmac.compare_digest(authorization.encode(), ("Bearer " + request.app.state.key).encode()):
         return JSONResponse({"status": "error", "error_code": "unauthorized"}, status_code=401)

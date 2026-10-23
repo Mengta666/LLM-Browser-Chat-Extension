@@ -8,6 +8,7 @@ from storage import kb_store as KS, kb_document_store as DS
 
 
 def prepare(kb_id, doc_id, parse_id, lease, config):
+    """按解析版本和配置指纹复用或创建独立结构版本。"""
     fingerprint = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
     with KS._transaction() as conn:
         DS.current(conn, kb_id, doc_id, parse_id, lease)
@@ -21,6 +22,7 @@ def prepare(kb_id, doc_id, parse_id, lease, config):
 
 
 def save(kb_id, doc_id, parse_id, lease, structure_id, nodes, relations, quality, blocks=None):
+    """校验结构树和来源范围，在有效解析租约下保存节点、关系和可选块投影。"""
     from rag.document_hierarchy import validate
     original = DS.blocks(parse_id)
     if blocks is not None:
@@ -54,6 +56,7 @@ def save(kb_id, doc_id, parse_id, lease, structure_id, nodes, relations, quality
 
 
 def snapshot(kb_id, doc_id, *, parse_id=None, structure_id=None, index_run_id=None):
+    """解析并固定可读取的解析、结构和索引版本组合。"""
     with KS._transaction() as conn:
         doc = DS.owned(conn, kb_id, doc_id)
         where, params = "doc_id=? AND r.status='published'", [doc_id]
@@ -80,6 +83,7 @@ def snapshot(kb_id, doc_id, *, parse_id=None, structure_id=None, index_run_id=No
 
 
 def load(structure_id):
+    """加载结构节点及关系，并恢复节点的原文来源范围。"""
     with KS._transaction() as conn:
         rows = [dict(r) for r in conn.execute('SELECT * FROM kb_document_nodes WHERE structure_id=? ORDER BY ordinal', (structure_id,))]
         sources = [dict(r) for r in conn.execute('SELECT * FROM kb_node_sources WHERE structure_id=? ORDER BY node_id,ordinal', (structure_id,))]
@@ -96,6 +100,7 @@ def load(structure_id):
 
 
 def descendant(node, root_id, known):
+    """沿父链判断节点是否属于指定根节点的后代。"""
     while node['parent_id']:
         if node['parent_id'] == root_id:
             return True
@@ -104,6 +109,7 @@ def descendant(node, root_id, known):
 
 
 def reviewed_section(structure_id, section_id):
+    """在已审阅结构中定位章节，区分未启用审阅投影和目标不存在。"""
     nodes, _ = load(structure_id)
     if not nodes or not nodes[0]['attributes'].get('review_range_version'):
         return None
@@ -115,6 +121,7 @@ def reviewed_section(structure_id, section_id):
 
 
 def outline(kb_id, doc_id, *, parse_id=None, structure_id=None, index_run_id=None, node_id=None, offset=0, limit=20, depth=1):
+    """按节点深度及分页范围返回结构目录，附带原文位置而不冒充正文。"""
     snap = snapshot(kb_id, doc_id, parse_id=parse_id, structure_id=structure_id, index_run_id=index_run_id)
     if not snap['structure_id']:
         raise KS.KBConflict('此文档尚无层级结构，请重建索引；旧页块目录仍可读取')
@@ -151,6 +158,7 @@ def outline(kb_id, doc_id, *, parse_id=None, structure_id=None, index_run_id=Non
 
 
 def navigation_chunks(structure_id, counter, token_limit):
+    """把结构路径和预览转换为额度内的导航索引片段。"""
     nodes, _ = load(structure_id)
     known = {n['node_id']: n for n in nodes}
     chunks = []

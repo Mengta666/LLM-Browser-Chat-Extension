@@ -9,6 +9,7 @@ from agent.memory.vector import (batch_insert_memories, get_kb_chunk, kb_index_c
 
 
 def search_memories(query_vector, *, page=None, section_id=None, dense_k=None, sparse_k=None, snapshots=None, node_id=None, **options):
+    """按固定文档快照和结构范围过滤向量召回，组合稠密与稀疏候选。"""
     if page is None and section_id is None and dense_k is None and sparse_k is None and not snapshots and not node_id:
         return V.search_memories(query_vector, **options)
     from storage import kb_store as KS

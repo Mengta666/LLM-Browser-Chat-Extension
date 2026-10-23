@@ -10,10 +10,12 @@ import urllib.request
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        """禁止自动跟随重定向，防止鉴权信息被转发到其他目标。"""
         return None
 
 
 def load_settings(path):
+    """读取部署配置中的键值，不执行配置文本。"""
     values = {}
     for line in path.read_text(encoding="utf-8").splitlines():
         if line.strip() and not line.lstrip().startswith("#") and "=" in line:
@@ -23,6 +25,7 @@ def load_settings(path):
 
 
 def check(settings, reader_url=None, search_url=None, page_url=None):
+    """检查网页读取与搜索服务的可用性，不调用模型推理。"""
     results = []
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
     if reader_url:

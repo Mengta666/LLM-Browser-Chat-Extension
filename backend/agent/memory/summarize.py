@@ -101,6 +101,7 @@ def _default_llm(system: str, user: str) -> Optional[dict]:
 
 
 def _parse_json(raw: str) -> Optional[dict]:
+    """解析模型返回的摘要分组 JSON，容忍代码围栏和外围文字。"""
     text = str(raw or "").strip()
     if text.startswith("```"):
         text = text.split("```", 2)[1] if text.count("```") >= 2 else text
@@ -120,6 +121,7 @@ def _parse_json(raw: str) -> Optional[dict]:
 
 
 def _build_compact_user_prompt(items: list[dict[str, str]]) -> str:
+    """将候选核心记忆序列化为分组压缩模型的输入。"""
     return "输入:\n" + json.dumps(items, ensure_ascii=False, indent=2)
 
 

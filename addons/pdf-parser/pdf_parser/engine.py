@@ -14,11 +14,13 @@ from .vlm_result import VLMResultTracker
 
 class ParseError(Exception):
     def __init__(self, code):
+        """保存可对外公开的解析错误码，不携带可能泄露配置的底层异常内容。"""
         self.code = code
         super().__init__(code)
 
 
 def check_vlm(settings):
+    """检查视觉模型接口及配置模型是否可用，不执行页面推理。"""
     try:
         with httpx.Client(timeout=5, trust_env=False, follow_redirects=False) as client:
             response = client.get(settings.vlm_url + "/models", headers={
@@ -33,6 +35,7 @@ def check_vlm(settings):
 
 
 def decode_image(content, max_pixels):
+    """验证图像尺寸和方向，解码为解析管线需要的 RGB 图像。"""
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("error", Image.DecompressionBombWarning)
@@ -57,6 +60,7 @@ def decode_image(content, max_pixels):
 
 
 def normalize_result(raw, width, height, page_number, image_sha256, versions):
+    """校验并转换 OCR 输出，返回绑定页面、输入图像摘要和版本的结构化结果。"""
     page = raw.get("res") if isinstance(raw, dict) else None
     if not isinstance(page, dict) or not isinstance(page.get("parsing_res_list"), list):
         raise ParseError("invalid_pipeline_result")
@@ -100,6 +104,7 @@ def normalize_result(raw, width, height, page_number, image_sha256, versions):
 
 class PaddleEngine:
     def __init__(self, settings):
+        """检查上游模型并初始化 OCR 管线、版本记录和结束原因跟踪器。"""
         from paddleocr import PaddleOCRVL
 
         check_vlm(settings)
@@ -121,6 +126,7 @@ class PaddleEngine:
         self.tracker = VLMResultTracker(self.pipeline.paddlex_pipeline.vl_rec_model, self.versions)
 
     def parse(self, content, page_number):
+        """执行一次图像版面解析，汇总块内容、模型结束原因及结果大小检查。"""
         import numpy as np
 
         picture = decode_image(content, self.settings.max_pixels)

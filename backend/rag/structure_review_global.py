@@ -18,6 +18,7 @@ edits 不超过 edit_limit；如果无法完成本次候选检查或需要更多
 
 
 def window(anchors,outputs,groups):
+    """汇总全部结构候选及其边界上下文，构造一次全局复核窗口。"""
     items=[i for o in outputs for i in o['items']]
     positions={a['id']:n for n,a in enumerate(anchors)}
     required={a for i in items for a in i['anchors']}
@@ -36,6 +37,7 @@ def window(anchors,outputs,groups):
 
 
 def wire_payload(payload):
+    """移除全局复核输入中的内部字段，生成模型可接收的协议载荷。"""
     if 'encoding' not in payload:
         return payload
     if payload['encoding']!='compact_v1':
@@ -53,6 +55,7 @@ def wire_payload(payload):
 
 
 def output_load(payload,counter):
+    """估算全局修订结果所需的输出 token 数。"""
     longest=max((a['id'] for a in payload['anchors']),key=len,default='anchor')
     item={'anchors':[longest],'role':'section_heading','parent_section':longest,'section_level':2,
           'status':'unresolved','evidence_refs':[longest,longest+'#style'],
@@ -62,6 +65,7 @@ def output_load(payload,counter):
 
 
 def apply(value,payload):
+    """把按锚点定位的全局修订应用到候选项集合。"""
     items={i['anchors'][0]:deepcopy(i) for i in payload['candidate_items']}
     for edit in value['edits']:
         if edit['replacement'] is None:items.pop(edit['target_anchor'])
@@ -70,6 +74,7 @@ def apply(value,payload):
 
 
 def validate(value,payload,anchors,groups):
+    """校验全局修订格式、锚点和修改后的整体结构，定位协议错误。"""
     P.validate_shape(value,payload)
     available={a['id'] for a in payload['anchors']};existing={i['anchors'][0] for i in payload['candidate_items']}
     if len(value['edits'])>payload['edit_limit']:
@@ -104,6 +109,7 @@ def validate(value,payload,anchors,groups):
 
 
 def corrected(value,payload,anchors):
+    """应用全局修订并按原始锚点顺序输出最终候选及问题记录。"""
     positions={a['id']:i for i,a in enumerate(anchors)}
     return [{'window_id':'global','items':sorted(apply(value,payload),key=lambda i:positions[i['anchors'][0]]),
              'issues':payload['initial_issues']+value['issues']}]

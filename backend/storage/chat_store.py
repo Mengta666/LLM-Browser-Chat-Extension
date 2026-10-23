@@ -34,6 +34,7 @@ _TITLE_MAX_LEN = 30
 
 
 def _now_iso() -> str:
+    """返回当前 UTC 时间的 ISO 字符串，统一会话时间字段格式。"""
     return datetime.now(timezone.utc).isoformat()
 
 
@@ -71,6 +72,7 @@ def _get_conn() -> sqlite3.Connection:
 
 
 def _init_schema(conn: sqlite3.Connection) -> None:
+    """创建并迁移会话、轮次及压缩表，同时初始化关联存储模块的表结构。"""
     with conn:
         from storage import chat_events
         chat_events.init_schema(conn)
@@ -376,12 +378,14 @@ def get_messages_after(chat_id: str, offset: int, limit: int = 500) -> list[dict
 
 class SessionError(Exception):
     def __init__(self, code: str, status: int = 409):
+        """保存会话业务错误码及对应的 HTTP 状态。"""
         super().__init__(code)
         self.code = code
         self.status = status
 
 
 def get_session(chat_id: str) -> dict[str, Any] | None:
+    """按会话编号读取元数据，不存在时返回空值。"""
     conn = _get_conn()
     with _lock:
         row = conn.execute('SELECT * FROM chat_sessions WHERE chat_id=?', (chat_id,)).fetchone()
@@ -389,6 +393,7 @@ def get_session(chat_id: str) -> dict[str, Any] | None:
 
 
 def begin_turn(chat_id: str, request_id: str, request_hash: str, expected_last_seq: int, content: str, request_json: str = '', continuation_of: str = '', attachment_ids=None) -> dict[str, Any]:
+    """校验会话序号和请求幂等性，原子保存用户输入并登记活动执行尝试。"""
     conn = _get_conn()
     now = _now_iso()
     with _lock, conn:
@@ -446,6 +451,7 @@ def begin_turn(chat_id: str, request_id: str, request_hash: str, expected_last_s
 
 
 def complete_turn(chat_id: str, request_id: str, attempt: int, content: str, tools: list, finish_reason: str = 'stop') -> dict[str, Any]:
+    """校验当前执行尝试后原子保存回答及工具步骤，更新轮次完成状态和会话序号。"""
     if finish_reason not in ('stop', 'length') or not content.strip():
         raise ValueError('invalid_answer')
     status = 'partial' if finish_reason == 'length' else 'completed'
@@ -465,6 +471,7 @@ def complete_turn(chat_id: str, request_id: str, attempt: int, content: str, too
 
 
 def fail_turn(chat_id: str, request_id: str, attempt: int, code: str, interrupted: bool = False) -> None:
+    """仅将匹配且仍运行的执行尝试置为失败或中断，释放其会话占用。"""
     conn = _get_conn()
     with _lock, conn:
         cur = conn.execute("UPDATE chat_turns SET status=?,error_code=?,updated_at=? WHERE chat_id=? AND request_id=? AND attempt=? AND status='running'", ('interrupted' if interrupted else 'failed', code, _now_iso(), chat_id, request_id, attempt))
@@ -477,6 +484,7 @@ def fail_turn(chat_id: str, request_id: str, attempt: int, code: str, interrupte
 
 
 def get_request(chat_id: str, request_id: str) -> dict[str, Any] | None:
+    """组装持久化请求状态、消息和工具记录，计算重试、取消及继续生成能力。"""
     conn = _get_conn()
     with _lock:
         row = conn.execute('SELECT * FROM chat_turns WHERE chat_id=? AND request_id=?', (chat_id, request_id)).fetchone()
@@ -511,6 +519,7 @@ def get_request(chat_id: str, request_id: str) -> dict[str, Any] | None:
 
 
 def ensure_turn_active(chat_id, request_id, attempt):
+    """检查会话未删除且请求代次仍为当前活动轮次，否则阻止继续执行。"""
     conn = _get_conn()
     with _lock:
         row = conn.execute("SELECT 1 FROM chat_turns t JOIN chat_sessions s ON s.chat_id=t.chat_id "
@@ -522,6 +531,7 @@ def ensure_turn_active(chat_id, request_id, attempt):
 
 
 def set_turn_phase(chat_id, request_id, attempt, phase):
+    """仅更新仍有效的执行尝试阶段，旧代次或已终止请求不能覆盖状态。"""
     conn = _get_conn()
     with _lock, conn:
         cur = conn.execute("UPDATE chat_turns SET phase=?,updated_at=? WHERE chat_id=? AND request_id=? AND attempt=? AND status='running'",
@@ -531,6 +541,7 @@ def set_turn_phase(chat_id, request_id, attempt, phase):
 
 
 def cancel_turn(chat_id, request_id):
+    """原子取消请求及相关处理任务，清除活动占用并保留已保存的问题。"""
     conn = _get_conn()
     with _lock, conn:
         conn.execute('BEGIN IMMEDIATE')
@@ -550,6 +561,7 @@ def cancel_turn(chat_id, request_id):
 
 
 def get_compaction(chat_id):
+    """读取会话压缩任务并解码其计划和工作状态。"""
     conn = _get_conn()
     with _lock:
         row = conn.execute('SELECT * FROM chat_compactions WHERE chat_id=?', (chat_id,)).fetchone()
@@ -561,6 +573,7 @@ def get_compaction(chat_id):
 
 
 def compaction_progress(job):
+    """生成压缩批次、调用次数和可用恢复动作的进度视图。"""
     return {key: job[key] for key in ('job_id', 'request_id', 'status', 'phase', 'next_batch', 'calls', 'reduce_attempts', 'error_code')} | {
         'total_batches': len(job['plan']), 'through_seq': job['through_seq'],
         'execution_attempt': job['execution_attempt'], 'repair_attempts': job['repair_attempts'],
@@ -570,6 +583,7 @@ def compaction_progress(job):
 
 
 def claim_compaction(chat_id, request_id, attempt, snapshot, plan, fingerprint):
+    """核对会话摘要基线和请求代次，恢复兼容检查点或创建新的压缩任务。"""
     conn = _get_conn()
     with _lock, conn:
         conn.execute('BEGIN IMMEDIATE')
@@ -603,6 +617,7 @@ def claim_compaction(chat_id, request_id, attempt, snapshot, plan, fingerprint):
 def checkpoint_compaction(job, *, summary=None, candidate=None, phase=None, next_batch=None, calls=None,
                           status=None, error_code=None, reduce_attempts=None, state_json=None, plan_json=None,
                           repair_attempts=None, coverage=None, overview=None):
+    """按任务代次保存压缩状态及原文覆盖记录，拒绝终止后的迟到写入。"""
     fields = {k: v for k, v in locals().copy().items() if k not in ('job', 'coverage', 'overview') and v is not None}
     fields['updated_at'] = _now_iso()
     conn = _get_conn()
@@ -618,6 +633,7 @@ def checkpoint_compaction(job, *, summary=None, candidate=None, phase=None, next
 
 
 def publish_compaction(job):
+    """在基线版本仍一致时原子发布摘要、工作状态、覆盖水位和历史索引。"""
     conn = _get_conn()
     with _lock, conn:
         conn.execute('BEGIN IMMEDIATE')
@@ -628,6 +644,7 @@ def publish_compaction(job):
             raise SessionError('compaction_incomplete')
         from storage.history_index import publish
         publish(conn, current)
+        # 摘要、水位和原文索引在同一事务发布；基线版本变化时整笔回滚，防止覆盖新摘要。
         cur = conn.execute("""UPDATE chat_sessions SET context_summary=?,context_state=?,summary_upto_seq=?,summary_version=summary_version+1
             WHERE chat_id=? AND summary_version=? AND summary_upto_seq=? AND deleted_at=''""",
             (current['summary'], current['state_json'], current['through_seq'], job['chat_id'], current['base_version'], current['base_upto_seq']))
@@ -638,6 +655,7 @@ def publish_compaction(job):
 
 
 def context_snapshot(chat_id: str, *, include_compacted=False) -> dict[str, Any]:
+    """读取同一锁保护下的摘要及可纳入模型的历史消息，组成一致会话快照。"""
     conn = _get_conn()
     with _lock:
         session = dict(conn.execute('SELECT * FROM chat_sessions WHERE chat_id=?', (chat_id,)).fetchone())
@@ -654,6 +672,7 @@ def context_snapshot(chat_id: str, *, include_compacted=False) -> dict[str, Any]
 
 
 def _history_excerpt(text, terms, size=800):
+    """从关键词命中窗口中选择覆盖度较好的节选，返回偏移和原文片段。"""
     terms = [term for term in terms if term]
     patterns = [re.compile(re.escape(term), re.IGNORECASE) for term in terms]
     counts = [sum(1 for _ in pattern.finditer(text)) for pattern in patterns]
@@ -699,6 +718,7 @@ def _history_excerpt(text, terms, size=800):
 def history_records(chat_id: str, upto_seq: int, *, terms: list[str] | None = None,
                     start_seq: int = 1, end_seq: int | None = None, offset: int = 0,
                     limit: int = 5) -> tuple[list[dict], bool]:
+    """按来源序号或查询词读取可见历史片段，并返回是否还有下一页。"""
     conn = _get_conn()
     with _lock:
         session = conn.execute('SELECT deleted_at FROM chat_sessions WHERE chat_id=?', (chat_id,)).fetchone()
@@ -743,6 +763,7 @@ def history_records(chat_id: str, upto_seq: int, *, terms: list[str] | None = No
 
 
 def publish_summary(chat_id: str, text: str, upto_seq: int, previous_version: int) -> bool:
+    """使用预期版本条件更新摘要和水位，返回是否成功发布。"""
     conn = _get_conn()
     with _lock, conn:
         cur = conn.execute("""UPDATE chat_sessions SET context_summary=?,summary_upto_seq=?,summary_version=summary_version+1
@@ -752,6 +773,7 @@ def publish_summary(chat_id: str, text: str, upto_seq: int, previous_version: in
 
 
 def message_page(chat_id: str, before_seq: int | None, limit: int) -> dict[str, Any]:
+    """分页恢复会话消息和附件，并附带请求、压缩及续读状态。"""
     conn = _get_conn()
     with _lock:
         session = conn.execute('SELECT * FROM chat_sessions WHERE chat_id=?', (chat_id,)).fetchone()

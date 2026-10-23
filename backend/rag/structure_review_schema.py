@@ -6,6 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 class ProtocolError(ValueError):
     def __init__(self, code, details):
+        """携带协议错误码和字段路径等细节，供模型修复输出。"""
         super().__init__(code)
         self.details = details
 
@@ -48,6 +49,7 @@ class GlobalOutput(Contract):
 
 
 def validate_shape(value, payload):
+    """使用共享数据模型检查字段契约，并把校验失败转换为结构化协议错误。"""
     global_review = payload['window_id'] == 'global' and 'candidate_items' in payload
     model = GlobalOutput if global_review else RoleOutput
     try:
@@ -71,6 +73,7 @@ def validate_shape(value, payload):
 
 
 def response_format(payload, mode):
+    """根据审阅阶段和解码模式生成 JSON 输出约束。"""
     if mode == 'json_object':
         return {'type': 'json_object'}
     if mode != 'json_schema':

@@ -17,6 +17,7 @@ _pool = ThreadPoolExecutor(max_workers=6, thread_name_prefix="web-reader")
 
 
 def _read_one(base_url, key, url, deadline):
+    """在总期限内调用正文服务，校验返回 URL、正文结构及大小并分类报告错误。"""
     remaining = deadline - time.monotonic()
     if remaining < 2:
         return {"status": "error", "error_code": "budget_exhausted"}
@@ -67,11 +68,13 @@ def _read_one(base_url, key, url, deadline):
 
 
 def select_excerpt(text, query, token_budget):
+    """从网页正文中选择额度内的相关完整片段，返回文本和截断标记。"""
     excerpt, truncated, _ = select_blocks(text, query, token_budget)
     return excerpt, truncated
 
 
 def enrich_results(results, query, *, deadline, cache=None, context_tokens=None, budget=None):
+    """为搜索结果补充正文，再使用本轮共享预算分配实际可交付片段。"""
     budget = budget if budget is not None else TurnWebBudget()
     available = min(budget.remaining, max(0, context_tokens)) if context_tokens is not None else budget.remaining
     meta = _fetch_results(results, deadline=deadline, cache=cache, context_tokens=available)
@@ -81,6 +84,7 @@ def enrich_results(results, query, *, deadline, cache=None, context_tokens=None,
 
 
 def _fetch_results(results, *, deadline, cache=None, context_tokens=None):
+    """并发调用可选正文服务，按标准化 URL 复用缓存并更新读取状态。"""
     if os.getenv("WEB_READER_ENABLED", "0").lower() not in ("1", "true"):
         return {"outcome": "disabled", "attempted": 0, "read_count": 0, "failed_count": 0}
     meta = {"outcome": "skipped", "attempted": 0, "read_count": 0, "failed_count": 0, "cached_count": 0}

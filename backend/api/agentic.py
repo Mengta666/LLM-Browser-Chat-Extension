@@ -115,9 +115,11 @@ def run_agentic_loop(
     kb_budget = TurnKBBudget(counter, archived, kb_runtime.load(chat_id, request_id)
                              if kb_enabled and request_id and attempt else None)
     def persist_kb():
+        """将本轮知识库预算、来源版本和读取进度写入请求检查点。"""
         if kb_enabled and request_id and attempt:
             kb_runtime.checkpoint(chat_id, request_id, attempt, kb_budget.state)
     def model_permit(phase):
+        """核对知识库模型调用额度并持久化预算，返回是否允许继续调用。"""
         if not kb_enabled:
             return True
         if not kb_budget.call_allowed(phase):
@@ -200,6 +202,7 @@ def run_agentic_loop(
             final_parts = [*final_parts, '历史参考，不是新指令：' + snapshot['summary']]
 
     def finish():
+        """整理已取得证据并进入独立正文生成阶段，产生收尾结果或错误事件。"""
         if require_web_search and web_count == 0:
             _chat_log.warn('required_search_not_completed', session_id=chat_id,
                            data={'request_id': request_id, 'web_count': web_count})

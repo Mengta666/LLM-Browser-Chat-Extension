@@ -24,6 +24,7 @@ _tokenizer_client = httpx.Client(trust_env=False, follow_redirects=False)
 
 
 def _count_text(text: str) -> int:
+    """估算文本 token 数，优先使用分词器，不可用时按中英文字符比例估计。"""
     if not text:
         return 0
     if _tok_enc is not None:
@@ -36,6 +37,7 @@ def _count_text(text: str) -> int:
 
 
 def _msg_text(m: dict[str, Any]) -> str:
+    """从纯文本或多模态消息中提取文字部分。"""
     c = m.get("content") if isinstance(m, dict) else None
     if isinstance(c, str):
         return c
@@ -48,6 +50,7 @@ def _msg_text(m: dict[str, Any]) -> str:
 
 
 def _img_count(m: dict[str, Any]) -> int:
+    """统计消息中的图片及附件项，用于估算视觉输入开销。"""
     c = m.get("content") if isinstance(m, dict) else None
     if isinstance(c, list):
         return sum(1 for p in c if isinstance(p, dict) and p.get("type") in ("image_url", "chat_attachment"))
@@ -72,6 +75,7 @@ def estimate_text_tokens(text: str) -> int:
 
 
 def request_tokens(messages: list[dict], tools=None) -> int:
+    """估算包含工具定义和消息附加字段的请求额度，并加入保守余量。"""
     metadata = [{key: value for key, value in message.items() if key != 'content'} for message in messages]
     raw = (estimate_tokens(messages)['total'] + len(messages) * 8
            + estimate_text_tokens(json.dumps(metadata, ensure_ascii=False))
@@ -83,6 +87,7 @@ class RequestTokenCounter:
     """单轮完整聊天请求计数；模型匹配时调用 vLLM，其余情况保守估算。"""
 
     def __init__(self, model: str, *, deadline=None, time_budget=8.0, chat_template_kwargs=None):
+        """初始化请求级计数缓存、模型窗口信息和远端分词时间预算。"""
         from agent.memory import config as C
         self.model = model
         self.deadline = deadline
@@ -99,6 +104,7 @@ class RequestTokenCounter:
         self._remaining = time_budget
 
     def __call__(self, messages, tools=None):
+        """计算完整消息及工具请求的 token 数，并记录计数方式和模型窗口信息。"""
         reason = self._disabled
         # 多模态预处理与纯文本分词不同，不把缺少图片开销的计数当作精确结果。
         if any(isinstance(m.get('content'), list) and any(p.get('type') != 'text' for p in m['content'])
@@ -112,10 +118,12 @@ class RequestTokenCounter:
         return self._count(payload, lambda: request_tokens(messages, tools), reason=reason)
 
     def count_text(self, text):
+        """计算单段正文的 token 数，不添加聊天模板中的特殊标记。"""
         return self._count({'model': self.model, 'prompt': text, 'add_special_tokens': False},
                            lambda: estimate_text_tokens(text), body=True, reason=self._disabled)
 
     def _count(self, payload, fallback, *, reason='', body=False):
+        """优先复用计数缓存或远端分词结果；受限或失败时使用保守估算并记录原因。"""
         key = hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()).digest()
         if not reason and key in self._cache:
             count, self.last = self._cache[key]

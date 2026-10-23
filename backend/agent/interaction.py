@@ -2,6 +2,7 @@
 
 
 def prepare(action, raw, page):
+    """把动作声明的预期转换为绑定当前节点或弹层的可验证条件。"""
     target = next((e for e in page.interactive_elements if e.get('id') == action.index), {})
     requested = raw.get('expect')
     if requested is None and action.type == 'click' and target.get('control_kind') in ('checkbox', 'radio', 'switch'):
@@ -39,6 +40,7 @@ def prepare(action, raw, page):
 
 
 def evaluate(expect, page):
+    """依据新观察核实局部预期；目标替换或观察不完整时保留未知状态。"""
     if not expect:
         return {'status': 'not_requested'}
     kind = expect['kind']

@@ -87,6 +87,7 @@ CHAT_COMPACT_SYSTEM_PROMPT = f"""你是对话压缩器,把一段用户与AI助�
 
 class SummaryError(Exception):
     def __init__(self, code, retryable=False):
+        """保存摘要失败的错误码和可重试标记，供调用层选择恢复方式。"""
         super().__init__(code)
         self.code, self.retryable = code, retryable
 
@@ -273,6 +274,7 @@ def schedule_background_compact(chat_id: str) -> None:
         return
 
     def _worker():
+        """执行后台会话压缩，并在结束时释放该会话的并发占用。"""
         compact_chat(chat_id, force=True)
 
     try:

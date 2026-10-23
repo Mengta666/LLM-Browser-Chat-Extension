@@ -23,6 +23,7 @@ class KBConflict(ValueError):
 
 
 def _get_conn() -> sqlite3.Connection:
+    """打开知识库数据库连接并设置连接级行为。"""
     path = Path(MEMORY_DB_PATH)
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), timeout=30)
@@ -32,11 +33,13 @@ def _get_conn() -> sqlite3.Connection:
 
 @contextmanager
 def _transaction():
+    """提供自动提交或回滚并关闭连接的知识库事务上下文。"""
     with _lock, closing(_get_conn()) as conn, conn:
         yield conn
 
 
 def _ensure_tables() -> None:
+    """创建或迁移知识库元数据和相关文档表结构。"""
     with _transaction() as conn:
         old_columns = {r["name"] for r in conn.execute("PRAGMA table_info(kb_docs)")}
         page_columns = {r['name'] for r in conn.execute('PRAGMA table_info(kb_pages)')}
@@ -110,6 +113,7 @@ _ensure_tables()
 
 
 def _owned_kb(conn, kb_id, user_id, *, active=False):
+    """验证知识库属于指定用户，并按需要求其处于活动状态。"""
     row = conn.execute("SELECT * FROM kb_kbs WHERE kb_id=? AND user_id=?",
                        (kb_id, user_id)).fetchone()
     if not row or (active and (row["deleted_at"] or row["sync_action"])):
@@ -118,18 +122,21 @@ def _owned_kb(conn, kb_id, user_id, *, active=False):
 
 
 def create_kb(kb_id: str, user_id: str, name: str, description: str, created_at: str) -> None:
+    """将指定知识库身份及基本信息写入元数据表。"""
     with _transaction() as conn:
         conn.execute("""INSERT INTO kb_kbs(kb_id,user_id,name,description,created_at,updated_at)
                         VALUES(?,?,?,?,?,?)""", (kb_id,user_id,name,description,created_at,created_at))
 
 
 def get_kb(kb_id: str) -> Optional[dict[str, Any]]:
+    """按编号读取知识库元数据，不存在时返回空值。"""
     with _transaction() as conn:
         row = conn.execute("SELECT * FROM kb_kbs WHERE kb_id=?", (kb_id,)).fetchone()
     return dict(row) if row else None
 
 
 def list_kbs(user_id: str) -> list[dict[str, Any]]:
+    """按创建时间列出指定用户未删除的知识库。"""
     with _transaction() as conn:
         rows = conn.execute("SELECT * FROM kb_kbs WHERE user_id=? AND deleted_at='' ORDER BY created_at DESC",
                             (user_id,)).fetchall()
@@ -139,6 +146,7 @@ def list_kbs(user_id: str) -> list[dict[str, Any]]:
 def create_doc(doc_id: str, kb_id: str, filename: str, file_type: str,
                file_bytes: int, created_at: str, content_hash: str = "", *,
                index_run_id: str = "", user_id: str = CHAT_USER_ID) -> None:
+    """验证知识库可用性及内容去重条件后登记文档。"""
     with _transaction() as conn:
         _owned_kb(conn, kb_id, user_id, active=True)
         if content_hash and conn.execute("""
@@ -153,12 +161,14 @@ def create_doc(doc_id: str, kb_id: str, filename: str, file_type: str,
 
 
 def get_doc(doc_id: str) -> Optional[dict[str, Any]]:
+    """按文档编号读取元数据。"""
     with _transaction() as conn:
         row = conn.execute("SELECT * FROM kb_docs WHERE doc_id=?", (doc_id,)).fetchone()
     return dict(row) if row else None
 
 
 def list_docs(kb_id: str) -> list[dict[str, Any]]:
+    """列出指定知识库中未删除的文档。"""
     with _transaction() as conn:
         rows = conn.execute("SELECT * FROM kb_docs WHERE kb_id=? AND deleted_at='' ORDER BY created_at DESC",
                             (kb_id,)).fetchall()
@@ -166,6 +176,7 @@ def list_docs(kb_id: str) -> list[dict[str, Any]]:
 
 
 def document_catalog(kb_id: str, user_id: str, *, page: int = 1, limit: int = 20) -> dict:
+    """分页返回可公开的文档目录、处理数量和可检索标记。"""
     if type(page) is not int or not 1 <= page <= 1_000_000:
         raise ValueError("page 必须是 1～1000000 的整数")
     if type(limit) is not int or not 1 <= limit <= 50:
@@ -195,12 +206,14 @@ def document_catalog(kb_id: str, user_id: str, *, page: int = 1, limit: int = 20
 
 
 def all_docs(kb_id: str) -> list[dict[str, Any]]:
+    """读取知识库所有文档，包括用于删除与恢复流程的已删除记录。"""
     with _transaction() as conn:
         rows = conn.execute("SELECT * FROM kb_docs WHERE kb_id=?", (kb_id,)).fetchall()
     return [dict(r) for r in rows]
 
 
 def index_is_current(kb_id: str, doc_id: str, run_id: str, user_id: str) -> bool:
+    """判断待发布索引是否仍是该用户活动文档的当前任务。"""
     with _transaction() as conn:
         return bool(conn.execute("""
             SELECT 1 FROM kb_docs d JOIN kb_kbs k ON k.kb_id=d.kb_id
@@ -210,6 +223,7 @@ def index_is_current(kb_id: str, doc_id: str, run_id: str, user_id: str) -> bool
 
 
 def publish_index(kb_id: str, doc_id: str, run_id: str, count: int, now: str, user_id: str) -> bool:
+    """按预期索引任务条件发布文档，返回是否成功更新。"""
     with _transaction() as conn:
         cursor = conn.execute("""
             UPDATE kb_docs SET status='indexed',published_run_id=?,chunk_count=?,indexed_at=?,
@@ -222,6 +236,7 @@ def publish_index(kb_id: str, doc_id: str, run_id: str, count: int, now: str, us
 
 
 def fail_index(kb_id: str, doc_id: str, run_id: str, error: str) -> None:
+    """仅将匹配的索引任务标记为失败。"""
     with _transaction() as conn:
         conn.execute("""UPDATE kb_docs SET status='failed',error_msg=?,sync_pending=1
                         WHERE kb_id=? AND doc_id=? AND index_run_id=? AND status='pending'""",
@@ -229,6 +244,7 @@ def fail_index(kb_id: str, doc_id: str, run_id: str, error: str) -> None:
 
 
 def mark_doc_deleted(kb_id: str, doc_id: str, now: str, user_id: str) -> None:
+    """逻辑删除指定文档并登记向量同步待办。"""
     with _transaction() as conn:
         _owned_kb(conn, kb_id, user_id, active=True)
         row = conn.execute("SELECT * FROM kb_docs WHERE kb_id=? AND doc_id=?", (kb_id,doc_id)).fetchone()
@@ -243,6 +259,7 @@ def mark_doc_deleted(kb_id: str, doc_id: str, now: str, user_id: str) -> None:
 
 
 def mark_kb_deleted(kb_id: str, now: str, user_id: str) -> None:
+    """为知识库建立删除批次，级联标记相关文档及同步状态。"""
     with _transaction() as conn:
         kb = _owned_kb(conn, kb_id, user_id)
         if kb["sync_action"] == "purge":
@@ -259,6 +276,7 @@ def mark_kb_deleted(kb_id: str, now: str, user_id: str) -> None:
 
 
 def request_restore(kb_id: str, user_id: str) -> None:
+    """验证知识库可恢复后登记恢复同步动作。"""
     with _transaction() as conn:
         kb = _owned_kb(conn, kb_id, user_id)
         if kb["sync_action"] == "purge":
@@ -268,6 +286,7 @@ def request_restore(kb_id: str, user_id: str) -> None:
 
 
 def finish_restore(kb_id: str, batch: str) -> bool:
+    """按删除批次条件完成恢复，避免恢复其他独立删除的文档。"""
     with _transaction() as conn:
         cursor = conn.execute("""
             UPDATE kb_kbs SET deleted_at='',sync_action='',sync_error=''
@@ -282,6 +301,7 @@ def finish_restore(kb_id: str, batch: str) -> bool:
 
 
 def finish_delete_sync(kb_id: str, batch: str) -> None:
+    """在对应删除批次的向量同步完成后清除待办状态。"""
     with _transaction() as conn:
         cursor = conn.execute("""
             UPDATE kb_kbs SET sync_action='',sync_error=''
@@ -291,17 +311,20 @@ def finish_delete_sync(kb_id: str, batch: str) -> None:
 
 
 def set_doc_sync(doc_id: str, run_id: str, pending: bool, error: str = "") -> None:
+    """按文档索引版本更新向量同步状态和失败原因。"""
     with _transaction() as conn:
         conn.execute("UPDATE kb_docs SET sync_pending=?,sync_error=? WHERE doc_id=? AND index_run_id=?",
                      (int(pending),error,doc_id,run_id))
 
 
 def set_kb_sync_error(kb_id: str, error: str) -> None:
+    """记录知识库生命周期同步失败，供后台重试使用。"""
     with _transaction() as conn:
         conn.execute("UPDATE kb_kbs SET sync_error=? WHERE kb_id=?", (error,kb_id))
 
 
 def request_purge(kb_id: str, user_id: str) -> None:
+    """验证清除条件后登记知识库永久清除动作。"""
     with _transaction() as conn:
         kb = _owned_kb(conn, kb_id, user_id)
         if not kb["deleted_at"]:
@@ -310,6 +333,7 @@ def request_purge(kb_id: str, user_id: str) -> None:
 
 
 def finish_purge(kb_id: str) -> int:
+    """在清除状态下移除知识库元数据及受管原文件，并返回删除文档数量。"""
     with _transaction() as conn:
         kb = conn.execute("SELECT * FROM kb_kbs WHERE kb_id=?", (kb_id,)).fetchone()
         if not kb or kb["sync_action"] != "purge" or not kb["deleted_at"]:
@@ -342,6 +366,7 @@ def finish_purge(kb_id: str) -> int:
 
 
 def searchable_docs(kb_id: str, user_id: str, doc_ids: list[str]) -> dict[str, dict]:
+    """返回指定用户当前可检索的文档及其发布版本，用于过滤向量命中。"""
     if not doc_ids:
         return {}
     with _transaction() as conn:
@@ -355,6 +380,7 @@ def searchable_docs(kb_id: str, user_id: str, doc_ids: list[str]) -> dict[str, d
 
 
 def list_deleted_kbs(user_id: str) -> list[dict[str, Any]]:
+    """返回用户回收站中的知识库及关联文档数量。"""
     with _transaction() as conn:
         rows = conn.execute("""
             SELECT k.*,(SELECT count(*) FROM kb_docs d WHERE d.kb_id=k.kb_id) AS doc_count
@@ -363,6 +389,7 @@ def list_deleted_kbs(user_id: str) -> list[dict[str, Any]]:
 
 
 def recover_interrupted(user_id: str) -> None:
+    """服务重启时标记遗留的活动索引任务，并保留可重试状态。"""
     with _transaction() as conn:
         conn.execute("""UPDATE kb_structure_publications SET status='interrupted',error='后端重启中断发布，可显式恢复'
                         WHERE status IN ('queued','running') AND kb_id IN
@@ -387,6 +414,7 @@ def recover_interrupted(user_id: str) -> None:
 
 
 def pending_kbs(user_id: str) -> list[str]:
+    """列出有生命周期动作或文档向量同步待办的知识库。"""
     with _transaction() as conn:
         rows = conn.execute("""
             SELECT k.kb_id FROM kb_kbs k WHERE user_id=? AND

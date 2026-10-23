@@ -17,12 +17,15 @@ log = logging.getLogger("pdf-parser")
 
 
 def error(code, status):
+    """把受控错误码转换为指定状态码的 JSON 响应。"""
     return JSONResponse({"status": "error", "error_code": code}, status_code=status)
 
 
 def create_app(settings=None, runner_factory=ProcessRunner, check_upstream=check_vlm):
+    """创建带鉴权、单任务并发限制和子进程生命周期管理的解析服务。"""
     @asynccontextmanager
     async def lifespan(app):
+        """在服务启动时初始化解析进程，并在退出时释放进程资源。"""
         app.state.settings = settings or Settings.from_env()
         app.state.slot = asyncio.Semaphore(1)
         app.state.runner = runner_factory(app.state.settings)
@@ -40,16 +43,19 @@ def create_app(settings=None, runner_factory=ProcessRunner, check_upstream=check
                   docs_url=None, redoc_url=None, openapi_url=None)
 
     def authorized(request):
+        """使用恒定时间比较校验请求中的 Bearer 凭证。"""
         return hmac.compare_digest(request.headers.get("authorization", "").encode(),
                                    ("Bearer " + request.app.state.settings.api_key).encode())
 
     @app.get("/health")
     async def health():
+        """报告服务进程的健康状态，不触发模型推理。"""
         return {"status": "ok", "service": "pdf-parser", "version": VERSION,
                 "schema_version": SCHEMA_VERSION, "worker_ready": app.state.runner.alive()}
 
     @app.get("/ready")
     async def ready(request: Request):
+        """鉴权后检查解析进程和上游模型服务是否就绪，不执行页面解析。"""
         if not authorized(request):
             return error("unauthorized", 401)
         if not app.state.runner.alive():
@@ -65,6 +71,7 @@ def create_app(settings=None, runner_factory=ProcessRunner, check_upstream=check
 
     @app.post("/v1/parse/page")
     async def parse_page(request: Request):
+        """校验页面请求，在并发与超时限制内解析，并释放任务占用的资源。"""
         if not authorized(request):
             return error("unauthorized", 401)
         if request.headers.get("content-type", "").split(";", 1)[0] not in ("image/png", "image/jpeg"):

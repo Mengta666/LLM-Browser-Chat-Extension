@@ -19,6 +19,7 @@ class ReadRangeError(ValueError):
     code = 'kb_range_out_of_bounds'
 
     def __init__(self, message, kb_id, doc_id, snapshot, block_id, length, row_count=None):
+        """保存无效范围对应的文档快照、块长度和表格行数，供生成修正定位。"""
         super().__init__(message)
         target = {'doc_id':doc_id, **snapshot, 'mode':'block', 'block_id':block_id}
         self.details = {'valid_range':{'offset':0, 'end':length},
@@ -30,6 +31,7 @@ class ReadRangeError(ValueError):
 
 
 def formula_numbers(query):
+    """提取查询中明确出现的公式编号，去重后限制数量。"""
     number = r'[（(]?\s*[0-9]+(?:[.\-][0-9]+)*[a-z]?\s*[)）]?'
     pattern = rf'(?:公式|方程|不等式|式|equations?|eqs?\.?)[\s:：]*({number}(?:\s*(?:[,，、和及与&]|and)\s*(?:公式|式)?\s*{number})*)'
     return list(dict.fromkeys(n for m in re.finditer(pattern, query, re.I)
@@ -37,6 +39,7 @@ def formula_numbers(query):
 
 
 def diversify(hits, limit):
+    """按文档轮流选取候选并去重，防止结果额度被单一文档占满。"""
     groups = defaultdict(list)
     seen = set()
     for hit in hits:
@@ -54,7 +57,9 @@ def diversify(hits, limit):
 
 
 def deduplicate_ranges(hits):
+    """合并或过滤来源范围被其他候选覆盖的重复检索结果。"""
     def covers(outer, inner):
+        """判断外层候选的来源片段是否完整覆盖内层候选的范围。"""
         if (outer.get('doc_id'), outer.get('parse_id')) != (inner.get('doc_id'), inner.get('parse_id')):
             return False
         if outer.get('bundle_id') != inner.get('bundle_id'):
@@ -91,6 +96,7 @@ def deduplicate_ranges(hits):
 
 def outline(kb_id, doc_id, parse_id=None, page=None, offset=0, limit=20, section_id=None, view='blocks',
             structure_id=None, index_run_id=None, node_id=None, depth=1):
+    """在固定解析和结构版本下返回分页块目录、章节或节点层级。"""
     from storage import kb_structure_store as HS
     if view == 'tree':
         if page is not None or section_id:
@@ -163,6 +169,7 @@ def outline(kb_id, doc_id, parse_id=None, page=None, offset=0, limit=20, section
 def read(kb_id, doc_id, parse_id=None, page=None, block_id=None, offset=0, end=None, row_start=None, row_end=None,
          section_id=None, formula_number=None, include_related=False, structure_id=None, index_run_id=None,
          node_id=None, cursor=0, block_offset=0):
+    """依据明确定位读取原文，保留来源范围、结构关系和续读位置。"""
     from storage import kb_structure_store as HS
     snap = HS.snapshot(kb_id,doc_id,parse_id=parse_id,structure_id=structure_id,index_run_id=index_run_id)
     parse_id = snap['parse_id']
@@ -341,6 +348,7 @@ def read(kb_id, doc_id, parse_id=None, page=None, block_id=None, offset=0, end=N
 
 
 def hydrate(kb_id, hits, snapshots=None):
+    """按可检索的已发布版本从存储恢复候选正文，剔除已失效或版本不符的命中。"""
     output = []
     with KS._transaction() as conn:
         KS._owned_kb(conn, kb_id, CHAT_USER_ID, active=True)
@@ -386,6 +394,7 @@ def hydrate(kb_id, hits, snapshots=None):
 
 
 def search(kb_id, query, *, doc_id=None, page=None, section_id=None, node_id=None, snapshots=None):
+    """组合编号匹配、结构路由和向量召回，去重重排后返回证据及阶段诊断。"""
     from storage import kb_structure_store as HS
     from rag import hierarchical_retrieval as HR
     snapshots = snapshots if snapshots is not None else {}

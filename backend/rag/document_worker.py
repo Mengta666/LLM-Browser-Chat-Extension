@@ -27,16 +27,19 @@ _log = get_logger('kb')
 
 class TruncatedPage(ValueError):
     def __init__(self, result):
+        """携带被截断的单页解析结果，供失败时留存诊断材料。"""
         super().__init__('parser_output_truncated')
         self.result = result
 
 
 def parse_config():
+    """返回决定 PDF 解析版本兼容性的管线、渲染和协议配置。"""
     return {'schema': 1, 'normalizer': 4, 'parser_url': C.PARSER_URL, 'dpi': C.DPI,
             'max_pixels': C.MAX_PIXELS, 'pipeline': 'PaddleOCR-VL-1.6', 'layout': 'PP-DocLayoutV3'}
 
 
 def inspect_pdf(path):
+    """检查 PDF 是否可读、未加密且页数受限，返回允许处理的页面数量。"""
     if not C.PARSER_URL:
         raise ValueError('请先配置 KB_PDF_PARSER_URL；不会回退到丢失页块结构的旧解析')
     try:
@@ -55,6 +58,7 @@ def inspect_pdf(path):
 
 
 def parse_page(image, page, check, deadline):
+    """调用远端单页解析并校验图像身份、坐标和块内容，按期限重试临时网络失败。"""
     with requests.Session() as session:
         session.trust_env = False
         for attempt in range(3):
@@ -112,6 +116,7 @@ def parse_page(image, page, check, deadline):
 
 
 def run(kb_id, doc_id, parse_id, finish, publish_lock):
+    """从检查点继续 PDF 页面解析、结构构建及索引发布，并记录可恢复的失败。"""
     lease, current_page = None, None
     try:
         with _slots:
@@ -121,6 +126,7 @@ def run(kb_id, doc_id, parse_id, finish, publish_lock):
             deadline = time.monotonic() + C.TASK_TIMEOUT
 
             def check():
+                """检查文档任务期限和租约，返回仍有效的文档及解析状态。"""
                 if time.monotonic() >= deadline:
                     raise TimeoutError('document_task_timeout')
                 return DS.check(kb_id, doc_id, parse_id, lease)
@@ -151,6 +157,7 @@ def run(kb_id, doc_id, parse_id, finish, publish_lock):
                     if len(image) > 8 * 1024 * 1024:
                         raise ValueError('rendered_page_too_large')
                     result = parse_page(image, number, check, deadline)
+                    # 恢复任务时允许复用已存页面，但同一解析版本不能混入不同解析器的输出。
                     if parser_identity is not None and result.get('versions') != parser_identity:
                         raise ValueError('parser_version_changed_reparse_required')
                     parser_identity = result.get('versions')
@@ -234,6 +241,7 @@ def run(kb_id, doc_id, parse_id, finish, publish_lock):
 
 
 def publish_index(kb_id, doc_id, parse_id, lease, doc, config, chunks, check, deadline, publish_lock, *, review_id=None):
+    """分批写入暂存向量并推进检查点，完整校验后切换文档已发布索引。"""
     from rag import kb_vectors as V
     run_id, published = None, False
     try:
@@ -247,6 +255,7 @@ def publish_index(kb_id, doc_id, parse_id, lease, doc, config, chunks, check, de
                                  timeout=max(.1, min(120, deadline - time.monotonic())))
             if len(vectors) != len(batch):
                 raise ValueError('embedding_count_mismatch')
+            # 分批写入暂不可检索的向量，全部完成后才切换文档的已发布版本。
             items = [{'content': c['text'], 'vector': vector, 'memory_type': MEMORY_TYPE_KB_CHUNK,
                       'user_id': CHAT_USER_ID, 'kb_id': kb_id, 'doc_id': doc_id, 'index_run_id': run_id,
                       'source': doc['filename'], 'chunk_idx': c['chunk_idx'], 'chunk_id': c['chunk_idx'],
@@ -264,6 +273,7 @@ def publish_index(kb_id, doc_id, parse_id, lease, doc, config, chunks, check, de
             else:
                 DS.publish(kb_id, doc_id, parse_id, lease, run_id)
             published = True
+            # 先发布新版本再停用旧向量；旧向量清理失败不撤销已经成功的发布。
             if doc['published_run_id'] and doc['published_run_id'] != run_id:
                 try:
                     V.set_kb_chunks_valid(user_id=CHAT_USER_ID, kb_id=kb_id, doc_id=doc_id,

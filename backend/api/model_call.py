@@ -17,12 +17,14 @@ _log = get_logger('chat_context')
 
 
 def fingerprint(messages, tools=None):
+    """对消息和工具定义生成稳定摘要，供请求日志和诊断关联使用。"""
     return hashlib.sha256(json.dumps([messages, tools], ensure_ascii=False, sort_keys=True).encode('utf-8')).hexdigest()
 
 
 def events(client, *, model, messages, timeout, deadline=None, idle_timeout=None, check_active=None,
              clock=time.monotonic, phase='decision', chat_id='', request_id='', input_tokens=None, count_meta=None,
              kb_answer=False, **options):
+    """在线程中接收模型流，区分首包、空闲和总期限超时，完整结束后返回组装响应。"""
     started = clock()
     expires = deadline if deadline is not None else started + timeout
     idle_timeout = timeout if idle_timeout is None else idle_timeout
@@ -51,6 +53,7 @@ def events(client, *, model, messages, timeout, deadline=None, idle_timeout=None
     streams = []
 
     def send(item):
+        """把上游事件放入队列，遵守停止标记和截止时间。"""
         received_at = clock()
         while not stopped.is_set():
             try:
@@ -60,6 +63,7 @@ def events(client, *, model, messages, timeout, deadline=None, idle_timeout=None
                 pass
 
     def receive():
+        """建立上游流并收集文本、工具参数和用量，向消费线程发送事件或异常。"""
         response = None
         try:
             if stopped.is_set():
@@ -96,6 +100,7 @@ def events(client, *, model, messages, timeout, deadline=None, idle_timeout=None
     reasoning_chars = 0
 
     def timed_out(kind):
+        """构造带超时类型和已接收进度信息的模型超时异常。"""
         error = APITimeoutError(request=httpx.Request('POST', str(client.base_url)))
         error.timeout_kind = kind
         error.received_progress = first_progress is not None
@@ -206,6 +211,7 @@ def events(client, *, model, messages, timeout, deadline=None, idle_timeout=None
 
 
 def complete(client, **options):
+    """消费模型流中的文本事件，同步取得完整结束后的响应对象。"""
     stream = events(client, **options)
     while True:
         try:

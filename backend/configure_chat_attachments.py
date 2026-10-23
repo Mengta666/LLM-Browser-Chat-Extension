@@ -9,6 +9,7 @@ from dotenv import dotenv_values, set_key
 
 
 def main():
+    """验证附件公开地址并补齐本地配置，仅在缺少签名密钥时生成新密钥。"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--base-url', required=True, help='模型容器可访问的后端根地址，不含 /v1')
     args = parser.parse_args()

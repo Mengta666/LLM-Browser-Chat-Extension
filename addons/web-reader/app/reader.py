@@ -18,6 +18,7 @@ class ReadError(Exception):
 
 
 def resolve_target(url):
+    """规范化目标 URL，并检查端口及全部 DNS 结果是否允许公开访问。"""
     if not isinstance(url, str) or not url or len(url) > 4096:
         raise ReadError("invalid_url")
     if re.search(r"[\x00-\x20\x7f\\]", url):
@@ -63,6 +64,7 @@ def resolve_target(url):
 
 class PinnedConnection(http.client.HTTPConnection):
     def __init__(self, host, port, addresses, secure, deadline):
+        """保存已验证的目标地址，同时保留原始主机名用于 HTTP 与 TLS。"""
         super().__init__(host, port, timeout=max(.1, deadline - time.monotonic()))
         self.addresses = addresses
         self.secure = secure
@@ -70,6 +72,7 @@ class PinnedConnection(http.client.HTTPConnection):
 
     def connect(self):
         # 直接连接已校验的 sockaddr，不让 HTTP 库再次解析 DNS；TLS 仍校验原域名。
+        """连接固定的已验证 IP，使用原始主机名完成 TLS 校验。"""
         for family, socktype, proto, address in self.addresses:
             remaining = self.deadline - time.monotonic()
             if remaining <= 0:
@@ -90,8 +93,10 @@ class PinnedConnection(http.client.HTTPConnection):
 
 
 def download(url, deadline, max_bytes):
+    """逐跳校验重定向目标，在时间和大小限制内下载并解压网页内容。"""
     target = url
     for redirect in range(4):
+        # 每一跳都重新校验目标地址，避免合法公网链接通过重定向访问受限网络。
         canonical, host, port, addresses = resolve_target(target)
         parsed = urlsplit(canonical)
         connection = PinnedConnection(host, port, addresses, parsed.scheme == "https", deadline)
@@ -136,6 +141,7 @@ def download(url, deadline, max_bytes):
                 transferred += len(block)
                 if transferred > max_bytes:
                     raise ReadError("page_too_large")
+                # 压缩前后的大小分别受限，防止体积很小的响应解压后耗尽内存。
                 if decoder:
                     block = decoder.decompress(block, max_bytes - len(output) + 1)
                     if decoder.unconsumed_tail:
@@ -158,6 +164,7 @@ def download(url, deadline, max_bytes):
 
 
 def extract_html(html, final_url, max_chars):
+    """提取网页正文及结构，处理空内容和受限页面，并限制输出元数据长度。"""
     from .structure import serialize_body
 
     document = trafilatura.bare_extraction(
@@ -181,6 +188,7 @@ def extract_html(html, final_url, max_chars):
 
 
 def read_page(url, timeout_seconds, max_bytes, max_chars):
+    """下载并提取目标网页，补充来源信息和处理耗时。"""
     started = time.monotonic()
     html, final_url = download(url, started + timeout_seconds, max_bytes)
     result = extract_html(html, final_url, max_chars)
@@ -190,6 +198,7 @@ def read_page(url, timeout_seconds, max_bytes, max_chars):
 
 
 def worker(sender, url, timeout_seconds, max_bytes, max_chars):
+    """在子进程中执行网页读取，通过管道返回结果或受控错误。"""
     try:
         sender.send(read_page(url, timeout_seconds, max_bytes, max_chars))
     except ReadError as exc:

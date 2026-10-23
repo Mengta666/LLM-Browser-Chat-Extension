@@ -9,10 +9,12 @@ import fitz
 
 
 def normalized(text):
+    """统一字符形式并移除非文字标记，供 OCR 文本与 PDF 元素对齐。"""
     return re.sub(r'[\W_]+', '', unicodedata.normalize('NFKC', text)).casefold()
 
 
 def pdf_features(pdf, pages):
+    """从 PDF 提取字体、位置和书签信息，作为 OCR 结构推断的辅助依据。"""
     dimensions = {p['page']: (p['width'], p['height']) for p in pages}
     result = {}
     for number, page in enumerate(pdf, 1):
@@ -41,6 +43,7 @@ def pdf_features(pdf, pages):
 
 
 def enrich(blocks, features):
+    """将匹配到的 PDF 排版特征附加到解析块，不替换已保存的 OCR 正文。"""
     for block in blocks:
         page = features.get(block['page'])
         box = block.get('bbox')
@@ -68,6 +71,7 @@ def enrich(blocks, features):
 
 
 def reading_order(blocks, pages):
+    """结合页面位置和块结构推断阅读顺序，返回重排后的文档块。"""
     from rag.document_layout import MARGINS
     by_page = defaultdict(list)
     for block in blocks:

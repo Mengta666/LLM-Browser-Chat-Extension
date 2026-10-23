@@ -5,6 +5,7 @@ import json
 
 
 def record_stage(trace, name, rows, snapshots=None):
+    """记录检索阶段的候选身份和来源范围，避免把正文写入诊断账本。"""
     catalog = trace.setdefault('candidates', {})
     entries = []
     for row in rows:

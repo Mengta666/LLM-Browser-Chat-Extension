@@ -1,4 +1,5 @@
 // 在目标节点所属页面执行；描述对象只存活于一次动作，不跨观察复用 DOM 引用。
+/** 识别原生输入框、富文本和 CodeMirror 编辑区域，返回观察信息或受校验的操作接口。 */
 function describeEditingTarget(observe = false) {
   const node = this;
   const doc = node.ownerDocument;
@@ -7,7 +8,7 @@ function describeEditingTarget(observe = false) {
   let cm = wrapper?.CodeMirror;
   const cmInput = cm?.getInputField?.();
   const surface = node === wrapper || node === cmInput ||
-    ['CodeMirror-scroll', 'CodeMirror-sizer', 'CodeMirror-lines', 'CodeMirror-code'].some(c => node.classList.contains(c));
+    ['CodeMirror-scroll', 'CodeMirror-sizer', 'CodeMirror-lines', 'CodeMirror-code'].some(/** 识别 CodeMirror 可编辑表面的已知类名。 */ c => node.classList.contains(c));
   if (!surface || cm?.getWrapperElement?.() !== wrapper || !wrapper?.contains(cmInput)) cm = null;
   let root = cm ? wrapper : node;
   let input = cm ? cmInput : node;
@@ -19,11 +20,13 @@ function describeEditingTarget(observe = false) {
   }
   const direct = kind === 'native' && ['date', 'time', 'datetime-local', 'month', 'week', 'color', 'range'].includes(input.type);
   if (kind === 'native' && ['hidden', 'file', 'button', 'checkbox', 'radio', 'submit', 'reset', 'image'].includes(input.type)) kind = 'none';
+  /** 按编辑器类型读取完整文本，并统一富文本换行及不换行空格。 */
   const value = () => {
     if (cm) return cm.getValue('\n');
     if (kind === 'native') return input.value;
     if (kind !== 'contenteditable') return '';
     // 浏览器用块元素分行，并在空行末尾保留占位 BR；innerText 会额外计算这些占位换行。
+    /** 递归重建富文本的可见文本，保留块级换行并排除占位换行。 */
     const textOf = element => {
       let text = '', previousBlock = false;
       for (const child of element.childNodes) {
@@ -49,18 +52,21 @@ function describeEditingTarget(observe = false) {
     // 普通富文本编辑时 Chromium 会把边界空格转成 NBSP；纯文本回读统一为空格。
     return textOf(root).replace(/\r\n?/g, '\n').replace(/\u00a0/g, ' ');
   };
+  /** 判断文档及目标编辑区域是否仍持有输入焦点。 */
   const focused = () => {
     if (!doc.hasFocus()) return false;
     const active = input.getRootNode().activeElement;
     return active === input || kind === 'contenteditable' && input.contains(active);
   };
+  /** 收集原生校验失败项，并补充程序赋值时可能未触发的长度检查。 */
   const validity = (element) => {
     const violations = element.validity ? ['valueMissing', 'typeMismatch', 'patternMismatch', 'tooLong', 'tooShort',
-      'rangeUnderflow', 'rangeOverflow', 'stepMismatch', 'badInput', 'customError'].filter(key => element.validity[key]) : [];
+      'rangeUnderflow', 'rangeOverflow', 'stepMismatch', 'badInput', 'customError'].filter(/** 筛选原生有效性状态中的失败项。 */ key => element.validity[key]) : [];
     if (kind === 'native' && element.maxLength >= 0 && element.value.length > element.maxLength) violations.push('tooLong');
     if (kind === 'native' && element.value && element.minLength > element.value.length) violations.push('tooShort');
     return { valid: violations.length === 0, violations: [...new Set(violations)] };
   };
+  /** 确认编辑目标未被替换，返回可见性、只读状态、焦点及编辑能力。 */
   const state = () => {
     if (!root.isConnected || !input.isConnected || kind === 'contenteditable' && !root.isContentEditable || cm &&
         (wrapper.CodeMirror !== cm || cm.getInputField() !== input)) {
@@ -77,6 +83,7 @@ function describeEditingTarget(observe = false) {
       readOnly, visible, focused: focused(), direct, multiline: !!cm || kind === 'contenteditable' || input.tagName === 'TEXTAREA',
       proxy: !!cm && node !== wrapper };
   };
+  /** 分派读取、聚焦、选区和写入操作，在修改前检查目标、焦点及完整原值。 */
   const call = (operation, arg) => {
     const s = state();
     if (!s.success) return s;
@@ -104,6 +111,7 @@ function describeEditingTarget(observe = false) {
     if (!s.focused) return { success: false, error: '编辑焦点已转移，未继续输入' };
     if (operation === 'guard') return s;
     if (operation === 'guard_value' || operation === 'replace') {
+      // 用完整原值做并发校验，防止观察之后的用户编辑或页面更新被旧动作覆盖。
       if (value() !== arg.prior) return { success: false, stale: true, error: '字段完整原值已改变，未覆盖，请重新观察' };
       if (operation === 'guard_value') return s;
       if (kind === 'native') {
@@ -112,7 +120,7 @@ function describeEditingTarget(observe = false) {
         input.dispatchEvent(new win.Event('input', { bubbles: true }));
         input.dispatchEvent(new win.Event('change', { bubbles: true }));
       } else if (cm) {
-        cm.operation(() => cm.replaceRange(arg.text, { line: 0, ch: 0 }, cm.posFromIndex(arg.prior.length), '+input'));
+        cm.operation(/** 在一次 CodeMirror 操作中替换完整原文。 */ () => cm.replaceRange(arg.text, { line: 0, ch: 0 }, cm.posFromIndex(arg.prior.length), '+input'));
       } else return { success: false, error: '此编辑器不支持同步替换' };
       return state();
     }
@@ -140,6 +148,7 @@ function describeEditingTarget(observe = false) {
       return state();
     }
     if (operation === 'expected') {
+      // 先根据当前选区推导输入后的全文，供执行后回读比较；反向选区也按起止范围处理。
       const text = value();
       let start, end;
       if (cm) {
@@ -169,12 +178,12 @@ function describeEditingTarget(observe = false) {
     const group = node.closest('fieldset');
     const form = node.closest('form');
     const row = node.closest('tr');
-    const hints = [...(node.labels || [])].map(label => label.textContent.trim());
+    const hints = [...(node.labels || [])].map(/** 读取关联标签的文本提示。 */ label => label.textContent.trim());
     for (const id of (node.getAttribute('aria-describedby') || '').split(/\s+/).filter(Boolean)) {
       const hint = doc.getElementById(id)?.textContent?.trim();
       if (hint) hints.push(hint);
     }
-    if (row) hints.push(...[...row.querySelectorAll('th')].map(cell => cell.textContent.trim()));
+    if (row) hints.push(...[...row.querySelectorAll('th')].map(/** 提取当前表格行的表头提示。 */ cell => cell.textContent.trim()));
     return { ...s, preview: current.slice(0, 120), value_truncated: current.length > 120,
       ...(kind !== 'none' && input.type !== 'password' || node.tagName === 'SELECT' ? { snapshot_value: current } : {}),
       value_attribute: node.getAttribute('value') || '',
@@ -184,12 +193,13 @@ function describeEditingTarget(observe = false) {
         group?.querySelector('legend')?.textContent?.trim()].filter(Boolean).join(' / ').slice(0, 400),
       field_context: hints.join(' / ').slice(0, 600),
       ...(node.tagName === 'SELECT' ? { selected_text: node.selectedOptions[0]?.textContent.trim() || '',
-        options: [...node.options].map(o => ({ text: o.textContent.trim(), value: o.value,
+        options: [...node.options].map(/** 序列化选项文本、值及禁用状态。 */ o => ({ text: o.textContent.trim(), value: o.value,
           disabled: o.disabled || o.parentElement.tagName === 'OPTGROUP' && o.parentElement.disabled })) } : {}) };
   }
   return { call };
 }
 
+/** 精确匹配原生单选下拉项，校验原值与选项身份，按模式只读核验或执行选择。 */
 function selectNativeTarget(params, readOnly) {
   if (!this.isConnected) return { success: false, stale: true, error: '选择目标已脱离页面' };
   if (this.multiple) return { success: false, error: '单项选择不能用于多选控件' };
@@ -197,12 +207,13 @@ function selectNativeTarget(params, readOnly) {
   if (params.material_id && !(readOnly && params.expected_prior_complete === false) &&
       (typeof params.expected_prior !== 'string' || this.value !== params.expected_prior))
     return { success: false, stale: true, error: '字段值已改变，未覆盖，请重新观察' };
-  const matches = [...this.options].filter(o => o.textContent.trim() === params.option_text);
+  const matches = [...this.options].filter(/** 精确匹配请求指定的选项文本。 */ o => o.textContent.trim() === params.option_text);
   if (matches.length !== 1) return { success: false, error: '目标选项不存在或不唯一，未进行模糊选择' };
   const option = matches[0];
+  /** 读取目标选项的索引、文本和值，供执行前后检查身份是否一致。 */
   const identity = () => ({ index: option.index, text: option.textContent.trim(), value: option.value });
   const expected = params.expected_option || identity();
-  if (Object.entries(expected).some(([key, value]) => identity()[key] !== value))
+  if (Object.entries(expected).some(/** 检查选择前的选项身份是否变化。 */ ([key, value]) => identity()[key] !== value))
     return { success: false, stale: true, error: '目标选项身份已变化，请重新观察' };
   if (option.disabled || option.parentElement.tagName === 'OPTGROUP' && option.parentElement.disabled)
     return { success: false, error: '目标选项已禁用' };
@@ -214,7 +225,7 @@ function selectNativeTarget(params, readOnly) {
     this.dispatchEvent(new Event('input', { bubbles: true }));
     this.dispatchEvent(new Event('change', { bubbles: true }));
   }
-  if (!this.isConnected || !this.contains(option) || Object.entries(expected).some(([key, value]) => identity()[key] !== value))
+  if (!this.isConnected || !this.contains(option) || Object.entries(expected).some(/** 检查选择后的选项身份是否仍一致。 */ ([key, value]) => identity()[key] !== value))
     return { success: false, stale: true, error: '选择目标被替换或选项变化，请重新观察' };
   const matched = option.selected && this.selectedIndex === expected.index && this.value === expected.value;
   const valid = this.validity.valid;

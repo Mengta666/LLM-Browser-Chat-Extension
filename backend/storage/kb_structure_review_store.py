@@ -6,6 +6,7 @@ from storage import kb_store as KS, kb_document_store as DS
 
 
 def create(kb_id, doc_id, snapshot, fingerprint, config,request_id=''):
+    """按文档快照和配置指纹创建或复用结构审阅记录。"""
     with KS._transaction() as conn:
         doc = DS.owned(conn, kb_id, doc_id)
         if doc['file_type'] != 'pdf':
@@ -30,6 +31,7 @@ def create(kb_id, doc_id, snapshot, fingerprint, config,request_id=''):
 
 
 def owned(conn, kb_id, doc_id, review_id):
+    """校验文档归属后读取指定结构审阅任务。"""
     DS.owned(conn, kb_id, doc_id)
     row = conn.execute('SELECT * FROM kb_structure_reviews WHERE review_id=? AND kb_id=? AND doc_id=?',
                        (review_id,kb_id,doc_id)).fetchone()
@@ -39,6 +41,7 @@ def owned(conn, kb_id, doc_id, review_id):
 
 
 def get(kb_id, doc_id, review_id):
+    """返回审阅状态、检查点和结果，并补充显式发布信息。"""
     with KS._transaction() as conn:
         row = owned(conn,kb_id,doc_id,review_id)
         row['checkpoint'] = json.loads(row.pop('checkpoint_json'))
@@ -61,6 +64,7 @@ def get(kb_id, doc_id, review_id):
 
 
 def claim(kb_id, doc_id, review_id, fingerprint):
+    """校验配置指纹并领取审阅租约，防止并发执行同一任务。"""
     with KS._transaction() as conn:
         row = owned(conn,kb_id,doc_id,review_id)
         if row['fingerprint'] != fingerprint:
@@ -74,6 +78,7 @@ def claim(kb_id, doc_id, review_id, fingerprint):
 
 
 def check(conn, kb_id, doc_id, review_id, lease):
+    """在调用方事务内确认审阅任务仍由指定租约持有。"""
     row = owned(conn,kb_id,doc_id,review_id)
     if row['status'] != 'running' or row['lease'] != lease:
         raise KS.KBConflict('结构分析已停止或租约已过期')
@@ -81,11 +86,13 @@ def check(conn, kb_id, doc_id, review_id, lease):
 
 
 def batches(review_id):
+    """按批次顺序读取已经保存的结构审阅结果。"""
     with KS._transaction() as conn:
         return [dict(r) for r in conn.execute('SELECT * FROM kb_structure_review_batches WHERE review_id=? ORDER BY batch_no', (review_id,))]
 
 
 def save_batch(kb_id,doc_id,review_id,lease,batch_no,input_hash,request,output,metrics,checkpoint):
+    """在有效租约下保存窗口输出、用量和下一步检查点。"""
     with KS._transaction() as conn:
         current=check(conn,kb_id,doc_id,review_id,lease)
         checkpoint={**json.loads(current['checkpoint_json']),**checkpoint}
@@ -99,6 +106,7 @@ def save_batch(kb_id,doc_id,review_id,lease,batch_no,input_hash,request,output,m
 
 
 def reserve_call(kb_id,doc_id,review_id,lease,limit,*,request=None,input_hash=None):
+    """在额度内登记一次模型调用及窗口输入，避免超额或错误复用。"""
     with KS._transaction() as conn:
         row=check(conn,kb_id,doc_id,review_id,lease)
         checkpoint=json.loads(row['checkpoint_json'])
@@ -122,6 +130,7 @@ def reserve_call(kb_id,doc_id,review_id,lease,limit,*,request=None,input_hash=No
 
 
 def record_attempt(kb_id,doc_id,review_id,lease,input_hash,metrics,result=None):
+    """保存当前窗口调用的指标和可选结果，并校验输入摘要一致。"""
     with KS._transaction() as conn:
         row=check(conn,kb_id,doc_id,review_id,lease)
         checkpoint=json.loads(row['checkpoint_json']);active=checkpoint['active_window']
@@ -134,6 +143,7 @@ def record_attempt(kb_id,doc_id,review_id,lease,input_hash,metrics,result=None):
 
 
 def split_window(kb_id,doc_id,review_id,lease,input_hash):
+    """在窗口超限后登记拆分计划并保留被替换窗口的尝试信息。"""
     with KS._transaction() as conn:
         row=check(conn,kb_id,doc_id,review_id,lease)
         checkpoint=json.loads(row['checkpoint_json']);active=checkpoint['active_window']
@@ -148,6 +158,7 @@ def split_window(kb_id,doc_id,review_id,lease,input_hash):
 
 
 def complete(kb_id,doc_id,review_id,lease,result):
+    """将审阅建议保存为完成结果，清理活动窗口但不发布正式结构。"""
     with KS._transaction() as conn:
         row=check(conn,kb_id,doc_id,review_id,lease)
         checkpoint={**json.loads(row['checkpoint_json']),'phase':'completed'}
@@ -156,6 +167,7 @@ def complete(kb_id,doc_id,review_id,lease,result):
 
 
 def fail(review_id,lease,error,metrics=None):
+    """仅更新匹配租约的活动审阅任务，保留检查点和诊断信息。"""
     with KS._transaction() as conn:
         row=conn.execute("SELECT checkpoint_json FROM kb_structure_reviews WHERE review_id=? AND lease=? AND status='running'", (review_id,lease)).fetchone()
         if not row:
@@ -169,6 +181,7 @@ def fail(review_id,lease,error,metrics=None):
 
 
 def cancel(kb_id,doc_id,review_id):
+    """取消结构审阅并使现有租约失效，返回最终状态。"""
     with KS._transaction() as conn:
         row=owned(conn,kb_id,doc_id,review_id)
         if row['status'] in ('pending','running'):
@@ -178,5 +191,6 @@ def cancel(kb_id,doc_id,review_id):
 
 
 def interrupt_running():
+    """将服务退出或重启时遗留的活动审阅任务置为中断。"""
     with KS._transaction() as conn:
         conn.execute("UPDATE kb_structure_reviews SET status='interrupted',lease='',updated_at=? WHERE status='running'", (DS.now(),))

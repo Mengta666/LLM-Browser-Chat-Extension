@@ -234,6 +234,7 @@ def render_history_block(session: "AgentSession") -> str:
 
 
 def _force_done_note(session: "AgentSession") -> str:
+    """生成强制收尾提示，要求模型如实报告完成情况而不再派发操作。"""
     return (
         "[收尾] 这一步**只能输出 action.type = task_complete**。\n"
         "若任务尚未完全完成，设 success=false，并在 summary 里如实写清：你查到了什么、"
@@ -262,6 +263,7 @@ def build_plan_block(session: "AgentSession") -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def build_observation_message(page_state: PageState) -> str:
+    """将页面布局、弹层和交互元素组织成供模型决策使用的文字观察。"""
     parts = []
     parts.append(f"## 当前页面\nURL: {page_state.url}\n标题: {page_state.title}")
     if page_state.screenshot:
@@ -360,6 +362,7 @@ def build_observation_message(page_state: PageState) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _format_element(el: dict[str, Any]) -> str:
+    """格式化单个元素的编号、标签、状态和字段信息，保留可执行目标的身份。"""
     eid = el.get("id", "?")
     tag = el.get("tag", "?")
     parts = []
@@ -439,6 +442,7 @@ def _format_element(el: dict[str, Any]) -> str:
 
 
 def _is_similar_element(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    """判断相邻元素是否可归为同一展示组，避免合并语义不同的控件。"""
     if a.get('bounding_box') or b.get('bounding_box'):
         return False
     if a.get("tag") != b.get("tag") or a.get("role") != b.get("role"):
@@ -454,6 +458,7 @@ def _is_similar_element(a: dict[str, Any], b: dict[str, Any]) -> bool:
 
 
 def _format_element_group(group: list[dict[str, Any]]) -> str:
+    """压缩展示一组相似元素，同时保留编号与选项文字的对应关系。"""
     first_id = group[0].get("id", "?")
     last_id = group[-1].get("id", "?")
     tag = group[0].get("tag", "?")
@@ -488,6 +493,7 @@ def _format_element_group(group: list[dict[str, Any]]) -> str:
 
 
 def _group_and_format_elements(elements: list[dict[str, Any]]) -> list[str]:
+    """按相邻元素的相似性分组，将分组和独立元素转换为观察文本。"""
     lines: list[str] = []
     i = 0
     while i < len(elements):
@@ -509,6 +515,7 @@ def _group_and_format_elements(elements: list[dict[str, Any]]) -> list[str]:
 def _split_by_viewport(
     elements: list[dict[str, Any]], viewport: dict[str, int]
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """依据元素边界框将元素分为视口内和视口外两组。"""
     vh = viewport.get("height", 900)
     vw = viewport.get("width", 1920)
     in_vp, out_vp = [], []

@@ -9,6 +9,7 @@ import pytest
 
 
 def test_deployment_checker_does_not_forward_auth_on_redirect():
+    """验证部署检查遇到重定向时不会把鉴权信息转发给其他地址。"""
     path = Path(__file__).resolve().parents[3] / 'deploy' / 'check.py'
     spec = importlib.util.spec_from_file_location('deploy_check', path)
     module = importlib.util.module_from_spec(spec)
@@ -16,6 +17,7 @@ def test_deployment_checker_does_not_forward_auth_on_redirect():
     calls = []
     class RedirectServer(urllib.request.HTTPHandler):
         def http_open(self, request):
+            """模拟返回重定向的 HTTP 服务，记录部署检查发出的请求。"""
             calls.append(request.full_url)
             assert len(calls) == 1, 'Redirect must not be followed'
             headers = Message()

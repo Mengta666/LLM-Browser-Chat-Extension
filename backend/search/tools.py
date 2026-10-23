@@ -29,6 +29,7 @@ WEB_SEARCH_TOOL = {
 
 
 def web_search_guidance() -> str:
+    """生成联网检索、正文覆盖和引用时效的使用规则。"""
     return (
         f'服务端当前日期：{datetime.now().astimezone().isoformat(timespec="seconds")}。\n'
         '联网检索规则：结合当前问题和相关历史理解指代、追问与纠正，生成独立完整的搜索词；'
@@ -49,6 +50,7 @@ def web_search_guidance() -> str:
 
 def execute_web_search(query: str, *, timeout: float | None = None, reader_cache=None,
                        reader_context_tokens=None, reader_budget=None) -> tuple[str, list[SearchResult], dict]:
+    """执行搜索及可选正文提取，返回工具文本、来源结果和搜索状态。"""
     from search.searxng import search_searxng_with_status
     from search.reader import enrich_results
     deadline = time.monotonic() + (timeout if timeout is not None else 40)
@@ -69,6 +71,7 @@ def execute_web_search(query: str, *, timeout: float | None = None, reader_cache
 
 
 def parse_tool_arguments(name: str, arguments: str | dict) -> dict:
+    """按工具类型验证并规范化搜索、知识库及历史读取参数。"""
     from search import kb_task
     if name == kb_task.NAME:
         return kb_task.parse(arguments)
@@ -147,6 +150,7 @@ def parse_tool_arguments(name: str, arguments: str | dict) -> dict:
 
 
 def handle_tool_call(name: str, arguments: str | dict, start_index: int = 1) -> tuple[str, list[SearchResult]]:
+    """执行兼容入口支持的搜索工具，返回带引用编号的文本和来源。"""
     if name != "web_search":
         return f"未知工具: {name}", []
     try:
@@ -159,6 +163,7 @@ def handle_tool_call(name: str, arguments: str | dict, start_index: int = 1) -> 
 
 
 def format_search_results(results: list[SearchResult], start_index: int = 1) -> str:
+    """将搜索摘要或正文节选格式化为编号来源，标明实际读取程度。"""
     if not results:
         return "未找到相关搜索结果；可以换词补搜，无法核实时请说明，不要把旧知识当成已核实的最新信息。"
     lines = [
@@ -183,6 +188,7 @@ def format_search_results(results: list[SearchResult], start_index: int = 1) -> 
 
 
 def format_search_results_for_manual(results: list[SearchResult]) -> str:
+    """为用户主动搜索生成独立结果说明。"""
     if not results:
         return "用户请求搜索，但未找到相关结果；无法核实时请明确说明。"
     lines = [
@@ -285,6 +291,7 @@ KB_TOOL_GUIDANCE = (
 
 
 def handle_kb_list_documents(kb_id: str, page: int = 1, limit: int = 20) -> tuple[str, list, dict]:
+    """返回分页文档目录及数量信息，明确目录不是正文证据。"""
     from storage import kb_store
     from agent.memory.config import CHAT_USER_ID
 
@@ -296,6 +303,7 @@ def handle_kb_list_documents(kb_id: str, page: int = 1, limit: int = 20) -> tupl
 
 
 def handle_kb_search(kb_id: str, query: str, start_index: int = 1, questions: list[str] | None = None) -> tuple[str, list[dict], dict]:
+    """按主问题和可选子问题检索知识库，合并结果及查询元数据。"""
     from rag import kb as KB
     from storage import kb_store
     from agent.memory.config import CHAT_USER_ID
@@ -325,6 +333,7 @@ def handle_kb_search(kb_id: str, query: str, start_index: int = 1, questions: li
 
 
 def execute_kb_tool(name: str, arguments: dict, start_index: int = 1) -> tuple[str, list, dict]:
+    """派发知识库搜索或目录工具，并将存储错误转换为工具业务状态。"""
     try:
         if name == "kb_list_documents":
             return handle_kb_list_documents(**arguments)

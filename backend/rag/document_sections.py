@@ -12,6 +12,7 @@ NUMBER = re.compile(r'^\s*(\d+(?:\.\d+)*)(?:[.、．\s]|$)')
 
 
 def heading_level(text):
+    """从标题编号或明确章节名称推断层级，并返回判断依据。"""
     match = NUMBER.match(re.sub(r'^\s*§\s*', '', text))
     if match:
         return match[1].count('.') + 1, 'numbering'
@@ -25,6 +26,7 @@ def heading_level(text):
 
 
 def marker(text):
+    """解析章节标号的体系、编号和标题，无法识别时返回空值。"""
     text = unicodedata.normalize('NFKC', text).strip()
     patterns = [
         ('part', r'^(?:第([一二三四五六七八九十百\d]+)[篇部]|PART\s+([IVXLCDM]+|[A-Z]|\d+)\b)[\s:：.、]*(.*)$'),
@@ -49,6 +51,7 @@ def marker(text):
 
 
 def match_score(mark, block):
+    """结合标题相似度及页内位置，计算目录项与候选标题块的匹配分数。"""
     text, title = block['text'], mark['title']
     a, b = marker(text), marker(title)
     one, two = normalized(a['title'] if a else text), normalized(b['title'] if b else title)
@@ -67,6 +70,7 @@ def match_score(mark, block):
 
 def align(marks, candidates):
     # 保持目录顺序的一对一匹配，允许跳过无正文锚点的目录项。
+    """在顺序约束下选择目录项与候选标题的最佳对应关系。"""
     states = {-1: (0, [])}
     for mark in marks:
         previous, updated = states, dict(states)
@@ -85,6 +89,7 @@ def align(marks, candidates):
 
 
 def printed_toc(blocks, pages):
+    """从印刷目录提取标题和目标页信息，并记录目录来源块。"""
     labels = {}
     for page in pages:
         if page.get('printed_page'):
@@ -108,6 +113,7 @@ def printed_toc(blocks, pages):
 
 
 def assign(blocks, bookmarks=(), *, pages=()):
+    """结合书签、印刷目录和版式线索确定章节归属，写入块的结构投影。"""
     from rag.document_layout import HEADINGS, MARGINS, STATEMENT
     from rag.document_hierarchy import PROOF
     toc, toc_blocks = printed_toc(blocks, pages)

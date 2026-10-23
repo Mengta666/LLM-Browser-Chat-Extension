@@ -90,6 +90,7 @@ def try_acquire(user_id: str) -> Optional[dict[str, Any]]:
 
 
 def release(user_id: str) -> None:
+    """解除指定用户的记忆整理占用。"""
     with _rethink_lock:
         _rethink_in_progress.pop(user_id, None)
 
@@ -187,6 +188,7 @@ stability_score、created_at、expires_at、verified、now(用于判 expires_at 
 
 
 def _build_rethink_user_prompt(items: list[dict[str, Any]], now_iso: str) -> str:
+    """将当前时间和活跃核心记忆组成冲突、过期及合并判断的输入。"""
     return f"""当前时间(用于判 expires_at 是否已过):{now_iso}
 
 候选 core 记忆(全部活跃 core):
@@ -221,6 +223,7 @@ def _default_llm(system: str, user: str) -> Optional[dict]:
 
 
 def _parse_json(raw: str) -> Optional[dict]:
+    """从模型返回的文本或代码围栏中解析 JSON，解析失败时返回空值。"""
     text = str(raw or "").strip()
     if not text:
         return None
@@ -548,6 +551,7 @@ def start_rethink_daemon() -> None:
         return
 
     def _loop():
+        """按设定周期触发核心记忆整理，作为后台维护循环运行。"""
         interval_sec = RETHINK_CORE_INTERVAL_HOURS * 3600
         while True:
             try:

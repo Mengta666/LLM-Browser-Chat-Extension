@@ -335,6 +335,7 @@ def _schedule_memory_write(user_text: str, assistant_text: str, chat_id: str = "
         return
 
     def _worker():
+        """在后台提取近期对话记忆并记录结果，失败时不影响已完成回答。"""
         try:
             from agent.memory import service as memory_service
             # 修抽取丢数据 bug:N 轮去抖 + 单对抽取会丢前几轮事实,
@@ -414,6 +415,7 @@ def _save_history(chat_id: str, user_text: str, assistant_text: str, tools_json:
         return
 
     def _worker():
+        """在后台保存用户和助手消息，并为新会话补充生成的标题。"""
         try:
             from storage import chat_store
             is_new = chat_store.ensure_session(chat_id, first_user_text=user_text)
@@ -449,6 +451,7 @@ except ImportError:
 
 
 def _is_tools_unsupported(exc: Exception) -> bool:
+    """根据上游错误文字判断是否可能不支持工具调用参数。"""
     msg = str(exc).lower()
     return any(kw in msg for kw in ("400", "422", "tool", "unsupported", "not support"))
 
@@ -482,6 +485,7 @@ def _sse_search_meta(results) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _sse(data: dict[str, Any]) -> str:
+    """将事件对象序列化为以空行结束的 SSE 数据帧。"""
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
@@ -496,6 +500,7 @@ def stream_chat(model: str, messages: list[dict[str, Any]],
     """
 
     def _gen():
+        """逐步转发模型或工具循环事件，结束后安排历史保存和记忆提取。"""
         full_text = ""
         tools_steps = []  # 收集工具调用步骤
         _sr = search_results or []

@@ -8,6 +8,7 @@ from search import kb_workspace as W
 
 
 def prepare_one(messages, records, state, counter, limit, complete, *, rows=None):
+    """在证据超出预算时推进一个压缩片段，保存检查点并返回本步是否执行了整理。"""
     config = W.settings(state)
     if not config['WORKSPACE_ENABLED'] or not config['WORKSPACE_COMPACT']:
         return False
@@ -23,6 +24,7 @@ def prepare_one(messages, records, state, counter, limit, complete, *, rows=None
     bound = min(config['WORKSPACE_BATCH_TOKENS'], limit,
                 min(counter.model_window or C.CHAT_CONTEXT_LENGTH, C.CHAT_CONTEXT_LENGTH)
                 - config['WORKSPACE_OUTPUT_TOKENS'] - C.CHAT_CONTEXT_SAFETY_TOKENS)
+    # 保留最后一组原文；较早证据按片段推进检查点，避免一次压缩占满整个决策步骤。
     for group in W.units(rows)[:-1]:
         key = W.pack_key(group, state)
         record = packs.get(key)
@@ -62,6 +64,7 @@ def prepare_one(messages, records, state, counter, limit, complete, *, rows=None
             if len(record['parts']) == len(record['plan']):
                 merged = merge_parts(group, record['parts'], key)
                 after = counter.count_text(json.dumps(merged,ensure_ascii=False))
+                # 所有片段校验完成且确实节省 token 后，压缩结果才可替代原文视图。
                 record.update(status='complete' if after < before else 'no_gain',
                               before_tokens=before, after_tokens=after)
                 if after < before:

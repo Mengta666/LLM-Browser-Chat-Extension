@@ -26,6 +26,7 @@ document_evidence 是整本文档实际出现的编号/样式组，不是等级�
 
 
 def validate(value, payload):
+    """验证结构候选的角色、层级、锚点引用及前后窗口衔接。"""
     validate_shape(value, payload)
     available={a['id']:a for a in payload['anchors']}
     positions={a:i for i,a in enumerate(available)}
@@ -87,6 +88,7 @@ def validate(value, payload):
 
 
 def advance(prior, result, lookup):
+    """根据当前窗口结果更新仍然有效的章节上下文，供后续窗口续接。"""
     active=list(prior)
     for item in result['items']:
         if item['role']!='section_heading':
@@ -100,6 +102,7 @@ def advance(prior, result, lookup):
 
 
 def assemble(all_anchors, outputs, groups=()):
+    """合并各窗口候选并推导正文归属，返回保留不确定信息的结构建议。"""
     by_id={a['id']:a for a in all_anchors};positions={a:i for i,a in enumerate(by_id)}
     items=[i for output in outputs for i in output['items']]
     items.sort(key=lambda i:positions[i['anchors'][0]])

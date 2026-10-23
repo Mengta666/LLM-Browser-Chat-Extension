@@ -32,6 +32,7 @@ _collection_ready = False
 
 
 def _now_iso() -> str:
+    """返回当前 UTC 时间的 ISO 格式字符串，用于记忆更新时间。"""
     return datetime.now(timezone.utc).isoformat()
 
 
@@ -51,6 +52,7 @@ def _point_id(memory_id: str) -> str:
 
 
 def _resolve_distance() -> models.Distance:
+    """把配置中的距离名称转换为 Qdrant 距离枚举，拒绝不支持的值。"""
     try:
         return models.Distance(QDRANT_DISTANCE)
     except ValueError as exc:
@@ -332,6 +334,7 @@ def batch_insert_memories(items: list[dict[str, Any]], *, batch_size: int = 64,
 
 def _kb_index_filter(user_id: str, kb_id: str, doc_id: Optional[str] = None,
                      index_run_id: Optional[str] = None, *, valid_only: bool = False):
+    """构造按用户、知识库、文档和索引版本隔离的向量过滤条件。"""
     flt = _build_filter(user_id=user_id, memory_type=MEMORY_TYPE_KB_CHUNK,
                         scope=None, domain=None, kb_id=kb_id, doc_id=doc_id,
                         include_invalid=not valid_only)
@@ -347,6 +350,7 @@ def _kb_index_filter(user_id: str, kb_id: str, doc_id: Optional[str] = None,
 
 def set_kb_chunks_valid(*, user_id: str, kb_id: str, valid: bool,
                         doc_id: Optional[str] = None, index_run_id: Optional[str] = None) -> None:
+    """批量切换指定知识库索引片段的有效标记，控制版本的检索可见性。"""
     if valid and (not doc_id or index_run_id is None):
         raise ValueError("恢复必须指定文档及已发布索引版本")
     ensure_collection()
@@ -359,6 +363,7 @@ def set_kb_chunks_valid(*, user_id: str, kb_id: str, valid: bool,
 
 def kb_index_complete(*, user_id: str, kb_id: str, doc_id: str, index_run_id: str,
                        expected: int) -> bool:
+    """遍历指定索引的片段编号，确认数量及编号集合满足发布完整性要求。"""
     if expected <= 0:
         return False
     ensure_collection()
@@ -379,6 +384,7 @@ def kb_index_complete(*, user_id: str, kb_id: str, doc_id: str, index_run_id: st
 
 
 def get_kb_chunk(*, user_id: str, kb_id: str, doc_id: str, index_run_id: str, chunk_idx: int):
+    """按固定索引版本和片段编号读取唯一向量载荷，缺失或不唯一时返回空值。"""
     ensure_collection()
     flt = _kb_index_filter(user_id, kb_id, doc_id, index_run_id, valid_only=True)
     flt.must.append(models.FieldCondition(key="chunk_idx", match=models.MatchValue(value=chunk_idx)))
@@ -388,6 +394,7 @@ def get_kb_chunk(*, user_id: str, kb_id: str, doc_id: str, index_run_id: str, ch
 
 
 def purge_kb_chunks(*, user_id: str, kb_id: str) -> int:
+    """删除指定用户知识库的全部向量片段，返回删除前统计的匹配数量。"""
     ensure_collection()
     flt = _kb_index_filter(user_id, kb_id)
     count = get_client().count(collection_name=MEMORY_COLLECTION, count_filter=flt, exact=True).count
@@ -639,6 +646,7 @@ def prune_episodic(chat_id: str, *, user_id: str = CHAT_USER_ID,
     grace_cutoff = now.timestamp() - EPISODIC_PRUNE_GRACE_HOURS * 3600
 
     def _in_grace(m: dict[str, Any]) -> bool:
+        """判断事件记忆是否仍处于保护时间窗口，避免刚写入即被遗忘。"""
         raw = str(m.get("created_at", ""))
         if not raw:
             return False

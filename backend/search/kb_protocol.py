@@ -30,6 +30,7 @@ MODES = {mode: (required, tuple(dict.fromkeys((*optional, 'cursor', 'block_offse
 
 
 def target_schema():
+    """构造各读取模式的参数契约，明确必填定位和允许的字段。"""
     return {'oneOf': [{'type': 'object', 'properties': {**DOCUMENT,
         'mode': {'const': mode}, 'intent':INTENT, **{k: POSITION[k] for k in (*required, *optional)}},
         'required': ['mode', *required], 'additionalProperties': False,
@@ -38,6 +39,7 @@ def target_schema():
 
 
 def validate_target(target):
+    """校验读取目标的模式、文档身份和范围参数，返回独立的规范化副本。"""
     mode = target.get('mode') if isinstance(target, dict) else None
     required, optional = MODES.get(mode, ((), ())) if isinstance(mode, str) else ((), ())
     fields = {**DOCUMENT, 'intent':INTENT, **{k: POSITION[k] for k in (*required, *optional)}}
@@ -74,6 +76,7 @@ def validate_target(target):
 
 
 def from_legacy(args):
+    """把旧 HTTP 定位参数无损转换为统一读取目标。"""
     data = {k: v for k, v in args.items() if k != 'kb_id' and v is not None}
     if 'mode' in data:
         raise ValueError('mode 只能放在 targets 内，不能混入旧定位参数')
@@ -104,6 +107,7 @@ def from_legacy(args):
 
 
 def to_legacy(target):
+    """将校验后的统一读取目标转换为旧接口接受的定位参数。"""
     data = validate_target(target)
     mode = data.pop('mode')
     data.pop('intent', None)
@@ -113,6 +117,7 @@ def to_legacy(target):
 
 
 def read_entry(kb_id, **args):
+    """将知识库及定位包装为统一的可调用原文读取入口。"""
     if set(args)=={'targets'}:
         return {'kb_id':kb_id,'targets':[validate_target(t) for t in args['targets']]}
     return {'kb_id': kb_id, 'targets': [from_legacy(args)]}

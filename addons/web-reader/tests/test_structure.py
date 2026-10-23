@@ -11,6 +11,7 @@ from app.structure import serialize_body
     '当 <a href="/p"><code>电源</code></a> 未断开时，<strong>不要</strong>进行校准；确认断电后才可以继续。',
 ])
 def test_real_extractor_preserves_inline_order_and_qualifications(phrase):
+    """验证真实提取结果保留行内文本顺序和限定性内容。"""
     html = '<html><body><article><h2>Rules</h2><p>' + phrase + '</p><p>' + 'Background information for this technical reference. ' * 10 + '</p></article></body></html>'
     result = extract_html(html.encode(), 'https://example.org/', 10000)
     expected = ''.join(etree.fromstring('<p>' + phrase + '</p>').itertext())
@@ -21,6 +22,7 @@ def test_real_extractor_preserves_inline_order_and_qualifications(phrase):
 
 
 def test_lists_tables_and_code_are_atomic_and_offsets_are_exact():
+    """验证列表、表格和代码块完整保留，且偏移与正文准确对应。"""
     body = etree.fromstring('''<body><head rend="h2">Rules</head><p>Begin.</p>
       <list rend="ol"><item>First <hi>item</hi> ends.<list rend="ul"><item>Nested condition.</item></list></item><item>Second.</item></list>
       <code>if ready:\n    run()\n    stop()</code>
@@ -36,6 +38,7 @@ def test_lists_tables_and_code_are_atomic_and_offsets_are_exact():
 
 
 def test_code_inside_list_preserves_lines_and_indentation():
+    """验证列表内的代码保留换行和缩进。"""
     body = etree.fromstring('<body><list><item>Example:<code>if ready:\n    run()</code><p>Only after initialization.</p></item></list></body>')
     result = serialize_body(body,10000)
     assert result['content'] == '- Example:\n  ```\n  if ready:\n      run()\n  ```\n  Only after initialization.'
@@ -43,6 +46,7 @@ def test_code_inside_list_preserves_lines_and_indentation():
 
 @pytest.mark.parametrize('tag', ['code','list','table'])
 def test_oversized_atomic_block_not_cut(tag):
+    """验证超过长度预算的原子块不会被从中间截断。"""
     value = {'code':'x' * 300, 'list':'<item>' + 'x' * 300 + '</item>',
              'table':'<row><cell>' + 'x' * 300 + '</cell></row>'}[tag]
     result = serialize_body(etree.fromstring('<body><p>Introduction.</p><' + tag + '>' + value + '</' + tag + '></body>'), 100)
@@ -50,6 +54,7 @@ def test_oversized_atomic_block_not_cut(tag):
 
 
 def test_block_count_bound_and_section_transitions():
+    """验证结构块数量限制及章节上下文切换。"""
     result = serialize_body(etree.fromstring('<body><head rend="h1">A</head><p>a</p><head rend="h2">B</head>' + '<p>b</p>' * 2200 + '</body>'), 100000)
     assert len(result['blocks']) == 2048 and result['truncated']
     assert [b['section'] for b in result['blocks'][:4]] == [0,0,2,2]

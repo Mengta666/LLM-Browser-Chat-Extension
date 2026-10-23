@@ -19,12 +19,14 @@ HEARTBEAT_SECONDS = 10
 
 
 def start():
+    """开放聊天执行器接收新请求，清除关闭状态。"""
     global _closing
     with _lock:
         _closing = False
 
 
 def submit(chat_id, request_id, digest, begin, factory):
+    """按请求摘要去重并限制并发，成功登记轮次后启动独立工作线程。"""
     with _lock:
         previous = chat_events.head(chat_id, request_id)
         if previous and previous['request_hash'] != digest:
@@ -42,6 +44,7 @@ def submit(chat_id, request_id, digest, begin, factory):
 
 
 def _run(key, factory, turn):
+    """消费聊天事件并持久化文本和元数据，最后清理任务占用及未完成状态。"""
     chat_id, request_id, attempt = key
     text = []
     chars = 0
@@ -49,6 +52,7 @@ def _run(key, factory, turn):
     source = None
 
     def flush():
+        """将累计文本合并为一个事件写入档案，再重置刷新计数和时间。"""
         nonlocal chars, flushed
         if text:
             chat_events.append(*key, {'choices': [{'delta': {'content': ''.join(text)}, 'index': 0}]})
@@ -61,6 +65,7 @@ def _run(key, factory, turn):
         source = factory(turn)
         for event in source:
             delta = event.get('choices', [{}])[0].get('delta', {}).get('content')
+            # 合并纯文本增量以减少存储写入；其他事件到来前先刷出文本，保持事件顺序。
             if delta and set(event) == {'choices'}:
                 text.append(delta)
                 chars += len(delta)
@@ -90,6 +95,7 @@ def _run(key, factory, turn):
 
 
 def stop():
+    """停止接收新任务，并把活动轮次标记为后端关闭导致的中断。"""
     global _closing
     with _lock:
         _closing = True
@@ -99,6 +105,7 @@ def stop():
 
 
 def snapshot(chat_id, request_id):
+    """返回可公开的请求状态和成果，排除原请求参数及客户端配置。"""
     state = store.get_request(chat_id, request_id)
     # 不向订阅发送原请求参数或客户端配置。
     return {**{k: state[k] for k in ('chat_id', 'request_id', 'attempt', 'status', 'phase', 'error_code',
@@ -108,9 +115,11 @@ def snapshot(chat_id, request_id):
 
 
 def subscribe(chat_id, request_id, attempt, after=0):
+    """创建可按游标续接的 SSE 订阅，连接断开不取消后台任务。"""
     chat_events.page(chat_id, request_id, attempt, after, 1)
 
     async def stream():
+        """按事件序号发送增量及心跳，任务收尾且事件耗尽后发送最终快照。"""
         cursor = after
         last_ping = 0
         reason = 'subscriber_disconnected'
@@ -132,6 +141,7 @@ def subscribe(chat_id, request_id, attempt, after=0):
                     yield f'id: {attempt}:{cursor}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n'
                 with _lock:
                     active = (chat_id, request_id, attempt) in _tasks
+                # 终态落库可能早于任务收尾，必须等事件耗尽且任务退出活动表后再发送最终快照。
                 if not batch and current['status'] != 'running' and not active:
                     state = await asyncio.to_thread(snapshot, chat_id, request_id)
                     meta = {k: v for k, v in state.items() if k not in ('messages', 'tool_steps', 'kb_progress')}
@@ -154,6 +164,7 @@ def subscribe(chat_id, request_id, attempt, after=0):
 
 
 def wait_result(chat_id, request_id, attempt):
+    """等待指定执行尝试退出活动状态，再返回持久化的请求快照。"""
     while True:
         state = chat_events.head(chat_id, request_id)
         with _lock:

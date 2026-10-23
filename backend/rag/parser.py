@@ -48,6 +48,7 @@ def parse(file_path: str | Path, file_type: str) -> str:
 
 
 def _parse_pdf(path: Path) -> str:
+    """拒绝扫描型 PDF 后提取 Markdown 正文，并检查解析结果非空。"""
     try:
         import pymupdf4llm
     except ImportError as exc:
@@ -69,6 +70,7 @@ def _parse_pdf(path: Path) -> str:
 
 
 def _read_text(path: Path) -> str:
+    """解码文本文件并检查正文非空，编码问题交由统一解码逻辑处理。"""
     try:
         from rag.text_source import decode
         text, _ = decode(path.read_bytes())

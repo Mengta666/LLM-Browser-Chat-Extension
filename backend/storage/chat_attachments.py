@@ -24,6 +24,7 @@ _worker = None
 
 
 def settings():
+    """读取并检查附件公开地址、签名密钥和有效期，返回配置及可用标记。"""
     base = os.getenv('CHAT_ATTACHMENT_BASE_URL', '').strip().rstrip('/')
     key = os.getenv('CHAT_ATTACHMENT_SIGNING_KEY', '').strip()
     try:
@@ -39,16 +40,19 @@ def settings():
 
 
 def capabilities():
+    """公开附件协议版本、启用状态以及图片大小和像素限制。"""
     return {'protocol_version': 1, 'enabled': settings()[3], 'max_count': 1,
             'max_bytes': MAX_BYTES, 'max_pixels': MAX_PIXELS}
 
 
 def require_enabled():
+    """确认附件功能已正确配置，否则抛出可返回客户端的业务错误。"""
     if not settings()[3]:
         raise store.SessionError('attachments_not_configured', 503)
 
 
 def init_schema(conn):
+    """建立附件元数据及消息绑定表。"""
     conn.execute('''CREATE TABLE IF NOT EXISTS chat_attachments (
         attachment_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, client_attachment_id TEXT NOT NULL,
         name TEXT NOT NULL, mime TEXT NOT NULL, size INTEGER NOT NULL,
@@ -62,10 +66,12 @@ def init_schema(conn):
 
 
 def root():
+    """返回与会话数据库相邻的附件存储根目录。"""
     return store._DB_PATH.parent / 'chat_attachments'
 
 
 def file_path(row):
+    """根据合法附件身份构造磁盘路径，并确认路径不越出附件目录。"""
     name = row['storage_name']
     if not re.fullmatch(r'[0-9a-f]{32}\.(png|jpeg|webp)', name):
         raise store.SessionError('attachment_unavailable', 404)
@@ -76,11 +82,13 @@ def file_path(row):
 
 
 def metadata(row):
+    """返回前端可见的附件属性及本地文件是否仍可用。"""
     return {**{k: row[k] for k in ('attachment_id', 'name', 'mime', 'size', 'width', 'height')},
             'first_frame': bool(row['first_frame']), 'available': file_path(row).is_file()}
 
 
 def require_row(conn, chat_id, attachment_id):
+    """验证附件属于指定的未删除会话，并确认记录和文件可访问。"""
     row = conn.execute('SELECT * FROM chat_attachments WHERE attachment_id=? AND chat_id=?',
                        (attachment_id, chat_id)).fetchone()
     session = conn.execute('SELECT deleted_at FROM chat_sessions WHERE chat_id=?', (chat_id,)).fetchone()
@@ -92,6 +100,7 @@ def require_row(conn, chat_id, attachment_id):
 
 
 def normalize_image(data):
+    """验证图片格式及像素数，必要时将动画首帧转换为静态图片。"""
     if not data or len(data) > MAX_BYTES:
         raise store.SessionError('attachment_too_large', 413)
     try:
@@ -123,6 +132,7 @@ def normalize_image(data):
 
 
 def upload(chat_id, client_id, name, data, was_first_frame=False):
+    """按客户端附件标识幂等保存图片和元数据，拒绝同标识对应不同内容。"""
     require_enabled()
     if not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', chat_id) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', client_id):
         raise store.SessionError('attachment_invalid_identity', 422)
@@ -162,6 +172,7 @@ def upload(chat_id, client_id, name, data, was_first_frame=False):
 
 
 def validate_ids(conn, chat_id, ids):
+    """校验消息附件数量及每个附件的会话归属。"""
     if len(ids) > 1:
         raise store.SessionError('attachment_count_exceeded', 422)
     for identity in ids:
@@ -169,6 +180,7 @@ def validate_ids(conn, chat_id, ids):
 
 
 def enrich(conn, messages):
+    """批量为历史消息补充已绑定附件的展示元数据。"""
     if not messages:
         return messages
     by_id = {m['message_id']: m for m in messages}
@@ -183,6 +195,7 @@ def enrich(conn, messages):
 
 
 def signed_access(chat_id, identity, purpose='preview'):
+    """为指定用途生成有时限的附件访问签名和路径。"""
     require_enabled()
     if purpose not in ('preview', 'model'):
         raise store.SessionError('attachment_invalid_purpose', 403)
@@ -198,6 +211,7 @@ def signed_access(chat_id, identity, purpose='preview'):
 
 
 def verify_access(identity, purpose, expires, signature):
+    """校验访问用途、到期时间和签名，再读取仍可访问的附件记录。"""
     require_enabled()
     _, key, ttl, _ = settings()
     now = int(time.time())
@@ -215,6 +229,7 @@ def verify_access(identity, purpose, expires, signature):
 
 
 def model_messages(messages, chat_id):
+    """把内部附件标记转换为模型可访问的临时签名图片 URL。"""
     result = []
     for message in messages:
         content = message.get('content')
@@ -226,6 +241,7 @@ def model_messages(messages, chat_id):
 
 
 def delete_unbound(chat_id, identity):
+    """删除未绑定消息的临时附件及磁盘文件，保护已发送消息的附件。"""
     conn = store._get_conn()
     with store._lock, conn:
         conn.execute('BEGIN IMMEDIATE')
@@ -239,6 +255,7 @@ def delete_unbound(chat_id, identity):
 
 
 def cleanup():
+    """清理超过保留期且没有消息引用的临时附件，返回清理数量。"""
     conn = store._get_conn()
     cutoff = time.time() - 86400
     with store._lock, conn:
@@ -259,11 +276,13 @@ def cleanup():
 
 
 def start_cleanup():
+    """启动单个附件清理线程，重复调用时复用已有线程。"""
     global _worker
     if _worker and _worker.is_alive():
         return
     _stop.clear()
     def run():
+        """周期清理过期临时附件并记录结果，响应服务停止信号。"""
         from observability.logger import get_logger
         while not _stop.is_set():
             try:
@@ -278,6 +297,7 @@ def start_cleanup():
 
 
 def stop_cleanup():
+    """通知附件清理线程退出并有限等待其结束。"""
     _stop.set()
     if _worker:
         _worker.join(timeout=5)

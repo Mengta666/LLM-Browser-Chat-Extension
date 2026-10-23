@@ -6,6 +6,7 @@ from storage import chat_store as store
 
 
 def init_schema(conn):
+    """建立按会话、请求和执行尝试隔离的事件档案表。"""
     conn.execute('''CREATE TABLE IF NOT EXISTS chat_request_events (
         chat_id TEXT NOT NULL, request_id TEXT NOT NULL, attempt INTEGER NOT NULL,
         event_id INTEGER NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL,
@@ -13,6 +14,7 @@ def init_schema(conn):
 
 
 def head(chat_id, request_id):
+    """读取未删除会话中指定聊天请求的当前轮次状态。"""
     conn = store._get_conn()
     with store._lock:
         row = conn.execute('''SELECT t.* FROM chat_turns t JOIN chat_sessions s USING(chat_id)
@@ -21,12 +23,14 @@ def head(chat_id, request_id):
 
 
 def append(chat_id, request_id, attempt, payload):
+    """校验执行尝试后在同一事务内分配递增事件号并保存事件。"""
     encoded = json.dumps(payload, ensure_ascii=False)
     conn = store._get_conn()
     with store._lock, conn:
         row = head(chat_id, request_id)
         if not row or row['attempt'] != attempt or row['status'] in ('cancelled', 'interrupted'):
             raise store.SessionError('stale_attempt')
+        # 序号分配与写入共用锁和事务，保证同一次执行内的订阅游标唯一且递增。
         seq = conn.execute('''SELECT COALESCE(MAX(event_id),0)+1 FROM chat_request_events
             WHERE chat_id=? AND request_id=? AND attempt=?''', (chat_id, request_id, attempt)).fetchone()[0]
         conn.execute('INSERT INTO chat_request_events VALUES(?,?,?,?,?,?)',
@@ -35,6 +39,7 @@ def append(chat_id, request_id, attempt, payload):
 
 
 def page(chat_id, request_id, attempt, after=0, limit=100):
+    """按执行尝试和游标读取有序事件页，同时返回最新请求状态。"""
     conn = store._get_conn()
     with store._lock:
         current = head(chat_id, request_id)

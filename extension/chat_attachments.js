@@ -1,5 +1,5 @@
 /* Chat 图片文件与附件接口；不参与自动化的 Data URL 协议。 */
-(() => {
+(/** 封装并导出聊天图片处理及附件请求接口。 */ () => {
   const MAX_BYTES = 10 * 1024 * 1024;
   const MAX_PIXELS = 20_000_000;
   const errors = {
@@ -18,11 +18,14 @@
     session_deleted: '会话已删除。'
   };
 
+  /** 将附件字节数格式化为 KiB 或 MiB，供界面展示。 */
   function format(bytes) {
     return bytes < 1024 * 1024 ? `${(bytes / 1024).toFixed(1)} KiB` : `${(bytes / 1024 / 1024).toFixed(2)} MiB`;
   }
 
+  /** 根据文件头识别支持的图片格式，并检查 PNG 与 WebP 是否包含动画。 */
   function detect(bytes) {
+    /** 把指定字节区间转换为文件签名或数据块类型字符串。 */
     const text = (start, end) => String.fromCharCode(...bytes.slice(start, end));
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     if (bytes.length >= 8 && text(0, 8) === '\x89PNG\r\n\x1a\n') {
@@ -39,6 +42,7 @@
       for (let p = 12; p + 8 <= bytes.length;) {
         const length = view.getUint32(p + 4, true);
         if (text(p, p + 4) === 'ANIM') return { mime: 'image/webp', animated: true };
+        // RIFF 数据块按偶数字节对齐，奇数长度后还需跨过一个填充字节。
         p += 8 + length + length % 2;
       }
       return { mime: 'image/webp', animated: false };
@@ -46,6 +50,7 @@
     throw new Error(errors.attachment_type_unsupported);
   }
 
+  /** 校验图片大小及像素数，将动画转为首帧，并生成上传内容与本地预览。 */
   async function prepare(file) {
     if (!file.size || file.size > MAX_BYTES) throw new Error(errors.attachment_too_large);
     const bytes = new Uint8Array(await file.arrayBuffer());
@@ -61,7 +66,7 @@
         const canvas = document.createElement('canvas');
         canvas.width = width; canvas.height = height;
         canvas.getContext('2d').drawImage(bitmap, 0, 0);
-        blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+        blob = await new Promise(/** 将已绘制的首帧编码为 PNG 二进制数据。 */ resolve => canvas.toBlob(resolve, 'image/png'));
         if (!blob) throw new Error(errors.attachment_invalid_image);
       }
     } finally { bitmap.close(); }
@@ -71,6 +76,7 @@
       clientId: crypto.randomUUID() };
   }
 
+  /** 发送带鉴权、取消和超时约束的附件请求，把受控错误码转换为提示信息。 */
   async function request(url, apiKey, options = {}) {
     const headers = new Headers(options.headers);
     if (apiKey) headers.set('Authorization', `Bearer ${apiKey}`);
@@ -87,6 +93,7 @@
     return response;
   }
 
+  /** 提交图片内容及客户端附件标识，返回后端保存的附件信息。 */
   async function upload(endpoint, apiKey, image, signal) {
     const form = new FormData();
     form.append('file', image.blob, image.name);
@@ -95,6 +102,7 @@
     return (await request(endpoint, apiKey, { method: 'POST', body: form, signal })).json();
   }
 
+  /** 申请临时访问路径，校验其属于附件接口后获取图片并创建本地预览地址。 */
   async function preview(endpoint, apiKey, downloadUrl, signal) {
     const access = await (await request(endpoint, apiKey, { method: 'POST', signal })).json();
     // 相对路径由当前后端解析；不跟随响应提供的任意远程 URL。
@@ -103,13 +111,14 @@
     return URL.createObjectURL(await response.blob());
   }
 
+  /** 创建图片放大弹窗，并在关闭时移除弹窗节点。 */
   function enlarge(src) {
     const dialog = document.createElement('dialog');
     dialog.className = 'chat-image-dialog';
     const close = document.createElement('button'); close.textContent = '关闭'; close.type = 'button';
     const img = document.createElement('img'); img.src = src; img.alt = '图片放大预览';
-    close.addEventListener('click', () => dialog.close());
-    dialog.addEventListener('close', () => dialog.remove());
+    close.addEventListener('click', /** 响应关闭按钮，关闭图片弹窗。 */ () => dialog.close());
+    dialog.addEventListener('close', /** 弹窗关闭后移除其 DOM 节点。 */ () => dialog.remove());
     dialog.append(close, img); document.body.appendChild(dialog); dialog.showModal();
   }
 

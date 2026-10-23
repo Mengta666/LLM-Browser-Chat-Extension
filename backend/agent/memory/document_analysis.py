@@ -30,6 +30,7 @@ INSTRUCTION = ('你是只读文档分析器。只完成给定分析任务，不�
 
 def explicit_request(question):
     # 只检查问题的边界说明，不从长材料内部的“全文”等文字触发批处理。
+    """判断问题是否明确要求全文分析或继续分析，避免普通追问自动启动全文任务。"""
     text = re.sub(r'```[\s\S]*?```', '', question)
     edge = text if len(text) <= 2000 else text[:500] + '\n' + text[-500:]
     if re.search(r'(?:不需要|不要|不必|无需).{0,6}(?:全文|通读|逐段|整篇|整份)', edge):
@@ -38,6 +39,7 @@ def explicit_request(question):
 
 
 def parse(arguments):
+    """校验全文分析工具的来源、任务和续接参数，返回规范化参数。"""
     try:
         args = json.loads(arguments) if isinstance(arguments, str) else arguments
     except (ValueError, TypeError):
@@ -51,16 +53,19 @@ def parse(arguments):
 
 
 def _messages(task, source_ref, data, reducing=False):
+    """区分原文片段和派生摘要，组装分片分析或归并请求。"""
     return [{'role': 'system', 'content': INSTRUCTION}, {'role': 'user', 'content': json.dumps(
         {'task': task, 'source_ref': source_ref, 'kind': 'derived_summaries' if reducing else 'original_fragment', 'data': data}, ensure_ascii=False)}]
 
 
 def _limit(counter):
+    """计算单次文档分析可用输入预算，保留模型输出和安全额度。"""
     return min(C.CHAT_DOCUMENT_BATCH_TOKENS, min(counter.model_window or C.CHAT_CONTEXT_LENGTH, C.CHAT_CONTEXT_LENGTH)
                - C.CHAT_MAX_OUTPUT_TOKENS - C.CHAT_CONTEXT_SAFETY_TOKENS)
 
 
 def _result(job, counter, cap):
+    """在结果额度内汇总已完成的分析节点，并报告仍未处理的原文范围。"""
     payload = {**jobs.progress(job), 'kind': 'document_analysis', 'derived': True,
                'completed': job['status'] == 'completed', 'analyses': [],
                'resume_args': {'source_ref': f'M{job["source_seq"]}', 'task': job['task'], 'job_id': job['job_id']}}
@@ -83,6 +88,7 @@ def _result(job, counter, cap):
 
 def run(args, *, chat_id, request_id, attempt, upto_seq, client, model, counter, deadline,
         max_result_tokens=2000, continuing=False):
+    """按检查点分片分析已保存原文，受调用次数和时间约束地归并结果。"""
     existing = jobs.request_progress(chat_id, request_id)
     if args.get('job_id') and not existing and not continuing:
         raise store.SessionError('document_resume_confirmation_required')
@@ -98,6 +104,7 @@ def run(args, *, chat_id, request_id, attempt, upto_seq, client, model, counter,
     source_ref = args['source_ref']
 
     def invoke(data, reducing=False):
+        """执行一次分片分析或摘要归并，校验响应并记录调用及 token 用量。"""
         messages = _messages(job['task'], source_ref, data, reducing)
         measured = counter(messages)
         if measured > _limit(counter):
@@ -128,6 +135,7 @@ def run(args, *, chat_id, request_id, attempt, upto_seq, client, model, counter,
         return choice.message.content, measured, output_tokens, elapsed
 
     def reduce_once(nodes):
+        """选取能装入输入预算的连续分析节点，归并后保存替换检查点。"""
         group = []
         for node in nodes:
             candidate = group + [{'offset': node['offset'], 'end': node['end'], 'analysis': node['content']}]

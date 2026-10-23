@@ -39,6 +39,7 @@ class SearchResult:
 
 
 def search_searxng_with_status(query: str, count: int = 5, *, timeout: float | None = None) -> tuple[list[SearchResult], dict]:
+    """调用 SearXNG 并规范化搜索结果，同时返回引擎状态和耗时信息。"""
     started = time.monotonic()
     meta = {'outcome': 'error', 'searched_at': datetime.now(timezone.utc).isoformat(),
             'unresponsive_engines': []}
@@ -100,4 +101,5 @@ def search_searxng_with_status(query: str, count: int = 5, *, timeout: float | N
 
 
 def search_searxng(query: str, count: int = 5) -> list[SearchResult]:
+    """调用 SearXNG 状态接口并仅返回搜索结果列表。"""
     return search_searxng_with_status(query, count)[0]

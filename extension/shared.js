@@ -7,6 +7,7 @@ const MAX_AGENT_TASK_LENGTH = 8000;
 const DEFAULT_BACKEND_API_URL = 'http://127.0.0.1:8000/v1';
 const CUSTOM_API_BASE_URLS_KEY = 'customApiBaseUrls';
 
+/** 按地址前缀识别受支持的 IPv4 私网、回环和本地链路地址。 */
 function isPrivateIpv4Host(host) {
   return /^127\./.test(host)
     || /^10\./.test(host)
@@ -17,6 +18,7 @@ function isPrivateIpv4Host(host) {
     || /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(host);
 }
 
+/** 识别本地主机及受支持的 IPv4、IPv6 私网地址，包括 IPv4 映射形式。 */
 function isPrivateOrLocalHost(hostname) {
   const rawHost = String(hostname || '').trim().toLowerCase();
   if (!rawHost) return false;
@@ -39,6 +41,7 @@ function isPrivateOrLocalHost(hostname) {
   return false;
 }
 
+/** 校验并规范化后端基址，仅允许 HTTPS 或本地 HTTP，拒绝凭证、查询和片段。 */
 function normalizeApiBaseUrl(value) {
   try {
     const url = new URL(String(value || ''));

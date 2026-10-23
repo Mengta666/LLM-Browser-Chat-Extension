@@ -1,4 +1,5 @@
-(() => {
+(/** 封装并导出点击状态读取与命中检查接口。 */ () => {
+  /** 读取复选框、单选框或开关的实时状态，并提供用于前后核对的控件身份。 */
   function describeCheckable() {
     const control = this.tagName === 'LABEL' ? this.control : this;
     if (!control?.isConnected) return null;
@@ -17,7 +18,9 @@
       disabled: control.matches(':disabled') || control.getAttribute('aria-disabled') === 'true' };
   }
 
+  /** 验证指定点击点实际命中目标，并排除遮挡、过期节点及独立子控件。 */
   function inspectPoint(x, y, q, ...independent) {
+    /** 将 DOM 节点转换为用于命中诊断的标签、角色和层级路径。 */
     const brief = node => {
       if (!node) return null;
       const path = [];
@@ -27,6 +30,7 @@
       return { tag: node.tagName?.toLowerCase() || '', role: node.getAttribute?.('role') || '', path: path.join('/') };
     };
     const result = { ok: false, reason: '', target: brief(this), hit: null, roots: [] };
+    /** 保留命中诊断信息，生成带失败原因的检查结果。 */
     const fail = reason => ({ ...result, reason });
     if (!this.isConnected) return fail('target_stale');
     const control = this.tagName === 'LABEL' ? this.control : this;
@@ -36,6 +40,7 @@
     const left = Math.min(q[0], q[2], q[4], q[6]), top = Math.min(q[1], q[3], q[5], q[7]);
     const width = Math.max(q[0], q[2], q[4], q[6]) - left, height = Math.max(q[1], q[3], q[5], q[7]) - top;
     if (width <= 0 || height <= 0 || r.width <= 0 || r.height <= 0) return fail('no_geometry');
+    // 按元素边界的相对比例换算到所属文档的视口坐标，再执行命中测试。
     const lx = r.x + (x - left) * r.width / width, ly = r.y + (y - top) * r.height / height;
     const doc = this.ownerDocument;
     let at = doc.elementFromPoint(lx, ly);
@@ -58,12 +63,13 @@
       at = inner;
     }
     result.hit = brief(at);
+    /** 沿普通 DOM 和 Shadow DOM 宿主链判断节点归属。 */
     const contains = (parent, child) => {
       for (let node = child; node; node = node.parentNode || node.host) if (node === parent) return true;
       return false;
     };
-    if (independent.some(child => child !== (this.tagName === 'LABEL' ? this.control : null) && contains(child, at))) return fail('independent_control');
-    const matches = contains(this, at) || (this.tagName === 'INPUT' && Array.from(this.labels || []).some(label => contains(label, at))) ||
+    if (independent.some(/** 检查命中节点是否属于另一个独立子控件。 */ child => child !== (this.tagName === 'LABEL' ? this.control : null) && contains(child, at))) return fail('independent_control');
+    const matches = contains(this, at) || (this.tagName === 'INPUT' && Array.from(this.labels || []).some(/** 判断命中节点是否位于关联标签内。 */ label => contains(label, at))) ||
       (this.tagName === 'LABEL' && this.control === at);
     return matches ? { ...result, ok: true } : fail('occluded');
   }

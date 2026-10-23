@@ -18,6 +18,7 @@ from api import final_answer, chat_tasks
 
 
 def handle(item):
+    """处理可靠聊天请求的幂等提交和恢复，选择事件订阅或等待持久化结果。"""
     from api import chat
     turn_deadline = time.monotonic() + max(1, min(570, C.CHAT_TURN_TIMEOUT))
     if not item.chat_id or not item.request_id or item.expected_last_seq is None:
@@ -64,10 +65,12 @@ def handle(item):
         return JSONResponse(status_code=503, content={'error': {'code': 'history_unavailable'}})
 
     def events(turn):
+        """准备上下文并执行模型及工具链路，先保存轮次再发送完成确认。"""
         saved = turn['status'] in ('completed', 'partial')
         finish_reason = 'stop'
         error_message = ''
         def check_active():
+            """确认当前聊天执行尝试仍有效，阻止取消或旧代次继续写入。"""
             store.ensure_turn_active(item.chat_id, item.request_id, turn['attempt'])
         try:
             if saved:
@@ -225,6 +228,7 @@ def handle(item):
                     raise store.SessionError('model_response_incomplete', 502)
                 if time.monotonic() >= deadline:
                     raise store.SessionError('time_budget_exceeded', 502)
+                # 文本流到达客户端不代表已保存，提交完整轮次后才能发送 persisted=True 的回执。
                 record = store.complete_turn(item.chat_id, item.request_id, turn['attempt'], full_text, steps, finish_reason)
                 saved = True
                 if record['status'] == 'completed' and not item.continuation_of:

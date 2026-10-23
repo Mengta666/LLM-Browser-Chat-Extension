@@ -42,6 +42,7 @@ class ReviewRequired(ValueError):
 
 
 def settings():
+    """读取字段审阅开关、模型和预算配置，并校验参数是否合法。"""
     result = {'enabled': os.getenv('AGENT_FIELD_REVIEW_ENABLED', 'true').lower() == 'true',
               'model': os.getenv('AGENT_FIELD_REVIEW_MODEL', '').strip(),
               'timeout': float(os.getenv('AGENT_FIELD_REVIEW_TIMEOUT', '60')),
@@ -57,10 +58,12 @@ def settings():
 
 
 def _digest(value):
+    """对规范化后的结构化数据计算摘要，用于标识审阅输入是否变化。"""
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
 
 
 def _units(text, prefix, edits=None):
+    """把文本划分为带编号和字符范围的审阅单元，按需标记局部编辑范围。"""
     rows = []
     for match in re.finditer(r'[^\n。！？!?]+?(?:[。！？!?]+|(?<=\.)[ \t]+|(?=\n|$))|[。！？!?]+', text):
         cuts = sorted({match.start(), match.end(), *(n for e in edits or [] for n in (e['start'], e['end'])
@@ -76,6 +79,7 @@ def _units(text, prefix, edits=None):
 
 
 def _context(page, element):
+    """提取目标字段上下文和邻近字段信息，供审阅判断内容应归入哪个字段。"""
     keys = ('tag', 'type', 'role', 'name', 'html_id', 'aria_label', 'placeholder', 'form_context', 'maxlength')
     context = {'id': 'F1', **{k: element.get(k, '') for k in keys}}
     peers = [e for e in page.interactive_elements if e is not element
@@ -95,6 +99,7 @@ def _context(page, element):
 
 
 def packet(session, artifact, page, element):
+    """沿成果依赖收集证据，组装包含字段、待填稿和原文依据的审阅输入。"""
     state = session.task_state
     field, neighbors = _context(page, element)
     evidence = []
@@ -107,6 +112,7 @@ def packet(session, artifact, page, element):
                          'version': {k: source.get(k) for k in ('kb_id', 'doc_id', 'parse_id', 'index_run_id', 'structure_id')}})
     visited = set()
     def collect(row):
+        """递归收集成果及其依赖的证据，使用已访问集合避免重复展开。"""
         if row['id'] in visited:
             return
         visited.add(row['id'])
@@ -131,6 +137,7 @@ def packet(session, artifact, page, element):
 
 
 def enqueue(session, artifact, page):
+    """为当前稿件和字段登记审阅任务，输入一致时复用已有审阅结果。"""
     config = settings()
     if not config['enabled'] or not artifact.get('field_intent'):
         return None
@@ -177,6 +184,7 @@ def enqueue(session, artifact, page):
 
 
 def require(session, artifact, page, element):
+    """检查待填稿是否满足审阅要求，未通过时阻止填写并返回审阅需求。"""
     if not settings()['enabled'] or not artifact.get('field_intent'):
         return
     job = enqueue(session, artifact, page)
@@ -185,6 +193,7 @@ def require(session, artifact, page, element):
 
 
 def _validate(raw, payload):
+    """校验模型审阅结论和问题引用，将合法结果转换为内部审阅状态。"""
     result = json.loads(raw)
     if (not isinstance(result, dict) or set(result) != {'verdict', 'issues'}
             or result['verdict'] not in ('pass', 'needs_revision', 'uncertain')
@@ -218,6 +227,7 @@ def _validate(raw, payload):
 
 
 def process_pending(session, page, client):
+    """在时间和调用预算内处理一个待审任务，保存通过、修订或不确定的结论。"""
     if not settings()['enabled']:
         return False
     state = session.task_state
@@ -313,5 +323,6 @@ def process_pending(session, page, client):
 
 
 def public(session):
+    """返回可展示的审阅状态，去除完整审阅输入和内部目标身份。"""
     return [{k: v for k, v in job.items() if k not in ('payload', 'target_identity')}
             for job in session.task_state.get('field_review_jobs', {}).values()]

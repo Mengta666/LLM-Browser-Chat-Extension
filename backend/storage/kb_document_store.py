@@ -9,10 +9,12 @@ from storage import kb_store as KS
 
 
 def now():
+    """返回当前 UTC 时间，供文档处理状态记录使用。"""
     return datetime.now(timezone.utc).isoformat()
 
 
 def owned(conn, kb_id, doc_id):
+    """校验知识库归属并读取其未删除文档。"""
     KS._owned_kb(conn, kb_id, CHAT_USER_ID, active=True)
     doc = conn.execute("SELECT * FROM kb_docs WHERE kb_id=? AND doc_id=? AND deleted_at=''",
                        (kb_id, doc_id)).fetchone()
@@ -22,11 +24,13 @@ def owned(conn, kb_id, doc_id):
 
 
 def document(kb_id, doc_id):
+    """在事务中读取指定知识库拥有的文档元数据。"""
     with KS._transaction() as conn:
         return owned(conn, kb_id, doc_id)
 
 
 def create_pdf(kb_id, doc_id, filename, path, sha256, pages, fingerprint, config):
+    """检查 PDF 重复上传，保存原件元数据并创建初始解析版本。"""
     with KS._transaction() as conn:
         KS._owned_kb(conn, kb_id, CHAT_USER_ID, active=True)
         if conn.execute("SELECT 1 FROM kb_docs WHERE kb_id=? AND content_hash=? AND deleted_at=''", (kb_id, sha256)).fetchone():
@@ -38,6 +42,7 @@ def create_pdf(kb_id, doc_id, filename, path, sha256, pages, fingerprint, config
 
 
 def create_text(kb_id,doc_id,filename,file_type,path,sha256,fingerprint,config):
+    """检查文本重复上传，保存原件元数据并创建文本解析版本。"""
     with KS._transaction() as conn:
         KS._owned_kb(conn,kb_id,CHAT_USER_ID,active=True)
         if conn.execute("SELECT 1 FROM kb_docs WHERE kb_id=? AND content_hash=? AND deleted_at=''",(kb_id,sha256)).fetchone():
@@ -49,6 +54,7 @@ def create_text(kb_id,doc_id,filename,file_type,path,sha256,fingerprint,config):
 
 
 def _new_parse(conn, doc_id, pages, fingerprint, config):
+    """创建新的排队解析版本，并更新文档当前活动解析标识。"""
     parse_id = "pv_" + uuid4().hex
     conn.execute("INSERT INTO kb_parse_versions(parse_id,doc_id,fingerprint,config_json,status,page_count,created_at,updated_at) VALUES(?,?,?,?,'queued',?,?,?)",
                  (parse_id, doc_id, fingerprint, json.dumps(config, sort_keys=True), pages, now(), now()))
@@ -58,6 +64,7 @@ def _new_parse(conn, doc_id, pages, fingerprint, config):
 
 
 def restart(kb_id, doc_id, fingerprint, config, *, reparse=False, reindex=False):
+    """按重新解析或索引模式恢复文档任务，检查既有版本与配置兼容性。"""
     with KS._transaction() as conn:
         doc = owned(conn, kb_id, doc_id)
         if not doc['original_path']:
@@ -78,6 +85,7 @@ def restart(kb_id, doc_id, fingerprint, config, *, reparse=False, reindex=False)
 
 
 def claim(kb_id, doc_id, parse_id):
+    """为排队解析任务分配独占租约，无法领取时返回空值。"""
     lease = uuid4().hex
     with KS._transaction() as conn:
         doc = owned(conn, kb_id, doc_id)
@@ -89,6 +97,7 @@ def claim(kb_id, doc_id, parse_id):
 
 
 def current(conn, kb_id, doc_id, parse_id, lease):
+    """在调用方事务中校验活动解析版本及租约，返回文档和任务状态。"""
     doc = owned(conn, kb_id, doc_id)
     job = conn.execute("SELECT * FROM kb_parse_versions WHERE parse_id=?", (parse_id,)).fetchone()
     if (doc['active_parse_id'] != parse_id or not job or job['lease'] != lease
@@ -98,11 +107,13 @@ def current(conn, kb_id, doc_id, parse_id, lease):
 
 
 def check(kb_id, doc_id, parse_id, lease):
+    """在新事务内检查文档任务租约是否仍有效。"""
     with KS._transaction() as conn:
         return current(conn, kb_id, doc_id, parse_id, lease)
 
 
 def stop(kb_id, doc_id):
+    """停止当前文档任务并使已有解析租约失效。"""
     with KS._transaction() as conn:
         doc = owned(conn, kb_id, doc_id)
         conn.execute("UPDATE kb_parse_versions SET status='cancelled',lease='',error='用户取消，已完成页保留',updated_at=? WHERE parse_id=? AND status IN ('queued','parsing','indexing')",
@@ -113,6 +124,7 @@ def stop(kb_id, doc_id):
 
 
 def fail(parse_id, lease, error):
+    """仅把匹配租约的解析任务置为失败，避免覆盖新任务。"""
     with KS._transaction() as conn:
         changed = conn.execute("UPDATE kb_parse_versions SET status='failed',lease='',error=?,updated_at=? WHERE parse_id=? AND lease=? AND status IN ('parsing','indexing')",
                      (error[:500], now(), parse_id, lease))
@@ -121,6 +133,7 @@ def fail(parse_id, lease, error):
 
 
 def progress(doc):
+    """汇总解析页数、失败页、索引计数和结构质量为文档进度视图。"""
     doc={**doc,'original_available':bool(doc.get('original_path')),
          'source_kind':('pdf_page' if doc['file_type']=='pdf' else 'text_span') if doc.get('published_parse_id') else 'legacy_chunk'}
     if not doc.get('active_parse_id'):
@@ -142,6 +155,7 @@ def progress(doc):
 
 
 def begin_page(kb_id, doc_id, parse_id, lease, page, width, height):
+    """在有效租约下登记待解析页面及其渲染尺寸。"""
     with KS._transaction() as conn:
         current(conn, kb_id, doc_id, parse_id, lease)
         conn.execute("""INSERT INTO kb_pages(parse_id,page,status,width,height,coordinate_space,rotation,raw_path,warnings_json,attempts)
@@ -151,6 +165,7 @@ def begin_page(kb_id, doc_id, parse_id, lease, page, width, height):
 
 
 def fail_page(kb_id, doc_id, parse_id, lease, page, error, raw_path=''):
+    """保存单页失败状态和可选原始响应路径。"""
     with KS._transaction() as conn:
         current(conn, kb_id, doc_id, parse_id, lease)
         conn.execute("UPDATE kb_pages SET status=?,error=?,truncated=?,raw_path=? WHERE parse_id=? AND page=? AND status='parsing'",
@@ -159,6 +174,7 @@ def fail_page(kb_id, doc_id, parse_id, lease, page, error, raw_path=''):
 
 
 def save_page(kb_id, doc_id, parse_id, lease, result, raw_path, blocks, identifiers):
+    """原子保存页面结果、不可变原文块及标识符，并推进页面处理状态。"""
     with KS._transaction() as conn:
         current(conn, kb_id, doc_id, parse_id, lease)
         page = result['page_number']
@@ -184,11 +200,13 @@ def save_page(kb_id, doc_id, parse_id, lease, result, raw_path, blocks, identifi
 
 
 def pages(parse_id):
+    """按页码读取解析版本中的页面记录。"""
     with KS._transaction() as conn:
         return [dict(r) for r in conn.execute("SELECT * FROM kb_pages WHERE parse_id=? ORDER BY page", (parse_id,))]
 
 
 def blocks(parse_id, page=None, *, structure_id=None):
+    """按页序读取原始块或指定结构投影中的块，并解码位置和结构字段。"""
     with KS._transaction() as conn:
         table = 'kb_blocks' if structure_id is None else 'kb_resolved_blocks'
         condition, params = 'parse_id=?', [parse_id]
@@ -203,6 +221,7 @@ def blocks(parse_id, page=None, *, structure_id=None):
 
 
 def save_structure(kb_id, doc_id, parse_id, lease, blocks):
+    """在尚未发布索引时保存块结构信息，保护已发布解析结果不被改写。"""
     with KS._transaction() as conn:
         current(conn, kb_id, doc_id, parse_id, lease)
         if conn.execute("SELECT 1 FROM kb_index_runs WHERE parse_id=? AND status='published'", (parse_id,)).fetchone():
@@ -213,6 +232,7 @@ def save_structure(kb_id, doc_id, parse_id, lease, blocks):
 
 
 def prepare_index(kb_id, doc_id, parse_id, lease, fingerprint, config, chunks, structure_id=''):
+    """恢复配置匹配的暂存索引，或登记新索引及其完整片段计划。"""
     with KS._transaction() as conn:
         doc, job = current(conn, kb_id, doc_id, parse_id, lease)
         if doc['file_type']!='pdf' and not conn.execute('SELECT 1 FROM kb_text_sources WHERE parse_id=?',(parse_id,)).fetchone():
@@ -237,17 +257,20 @@ def prepare_index(kb_id, doc_id, parse_id, lease, fingerprint, config, chunks, s
 
 
 def index_chunks(run_id, offset=0, limit=32):
+    """按片段编号分页读取待向量化的索引内容。"""
     with KS._transaction() as conn:
         return [dict(r) for r in conn.execute("SELECT * FROM kb_chunks WHERE run_id=? AND chunk_idx>=? ORDER BY chunk_idx LIMIT ?", (run_id, offset, limit))]
 
 
 def advance_index(kb_id, doc_id, parse_id, lease, run_id, count):
+    """在有效租约下更新索引已写入片段数量。"""
     with KS._transaction() as conn:
         current(conn, kb_id, doc_id, parse_id, lease)
         conn.execute("UPDATE kb_index_runs SET indexed_count=? WHERE run_id=? AND parse_id=? AND status='building'", (count, run_id, parse_id))
 
 
 def publish(kb_id, doc_id, parse_id, lease, run_id, *, review_id=None):
+    """验证暂存索引完成且基线有效，原子切换文档的已发布解析、结构和索引版本。"""
     with KS._transaction() as conn:
         doc, _ = current(conn, kb_id, doc_id, parse_id, lease)
         if review_id:
@@ -273,6 +296,7 @@ def publish(kb_id, doc_id, parse_id, lease, run_id, *, review_id=None):
 
 
 def resolve_version(kb_id, doc_id, parse_id=None):
+    """解析显式或默认解析版本，只允许访问已有发布索引支撑的版本。"""
     with KS._transaction() as conn:
         doc = owned(conn, kb_id, doc_id)
         version = parse_id or doc['published_parse_id']

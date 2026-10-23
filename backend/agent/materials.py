@@ -21,10 +21,12 @@ FIELD_KEYS = ('tag', 'type', 'role', 'name', 'html_id', 'text', 'aria_label', 'p
 
 
 def initial_state():
+    """初始化任务内字段物料表、编号计数和错误状态。"""
     return {'fields': {}, 'next_field': 1, 'next_material': 1, 'error': ''}
 
 
 def validate_kb(kb_id):
+    """检查绑定知识库存在且属于当前用户，否则拒绝启动取材任务。"""
     from storage import kb_store as KS
     from agent.memory.config import CHAT_USER_ID
     with KS._transaction() as conn:
@@ -32,16 +34,19 @@ def validate_kb(kb_id):
 
 
 def field_description(element):
+    """提取非空的字段描述属性，供目标识别和物料绑定使用。"""
     return {key: element[key] for key in FIELD_KEYS if element.get(key) not in (None, '', [])}
 
 
 def field_signature(element, page, entity):
+    """结合页面、业务对象和字段描述计算签名，用于区分不同填写目标。"""
     origin = urlsplit(page.url)
     identity = [origin.scheme, origin.netloc, origin.path, entity, field_description(element)]
     return hashlib.sha256(json.dumps(identity, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
 
 
 def collect_fields(session, page, args):
+    """从当前观察登记或复用目标字段，返回带稳定字段编号的记录。"""
     indices = args.get('indices')
     entity = args.get('entity', '')
     if (not isinstance(entity, str) or not entity.strip() or len(entity) > 300 or
@@ -87,6 +92,7 @@ def collect_fields(session, page, args):
 
 
 def transform_value(raw, transform, field, quotes):
+    """按已声明的单位或日期规则转换原始物料，拒绝无法核实的转换。"""
     if set(transform) - {'kind','from','to'}:
         raise ValueError('转换仅接受 kind、from、to；例如 {"kind":"unit","from":"MPa","to":"kPa"}')
     kind = transform.get('kind', 'identity')
@@ -138,6 +144,7 @@ def transform_value(raw, transform, field, quotes):
 
 
 def public_state(session):
+    """提取可供前端展示的字段物料、来源和填写进度。"""
     return {'kb_id': session.kb_id, 'error': session.material_state.get('error', ''),
             'fields': [{k: f.get(k) for k in ('field_id', 'material_id', 'entity', 'label', 'status',
                         'raw_value', 'value', 'transform', 'sources', 'reason', 'fill_status')}
@@ -150,6 +157,7 @@ class FieldSnapshotRequired(ValueError):
 
 class FieldLengthExceeded(ValueError):
     def __init__(self, *, artifact_id, subject, label, index, maximum, actual, signature, target_identity):
+        """保存超长稿件、字段身份和 UTF-16 长度约束，供模型定向精简。"""
         super().__init__(f'字段“{label}”最多 {maximum} 个 UTF-16 长度单位，待填成果 {artifact_id} 为 {actual}，超出 {actual - maximum}；未写入')
         self.feedback = {'code': 'field_value_too_long', 'error': str(self),
             'artifact_id': artifact_id, 'subject': subject, 'field_label': label, 'index': index,
@@ -158,6 +166,7 @@ class FieldLengthExceeded(ValueError):
 
 
 def validate_snapshot(snapshot):
+    """验证字段快照的格式、长度和摘要字段，拒绝不完整的快照协议。"""
     if snapshot is not None and (not isinstance(snapshot, dict) or snapshot.get('format') != 'text-v1'
             or not isinstance(snapshot.get('id'), str) or not snapshot['id']
             or not isinstance(snapshot.get('digest'), str) or not re.fullmatch(r'[0-9a-f]{64}', snapshot['digest'])
@@ -166,6 +175,7 @@ def validate_snapshot(snapshot):
 
 
 def bind_action(session, page, action, args):
+    """绑定物料动作；校验失败时用事先保存的副本恢复物料状态。"""
     before = copy.deepcopy(session.material_state)
     try:
         _bind_action(session, page, action, args)
@@ -175,6 +185,7 @@ def bind_action(session, page, action, args):
 
 
 def _bind_action(session, page, action, args):
+    """核对成果来源、字段身份、原值和填写约束，将可用物料绑定到页面动作。"""
     if action.type == 'read_field':
         from agent.field_reads import prepare
         prepare(session, page, action, args)
@@ -335,6 +346,7 @@ def _bind_action(session, page, action, args):
 
 
 def verification_matches(action, result):
+    """核对回读值、选项身份和物料编号，判断回执是否验证了本次填写。"""
     check = result.material_verification or {}
     expected = action.params.get('option_text', action.params.get('text', ''))
     expected = expected.replace('\r\n', '\n').replace('\r', '\n')
@@ -348,6 +360,7 @@ def verification_matches(action, result):
 
 
 def record_result(session, action, result):
+    """根据真实执行回执更新字段填写状态及相关修稿、审阅记录。"""
     material_id = action.params.get('material_id')
     if not material_id:
         return
@@ -372,6 +385,7 @@ def record_result(session, action, result):
 
 
 def incomplete(session):
+    """汇总尚未完成填写或修复的字段，用于任务收尾检查。"""
     fields = [f['label'] for f in session.material_state['fields'].values()
             if f['fill_status'] not in ('verified', 'not_dispatched')
             or f['fill_status'] == 'verified' and f['status'] != 'available']
@@ -385,6 +399,7 @@ def incomplete(session):
 
 
 def revalidate(session):
+    """重新检查任务来源及成果有效性，并将失效传播到依赖物料的字段。"""
     from agent import task_workspace as W
     valid = W.revalidate(session)
     for field in session.material_state.get('fields', {}).values():
@@ -396,6 +411,7 @@ def revalidate(session):
 
 
 def context(session):
+    """把字段物料状态序列化为上下文数据，供下一步决策参考。"""
     view = public_state(session)
     # 主执行模型只需要核准值及来源位置，不反复携带检索正文；完整引文仍留在账本和界面。
     for field in view['fields']:

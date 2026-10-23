@@ -26,6 +26,7 @@ router = APIRouter(prefix="/v1/kb", tags=["kb"])
 
 @contextmanager
 def _kb_errors():
+    """将知识库业务错误转换为相应 HTTP 错误，统一接口异常处理。"""
     try:
         yield
     except KS.KBNotFound as exc:
@@ -252,12 +253,14 @@ def get_doc_status(kb_id: str, doc_id: str):
 
 @router.post('/{kb_id}/docs/{doc_id}/retry')
 def retry_doc(kb_id: str, doc_id: str, reparse: bool = False, reindex: bool = False):
+    """按用户选择恢复文档检查点、重新解析或重新索引。"""
     with _kb_errors():
         return KB.retry_document(kb_id, doc_id, reparse=reparse, reindex=reindex)
 
 
 @router.post('/{kb_id}/docs/{doc_id}/cancel')
 def cancel_doc(kb_id: str, doc_id: str):
+    """取消指定文档的后台处理并返回任务状态。"""
     with _kb_errors():
         return KB.cancel_document(kb_id, doc_id)
 
@@ -267,6 +270,7 @@ def document_outline(kb_id: str, doc_id: str, parse_id: str | None = None,
                      page: int | None = Query(None, ge=1), offset: int = Query(0, ge=0), limit: int = Query(20, ge=1, le=50),
                      section_id: str | None = None, view: str = 'blocks', structure_id: str | None = None,
                      index_run_id: str | None = None, node_id: str | None = None, depth: int = Query(1,ge=1,le=3)):
+    """读取固定文档版本的分页目录或结构节点视图。"""
     from rag.document_retrieval import outline
     with _kb_errors():
         return outline(kb_id, doc_id, parse_id, page, offset, limit, section_id, view,structure_id,index_run_id,node_id,depth)
@@ -279,6 +283,7 @@ def document_read(kb_id: str, doc_id: str, block_id: str | None = None, parse_id
                   include_related: bool = False, row_start: int | None = Query(None, ge=0), row_end: int | None = Query(None, ge=1),
                   structure_id: str | None = None,index_run_id: str | None = None,node_id: str | None = None,
                   cursor: int | None = Query(None,ge=0),block_offset: int | None = Query(None,ge=0)):
+    """根据块、范围或结构节点读取原文，在单次结果限制内返回定位和续读参数。"""
     from rag.document_retrieval import read
     from search.kb_documents import trim_row
     from search.kb_protocol import from_legacy, to_legacy
@@ -321,6 +326,7 @@ def document_read(kb_id: str, doc_id: str, block_id: str | None = None, parse_id
 def search_document(kb_id: str, doc_id: str, query: str = Query(min_length=1, max_length=2000),
                     page: int | None = Query(None, ge=1), section_id: str | None = None,
                     node_id: str | None = None, structure_id: str | None = None, index_run_id: str | None = None):
+    """在文档快照中检索相关片段，返回预览、定位信息和检索元数据。"""
     from rag.document_retrieval import search
     from storage.kb_structure_store import snapshot
     from search.kb_documents import trim_row
@@ -335,6 +341,7 @@ def search_document(kb_id: str, doc_id: str, query: str = Query(min_length=1, ma
 @router.get('/{kb_id}/docs/{doc_id}/text')
 def document_text(kb_id: str, doc_id: str, parse_id: str, offset: int = Query(0,ge=0),
                   end: int | None = Query(None,ge=0)):
+    """按字符范围读取文本原文，返回行号定位和下一次续读偏移。"""
     from storage import kb_document_store as DS, kb_text_store as TS
     with _kb_errors():
         doc, version=DS.resolve_version(kb_id,doc_id,parse_id)
@@ -362,6 +369,7 @@ class StructurePublishRequest(BaseModel):
 
 @router.post('/{kb_id}/docs/{doc_id}/structure-review/{review_id}/publish')
 def publish_structure_review(kb_id: str, doc_id: str, review_id: str, request: StructurePublishRequest):
+    """以预期索引版本为基线发布已完成的结构审阅建议。"""
     from rag.structure_publication import start
     with _kb_errors():
         return start(kb_id, doc_id, review_id, request.expected_run_id)
@@ -369,6 +377,7 @@ def publish_structure_review(kb_id: str, doc_id: str, review_id: str, request: S
 
 @router.get('/{kb_id}/docs/{doc_id}/structure-review/{review_id}/publication')
 def get_structure_publication(kb_id: str, doc_id: str, review_id: str):
+    """查询结构建议的发布状态及其是否为文档当前版本。"""
     from rag.structure_publication import get
     with _kb_errors():
         return get(kb_id, doc_id, review_id)
@@ -376,6 +385,7 @@ def get_structure_publication(kb_id: str, doc_id: str, review_id: str):
 
 @router.get('/{kb_id}/docs/{doc_id}/structure-reviews')
 def list_structure_reviews(kb_id: str, doc_id: str):
+    """校验文档归属后列出结构审阅任务。"""
     from storage import kb_document_store as DS
     from rag.structure_review_protocol import VERSION
     with _kb_errors(), KS._transaction() as conn:
@@ -393,6 +403,7 @@ def list_structure_reviews(kb_id: str, doc_id: str):
 
 @router.post('/{kb_id}/docs/{doc_id}/structure-review')
 def start_structure_review(kb_id: str, doc_id: str, request: StructureReviewRequest | None = None):
+    """创建文档结构审阅任务，按请求标识复用已登记的任务。"""
     from rag.document_structure_review import start
     with _kb_errors():
         return start(kb_id, doc_id,request_id=str(request.request_id) if request else '')
@@ -400,6 +411,7 @@ def start_structure_review(kb_id: str, doc_id: str, request: StructureReviewRequ
 
 @router.get('/{kb_id}/docs/{doc_id}/structure-review/{review_id}')
 def get_structure_review(kb_id: str, doc_id: str, review_id: str):
+    """查询指定结构审阅的状态、检查点及结果。"""
     from storage.kb_structure_review_store import get
     with _kb_errors():
         return get(kb_id, doc_id, review_id)
@@ -407,6 +419,7 @@ def get_structure_review(kb_id: str, doc_id: str, review_id: str):
 
 @router.post('/{kb_id}/docs/{doc_id}/structure-review/{review_id}/cancel')
 def cancel_structure_review(kb_id: str, doc_id: str, review_id: str):
+    """停止结构审阅并保留已经保存的检查点。"""
     from storage.kb_structure_review_store import cancel
     with _kb_errors():
         return cancel(kb_id, doc_id, review_id)
@@ -414,6 +427,7 @@ def cancel_structure_review(kb_id: str, doc_id: str, review_id: str):
 
 @router.post('/{kb_id}/docs/{doc_id}/structure-review/{review_id}/resume')
 def resume_structure_review(kb_id: str, doc_id: str, review_id: str):
+    """从既有审阅任务的检查点继续分析。"""
     from rag.document_structure_review import start
     with _kb_errors():
         return start(kb_id, doc_id, review_id)
@@ -421,6 +435,7 @@ def resume_structure_review(kb_id: str, doc_id: str, review_id: str):
 
 @router.get('/{kb_id}/docs/{doc_id}/file')
 def document_file(kb_id: str, doc_id: str):
+    """校验文档归属和源文件路径后返回原始文件。"""
     from storage import kb_document_store as DS
     from rag.document_config import document_path
     with _kb_errors():
@@ -435,6 +450,7 @@ def document_file(kb_id: str, doc_id: str):
 
 @router.get('/{kb_id}/docs/{doc_id}/pages/{page}.png')
 def document_page(kb_id: str, doc_id: str, page: int, parse_id: str):
+    """按固定解析版本定位 PDF 页面，渲染为不缓存的 PNG 供预览。"""
     import fitz
     from storage import kb_document_store as DS
     from rag.document_config import document_path, MAX_PIXELS

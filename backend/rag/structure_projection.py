@@ -5,11 +5,13 @@ VERSION = 1
 
 
 def contains(sources, atom):
+    """判断原文片段是否被给定来源范围完整包含。"""
     return any(s['block_id'] == atom['block']['block_id'] and s['start'] <= atom['start'] < atom['end'] <= s['end']
                for s in sources)
 
 
 def boundaries(review):
+    """按原文块汇总审阅结果中的范围边界，供结构切分使用。"""
     result = {}
     for sources in [review['unassigned_sources'], *[n['sources'] for n in review['nodes']],
                     *[n['heading_sources'] for n in review['nodes']], *[m['sources'] for m in review['materials']]]:
@@ -19,6 +21,7 @@ def boundaries(review):
 
 
 def merged(sources):
+    """合并按序排列且可以连续拼接的来源范围。"""
     result = []
     for s in sources:
         if result and result[-1]['block_id'] == s['block_id'] and result[-1]['end'] == s['start']:
@@ -29,6 +32,7 @@ def merged(sources):
 
 
 def validate_review(review, blocks):
+    """校验结构建议的节点关系及原文覆盖，拒绝范围缺失、重叠或越界。"""
     from rag.structure_review_protocol import VERSION as protocol_version
     if review.get('schema_version') != protocol_version or review.get('body_ownership_version') != 2:
         raise ValueError('publication_review_version_unsupported')
@@ -68,6 +72,7 @@ def validate_review(review, blocks):
 
 
 def build(blocks, review, *, title, check=lambda: None):
+    """将审阅建议投影到原文块并重建结构树，返回投影、节点、关系及质量信息。"""
     from rag import document_hierarchy as H, document_config as C
     validate_review(review, blocks)
     nodes, relations, quality = H.build(blocks, title=title, review=review, max_chars=C.UNIT_MAX_CHARS,
@@ -96,6 +101,7 @@ def build(blocks, review, *, title, check=lambda: None):
 
 
 def chunks(blocks, review, nodes, filename, counter):
+    """按审阅后的结构生成索引片段，并把片段位置映射回不可变原文。"""
     from rag.document_structure import build_chunks
     known = {b['block_id']: b for b in blocks}
     sections = {n['attributes']['heading_anchor']: n for n in nodes if n['kind'] == 'section'}

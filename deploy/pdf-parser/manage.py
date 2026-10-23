@@ -15,6 +15,7 @@ MODELS = {
 
 
 def load_env(path):
+    """解析部署环境文件，拒绝重复键及不合规的配置项。"""
     values = {}
     for number, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
         line = line.strip()
@@ -36,6 +37,7 @@ def load_env(path):
 
 
 def initialize(path, gpu=None):
+    """以独占创建方式生成部署配置和随机密钥，保留已有配置。"""
     content = (DEPLOY / ".env.example").read_text(encoding="utf-8")
     if gpu is not None:
         if not re.fullmatch(r"\d+", gpu):
@@ -51,12 +53,14 @@ def initialize(path, gpu=None):
 
 
 def prepare_models(values):
+    """准备固定版本的模型文件，拒绝复用不受管理的目标目录。"""
     from huggingface_hub import snapshot_download
 
     for key, (repository, revision) in MODELS.items():
         target = Path(values[key])
         manifest = target / "deployment-model.json"
         expected = {"repository": repository, "revision": revision}
+        # 只续传同一固定版本的受管权重，避免把已有目录中的其他模型混入当前部署。
         if target.exists() and any(target.iterdir()):
             if not manifest.is_file() or json.loads(manifest.read_text(encoding="utf-8")) != expected:
                 raise ValueError("Model directory already contains unmanaged or different weights; choose a new directory")
@@ -70,6 +74,7 @@ def prepare_models(values):
 
 
 def launch_command(mode, values):
+    """检查启动资源和配置，生成隔离代理环境的服务启动命令。"""
     environment = os.environ.copy()
     environment.update(values)
     key_names = ("PDF_PARSER_API_KEY", "OCR_VLLM_API_KEY") if mode == "parser" else ("OCR_VLLM_API_KEY",)
@@ -120,6 +125,7 @@ def launch_command(mode, values):
 
 
 def main():
+    """分派初始化、模型准备和服务启动命令，以受控信息报告失败。"""
     parser = argparse.ArgumentParser(description="Independent OCR deployment; never modifies backend configuration")
     parser.add_argument("command", choices=["init", "prepare-models", "vllm", "parser"])
     parser.add_argument("--env-file", type=Path, default=DEPLOY / ".env")

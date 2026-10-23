@@ -5,6 +5,7 @@ umask 077
 deploy=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 cd -- "$deploy"
 mkdir -p runtime/recovery
+# 文件锁覆盖本次恢复全过程，避免定时任务与开机任务同时重启容器。
 exec 9>runtime/recovery/recover.lock
 flock -n 9 || { echo 'recovery_busy'; exit 0; }
 if [[ -f runtime/recovery/paused ]]; then
@@ -64,6 +65,7 @@ if [[ "$previous" =~ ^[0-9]+$ ]] && (( now >= previous && now - previous < 600 )
     echo 'recovery_cooldown'
     exit 1
 fi
+# 尝试前写入冷却时间；失败也进入冷却，避免持续故障导致密集重启。
 printf '%s\n' "$now" >runtime/recovery/last_attempt
 
 for container in "${unhealthy[@]}"; do
@@ -73,6 +75,7 @@ for container in "${unhealthy[@]}"; do
     fi
 done
 
+# 只恢复现有部署并等待健康检查，不在恢复过程中构建、拉取镜像或重建容器。
 if timeout -k 10s 920s "${compose[@]}" up -d --no-build --pull never --no-recreate --wait --wait-timeout 900 ocr-vllm pdf-parser >/dev/null 2>&1; then
     echo 'recovered_healthy'
 else

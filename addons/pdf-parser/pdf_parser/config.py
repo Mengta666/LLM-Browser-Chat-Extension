@@ -23,6 +23,7 @@ class Settings:
 
     @classmethod
     def from_env(cls):
+        """读取 PDF 解析服务环境变量，构建并校验启动配置。"""
         result = cls(
             api_key=os.getenv("PDF_PARSER_API_KEY", ""),
             vlm_url=os.getenv("OCR_VLLM_BASE_URL", "http://127.0.0.1:18083/v1").rstrip("/"),
@@ -42,6 +43,7 @@ class Settings:
         return result
 
     def validate(self):
+        """校验模型路径、上游地址、密钥及资源限制，拒绝不安全或不可用配置。"""
         for name, key in (("PDF_PARSER_API_KEY", self.api_key), ("OCR_VLLM_API_KEY", self.vlm_key)):
             if len(key) < 32 or not key.isascii() or any(c.isspace() for c in key):
                 raise ValueError(f"{name} must contain at least 32 non-whitespace ASCII characters")

@@ -9,6 +9,7 @@ from rag.document_config import TASK_CITATION_LIMIT
 
 class CitationArgumentError(ValueError):
     def __init__(self, code, message, *, need_id=None):
+        """保存需求引用参数错误及相关需求编号。"""
         super().__init__(message)
         self.code = code
         self.need_id = need_id
@@ -71,6 +72,7 @@ NEED_IDS = {'type': 'array', 'minItems': 1, 'maxItems': 12,
 
 
 def parse(arguments):
+    """校验知识库需求更新参数，区分正文引用和目录引用的合法形式。"""
     args = json.loads(arguments) if isinstance(arguments, str) else arguments
     if not isinstance(args, dict) or set(args) != {'kb_id', 'needs'}:
         raise ValueError('需要 kb_id 和 needs')
@@ -111,6 +113,7 @@ def parse(arguments):
 
 
 def update(state, args):
+    """更新问题拆解、来源和回答要点，并校验模型声明的需求状态。"""
     args = parse(args)
     needs = copy.deepcopy(state.get('needs', []))
     known = {n['id']: n for n in needs}
@@ -174,18 +177,21 @@ def update(state, args):
 
 
 def linked_citations(state, need):
+    """汇总需求显式引用及已交付证据中关联到该需求的引用编号。"""
     evidence = state.get('evidence', {})
     return list(dict.fromkeys([*[ref for ref in need.get('citations', []) if str(ref) in evidence],
         *[int(ref) for ref, row in evidence.items() if need['id'] in row.get('need_ids', [])]]))
 
 
 def linked_outlines(state, need):
+    """汇总需求显式关联及目录账本中匹配的目录引用。"""
     sources = state.get('outline_sources', {})
     return list(dict.fromkeys([*[ref for ref in need.get('outline_refs', []) if ref in sources],
         *[ref for ref,row in sources.items() if need['id'] in row.get('need_ids', [])]]))
 
 
 def outline_reference(state, outline):
+    """为相同目录视图复用稳定编号，新视图分配新的目录引用。"""
     payload = {k:v for k,v in outline.items() if k!='source_ref'}
     for ref, row in state.get('outline_sources', {}).items():
         if row['outline'] == payload:
@@ -194,6 +200,7 @@ def outline_reference(state, outline):
 
 
 def record_outline(state, kb_id, outline, ids):
+    """记录目录来源及相关需求，随后重新判断可解除的错误。"""
     ref = outline['source_ref']
     source = state.setdefault('outline_sources', {}).setdefault(ref, {
         'kb_id':kb_id, 'kind':'structure', 'outline':{k:v for k,v in outline.items() if k!='source_ref'}, 'need_ids':[]})
@@ -202,6 +209,7 @@ def record_outline(state, kb_id, outline, ids):
 
 
 def reconcile_errors(state):
+    """根据新取得的正文或目录证据更新需求相关的待处理错误。"""
     needs = {n['id']: n for n in state.get('needs', [])}
     state['pending'] = [p for p in state.get('pending', []) if not (
         p.get('tool') == NAME and p.get('error_code') in ('kb_citations_unlinked', 'kb_citations_missing')
@@ -210,6 +218,7 @@ def reconcile_errors(state):
 
 
 def progress_snapshot(state):
+    """记录已读范围、目录及需求评估的客观进展，供检测重复无进展。"""
     from search.kb_coverage import covered_chars, missing
     # 按需求和原文范围累计，而不是按临时引用编号计数；重编号和状态来回切换不能刷进展。
     linked_ranges = state.setdefault('association_ranges', [])
@@ -237,12 +246,14 @@ def progress_snapshot(state):
 
 
 def record_progress(state, before, *, argument_errors=False):
+    """比较操作前后的进展快照，更新连续无进展计数。"""
     progressed = any(new > old for old, new in zip(before, progress_snapshot(state)))
     state['no_progress_rounds'] = 0 if progressed else state.get('no_progress_rounds', 0) + 1
     state['last_stall_reason'] = 'tool_arguments_not_repaired' if argument_errors and not progressed else 'no_progress'
 
 
 def validate_ids(state, args):
+    """校验工具参数中的需求编号，仅在单一需求时允许自动关联。"""
     ids = args.get('need_ids', [])
     if not isinstance(ids, list) or len(ids) > 12 or any(not isinstance(n, str) for n in ids):
         raise ValueError('need_ids 必须为 N编号数组')
@@ -253,6 +264,7 @@ def validate_ids(state, args):
 
 
 def delivered(state, rows, ids):
+    """把实际交付的证据登记到需求来源账本，保留各文档版本信息。"""
     archive = state.setdefault('evidence', {})
     for row in rows:
         citation = row['citation_index']
@@ -273,6 +285,7 @@ def delivered(state, rows, ids):
 
 
 def public(state, visible=None, visible_outlines=None):
+    """按需求汇总来源、当前可见性及模型评估，避免混淆取得资料与验证结论。"""
     if visible is None and 'visible_citations' in state:
         visible = set(state['visible_citations'])
     evidence = state.get('evidence', {})
@@ -324,6 +337,7 @@ def public(state, visible=None, visible_outlines=None):
 
 
 def visible_outline_refs(messages):
+    """从当前模型消息中收集真正可见的目录引用编号。"""
     refs = set()
     for message in messages:
         text = message.get('content', '')
@@ -348,6 +362,7 @@ def visible_outline_refs(messages):
 
 
 def visible_citations(messages):
+    """从当前模型消息中收集真正可见的正文引用编号。"""
     refs = set()
     for message in messages:
         text = message.get('content', '')

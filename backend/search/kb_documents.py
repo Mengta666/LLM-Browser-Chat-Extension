@@ -33,6 +33,7 @@ KB_DOCUMENT_TOOLS = [
 
 
 def parse(name, arguments):
+    """校验知识库工具参数并将旧定位形式转换为统一读取协议。"""
     args = json.loads(arguments) if isinstance(arguments, str) else arguments
     if not isinstance(args, dict):
         raise ValueError('参数必须是 JSON 对象')
@@ -79,6 +80,7 @@ def parse(name, arguments):
 
 
 def execute(name, args, versions=None):
+    """在固定来源版本下执行目录、搜索或原文读取，返回证据及业务状态。"""
     from rag import document_retrieval as R
     from storage import kb_store as KS
     from agent.memory.config import CHAT_USER_ID
@@ -197,6 +199,7 @@ def execute(name, args, versions=None):
 
 
 def resolve_scope(args, versions):
+    """解析文档名称和定位范围，并在请求内固定解析、结构和索引版本。"""
     from storage import kb_store as KS, kb_document_store as DS
     from storage import kb_structure_store as HS
     from agent.memory.config import CHAT_USER_ID
@@ -231,6 +234,7 @@ def resolve_scope(args, versions):
 
 
 def complete_unit(row, *, exact=False):
+    """补齐证据对应的结构单元及必要关联，维护不可拆分内容的完整性。"""
     from rag import document_retrieval as R
     if exact or not row.get('parse_id'):
         return row
@@ -310,6 +314,7 @@ def complete_unit(row, *, exact=False):
 
 
 def render(rows, meta):
+    """将证据按文档归组输出为模型工具结果，保留引用、定位和交付说明。"""
     from storage.kb_text_store import annotate
     rows=[annotate(row) for row in rows]
     evidence, documents, refs = [], [], {}
@@ -335,6 +340,7 @@ def render(rows, meta):
         meta = {**meta, 'items': [delivery.progress(item, rows) for item in meta['items']]}
     for row in rows:
         def entry(value):
+            """将已有定位统一包装为可直接调用的读取入口。"""
             if not value:
                 return None
             return value if 'targets' in value else P.read_entry(**value)
@@ -385,6 +391,7 @@ def render(rows, meta):
 
 
 def trim_row(row, length):
+    """裁减一条非完整交付证据的正文并同步范围、位置和续读信息。"""
     row = copy.deepcopy(row)
     original_segments = row.get('segments', [])
     segments, remaining = [], length
@@ -436,6 +443,7 @@ def trim_row(row, length):
 
 class TurnKBBudget:
     def __init__(self, counter, archived=(), state=None):
+        """恢复请求级知识库配置、累计额度、来源快照及读取任务账本。"""
         self.counter = counter
         used = 0
         if state is None:
@@ -454,10 +462,12 @@ class TurnKBBudget:
 
     @property
     def used(self):
+        """返回本轮已累计交付的知识库 token 数。"""
         return self.state['used']
 
     @property
     def remaining(self):
+        """按有界或任务模式计算下一次知识库工具可用额度。"""
         if self.task_mode:
             return max(self.settings[k] for k in ('READ_TOKENS', 'SEARCH_TOKENS', 'DIRECTORY_TOKENS'))
         return max(0, self.settings['TURN_TOKENS'] - self.used)
@@ -465,9 +475,11 @@ class TurnKBBudget:
     @property
     def task_mode(self):
         # 旧请求快照没有此字段，继续沿用其原有额度，恢复不能悄悄扩权。
+        """判断本请求是否采用按任务推进的知识库执行模式。"""
         return self.settings.get('EXECUTION_MODE', 'bounded') == 'task'
 
     def call_allowed(self, phase):
+        """检查当前阶段是否仍有模型调用额度，并为收尾保留必要调用。"""
         if self.task_mode:
             return True
         reserve = 2 if phase in ('decision','kb_compact') else 0
@@ -475,9 +487,11 @@ class TurnKBBudget:
 
     @property
     def needs_recovery(self):
+        """判断是否还有必须补齐的知识库读取或恢复项。"""
         return any(p.get('required', True) for p in self.state['pending'])
 
     def charge_error(self, code, message, context_tokens):
+        """在剩余额度内生成工具错误文本，并记录其上下文开销。"""
         cap = min(self.remaining, max(0, context_tokens), self.settings['DIRECTORY_TOKENS'])
         lo, hi, text = 0, len(message), ''
         while lo <= hi:
@@ -493,6 +507,7 @@ class TurnKBBudget:
         return text, {'kb_tokens': tokens, 'kb_remaining_tokens': self.remaining}
 
     def record_error(self, name, args, error, *, error_code=None, need_id=None):
+        """登记知识库工具失败及对应需求，供后续定位修正和进度判断。"""
         signature = json.dumps([name, args], ensure_ascii=False, sort_keys=True)
         self.state['errors'].append(signature)
         self.state['pending'] = [p for p in self.state['pending']
@@ -502,6 +517,7 @@ class TurnKBBudget:
             **({'error_code': error_code, 'need_id': need_id} if error_code else {})})
 
     def guidance(self):
+        """生成当前需求、预算和未读范围的决策提示。"""
         coverage.reconcile_pending(self.state)
         kb_task.reconcile_errors(self.state)
         return ('知识库请求账本（仅记录取得范围，不代表语义核验通过）：' + json.dumps({
@@ -541,6 +557,7 @@ class TurnKBBudget:
             '分别回答每个子问题并在句旁引用；文档和解析版本分别归属，不能把甲文档数值套给乙文档。')
 
     def bind_names(self, kb_id, question):
+        """保存本轮知识库的文档名称目录，供问题中的显式文档名绑定。"""
         from storage import kb_store as KS
         from agent.memory.config import CHAT_USER_ID
         if 'named_documents' in self.state:
@@ -552,6 +569,7 @@ class TurnKBBudget:
                 if r['filename'] and r['filename'] in question]
 
     def revalidate(self, record):
+        """恢复旧请求时重新检查来源权限和版本，清理不可再沿用的证据状态。"""
         if record.get('status') == 'error':
             return
         from storage import kb_store as KS
@@ -605,6 +623,7 @@ class TurnKBBudget:
             raise
 
     def run(self, name, args, ledger, context_tokens):
+        """执行一次知识库工具，在结果预算内交付证据并更新引用、覆盖和任务进度。"""
         cap = min(self.remaining, max(0, context_tokens), self.settings[
             'READ_TOKENS' if name == 'kb_read_document' else 'SEARCH_TOKENS' if name == 'kb_search' else 'DIRECTORY_TOKENS'])
         if cap < 80:

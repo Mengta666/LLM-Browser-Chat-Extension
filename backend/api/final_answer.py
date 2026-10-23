@@ -34,8 +34,10 @@ INSTRUCTION = ('当前是最终回答阶段。依据当前问题和下列已取�
 
 
 def citation_warning(text, messages):
+    """核对正文引用编号是否存在于本次可见证据，发现缺失时返回提示而不改写正文。"""
     visible = set()
     def collect(payload):
+        """递归收集结构化证据中的可见引用编号。"""
         if isinstance(payload, list):
             for value in payload:
                 collect(value)
@@ -47,6 +49,7 @@ def citation_warning(text, messages):
             if isinstance(payload.get('result'), str):
                 extract(payload['result'])
     def extract(raw):
+        """从证据文本或序列化数据中提取可见引用编号。"""
         try:
             collect(json.loads(raw))
         except (ValueError, TypeError):
@@ -73,6 +76,7 @@ def citation_warning(text, messages):
 
 
 def usable_content(message):
+    """判断响应是否包含可用正文，排除空文本及伪装成正文的工具调用。"""
     text = message if isinstance(message, str) else message.content or ''
     tool_calls = False if isinstance(message, str) else message.tool_calls
     return bool(text.strip() and not tool_calls and not re.match(
@@ -95,6 +99,7 @@ FAILURES = {
 
 
 def response_failure(response):
+    """依据结束原因和正文内容区分输出截断、空回复及非法工具调用。"""
     choice = response.choices[0]
     if choice.message.tool_calls or (choice.message.content or '').strip() and not usable_content(choice.message):
         return 'final_tool_call_rejected'
@@ -107,6 +112,7 @@ def response_failure(response):
 
 
 def shorten(entry, query='', kb_needs=()):
+    """围绕当前问题缩短一条证据记录，保留可追溯的相关内容并返回是否修改。"""
     try:
         payload = json.loads(entry['result'])
     except (ValueError, TypeError):
@@ -153,6 +159,7 @@ def shorten(entry, query='', kb_needs=()):
 
 def project(initial, evidence, ranges, system_parts, counter, *, compact=False, kb_goals=(), kb_task_state=None,
             output_tokens=None):
+    """构造独立正文阶段的预算内消息，保留问题、适用状态和实际可见证据。"""
     current = next((m for m in reversed(initial) if m['role'] == 'user'), {'role': 'user', 'content': ''})
     query = current['content'] if isinstance(current['content'], str) else ''
     system = '\n\n'.join([*system_parts, INSTRUCTION])
@@ -221,6 +228,7 @@ def project(initial, evidence, ranges, system_parts, counter, *, compact=False, 
         selected.append({'tool':'kb_evidence','derived':False,'result':json.dumps({'evidence':kb_rows},ensure_ascii=False)})
     recent = []
     def data_message():
+        """按文档和来源分组当前证据，同时注明可见范围及尚未覆盖的知识库目标。"""
         visible = []
         groups, other = {}, []
         for entry in selected:
@@ -354,6 +362,7 @@ def project(initial, evidence, ranges, system_parts, counter, *, compact=False, 
 def generate(client, model, initial, evidence, ranges, system_parts, counter, deadline, steps,
              *, check_active=None, prepare_model_messages=None, allow_partial=False, clock=time.monotonic,
              chat_id='', request_id='', before_call=None, kb_goals=(), kb_task_state=None, kb_answer=False):
+    """在总期限内生成最终正文，处理预算调整和可恢复失败并产生结果事件。"""
     previous = None
     failure = 'final_answer_unavailable'
     kb_settings = C.kb_answer_settings(model) if kb_answer else {}

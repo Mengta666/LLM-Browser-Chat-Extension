@@ -16,28 +16,33 @@ _log = get_logger('chat_context')
 
 class CompactionError(Exception):
     def __init__(self, code):
+        """保存会话压缩失败的标准错误码。"""
         super().__init__(code)
         self.code = code
 
 
 def new_counter(deadline=None):
+    """为压缩模型创建计数器，限制远端分词所用时间。"""
     return RequestTokenCounter(os.getenv('CHAT_COMPACT_MODEL') or compact._COMPACT_MODEL,
                                deadline=deadline, time_budget=30.0)
 
 
 def _input_limit(counter):
+    """计算单批压缩可用的输入额度，预留摘要输出和安全空间。"""
     window = min(C.CHAT_CONTEXT_LENGTH, counter.model_window or C.CHAT_CONTEXT_LENGTH)
     return min(C.CHAT_COMPACT_BATCH_TOKENS,
                window - C.CHAT_COMPACT_MAX_OUTPUT_TOKENS - C.CHAT_CONTEXT_SAFETY_TOKENS)
 
 
 def _pieces(records, batch):
+    """按批次计划从已保存消息取出原文片段，保留来源序号、偏移和状态。"""
     return [{'seq': p['seq'], 'role': records[p['seq']]['role'], 'offset': p['offset'],
              'text': records[p['seq']]['content'][p['offset']:min(p['end'], records[p['seq']].get('source_length', p['end']))],
              'status': records[p['seq']].get('status', 'completed')} for p in batch]
 
 
 def _request(working, pieces, repair='', *, counter):
+    """选取额度内的工作状态并组合本批原文，生成状态提取或修复请求。"""
     limit = min(C.CHAT_CONTEXT_STATE_MAX_TOKENS, max(0, _input_limit(counter) // 4))
     try:
         selected = state.select(working, target=limit, limit=limit, count=counter.count_text,
@@ -50,6 +55,7 @@ def _request(working, pieces, repair='', *, counter):
 
 
 def split_batch(batch, records):
+    """优先沿完整对话轮次拆分超限批次，单条长消息再按文本边界拆分。"""
     if len(batch) > 1:
         mid = len(batch) // 2
         # 尽量在已完成轮次后拆分，不能跨边界时才拆消息。
@@ -69,6 +75,7 @@ def split_batch(batch, records):
 
 
 def make_plan(messages, *, working=None, counter=None):
+    """按实际 token 预算规划压缩批次，并返回决定检查点兼容性的配置指纹。"""
     counter = counter or new_counter()
     working = state.load(working) or state.empty()
     records = {m['seq']: m for m in messages}
@@ -111,6 +118,7 @@ def make_plan(messages, *, working=None, counter=None):
 
 def run(chat_id, snapshot, plan, fingerprint, *, request_id='', attempt=0, deadline=None, validate=None,
         counter=None, query=''):
+    """从检查点继续提取会话状态，校验后原子发布摘要，并逐步返回处理进度。"""
     deadline = min(deadline or float('inf'), time.monotonic() + C.CHAT_COMPACT_TIMEOUT)
     job = store.claim_compaction(chat_id, request_id, attempt, snapshot, plan, fingerprint)
     counter = counter or new_counter(deadline)
@@ -118,6 +126,7 @@ def run(chat_id, snapshot, plan, fingerprint, *, request_id='', attempt=0, deadl
     records = {m['seq']: m for m in snapshot['messages']}
 
     def check():
+        """确认压缩任务代次仍有效且未超过截止时间。"""
         current = store.get_compaction(chat_id)
         if not current or current['generation'] != job['generation'] or current['status'] != 'running':
             raise CompactionError('compaction_interrupted')
@@ -177,6 +186,7 @@ def run(chat_id, snapshot, plan, fingerprint, *, request_id='', attempt=0, deadl
                         raise CompactionError(exc.code) from None
                     repair = exc.detail
             if replan:
+                # 只拆分尚未完成的当前批次，保留已验证的状态和检查点，避免从头重复提取。
                 if splits >= 4:
                     raise CompactionError('compaction_replan_exhausted')
                 try:
@@ -208,6 +218,7 @@ def run(chat_id, snapshot, plan, fingerprint, *, request_id='', attempt=0, deadl
         rendered = state.render(state.select(working, target=C.CHAT_COMPACT_SUMMARY_MAX_TOKENS,
                                 limit=C.CHAT_CONTEXT_STATE_MAX_TOKENS, count=counter.count_text, query=query))
         job = store.checkpoint_compaction(job, summary=rendered, phase='validate')
+        # 候选摘要先保存并校验，发布成功前不推进会话的压缩水位。
         if validate:
             validate(job)
         check()

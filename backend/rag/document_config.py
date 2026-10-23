@@ -26,6 +26,7 @@ RERANK_K = int(os.getenv("KB_DOCUMENT_RERANK_K", "40"))
 EVIDENCE_K = int(os.getenv("KB_DOCUMENT_EVIDENCE_K", "5"))
 RERANK_MIN = float(os.getenv("KB_DOCUMENT_RERANK_MIN_SCORE", "0.1"))
 def _positive(name, default):
+    """读取正整数配置，拒绝零或负值，避免无效的资源与预算上限。"""
     try:
         value = int(os.getenv(name, str(default)))
     except ValueError:
@@ -72,6 +73,7 @@ WORKSPACE_MIN_TOKENS = _positive('KB_WORKSPACE_MIN_TOKENS', 512)
 
 
 def budget_settings():
+    """取得本次知识库请求需要固定的预算及工作区配置快照。"""
     return {key: globals()[key] for key in ('TURN_TOKENS', 'SEARCH_TOKENS', 'READ_TOKENS',
             'DIRECTORY_TOKENS', 'READ_MAX_TARGETS', 'DECISION_MAX_ROUNDS', 'RECOVERY_MAX_ROUNDS', 'MODEL_CALL_LIMIT',
             'EXECUTION_MODE', 'NO_PROGRESS_ROUNDS', 'WORKSPACE_ENABLED', 'WORKSPACE_TRIGGER', 'WORKSPACE_TARGET',
@@ -79,6 +81,7 @@ def budget_settings():
 
 
 def document_path(doc_id: str, *parts: str) -> Path:
+    """构造文档存储路径并验证其仍位于指定文档目录内，防止路径越界。"""
     if not doc_id.startswith("doc_") or not doc_id[4:].isalnum():
         raise ValueError("invalid document id")
     path = STORAGE.joinpath(doc_id, *parts).resolve()

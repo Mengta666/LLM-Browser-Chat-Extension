@@ -125,6 +125,7 @@ _janitor_thread.start()
 
 
 def get_session(session_id: str) -> Optional[AgentSession]:
+    """清理过期会话后，按会话标识返回仍保留的任务状态。"""
     with _sessions_lock:
         _cleanup_expired_sessions()
         return _sessions.get(session_id)
@@ -134,6 +135,7 @@ def create_session(session_id: str, task: str, model: str,
                    require_confirmation: Optional[list[str]] = None,
                    task_image: str = "",
                    llm_params: Optional[dict[str, Any]] = None, *, kb_id: str = '') -> AgentSession:
+    """检查容量并初始化自动化会话、任务工作区和绑定知识库。"""
     with _sessions_lock:
         _cleanup_expired_sessions()
         if session_id in _sessions:
@@ -161,6 +163,7 @@ def create_session(session_id: str, task: str, model: str,
 
 
 def cancel_session(session_id: str) -> bool:
+    """设置会话取消终态；会话尚未建立时也保存取消记录，阻止迟到启动。"""
     with _sessions_lock:
         session = _sessions.get(session_id)
         if not session:
@@ -185,6 +188,7 @@ def run_step(session: AgentSession, page_state: PageState,
              action_result: Optional[ActionResult] = None,
              force_done: bool = False) -> dict[str, Any]:
     # 模型调用不持锁；只在发布结果时检查取消，防止迟到结果改写终态。
+    """在工作副本上推进决策，再受锁保护地发布结果，避免取消被迟到结果覆盖。"""
     with _sessions_lock:
         if session.cancel_event.is_set() or session.status in (AgentStatus.COMPLETED, AgentStatus.ERROR):
             return _build_response(session)
@@ -312,6 +316,7 @@ def _run_step(session: AgentSession, page_state: PageState,
         counter = knowledge.counter_for(session)
         try:
             def compact(prompt, tokens, timeout):
+                """按压缩专用输出额度和剩余时间调用模型整理证据。"""
                 compact_session = copy.copy(session)
                 compact_session.decision_deadline = min(session.decision_deadline or float('inf'), time.monotonic() + timeout)
                 return _create_with_retry(_llm_client, session.model, prompt, session=compact_session,
@@ -687,6 +692,7 @@ def _build_create_kwargs(model: str, messages: list, llm_params: dict) -> dict:
 
 
 def _create_with_retry(client: OpenAI, model: str, messages: list, session: Optional[AgentSession] = None, *, overrides=None):
+    """调用模型并处理可重试失败及参数兼容问题，重试仍受取消信号和决策期限约束。"""
     llm_params = (session.llm_params if session else None) or {}
     create_kwargs = _build_create_kwargs(model, messages, llm_params)
     if session and session.kb_id and not any(k in create_kwargs for k in ('max_tokens', 'max_completion_tokens')):
@@ -753,6 +759,7 @@ def _create_with_retry(client: OpenAI, model: str, messages: list, session: Opti
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _strip_think_tags(text: str) -> str:
+    """移除回复中的思考标签内容，留下可解析的结构化输出。"""
     return re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
 
 
@@ -796,6 +803,7 @@ def _parse_structured(text: str) -> Optional[dict]:
 
 
 def _parse_action(func_name: str, args: dict[str, Any]) -> PageAction:
+    """将模型动作名称和参数转换为统一的页面动作对象。"""
     index = args.get("index")
     if index is not None:
         try:
@@ -923,10 +931,12 @@ def _result_summary(result: ActionResult, page_state: PageState) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _estimate_tokens(messages: list) -> dict:
+    """调用共享估算器，返回当前消息的文本和图片 token 用量。"""
     return _estimate_tokens_shared(messages)
 
 
 def _log_observation(session: AgentSession, page_state: PageState) -> None:
+    """记录页面观察的规模和主要状态，供排查模型当时看到的内容。"""
     txt = page_state.text_content_summary or ""
     els = page_state.interactive_elements or []
     popup = page_state.active_popup or {}
@@ -967,6 +977,7 @@ def _dump_screenshot(session: AgentSession, page_state: PageState) -> None:
 
 
 def _log_exec_tokens(session: AgentSession) -> None:
+    """记录当前执行上下文的 token 估算结果。"""
     t = _estimate_tokens(session.messages)
     _agent_log.info("step_prompt_tokens", session_id=session.session_id,
                     data={"step": session.current_step, "total": t["total"],
@@ -974,6 +985,7 @@ def _log_exec_tokens(session: AgentSession) -> None:
 
 
 def _build_response(session: AgentSession, thought: str = "") -> dict[str, Any]:
+    """把会话状态整理为前端协议响应，包含待执行动作、成果和恢复反馈。"""
     from agent.task_workspace import public_state as workspace_state
     resp: dict[str, Any] = {
         "protocol_version": 2,

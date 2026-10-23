@@ -28,15 +28,18 @@ replace 的 kind/scope/key 不得变化；必须提供本批的新证据，不�
 
 class StateError(Exception):
     def __init__(self, code, detail=''):
+        """携带状态格式或来源校验失败的错误码及修复说明。"""
         super().__init__(code)
         self.code, self.detail = code, detail
 
 
 def empty():
+    """创建当前版本的空会话工作状态。"""
     return {'schema': SCHEMA, 'items': []}
 
 
 def load(raw):
+    """解析并校验工作状态结构、条目身份及来源格式，拒绝不兼容的数据。"""
     if not raw:
         return None
     try:
@@ -66,6 +69,7 @@ def load(raw):
 
 
 def prompt(state, pieces, repair=''):
+    """把当前状态、本批原文和可选修复说明序列化为模型输入。"""
     catalog = [{k: item[k] for k in ('id', 'kind', 'scope', 'key', 'text', 'status', 'sources')}
                for item in state['items'] if item['status'] != 'superseded']
     data = {'current_state': catalog, 'messages': pieces}
@@ -75,6 +79,7 @@ def prompt(state, pieces, repair=''):
 
 
 def merge(state, output, pieces):
+    """验证模型状态变更及其原文依据，将合法变更合并为新的工作状态。"""
     try:
         data = json.loads(output)
     except (ValueError, TypeError):
@@ -164,6 +169,7 @@ def merge(state, output, pieces):
 
 
 def select(state, *, target, limit, count=None, query='', extraction=False, required_ids=()):
+    """在状态预算内优先保留必需条目和查询相关内容，记录被省略的数量。"""
     count = count or estimate_text_tokens
     active = [i for i in state['items'] if i['status'] != 'superseded']
     task_scopes = {i['scope'] for i in active if i['kind'] == 'task'}
@@ -181,6 +187,7 @@ def select(state, *, target, limit, count=None, query='', extraction=False, requ
                                  max(s['seq'] for s in i['sources'])), reverse=True)
 
     def text(items):
+        """按提取或展示用途序列化候选条目，供选择过程测量 token 用量。"""
         view = {'schema': SCHEMA, 'items': items, 'omitted': len(active) - len(items)}
         return json.dumps(items, ensure_ascii=False, separators=(',', ':')) if extraction else render(view)
 
@@ -203,6 +210,7 @@ def select(state, *, target, limit, count=None, query='', extraction=False, requ
 
 
 def render(selected):
+    """将选中的工作状态及来源引用渲染为模型可读的上下文。"""
     lines = [HEADER]
     for item in selected['items']:
         refs = ' '.join(f'{"用户" if s["role"] == "user" else "助手"} M{s["seq"]}[{s["offset"]},{s["end"]})' for s in item['sources'])

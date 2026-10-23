@@ -6,6 +6,7 @@ from storage import chat_store as store, history_index as history
 
 
 def init_schema(conn):
+    """创建全文分析任务、分片结果和请求级调用账本表。"""
     conn.execute('''CREATE TABLE IF NOT EXISTS document_jobs (
         job_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, source_seq INTEGER NOT NULL,
         source_hash TEXT NOT NULL, source_length INTEGER NOT NULL, task TEXT NOT NULL,
@@ -24,6 +25,7 @@ def init_schema(conn):
 
 
 def get(job_id, chat_id):
+    """读取属于指定会话的全文分析任务。"""
     conn = store._get_conn()
     with store._lock:
         row = conn.execute('SELECT * FROM document_jobs WHERE job_id=? AND chat_id=?', (job_id, chat_id)).fetchone()
@@ -31,6 +33,7 @@ def get(job_id, chat_id):
 
 
 def progress(job):
+    """返回全文任务处理范围和本次调用额度，明确辅助分析不等于主模型逐字已读。"""
     conn = store._get_conn()
     with store._lock:
         calls = conn.execute('SELECT calls FROM document_executions WHERE chat_id=? AND request_id=?',
@@ -43,6 +46,7 @@ def progress(job):
 
 
 def request_progress(chat_id, request_id):
+    """查询某次提问关联的全文任务进度，区分后来请求继续处理的情况。"""
     conn = store._get_conn()
     with store._lock:
         row = conn.execute('SELECT j.*,e.calls AS execution_calls FROM document_jobs j JOIN document_executions e ON e.job_id=j.job_id WHERE e.chat_id=? AND e.request_id=?',
@@ -59,6 +63,7 @@ def request_progress(chat_id, request_id):
 
 
 def resumable(chat_id):
+    """列出会话中最近未完成的全文分析任务，供显式续接。"""
     conn = store._get_conn()
     with store._lock:
         rows = conn.execute("SELECT * FROM document_jobs WHERE chat_id=? AND status!='completed' ORDER BY updated_at DESC LIMIT 3", (chat_id,)).fetchall()
@@ -67,6 +72,7 @@ def resumable(chat_id):
 
 
 def claim(chat_id, request_id, attempt, upto_seq, source_ref, task, fingerprint, job_id=None):
+    """核对原文、任务和配置指纹，创建或续接全文分析并绑定当前请求。"""
     conn = store._get_conn()
     seq = int(source_ref[1:])
     with store._lock, conn:
@@ -106,6 +112,7 @@ def claim(chat_id, request_id, attempt, upto_seq, source_ref, task, fingerprint,
 
 
 def check(job):
+    """验证聊天执行尝试及全文任务代次仍有效。"""
     store.ensure_turn_active(job['chat_id'], job['request_id'], job['attempt'])
     current = get(job['job_id'], job['chat_id'])
     if not current or current['generation'] != job['generation'] or current['status'] != 'running':
@@ -113,6 +120,7 @@ def check(job):
 
 
 def reserve_call(job):
+    """在事务内消耗一次全文分析调用额度，超限时拒绝继续调用。"""
     conn = store._get_conn()
     with store._lock, conn:
         check(job)
@@ -123,17 +131,20 @@ def reserve_call(job):
 
 
 def frontier(job):
+    """按原文顺序返回当前有效的分析节点，供继续归并。"""
     conn = store._get_conn()
     with store._lock:
         return [dict(r) for r in conn.execute('SELECT * FROM document_nodes WHERE job_id=? AND active=1 ORDER BY offset', (job['job_id'],))]
 
 
 def checkpoint(job, offset, end, content, *, replaced=(), input_tokens=0, output_tokens=0, elapsed_ms=0):
+    """保存新片段或连续节点的归并结果，只有新原文片段才推进读取偏移。"""
     conn = store._get_conn()
     with store._lock, conn:
         check(job)
         current = get(job['job_id'], job['chat_id'])
         if replaced:
+            # 归并只能替换连续且范围相同的有效节点，避免摘要覆盖出现缺口或重复区间。
             nodes = [r for r in frontier(job) if r['node_id'] in replaced]
             if (len(nodes) != len(replaced) or nodes[0]['offset'] != offset or nodes[-1]['end'] != end
                     or any(a['end'] != b['offset'] for a, b in zip(nodes, nodes[1:]))):
@@ -144,11 +155,13 @@ def checkpoint(job, offset, end, content, *, replaced=(), input_tokens=0, output
         conn.execute('''INSERT INTO document_nodes(job_id,kind,offset,end,content,input_tokens,output_tokens,elapsed_ms)
             VALUES(?,?,?,?,?,?,?,?)''', (job['job_id'], 'reduce' if replaced else 'piece', offset, end, content, input_tokens, output_tokens, elapsed_ms))
         if not replaced:
+            # 只有新原文片段推进读取位置；归并已有摘要不能算作读到了更多原文。
             conn.execute('UPDATE document_jobs SET next_offset=?,updated_at=? WHERE job_id=?', (end, store._now_iso(), job['job_id']))
         return get(job['job_id'], job['chat_id'])
 
 
 def finish(job, status, error_code=''):
+    """更新全文任务终态，标记完成前验证全部原文已归并为完整覆盖节点。"""
     conn = store._get_conn()
     with store._lock, conn:
         check(job)
@@ -161,6 +174,7 @@ def finish(job, status, error_code=''):
 
 
 def interrupt(conn, chat_id=None, request_id=None, code='backend_restarted'):
+    """中断匹配的活动全文任务并增加代次，阻止旧工作线程提交结果。"""
     where, args = (" AND chat_id=? AND request_id=?", (chat_id, request_id)) if chat_id else ('', ())
     conn.execute("UPDATE document_jobs SET status='interrupted',generation=generation+1,error_code=? WHERE status='running'" + where,
                  (code, *args))

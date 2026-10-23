@@ -8,6 +8,7 @@ from storage import chat_store as store
 
 
 def init_schema(conn):
+    """创建历史原文范围、目录、工具执行和请求预算表。"""
     conn.execute('''CREATE TABLE IF NOT EXISTS history_blocks (
         block_id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT NOT NULL,
         job_id TEXT NOT NULL DEFAULT '', batch_no INTEGER NOT NULL,
@@ -30,6 +31,7 @@ def init_schema(conn):
 
 
 def archive_missing(conn, chat_id=None):
+    """为尚未建立来源目录的历史消息补建原文归档记录。"""
     params = (chat_id,) if chat_id else ()
     rows = conn.execute('''SELECT m.chat_id,m.seq,m.content FROM chat_messages m
         WHERE NOT EXISTS (SELECT 1 FROM history_blocks b JOIN history_spans p ON b.block_id=p.block_id
@@ -45,6 +47,7 @@ def archive_missing(conn, chat_id=None):
 
 
 def stage_batch(conn, job, spans, overview):
+    """保存当前压缩批次的目录摘要和原文范围，等待摘要发布时一并生效。"""
     cur = conn.execute('''INSERT INTO history_blocks(chat_id,job_id,batch_no,overview,kind,version)
         VALUES(?,?,?,?, 'compaction', NULL)''',
         (job['chat_id'], job['job_id'], job['next_batch'], overview))
@@ -53,6 +56,7 @@ def stage_batch(conn, job, spans, overview):
 
 
 def publish(conn, job):
+    """发布已完成压缩批次的历史目录，维护其与原始消息的对应关系。"""
     blocks = conn.execute('SELECT block_id,batch_no FROM history_blocks WHERE chat_id=? AND job_id=? ORDER BY batch_no',
                           (job['chat_id'], job['job_id'])).fetchall()
     if len(blocks) != len(job['plan']):
@@ -79,6 +83,7 @@ def publish(conn, job):
 
 
 def records(chat_id, upto_seq, request_id=''):
+    """读取当前请求允许访问的历史原文，包括本轮已保存的用户输入。"""
     conn = store._get_conn()
     with store._lock:
         return [dict(r) for r in conn.execute('''SELECT m.*,COALESCE(t.status,'completed') AS status
@@ -91,6 +96,7 @@ def records(chat_id, upto_seq, request_id=''):
 
 
 def list_blocks(chat_id, upto_seq, request_id='', *, block_ref=None, cursor=0, limit=20):
+    """分页列出可见历史目录块及其原文覆盖，返回是否仍有后续目录。"""
     rows = {r['seq']: r for r in records(chat_id, upto_seq, request_id)}
     conn = store._get_conn()
     with store._lock, conn:
@@ -123,6 +129,7 @@ def list_blocks(chat_id, upto_seq, request_id='', *, block_ref=None, cursor=0, l
 
 
 def query_records(chat_id, upto_seq, request_id='', *, query='', block_ref=None, source_ref=None):
+    """在允许的目录或原文范围内搜索，按命中情况返回可定位节选。"""
     if source_ref and block_ref:
         raise ValueError('source_ref 和 block_ref 不能同时指定')
     rows = records(chat_id, upto_seq, request_id)
@@ -161,6 +168,7 @@ def query_records(chat_id, upto_seq, request_id='', *, query='', block_ref=None,
 
 
 def load_budget(chat_id, request_id):
+    """读取某次提问持久化的历史回查额度和范围账本。"""
     conn = store._get_conn()
     with store._lock:
         row = conn.execute('SELECT * FROM history_budgets WHERE chat_id=? AND request_id=?', (chat_id, request_id)).fetchone()
@@ -168,18 +176,21 @@ def load_budget(chat_id, request_id):
 
 
 def save_budget(conn, chat_id, request_id, used, calls, ranges, initial):
+    """在调用方事务内更新历史回查次数、token 消耗和已读范围。"""
     conn.execute('''INSERT INTO history_budgets VALUES(?,?,?,?,?,?) ON CONFLICT(chat_id,request_id)
         DO UPDATE SET used=excluded.used,calls=excluded.calls,ranges_json=excluded.ranges_json,initial_text=excluded.initial_text''',
         (chat_id, request_id, used, calls, json.dumps(ranges), initial))
 
 
 def tool_runs(chat_id, request_id):
+    """按执行尝试和步骤序号读取请求的工具执行档案。"""
     conn = store._get_conn()
     with store._lock:
         return [dict(r) for r in conn.execute('SELECT * FROM chat_tool_runs WHERE chat_id=? AND request_id=? ORDER BY attempt,ordinal', (chat_id, request_id))]
 
 
 def save_tool(chat_id, request_id, attempt, ordinal, call_id, name, arguments, result='', status='running', step=None, *, budget=None, kb_state=None):
+    """校验请求仍活动后保存工具结果，并同步历史和知识库预算检查点。"""
     if not request_id:
         return
     conn = store._get_conn()
@@ -188,6 +199,7 @@ def save_tool(chat_id, request_id, attempt, ordinal, call_id, name, arguments, r
     except (TypeError, ValueError):
         parsed = {'invalid_arguments_hash': fingerprint(str(arguments))}
     def redact(value):
+        """递归隐藏工具参数中的密码、密钥和凭证字段。"""
         if isinstance(value, dict):
             return {k: '[REDACTED]' if re.search(r'(?i)(?:password|secret|authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|cookie)', k)
                     else redact(v) for k, v in value.items()}
@@ -209,4 +221,5 @@ def save_tool(chat_id, request_id, attempt, ordinal, call_id, name, arguments, r
 
 
 def fingerprint(text):
+    """计算 UTF-8 文本摘要，用于原文及工具输入的一致性校验。"""
     return hashlib.sha256(text.encode('utf-8')).hexdigest()

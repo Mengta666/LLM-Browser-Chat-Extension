@@ -15,6 +15,7 @@ COUNT_MODE = 'cl100k_estimate_1.25x' if estimate_tokens([])['method'] == 'tiktok
 
 class TurnWebBudget:
     def __init__(self):
+        """初始化本轮网页正文的总 token 额度、消耗和已交付片段集合。"""
         try:
             self.limit = max(128, min(16000, int(os.getenv("WEB_READER_CONTEXT_TOKENS", "6000"))))
         except ValueError:
@@ -24,9 +25,11 @@ class TurnWebBudget:
 
     @property
     def remaining(self):
+        """返回本轮尚可使用的网页正文额度。"""
         return max(0, self.limit - self.used)
 
     def allocate(self, results, query, context_tokens=None):
+        """为各搜索来源选择尚未交付的完整片段，并累计本轮额度和读取状态。"""
         available = min(self.remaining, max(0, context_tokens)) if context_tokens is not None else self.remaining
         for result in results:
             identity = normalize_web_url(getattr(result, 'final_url', '') or result.url)
@@ -57,10 +60,12 @@ class TurnWebBudget:
 
 def web_tokens(text):
     # 当前网关没有匹配模型的 tokenizer；留出估算余量，不宣称精确计数。
+    """以保守余量估算网页正文的 token 开销。"""
     return (estimate_text_tokens(text) * 5 + 3) // 4
 
 
 def validate_blocks(data):
+    """校验正文块的编号、范围和覆盖关系，拒绝与原文不一致的结构。"""
     if "structure_version" not in data and "blocks" not in data:
         return
     blocks, text = data.get("blocks"), data["content"]
@@ -89,6 +94,7 @@ def validate_blocks(data):
 
 
 def legacy_blocks(text):
+    """为没有结构信息的旧正文推导段落、列表、表格和代码范围。"""
     blocks, section = [], -1
     # 旧服务缺少结构，只把显式 Markdown 标题识别为标题，不按短行猜测。
     lines = text.splitlines(keepends=True)
@@ -126,6 +132,7 @@ def legacy_blocks(text):
 
 
 def select_blocks(text, query, token_budget, blocks=None, excluded=None, *, details=None):
+    """按查询相关性选择预算内的完整语义块，输出仍保留原文顺序和省略标记。"""
     blocks = blocks if blocks is not None else legacy_blocks(text)
     excluded = excluded or set()
     terms = set(re.findall(r"[a-z0-9][a-z0-9._-]+|[\u4e00-\u9fff]{1,2}", query.lower()))
@@ -151,6 +158,7 @@ def select_blocks(text, query, token_budget, blocks=None, excluded=None, *, deta
         return "", True, []
 
     def render(indices):
+        """按原顺序拼接选中语义块，并在未覆盖区间添加省略标记。"""
         parts, previous = [], -2
         for i in sorted(indices):
             if i != previous + 1 and i != 0:
@@ -174,6 +182,7 @@ def select_blocks(text, query, token_budget, blocks=None, excluded=None, *, deta
             headings.setdefault(units[i]["block"]["id"], set()).add(i)
 
     def fits(indices):
+        """计算候选块及省略标记的额度，判断是否能放入本次正文预算。"""
         ordered = sorted(indices)
         gaps = sum(i != j + 1 for i, j in zip(ordered, [-1, *ordered]))
         return sum(costs[i] for i in indices) + (gaps + 1) * web_tokens(OMISSION) <= token_budget
@@ -211,6 +220,7 @@ def select_blocks(text, query, token_budget, blocks=None, excluded=None, *, deta
 
 
 def history_excerpt(text, max_chars=800):
+    """为历史检索记录选取受字符数限制的完整正文片段。"""
     pieces, size = [], 0
     for block in legacy_blocks(text):
         value = text[block['start']:block['end']]

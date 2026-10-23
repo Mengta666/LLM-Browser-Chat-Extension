@@ -8,6 +8,7 @@ HEADER = re.compile(r'^\[原文 (M[1-9][0-9]*)；role=(user|assistant)；范围 
 
 
 def count_fragment(messages, counter):
+    """计算消息片段的 token；缺少用户消息时仅为计数补一个空用户占位。"""
     if not messages:
         return 0
     # vLLM 的聊天模板拒绝空对话及没有 user 的片段；占位 user 仅用于计数，不发给生成模型。
@@ -17,6 +18,7 @@ def count_fragment(messages, counter):
 
 
 def original_data(message):
+    """解析历史原文包装，恢复来源编号、片段范围和省略信息。"""
     text = message.get('content', '')
     if not isinstance(text, str):
         return None
@@ -38,6 +40,7 @@ def original_data(message):
 
 
 def visible_ranges(messages):
+    """汇总消息中实际可见的原文范围，供覆盖记录和后续回查使用。"""
     return [{'source_ref': data['source_ref'], 'role': data['role'], 'offset': part['offset'],
              'end': part['end'], 'content_length': data['content_length']}
             for message in messages if (data := original_data(message)) and data.get('source_ref')
@@ -45,6 +48,7 @@ def visible_ranges(messages):
 
 
 def _clip(message, counter, cap, query):
+    """在当前可见原文内选取首尾及查询命中片段，缩减到单条消息额度内。"""
     if count_fragment([message], counter) <= cap:
         return dict(message)
     data = original_data(message)
@@ -96,8 +100,10 @@ def _clip(message, counter, cap, query):
 
 
 def select_recent(messages, counter, *, total, per_message, query=''):
+    """按明确引用、短消息和新近程度选择历史，最终按原始顺序返回预算内消息。"""
     chosen = {}
     refs = set(re.findall(r'\bM[1-9][0-9]*\b', query))
+    # 先保障明确引用的消息，再优先容纳短消息和近况；输出仍恢复原始对话顺序。
     priorities = sorted(range(len(messages)), key=lambda i: (
         bool((data := original_data(messages[i])) and data.get('source_ref') in refs),
         count_fragment([messages[i]], counter) <= min(512, per_message), i), reverse=True)

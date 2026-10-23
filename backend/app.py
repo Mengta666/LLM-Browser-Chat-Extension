@@ -76,6 +76,7 @@ if _modules_failed:
 
 @app.on_event("shutdown")
 async def _on_shutdown():
+    """停止聊天、附件清理和知识库恢复任务，并记录后端运行时长。"""
     from api import chat_tasks
     chat_tasks.stop()
     from storage.chat_attachments import stop_cleanup
@@ -91,6 +92,7 @@ async def _on_shutdown():
 
 @app.on_event('startup')
 def _init_chat_sessions():
+    """初始化会话存储并启动后台维护，将遗留结构审阅任务标记为中断。"""
     from storage import chat_store
     chat_store._get_conn()
     from api import chat_tasks
@@ -105,4 +107,4 @@ def _init_chat_sessions():
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=18000)

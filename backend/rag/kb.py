@@ -27,15 +27,18 @@ class KBSyncUnavailable(RuntimeError):
 
 
 def _now_iso() -> str:
+    """返回当前 UTC 时间，供知识库生命周期记录使用。"""
     return datetime.now(timezone.utc).isoformat()
 
 
 def _kb_lock(kb_id):
+    """取得指定知识库的可重入锁，串行协调发布、删除和恢复。"""
     with _locks_guard:
         return _locks.setdefault(kb_id, threading.RLock())
 
 
 def _require_kb(kb_id, *, active=False):
+    """读取当前用户的知识库，按需要求其处于可用状态。"""
     kb = KS.get_kb(kb_id)
     if not kb or kb["user_id"] != CHAT_USER_ID or (active and (kb["deleted_at"] or kb["sync_action"])):
         raise KS.KBNotFound("知识库不存在或不可用")
@@ -43,11 +46,13 @@ def _require_kb(kb_id, *, active=False):
 
 
 def _has_worker(kb_id, doc_id=None):
+    """判断知识库或指定文档是否仍有登记的后台工作任务。"""
     with _workers_guard:
         return any(k == kb_id and (doc_id is None or d == doc_id) for k, d, _ in _workers)
 
 
 def _restore_index(kb_id, doc):
+    """验证文档已发布索引完整后恢复对应向量的可检索标记。"""
     run_id = doc["published_run_id"]
     if not V.kb_index_complete(user_id=CHAT_USER_ID, kb_id=kb_id, doc_id=doc["doc_id"],
                                index_run_id=run_id, expected=doc["chunk_count"]):
@@ -58,6 +63,7 @@ def _restore_index(kb_id, doc):
 
 
 def _sync_doc_locked(kb_id, doc):
+    """在知识库锁内同步单份文档的向量可见性，并保存待重试状态。"""
     kb = _require_kb(kb_id)
     if doc["status"] == "pending" and not doc["deleted_at"] and not kb["deleted_at"]:
         return False
@@ -80,6 +86,7 @@ def _sync_doc_locked(kb_id, doc):
 
 
 def _sync_kb_locked(kb_id):
+    """在知识库锁内协调删除、恢复或清除的向量同步，返回是否全部完成。"""
     kb = _require_kb(kb_id)
     try:
         if kb["sync_action"] == "delete":
@@ -117,6 +124,7 @@ def _sync_kb_locked(kb_id):
 
 
 def reconcile_pending() -> None:
+    """尝试取得待同步知识库的锁并推进恢复，正在占用的知识库留待下一轮。"""
     for kb_id in KS.pending_kbs(CHAT_USER_ID):
         lock = _kb_lock(kb_id)
         if not lock.acquire(blocking=False):
@@ -129,6 +137,7 @@ def reconcile_pending() -> None:
 
 
 def start_recovery() -> None:
+    """恢复被中断任务的状态，并启动周期性的知识库同步补偿线程。"""
     global _recovery_thread
     if _recovery_thread and _recovery_thread.is_alive():
         return
@@ -136,6 +145,7 @@ def start_recovery() -> None:
     _recovery_stop.clear()
 
     def run():
+        """周期处理待同步知识库，直到收到服务停止信号。"""
         while not _recovery_stop.is_set():
             try:
                 reconcile_pending()
@@ -148,22 +158,26 @@ def start_recovery() -> None:
 
 
 def stop_recovery() -> None:
+    """通知知识库恢复线程停止，并有限等待其退出。"""
     _recovery_stop.set()
     if _recovery_thread:
         _recovery_thread.join(timeout=1)
 
 
 def create_kb(name: str, description: str = "") -> dict[str, Any]:
+    """为当前用户创建知识库并返回基本元数据。"""
     kb_id, now = f"kb_{uuid.uuid4().hex[:8]}", _now_iso()
     KS.create_kb(kb_id, CHAT_USER_ID, name, description, now)
     return {"kb_id": kb_id, "name": name, "description": description, "created_at": now}
 
 
 def list_kbs() -> list[dict[str, Any]]:
+    """列出当前用户未删除的知识库。"""
     return KS.list_kbs(CHAT_USER_ID)
 
 
 def delete_kb(kb_id: str) -> dict:
+    """先逻辑删除知识库，再同步停用其向量，并返回是否仍有同步待办。"""
     with _kb_lock(kb_id):
         KS.mark_kb_deleted(kb_id, _now_iso(), CHAT_USER_ID)
         complete = _sync_kb_locked(kb_id)
@@ -172,6 +186,7 @@ def delete_kb(kb_id: str) -> dict:
 
 def add_doc(kb_id: str, file_path: str | Path, filename: str, file_type: str,
             content_hash: str = "") -> dict[str, Any]:
+    """按文件类型选择结构化 PDF 或文本入库流程。"""
     if file_type == 'pdf':
         return _add_pdf(kb_id, Path(file_path), filename, content_hash)
     if file_type in ('md','markdown','txt'):
@@ -180,12 +195,14 @@ def add_doc(kb_id: str, file_path: str | Path, filename: str, file_type: str,
 
 
 def list_docs(kb_id: str) -> list[dict[str, Any]]:
+    """列出知识库中的文档，并补充统一的处理进度视图。"""
     from storage.kb_document_store import progress
     _require_kb(kb_id, active=True)
     return [progress(doc) for doc in KS.list_docs(kb_id)]
 
 
 def get_doc_status(kb_id: str, doc_id: str) -> dict[str, Any]:
+    """查询指定文档的处理进度，不可访问时返回未找到状态。"""
     kb, doc = KS.get_kb(kb_id), KS.get_doc(doc_id)
     if not kb or kb["user_id"] != CHAT_USER_ID or kb["deleted_at"] or not doc or doc["kb_id"] != kb_id or doc["deleted_at"]:
         return {"status": "not_found"}
@@ -194,6 +211,7 @@ def get_doc_status(kb_id: str, doc_id: str) -> dict[str, Any]:
 
 
 def _start_document(kb_id, doc_id, parse_id, run=None):
+    """登记文档工作任务并启动对应解析线程，结束时释放任务占用。"""
     if run is None:
         if KS.get_doc(doc_id)['file_type']=='pdf':
             from rag.document_worker import run
@@ -201,6 +219,7 @@ def _start_document(kb_id, doc_id, parse_id, run=None):
             from rag.text_worker import run
 
     def finish():
+        """从活动集合移除当前文档解析任务。"""
         with _workers_guard:
             _workers.discard((kb_id, doc_id, parse_id))
 
@@ -217,6 +236,7 @@ def _start_document(kb_id, doc_id, parse_id, run=None):
 
 
 def _add_pdf(kb_id, path, filename, content_hash):
+    """验证并保存 PDF 原文件，创建解析版本后启动后台处理。"""
     import hashlib
     import shutil
     from rag.document_worker import inspect_pdf, parse_config
@@ -244,6 +264,7 @@ def _add_pdf(kb_id, path, filename, content_hash):
 
 
 def _add_text(kb_id,path,filename,file_type):
+    """验证文本编码并保存原文件，创建结构解析任务后启动后台处理。"""
     import hashlib
     import shutil
     from rag.text_source import decode
@@ -271,6 +292,7 @@ def _add_text(kb_id,path,filename,file_type):
 
 
 def retry_document(kb_id, doc_id, *, reparse=False, reindex=False):
+    """根据重试模式和现有检查点恢复文档处理，避免并发创建重复任务。"""
     from storage import kb_document_store as DS
     from rag.document_worker import parse_config
     from rag.document_structure import fingerprint
@@ -298,6 +320,7 @@ def retry_document(kb_id, doc_id, *, reparse=False, reindex=False):
 
 
 def cancel_document(kb_id, doc_id):
+    """在知识库锁内停止指定文档的当前解析任务。"""
     from storage import kb_document_store as DS
     with _kb_lock(kb_id):
         DS.stop(kb_id, doc_id)
@@ -305,6 +328,7 @@ def cancel_document(kb_id, doc_id):
 
 
 def delete_doc(kb_id: str, doc_id: str) -> dict:
+    """逻辑删除文档并同步停用其向量，保留失败时的重试状态。"""
     with _kb_lock(kb_id):
         KS.mark_doc_deleted(kb_id, doc_id, _now_iso(), CHAT_USER_ID)
         complete = _sync_doc_locked(kb_id, KS.get_doc(doc_id))
@@ -312,6 +336,7 @@ def delete_doc(kb_id: str, doc_id: str) -> dict:
 
 
 def _admit_chunks(kb_id: str, chunks: list[dict]) -> list[dict]:
+    """只保留属于可检索文档且匹配其当前发布版本的向量候选。"""
     docs = KS.searchable_docs(kb_id, CHAT_USER_ID, list({c.get("doc_id", "") for c in chunks}))
     return [c for c in chunks if c.get("doc_id") in docs
             and c.get("index_run_id", "") == docs[c["doc_id"]]["published_run_id"]]
@@ -319,6 +344,7 @@ def _admit_chunks(kb_id: str, chunks: list[dict]) -> list[dict]:
 
 def _get_sibling_chunk(kb_id: str, doc_id: str, chunk_id: int,
                        index_run_id: Optional[str] = None) -> Optional[dict[str, Any]]:
+    """在指定或当前发布索引中读取相邻片段，并再次检查版本可见性。"""
     docs = KS.searchable_docs(kb_id, CHAT_USER_ID, [doc_id])
     if doc_id not in docs:
         return None
@@ -332,6 +358,7 @@ def _get_sibling_chunk(kb_id: str, doc_id: str, chunk_id: int,
 
 
 def search_kb(kb_id: str, query: str, top_k: int = KB_SEARCH_TOP_K) -> list[dict[str, Any]]:
+    """调用结构化文档检索并限制返回条数。"""
     from rag.document_retrieval import search
     try:
         results, _ = search(kb_id, query)
@@ -343,10 +370,12 @@ def search_kb(kb_id: str, query: str, top_k: int = KB_SEARCH_TOP_K) -> list[dict
 
 
 def list_deleted_kbs() -> list[dict[str, Any]]:
+    """列出当前用户回收站中的知识库。"""
     return KS.list_deleted_kbs(CHAT_USER_ID)
 
 
 def restore_kb(kb_id: str) -> dict:
+    """申请恢复知识库并同步验证和启用各文档索引。"""
     with _kb_lock(kb_id):
         KS.request_restore(kb_id, CHAT_USER_ID)
         if not _sync_kb_locked(kb_id):
@@ -355,6 +384,7 @@ def restore_kb(kb_id: str) -> dict:
 
 
 def hard_delete_kb(kb_id: str) -> dict[str, Any]:
+    """在没有活动任务时清除知识库向量及元数据，失败时保留待同步状态。"""
     with _kb_lock(kb_id):
         _require_kb(kb_id)
         if _has_worker(kb_id):

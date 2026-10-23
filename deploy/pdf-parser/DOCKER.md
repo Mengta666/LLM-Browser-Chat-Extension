@@ -184,6 +184,7 @@ sudo docker compose --env-file deploy/pdf-parser/.env -f deploy/pdf-parser/compo
 
 1. `compose.recovery.yaml` 给两个常驻容器启用 `unless-stopped`。Docker 启动或容器异常退出后恢复容器；`models` 仍不自动执行。
 2. Windows 任务 `Browser-Agent-OCR-Recovery` 在开机后 30 秒及每 2 分钟运行，以**发行版所属用户**的 S4U 身份启动指定 WSL，再执行 `recover.sh`。不保存 Windows 密码，不使用看不到该用户发行版的 SYSTEM 账户。
+3. 指定 `-ListenAddress` 后，同一任务在 OCR 健康时检查本机回环接口、VPN 地址监听及转发后的健康接口。VPN 尚未取得地址时记录 `network=address_pending`，后续巡检继续尝试；监听缺失时只重新注册该地址、端口到 `127.0.0.1` 同端口的转发。防火墙规则必须预先配置，本脚本不扩大放行范围、不重启共享 IP Helper 服务。
 
 任务仅恢复已存在的容器，不构建、不拉镜像、不下载模型、不重建或删除容器/卷。两服务健康时不修改它们；启动中等待下次检查；容器缺失或暂停时报错留待人工处理。对已判定 unhealthy 的 OCR 容器进行局部重启，对停止的容器按 Compose 依赖恢复。单次恢复等待最多约 16 分钟，相邻恢复尝试至少间隔 10 分钟；健康检查不受该冷却限制。任务不并发执行，也不会唤醒休眠的 Windows。
 
@@ -205,11 +206,13 @@ sudo bash deploy/pdf-parser/recover.sh
 把同目录的 `install-wsl-recovery.ps1` 和 `recover-wsl.ps1` 复制到 Windows 本地目录，以**发行版所有者的管理员 PowerShell**执行：
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install-wsl-recovery.ps1 -Distribution Ubuntu-24.04 -DeploymentRoot /opt/docker/vllm/ocr-server
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install-wsl-recovery.ps1 -Distribution Ubuntu-24.04 -DeploymentRoot /opt/docker/vllm/ocr-server -ListenAddress 10.8.125.11 -ListenPort 19082
 Start-ScheduledTask -TaskName Browser-Agent-OCR-Recovery
 ```
 
 安装器拒绝覆盖同名任务或已有安装目录，避免误改现存配置。脚本复制到 `C:\ProgramData\BrowserAgentOCR`，仅管理员、SYSTEM 和安装用户可写；Linux 恢复脚本仍位于指定部署目录。首次部署必须检查实际任务结果、外部 `/health`、带鉴权 `/ready` 和一次页面识别。
+
+两个 PowerShell 脚本使用 UTF-8 BOM，以兼容 Windows PowerShell 5.1 对中文注释的读取。已有任务升级时先备份脚本与导出的任务 XML，等待任务结束后更新脚本，在原动作参数中追加 `-ListenAddress` 和 `-ListenPort`，保留原用户身份、开机及周期触发器，再实际运行验证；不要重复运行安装器覆盖已有任务。
 
 ### 查询和维护暂停
 
@@ -218,7 +221,7 @@ Get-ScheduledTaskInfo -TaskName Browser-Agent-OCR-Recovery
 Get-Content C:\ProgramData\BrowserAgentOCR\recovery.log -Tail 10
 ```
 
-任务退出码 0 不一定已经就绪：`warming_up` 表示仍在加载，`healthy` / `recovered_healthy` 才表示容器健康检查通过；即便健康，OCR 准确率仍需实际材料验证。日志仅保留受控状态与退出码，1 MiB 轮转，不记录密钥或原文。Linux 冷却记录位于 `deploy/pdf-parser/runtime/recovery/`。
+任务退出码 0 不一定已经就绪：`warming_up` 表示仍在加载，`healthy` / `recovered_healthy` 才表示容器健康检查通过。配置转发检查时，还需 `network=healthy` 或 `network=recovered`；`loopback_unhealthy`、`portproxy_repair_failed`、`forward_health_failed` 分别指向回环服务、转发注册及转发后接口故障。远端本机的接口检查不能代替客户端跨机器访问及实际 OCR 识别。日志仅保留受控状态与退出码，1 MiB 轮转，不记录密钥或原文。Linux 冷却记录位于 `deploy/pdf-parser/runtime/recovery/`。
 
 **手动停服前先停用恢复任务**，并等当前执行结束，否则下一次巡检会拉起已停止的容器：
 
@@ -248,3 +251,11 @@ Linux 侧也可创建 `deploy/pdf-parser/runtime/recovery/paused` 暂停容器�
 - **未执行 Windows 整机重启，也未再触发一次真实 WSL 升级**；这两种完整场景仍待单独验收。当前证明的是受控 WSL 停止后自动恢复。
 
 客户端验收记录：`test/pdf-parser-deploy/recovery-live-20261006.json`；远端任务日志：`C:\ProgramData\BrowserAgentOCR\recovery.log`。合成材料的关键字通过不等于任意 PDF 识别准确。
+
+### 端口转发恢复验收（2026-10-19，远端 UTC+08）
+
+- 故障时两个容器均健康，Windows 回环 `/health` 返回 200，防火墙规则仍正确；但持久化 portproxy 规则没有对应的 VPN 地址监听。单独 `set` 未恢复，重新注册这一条规则后恢复。
+- 已更新 `C:\ProgramData\BrowserAgentOCR\recover-wsl.ps1` 和原任务动作参数，保留 S4U 身份、开机后 30 秒与每 2 分钟触发器。旧脚本和任务 XML 备份后缀为 `20261019-112737`，保存在同一受限目录。
+- 受控移除这一条转发后，客户端连接确实超时；未手动运行恢复脚本，下一次周期任务于 11:28:44 记录 `status=healthy network=recovered exit=0`，重新建立 VPN 监听。
+- 客户端鉴权 `/ready` 返回 `ready`；合成中英文图片识别通过 4 项关键字及页面结构检查，返回 3 个块、未截断，推理耗时约 9.05 秒。未读取用户文档或写入知识库。
+- 未执行 Windows 整机重启；实际开机与 VPN 启动先后顺序仍待重启验收。当前验证覆盖真实任务身份、周期触发、转发缺失恢复以及跨机器 OCR 调用。

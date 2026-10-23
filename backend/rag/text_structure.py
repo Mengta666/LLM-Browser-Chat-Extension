@@ -9,6 +9,7 @@ from rag.text_source import line_starts
 
 
 def config(file_type):
+    """生成文本解析规则和依赖版本配置，用于检查点兼容性判断。"""
     import os
     return {'schema': 1, 'parser': 'markdown-it-py' if file_type in ('md','markdown') else 'plain-text',
             'parser_version': version('markdown-it-py'), 'rules_version': 2,
@@ -17,6 +18,7 @@ def config(file_type):
 
 
 def markdown(text):
+    """解析 Markdown 语法块，保留其在原始文本中的字符范围。"""
     from markdown_it import MarkdownIt
     starts = line_starts(text)
     if starts[-1] != len(text):
@@ -62,6 +64,7 @@ def markdown(text):
 
 
 def build(text, file_type, filename):
+    """从文本语法范围构造原文块和章节树，并校验结构与来源对应关系。"""
     spans = markdown(text) if file_type in ('md','markdown') else plain(text)
     from rag.document_config import TEXT_MAX_BLOCKS
     if len(spans)>TEXT_MAX_BLOCKS:
@@ -90,6 +93,7 @@ def build(text, file_type, filename):
     block_ends=[b['structure']['source_end'] for b in blocks]
 
     def add(kind,parent,start,end,title,basis,sources,**attrs):
+        """创建带稳定身份和来源范围的文本结构节点。"""
         nid='N'+hashlib.sha256(f'{kind}:{start}:{end}:{parent}'.encode()).hexdigest()[:16]
         node={'node_id':nid,'parent_id':parent,'kind':kind,'ordinal':len(nodes),
               'depth':node_lookup[parent]['depth']+1 if parent else 0,
@@ -101,6 +105,7 @@ def build(text, file_type, filename):
         return node
 
     def sources(start,end):
+        """把全文字符范围映射为各原文块内的局部范围。"""
         return [{'block_id':b['block_id'],'start':max(start,b['structure']['source_start'])-b['structure']['source_start'],
                  'end':min(end,b['structure']['source_end'])-b['structure']['source_start']}
                 for b in blocks[bisect.bisect_right(block_ends,start):bisect.bisect_left(block_starts,end)]]
@@ -147,6 +152,7 @@ def build(text, file_type, filename):
 
 
 def plain(text):
+    """根据行边界和标题线索划分纯文本，保留完整原文偏移。"""
     lines=text.splitlines(keepends=True)
     candidates=[]; pos=0
     for i,line in enumerate(lines):

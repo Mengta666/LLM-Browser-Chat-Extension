@@ -1,7 +1,9 @@
 importScripts('shared.js', 'agent_execution.js', 'agent_editing.js', 'agent_click.js', 'agent_verification.js');
 
 const agentExecution = new AgentExecution.Controller({
+  /** 从扩展会话存储读取指定标签页的执行状态。 */
   read: async tabId => (await chrome.storage.session.get(`agentExecution:${tabId}`))[`agentExecution:${tabId}`],
+  /** 持久化指定标签页的执行状态，供后台恢复后判断动作是否已派发。 */
   write: (tabId, state) => chrome.storage.session.set({ [`agentExecution:${tabId}`]: state }),
 });
 
@@ -14,11 +16,13 @@ const AGENT_ENDPOINT_PATHS = ['/v1/agent/execute', '/v1/agent/step', '/v1/agent/
 // 会话历史 + 记忆管理 CRUD 的路径前缀(支持 GET/POST/PATCH/DELETE，仅本地/自定义后端）
 const BACKEND_API_PREFIXES = ['/v1/sessions', '/v1/memory'];
 
+/** 提取 URL 的来源与路径并移除末尾斜杠，用于接口白名单比较。 */
 function normalizeChatUrl(value) {
   const url = new URL(String(value || ''));
   return `${url.origin}${url.pathname.replace(/\/$/, '')}`;
 }
 
+/** 规范化 API 基址并移除末尾版本路径，得到后端根地址。 */
 function buildBackendRootFromApiBase(apiBaseUrl) {
   const normalizedApiBaseUrl = normalizeApiBaseUrl(apiBaseUrl);
   const url = new URL(normalizedApiBaseUrl);
@@ -29,11 +33,12 @@ function buildBackendRootFromApiBase(apiBaseUrl) {
   return `${url.origin}${pathname}`;
 }
 
+/** 从默认和已授权的自定义后端生成页面刷新接口白名单。 */
 async function getAllowedPageRefreshUrls() {
   const { [CUSTOM_API_BASE_URLS_KEY]: customUrls = [] } = await chrome.storage.local.get([CUSTOM_API_BASE_URLS_KEY]);
   return new Set(
     [DEFAULT_BACKEND_API_URL, ...customUrls]
-      .map((url) => {
+      .map(/** 从允许的后端基址生成刷新接口地址，忽略无效配置。 */ (url) => {
         try {
           return `${buildBackendRootFromApiBase(url)}${PAGE_REFRESH_ENDPOINT_PATH}`;
         } catch {
@@ -44,6 +49,7 @@ async function getAllowedPageRefreshUrls() {
   );
 }
 
+/** 确认刷新请求精确命中白名单接口，且不包含查询或片段。 */
 async function isAllowedPageRefreshUrl(value) {
   try {
     const url = new URL(String(value || ''));
@@ -56,6 +62,7 @@ async function isAllowedPageRefreshUrl(value) {
   }
 }
 
+/** 确认请求路径属于已配置后端的自动化接口集合。 */
 async function isAllowedAgentUrl(value) {
   try {
     const url = new URL(String(value || ''));
@@ -99,12 +106,13 @@ const DEFAULT_ALLOWED_CHAT_URLS = new Set([
   `${DEFAULT_BACKEND_API_URL}/chat/completions`
 ]);
 
+/** 合并默认聊天接口与已配置后端的聊天地址，生成允许访问的集合。 */
 async function getAllowedChatUrls() {
   const { [CUSTOM_API_BASE_URLS_KEY]: customUrls = [] } = await chrome.storage.local.get([CUSTOM_API_BASE_URLS_KEY]);
   return new Set([
     ...DEFAULT_ALLOWED_CHAT_URLS,
     ...customUrls
-      .map((url) => {
+      .map(/** 从自定义基址生成聊天接口地址，忽略无效配置。 */ (url) => {
         try {
           return `${normalizeApiBaseUrl(url)}/chat/completions`;
         } catch {
@@ -115,6 +123,7 @@ async function getAllowedChatUrls() {
   ]);
 }
 
+/** 校验聊天地址精确匹配白名单，拒绝附带查询或片段的地址。 */
 async function isAllowedChatUrl(value) {
   try {
     const url = new URL(String(value || ''));
@@ -125,10 +134,12 @@ async function isAllowedChatUrl(value) {
   }
 }
 
+/** 通过扩展消息通道转发指定聊天请求的事件。 */
 function sendLlmMessage(msgId, type, extra = {}) {
   chrome.runtime.sendMessage({ type, msgId, ...extra });
 }
 
+/** 从受支持的模型响应结构中提取本次正文文本。 */
 function extractChunkText(dataObj) {
   return dataObj?.choices?.[0]?.delta?.content
     || dataObj?.choices?.[0]?.message?.content
@@ -139,6 +150,7 @@ function extractChunkText(dataObj) {
     || '';
 }
 
+/** 校验聊天请求后连接后端，把普通响应或流式事件转发到侧边栏。 */
 async function handleCallLlmStream(request) {
   const { url, options, msgId } = request;
 
@@ -235,7 +247,7 @@ async function handleCallLlmStream(request) {
         if (parsed.session_meta) sendLlmMessage(msgId, 'LLM_SESSION_META', { session_meta: parsed.session_meta });
         if (parsed.context_compaction) sendLlmMessage(msgId, 'LLM_CONTEXT_COMPACTION', { progress: parsed.context_compaction });
         if (parsed.document_analysis) sendLlmMessage(msgId, 'LLM_DOCUMENT_ANALYSIS', { progress: parsed.document_analysis });
-        if (parsed.error || parsed.choices?.some(choice => choice.finish_reason === 'error')) {
+        if (parsed.error || parsed.choices?.some(/** 检查模型流是否报告错误结束。 */ choice => choice.finish_reason === 'error')) {
           sendLlmMessage(msgId, 'LLM_ERROR', { error: parsed.error?.message || parsed.error?.code || '后端处理失败，请检查会话状态后重试' });
           await reader.cancel();
           return;
@@ -257,6 +269,7 @@ async function handleCallLlmStream(request) {
   }
 }
 
+/** 从 JSON 或文本错误响应提取提示；无法读取时使用 HTTP 状态信息。 */
 async function getResponseErrorMessage(response) {
   const fallbackMessage = `${response.status} ${response.statusText}`.trim() || '未知错误';
 
@@ -285,6 +298,7 @@ async function getResponseErrorMessage(response) {
   }
 }
 
+/** 限制自动化和页面刷新请求的地址、方法及请求体，返回后端 JSON 结果。 */
 async function handleCallApiJson(request) {
   const { url, options } = request;
 
@@ -396,9 +410,9 @@ async function handleCallBackendApi(request) {
   return response.json();
 }
 
-chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+chrome.runtime.onMessage.addListener(/** 分发聊天、接口、页面观察及动作执行消息，并保留异步响应通道。 */ (request, sender, sendResponse) => {
   if (request.type === 'CALL_LLM_STREAM') {
-    handleCallLlmStream(request).catch((error) => {
+    handleCallLlmStream(request).catch(/** 将聊天请求异常转发为对应消息的错误事件。 */ (error) => {
       chrome.runtime.sendMessage({ type: 'LLM_ERROR', msgId: request.msgId, error: `请求失败：${error?.message || '未知错误'}` });
     });
     return true;
@@ -406,38 +420,38 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   if (request.type === 'CALL_API_JSON') {
     handleCallApiJson(request)
-      .then((body) => sendResponse({ ok: true, body }))
-      .catch((error) => sendResponse({ ok: false, error: error?.message || '未知错误', status: error?.status }));
+      .then(/** 回传自动化接口的成功结果。 */ (body) => sendResponse({ ok: true, body }))
+      .catch(/** 回传自动化接口的错误及 HTTP 状态。 */ (error) => sendResponse({ ok: false, error: error?.message || '未知错误', status: error?.status }));
     return true;
   }
 
   if (request.type === 'CALL_BACKEND_API') {
     handleCallBackendApi(request)
-      .then((body) => sendResponse({ ok: true, body }))
-      .catch((error) => sendResponse({ ok: false, error: error?.message || '未知错误', status: error?.status }));
+      .then(/** 回传通用后端接口的成功结果。 */ (body) => sendResponse({ ok: true, body }))
+      .catch(/** 回传通用后端接口的错误及 HTTP 状态。 */ (error) => sendResponse({ ok: false, error: error?.message || '未知错误', status: error?.status }));
     return true;
   }
 
   // CDP 观察/执行（Phase 1+，对齐 browser-use）
   if (request.type === 'AGENT_OBSERVE') {
     managedAgentObserve(request)
-      .then((r) => sendResponse({ ok: true, pageState: r.pageState }))
-      .catch((error) => sendResponse({ ok: false, error: error?.message || '观察失败', code: error?.code }));
+      .then(/** 把本轮页面观察发送给侧边栏。 */ (r) => sendResponse({ ok: true, pageState: r.pageState }))
+      .catch(/** 回传观察失败原因及受控错误码。 */ (error) => sendResponse({ ok: false, error: error?.message || '观察失败', code: error?.code }));
     return true;
   }
 
   if (request.type === 'AGENT_EXECUTE') {
     agentExecution.execute(request.tabId, request.sessionId, request.action,
-      ctx => handleAgentExecute(request.tabId, request.action, ctx), request.timeoutMs)
-      .then((result) => sendResponse({ ok: true, result }))
-      .catch((error) => sendResponse({ ok: false, error: error?.message || '执行失败', code: error?.code }));
+      /** 在控制器提供的动作上下文中执行浏览器操作。 */ ctx => handleAgentExecute(request.tabId, request.action, ctx), request.timeoutMs)
+      .then(/** 回传已完成的动作结果。 */ (result) => sendResponse({ ok: true, result }))
+      .catch(/** 回传动作执行异常及受控错误码。 */ (error) => sendResponse({ ok: false, error: error?.message || '执行失败', code: error?.code }));
     return true;
   }
 });
 
-chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+chrome.runtime.onMessage.addListener(/** 接收自动化控制消息，并异步回复控制器处理结果。 */ (request, sender, sendResponse) => {
   if (request.type !== 'AGENT_CONTROL') return;
-  Promise.resolve().then(async () => {
+  Promise.resolve().then(/** 按控制命令分派协议探测、启动、取消、查询、观察失效和结束操作。 */ async () => {
     const { tabId, sessionId, command } = request;
     if (command === 'probe') return { protocol_version: 2, interaction_version: 1, action_verification_version: 1, autonomous_recovery_version: 1 };
     if (command === 'start') return agentExecution.start(tabId, sessionId);
@@ -445,28 +459,29 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (command === 'status') return agentExecution.status(tabId, sessionId, request.actionId);
     if (command === 'abort_action') return agentExecution.abortAction(tabId, sessionId, request.actionId);
     if (command === 'invalidate_observation') return agentExecution.invalidateObservation(tabId, sessionId, request.observationId);
-    if (command === 'end') return agentExecution.end(tabId, sessionId, () => debuggerDetach(tabId));
+    if (command === 'end') return agentExecution.end(tabId, sessionId, /** 在会话关闭时卸载调试器并清理观察状态。 */ () => debuggerDetach(tabId));
     throw new Error('未知自动化控制请求');
-  }).then(result => sendResponse({ ok: true, result }))
-    .catch(error => sendResponse({ ok: false, error: error.message, code: error.code }));
+  }).then(/** 回传自动化控制命令的成功结果。 */ result => sendResponse({ ok: true, result }))
+    .catch(/** 回传控制命令的失败原因和错误码。 */ error => sendResponse({ ok: false, error: error.message, code: error.code }));
   return true;
 });
 
 // Debugger 会话管理：保持 attach 状态复用，避免每次 attach/detach 的开销
 const _debuggerAttached = new Set();
 
-chrome.debugger.onDetach.addListener((source, reason) => {
+chrome.debugger.onDetach.addListener(/** 处理调试器断开，更新挂载状态；用户主动取消时同步取消任务。 */ (source, reason) => {
   _debuggerAttached.delete(source.tabId);
   if (source.tabId != null) {
     if (reason === 'canceled_by_user') {
       const run = agentExecution.tabs.get(source.tabId);
-      if (run) agentExecution.cancel(source.tabId, run.sessionId).catch(() => {});
+      if (run) agentExecution.cancel(source.tabId, run.sessionId).catch(/** 消费取消请求的异常，继续记录调试器断开状态。 */ () => {});
     }
     // 标记未挂载（如用户点了横幅"取消"）；下次 ensureAttached 会重连并 bump epoch → execute 侧转 stale。
     saveTabState(STATE_KEYS.attach, source.tabId, { attached: false, sessionEpoch: _sessionEpoch.get(source.tabId) || 0 });
   }
 });
 
+/** 按需挂载标签页调试器，更新会话版本并启用子目标自动挂载。 */
 async function debuggerEnsureAttached(tabId) {
   if (_debuggerAttached.has(tabId)) return;
   await chrome.debugger.attach({ tabId }, '1.3');
@@ -483,6 +498,7 @@ async function debuggerEnsureAttached(tabId) {
 const _oopif = new Map();   // tabId -> { targets:Map<targetId,info>, sessions:Map<sessionId,{targetId}>,
                             //            targetSessions:Map<targetId,Set<sessionId>>, sessionToTarget:Map<sessionId,targetId> }
 
+/** 获取或初始化指定标签页的跨进程 iframe 目标与会话映射。 */
 function oopifState(tabId) {
   if (!_oopif.has(tabId)) {
     _oopif.set(tabId, { targets: new Map(), sessions: new Map(), targetSessions: new Map(), sessionToTarget: new Map() });
@@ -490,6 +506,7 @@ function oopifState(tabId) {
   return _oopif.get(tabId);
 }
 
+/** 启用页面和 iframe 目标发现，以及扁平化的子目标自动挂载。 */
 async function armAutoAttach(tabId) {
   try {
     await cdpSend({ tabId }, 'Target.setDiscoverTargets', { discover: true, filter: [{ type: 'page' }, { type: 'iframe' }] });
@@ -498,11 +515,11 @@ async function armAutoAttach(tabId) {
 }
 
 // chrome.debugger.onEvent：flatten 模式下子 target 的事件带 source.sessionId。
-chrome.debugger.onEvent.addListener((source, method, params) => {
+chrome.debugger.onEvent.addListener(/** 维护跨进程子目标挂载和分离时的会话映射。 */ (source, method, params) => {
   const tabId = source.tabId;
   if (tabId == null) return;
   if (method === 'Target.attachedToTarget') {
-    handleTargetAttached(tabId, params).catch(() => {});
+    handleTargetAttached(tabId, params).catch(/** 忽略已失效子目标造成的挂载处理失败。 */ () => {});
   } else if (method === 'Target.detachedFromTarget') {
     const st = oopifState(tabId);
     const sid = params && params.sessionId;
@@ -533,6 +550,7 @@ async function handleTargetAttached(tabId, params) {
   st.sessionToTarget.set(sessionId, targetId);
 }
 
+/** 卸载调试器并清除标签页缓存及持久化观察映射。 */
 async function debuggerDetach(tabId) {
   if (_debuggerAttached.has(tabId)) {
     try { await chrome.debugger.detach({ tabId }); }
@@ -582,6 +600,7 @@ const REQUIRED_COMPUTED_STYLES = [
 // ── CDP 命令门面 ─────────────────────────────────────────────────────────────
 // target = {tabId} 走根会话；{tabId, sessionId} 路由到子 protocol session（OOPIF flatten）。
 // chrome.debugger.sendCommand 官方支持 sessionId（Chromium debugger.json: DebuggerSession.sessionId）。
+/** 发送 CDP 命令，跟踪已派发副作用与清理操作，并按动作预算限制等待。 */
 function cdpSend(target, method, params, timeoutMs) {
   const { _agentAction: ctx, _agentCleanup: cleanup, _agentEffect: effect, ...debugTarget } = target;
   const releasing = cleanup || method === 'Runtime.releaseObject';
@@ -593,8 +612,8 @@ function cdpSend(target, method, params, timeoutMs) {
     const key = { mouseMoved: 'pointer_moved', mousePressed: 'press_sent', mouseReleased: 'release_sent' }[params?.type];
     if (key) ctx.clickEffects = { ...ctx.clickEffects, [key]: true };
   }
-  const cmdPromise = new Promise((resolve, reject) => {
-    chrome.debugger.sendCommand(debugTarget, method, params || {}, (result) => {
+  const cmdPromise = new Promise(/** 把浏览器调试命令的回调接口转换为异步结果。 */ (resolve, reject) => {
+    chrome.debugger.sendCommand(debugTarget, method, params || {}, /** 检查调试错误及页面异常，并记录鼠标释放是否已确认。 */ (result) => {
       const err = chrome.runtime.lastError;
       if (err) { reject(new Error(`${method}: ${err.message}`)); return; }
       if (ctx && isEffect && result?.exceptionDetails) { reject(new Error(`${method}: 页面输入脚本执行异常`)); return; }
@@ -605,7 +624,7 @@ function cdpSend(target, method, params, timeoutMs) {
   if (ctx) ctx.track(cmdPromise, effect || method.startsWith('Input.') || method === 'Page.navigate');
   if (ctx && !timeoutMs) timeoutMs = releasing ? 5000 : Math.max(1, Math.min(10000, ctx.deadline - Date.now()));
   if (!timeoutMs) return cmdPromise;
-  return withTimeout(cmdPromise, timeoutMs, method).catch(error => {
+  return withTimeout(cmdPromise, timeoutMs, method).catch(/** 等待失败且底层命令仍未结束时，标记当前动作取消并传递异常。 */ error => {
     if (ctx?.pending.has(cmdPromise)) ctx.cancelled = true;
     throw error;
   });
@@ -614,10 +633,10 @@ function cdpSend(target, method, params, timeoutMs) {
 // 只限制等待，不取消底层命令；动作占用必须等原始 CDP 回调结束才释放。
 function withTimeout(promise, ms, label) {
   let timer = null;
-  const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`${label || 'cdp'} timed out after ${ms}ms`)), ms);
+  const timeout = new Promise(/** 建立用于命令等待上限的超时任务。 */ (_, reject) => {
+    timer = setTimeout(/** 超时后以命令名称和等待时长报告失败。 */ () => reject(new Error(`${label || 'cdp'} timed out after ${ms}ms`)), ms);
   });
-  return Promise.race([promise, timeout]).finally(() => { if (timer) clearTimeout(timer); });
+  return Promise.race([promise, timeout]).finally(/** 等待结束时清理超时定时器。 */ () => { if (timer) clearTimeout(timer); });
 }
 
 // ── SW 生命周期：跨步骤状态存 storage.session（SW 重启不丢，浏览器重启才清）────────────
@@ -625,6 +644,7 @@ function withTimeout(promise, ms, label) {
 const STATE_KEYS = { attach: 'agentAttach', indexMap: 'agentIndexMap', oopif: 'agentOopif' };
 const _sessionEpoch = new Map();   // tabId -> epoch（内存缓存；权威在 storage.session.agentAttach）
 
+/** 从指定存储映射读取标签页状态，读取失败时返回空状态。 */
 async function loadTabState(key, tabId) {
   try {
     const all = await chrome.storage.session.get([key]);
@@ -632,6 +652,7 @@ async function loadTabState(key, tabId) {
   } catch { return null; }
 }
 
+/** 更新或删除存储映射中的标签页状态；必需写入失败时向调用者报错。 */
 async function saveTabState(key, tabId, value, required = false) {
   try {
     const all = await chrome.storage.session.get([key]);
@@ -651,6 +672,7 @@ async function bumpSessionEpoch(tabId) {
   return epoch;
 }
 
+/** 优先读取缓存，否则从会话存储恢复调试连接版本。 */
 async function getSessionEpoch(tabId) {
   if (_sessionEpoch.has(tabId)) return _sessionEpoch.get(tabId);
   const st = await loadTabState(STATE_KEYS.attach, tabId);
@@ -662,11 +684,11 @@ async function getSessionEpoch(tabId) {
 // ── Port keepalive（主防线）：活跃 Port 在则 SW 不被 terminate，覆盖单步 settle+LLM 长间隙 ──
 const _keepalivePorts = new Set();
 
-chrome.runtime.onConnect.addListener((port) => {
+chrome.runtime.onConnect.addListener(/** 登记自动化保活连接，并为断开连接安装资源清理。 */ (port) => {
   if (port.name !== 'agent-keepalive') return;
   _keepalivePorts.add(port);
   startKeepaliveAlarm();               // 第二保命：Port 在期间保持 alarm 空转
-  port.onDisconnect.addListener(() => {
+  port.onDisconnect.addListener(/** 移除断开的保活端口，最后一个端口关闭时清除闹钟。 */ () => {
     _keepalivePorts.delete(port);
     if (chrome.runtime.lastError) { /* 端口异常断开，忽略 */ }
     if (_keepalivePorts.size === 0) { try { chrome.alarms.clear('agent-keepalive-tick'); } catch { /* noop */ } }
@@ -674,10 +696,11 @@ chrome.runtime.onConnect.addListener((port) => {
 });
 
 // alarms 空转（第二保命）：仅在有活跃 keepalive 时注册，25s < SW 30s 空闲阈值。
-chrome.alarms.onAlarm.addListener((alarm) => {
+chrome.alarms.onAlarm.addListener(/** 接收保活闹钟以唤醒后台，不派发页面操作。 */ (alarm) => {
   if (alarm.name === 'agent-keepalive-tick') { /* 唤醒 SW，无需动作 */ }
 });
 
+/** 注册周期闹钟，为自动化后台提供保活触发。 */
 function startKeepaliveAlarm() {
   try { chrome.alarms.create('agent-keepalive-tick', { periodInMinutes: 25 / 60 }); } catch { /* noop */ }
 }
@@ -711,6 +734,7 @@ function parseFlatAttributes(arr) {
 // 三源拉取：captureSnapshot + getDocument（Phase 1 两源）+ getLayoutMetrics(DPR)。
 // 并行 + 首轮 deadline 10s、失败重试一轮 2s（对齐 service.py _get_all_trees asyncio.wait）。
 async function cdpGatherTrees(target) {
+  /** 采集包含计算样式、绘制顺序和布局矩形的 DOM 快照。 */
   const mkSnapshot = () => cdpSend(target, 'DOMSnapshot.captureSnapshot', {
     computedStyles: REQUIRED_COMPUTED_STYLES,
     includePaintOrder: true,
@@ -718,7 +742,9 @@ async function cdpGatherTrees(target) {
     includeBlendedBackgroundColors: false,
     includeTextColorOpacities: false,
   });
+  /** 采集完整 DOM 树，并穿透可访问的子文档和影子根。 */
   const mkDom = () => cdpSend(target, 'DOM.getDocument', { depth: -1, pierce: true });
+  /** 读取当前目标的页面布局与视口指标。 */
   const mkMetrics = () => cdpSend(target, 'Page.getLayoutMetrics', {});
 
   // 先并行发（首轮），deadline 由 withTimeout 施加在整体上。
@@ -752,13 +778,15 @@ async function cdpGatherTrees(target) {
     metrics: metrics.status === 'fulfilled' ? metrics.value : null };
 }
 
+/** 将单个异步任务转换为包含完成状态、结果或异常的对象。 */
 function settleOne(p) {
-  return p.then((v) => ({ status: 'fulfilled', value: v }),
-                (e) => ({ status: 'rejected', reason: e }));
+  return p.then(/** 把异步成功值包装为已完成状态。 */ (v) => ({ status: 'fulfilled', value: v }),
+                /** 把异步异常包装为失败状态。 */ (e) => ({ status: 'rejected', reason: e }));
 }
 
 // 建 snapshot lookup：{ backendNodeId -> { bounds(÷DPR), clientRects,
 //   computedStyles, paintOrder, isClickable } }（enhanced_snapshot.py build_snapshot_lookup）。
+/** 把快照字符串索引和布局数组转换为按后端节点编号查询的样式与几何信息。 */
 function buildSnapshotLookup(snapshot, dpr) {
   const lookup = new Map();
   const documents = (snapshot && snapshot.documents) || [];
@@ -830,6 +858,7 @@ function constructEnhancedTree(domRoot, snapshotLookup, opts) {
   const allNodes = [];                     // 扁平列表，供 serialize 遍历
   const pendingCrossOrigin = [];           // 跨源 iframe 待处理：{ hostNode, frameId, offset }
 
+  /** 递归合并 DOM、快照与无障碍信息，累加框架偏移并登记待采集的跨源子页面。 */
   function build(cdpNode, totalFrameOffset, frameViewport) {
     if (cdpNode == null) return null;
     if (nodeByNodeId.has(cdpNode.nodeId)) return nodeByNodeId.get(cdpNode.nodeId);
@@ -950,11 +979,11 @@ async function detectClickListeners(target) {
     // 分批 20 并发 describeNode。
     for (let i = 0; i < elObjectIds.length; i += 20) {
       const batch = elObjectIds.slice(i, i + 20);
-      const results = await Promise.all(batch.map(oid =>
-        cdpSend(target, 'DOM.describeNode', { objectId: oid }).then(r => r && r.node && r.node.backendNodeId).catch(() => null)));
+      const results = await Promise.all(batch.map(/** 解析一批远程元素引用对应的后端节点编号。 */ oid =>
+        cdpSend(target, 'DOM.describeNode', { objectId: oid }).then(/** 从节点描述响应提取后端编号。 */ r => r && r.node && r.node.backendNodeId).catch(/** 无法描述的节点返回空值，供后续过滤。 */ () => null)));
       for (const bid of results) if (bid != null) ids.add(bid);
     }
-    await cdpSend(target, 'Runtime.releaseObject', { objectId }).catch(() => {});
+    await cdpSend(target, 'Runtime.releaseObject', { objectId }).catch(/** 忽略探测结束时远程对象释放失败。 */ () => {});
   } catch { /* getEventListeners 不可用/异常：降级为空集 */ }
   return ids;
 }
@@ -986,6 +1015,7 @@ function bboxExempt(node) {
   return false;
 }
 
+/** 判断节点是否可作为容纳装饰性后代的交互容器。 */
 function isPropagating(node) {
   const tag = (node.nodeName || '').toLowerCase();
   if (PROPAGATING_TAGS.has(tag)) return true;
@@ -1005,6 +1035,7 @@ function containmentRatio(childBox, parentBox) {
   return (ix * iy) / (cw * ch);
 }
 
+/** 标记被父交互控件覆盖的非独立后代，避免为同一操作重复编号。 */
 function applyBoundingBoxFilter(allNodes) {
   for (const node of allNodes) {
     if (!node.isInteractive || !node.isVisible || node.ignoredByPaintOrder) continue;
@@ -1031,9 +1062,9 @@ function applyBoundingBoxFilter(allNodes) {
 // paint order 遮挡过滤（paint_order.py:165）：按 paint_order 降序分组，同一区域下层被上层遮挡则标 ignored。
 // 简化实现：对可交互可见节点，按 absolutePosition 中心点检查是否被更高 paintOrder 的元素覆盖。
 function applyPaintOrderFilter(allNodes) {
-  const candidates = allNodes.filter(n => n.isInteractive && n.isVisible && n.snapshot && n.snapshot.paintOrder != null && n.absolutePosition);
+  const candidates = allNodes.filter(/** 筛选同时具有交互性、可见性、绘制顺序和几何信息的节点。 */ n => n.isInteractive && n.isVisible && n.snapshot && n.snapshot.paintOrder != null && n.absolutePosition);
   // 按 paintOrder 降序：高 paintOrder 在上层。
-  candidates.sort((a, b) => b.snapshot.paintOrder - a.snapshot.paintOrder);
+  candidates.sort(/** 将上层绘制节点排在前面以检查遮挡。 */ (a, b) => b.snapshot.paintOrder - a.snapshot.paintOrder);
   const painted = [];  // 已确认在上层的矩形
   for (const n of candidates) {
     const r = n.absolutePosition;
@@ -1051,6 +1082,7 @@ function applyPaintOrderFilter(allNodes) {
   }
 }
 
+/** 沿父节点链判断第一个节点是否为第二个节点自身或祖先。 */
 function isAncestorOrSelf(a, b) {
   let cur = b;
   while (cur) { if (cur === a) return true; cur = cur.parent; }
@@ -1064,16 +1096,16 @@ async function axTreeForAllFrames(target) {
   try {
     const ft = await cdpSend(target, 'Page.getFrameTree', {});
     const frameIds = [];
-    (function collect(node) {
+    (/** 递归收集当前框架树中的全部框架标识。 */ function collect(node) {
       if (!node) return;
       const fid = node.frame && node.frame.id;
       if (fid) frameIds.push(fid);
       for (const c of (node.childFrames || [])) collect(c);
     })(ft && ft.frameTree);
-    const results = await Promise.all(frameIds.map((fid, i) =>
+    const results = await Promise.all(frameIds.map(/** 为每个框架请求完整无障碍树。 */ (fid, i) =>
       cdpSend(target, 'Accessibility.getFullAXTree', { frameId: fid })
-        .then(r => r && r.nodes ? r.nodes : [])
-        .catch((e) => { if (i === 0) throw e; return []; })));
+        .then(/** 从无障碍响应提取节点数组。 */ r => r && r.nodes ? r.nodes : [])
+        .catch(/** 主框架失败向上传递，子框架失败返回空节点集。 */ (e) => { if (i === 0) throw e; return []; })));
     const nodes = [];
     for (const arr of results) nodes.push(...arr);
     return nodes;
@@ -1081,6 +1113,7 @@ async function axTreeForAllFrames(target) {
 }
 
 // AX lookup：{ backendDOMNodeId -> { role, name, properties{} } }。
+/** 按后端 DOM 节点编号索引无障碍角色、名称、属性及忽略状态。 */
 function buildAxLookup(axNodes) {
   const map = new Map();
   for (const ax of (axNodes || [])) {
@@ -1142,12 +1175,14 @@ function isVisibleCss(node) {
   return true;
 }
 
+/** 检查节点是否具有事件监听、快照点击标记或显式指针事件属性。 */
 function hasExplicitClick(node) {
   const attrs = node.attributes || {};
   return node.hasJsClickListener || node.snapshot?.isClickable === true ||
-    ['onclick', 'onmousedown', 'onmouseup', 'onpointerdown', 'onpointerup'].some(key => key in attrs);
+    ['onclick', 'onmousedown', 'onmouseup', 'onpointerdown', 'onpointerup'].some(/** 判断节点是否声明了指定指针事件属性。 */ key => key in attrs);
 }
 
+/** 结合原生、无障碍和祖先状态判断控件是否禁用，并处理 fieldset 的 legend 例外。 */
 function isDisabled(node) {
   const attrs = node.attributes || {};
   const tag = (node.nodeName || '').toLowerCase();
@@ -1159,7 +1194,7 @@ function isDisabled(node) {
     if (p !== node && (p.nodeName || '').toLowerCase() === 'button' && 'disabled' in pa) return true;
     if ((p.nodeName || '').toLowerCase() === 'fieldset' && 'disabled' in pa &&
         ['button', 'input', 'select', 'textarea'].includes(tag)) {
-      const legend = p.children.find(c => (c.nodeName || '').toLowerCase() === 'legend');
+      const legend = p.children.find(/** 寻找禁用 fieldset 的首个 legend，以处理其控件例外。 */ c => (c.nodeName || '').toLowerCase() === 'legend');
       if (!legend || !isAncestorOrSelf(legend, node)) return true;
     }
   }
@@ -1214,12 +1249,14 @@ function interactionSource(node) {
   return '';
 }
 
+/** 根据交互证据来源判断节点是否属于可交互候选。 */
 function isInteractive(node) {
   return !!interactionSource(node);
 }
 
 // 取元素文本：AX name 优先（Phase 3），否则拼直接 TEXT 子节点。
 function extractLabel(node) {
+  /** 规范化并截短元素标签，同时保留标签来源。 */
   const label = (text, source) => ({ text: text.replace(/\s+/g, ' ').trim().slice(0, 100), source });
   if (node.ax && node.ax.name) return label(node.ax.name, 'ax');
   let t = '';
@@ -1255,10 +1292,12 @@ function extractLabel(node) {
   return { text: '', source: 'none' };
 }
 
+/** 读取元素标签的文本部分。 */
 function extractText(node) {
   return extractLabel(node).text;
 }
 
+/** 仅提取允许的短路由和动作枚举作为链接提示，丢弃其余 URL 信息。 */
 function safeLinkHint(href) {
   if (!href) return '';
   try {
@@ -1393,7 +1432,7 @@ function serializeInteractive(allNodes, ctx) {
     }
     for (let p = node.parent; p; p = p.parent) {
       if (!['iframe', 'frame'].includes((p.nodeName || '').toLowerCase())) continue;
-      const document = p.children.find(c => c.nodeType === NODE_TYPE.DOCUMENT);
+      const document = p.children.find(/** 找到 iframe 中已挂接的文档节点。 */ c => c.nodeType === NODE_TYPE.DOCUMENT);
       framePath.unshift({ backendNodeId: p.backendNodeId, sessionId: p.sessionId || null,
         childSessionId: document?.sessionId || null });
     }
@@ -1480,6 +1519,7 @@ const PAGE_EXTRAS_FN = `(() => {
   };
 })()`;
 
+/** 读取页面标题、正文摘要、表单和视口等补充信息，失败时返回空对象。 */
 async function pageExtrasProbe(target) {
   try {
     const res = await cdpSend(target, 'Runtime.evaluate', {
@@ -1504,12 +1544,12 @@ async function gatherAndConstructTarget(target, ctx, offset) {
     viewport, jsClickIds, axByBackend,
     sessionId: ctx.sessionId, targetId: ctx.targetId, initialOffset: offset,
   });
-  const uncertain = built.allNodes.filter(node => node.isInteractive &&
+  const uncertain = built.allNodes.filter(/** 筛选有交互证据但快照几何不足的可探测节点。 */ node => node.isInteractive &&
     (!node.viewportRect || node.viewportRect.width <= 0 || node.viewportRect.height <= 0) &&
     node.snapshot?.computedStyles?.display !== 'none');
   for (let i = 0; i < uncertain.length; i += 20) {
-    await Promise.all(uncertain.slice(i, i + 20).map(async node => {
-      const rect = await readElementRect(target, node.backendNodeId).catch(() => null);
+    await Promise.all(uncertain.slice(i, i + 20).map(/** 读取实时边界并更新候选节点的视口位置和可见性。 */ async node => {
+      const rect = await readElementRect(target, node.backendNodeId).catch(/** 几何探测失败时保留未知状态。 */ () => null);
       if (!rect || rect.width <= 0 || rect.height <= 0) return;
       node.viewportRect = { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
       node.absolutePosition = { ...node.viewportRect, x: rect.x + node._frameOffset.x,
@@ -1517,13 +1557,13 @@ async function gatherAndConstructTarget(target, ctx, offset) {
       node.isVisible = isVisibleCss(node);
     }));
   }
-  const candidates = built.allNodes.filter(node => node.nodeType === NODE_TYPE.ELEMENT &&
+  const candidates = built.allNodes.filter(/** 筛选需要进一步探测编辑或选择能力的 DOM 元素。 */ node => node.nodeType === NODE_TYPE.ELEMENT &&
     (['INPUT', 'TEXTAREA', 'SELECT', 'LABEL'].includes(node.nodeName) ||
      ['checkbox', 'radio', 'switch'].includes(node.attributes.role) ||
      ['true', '', 'plaintext-only'].includes(node.attributes.contenteditable) ||
      (node.attributes.class || '').split(/\s+/).includes('CodeMirror')));
   for (let i = 0; i < candidates.length; i += 20) {
-    await Promise.all(candidates.slice(i, i + 20).map(async node => {
+    await Promise.all(candidates.slice(i, i + 20).map(/** 读取控件实时状态及编辑描述，生成字段快照后释放远程引用。 */ async node => {
       let objectId;
       try {
         objectId = (await cdpSend(target, 'DOM.resolveNode', { backendNodeId: node.backendNodeId })).object?.objectId;
@@ -1548,7 +1588,7 @@ async function gatherAndConstructTarget(target, ctx, offset) {
           node.editing = info;
         }
       } catch { /* 探测失败不猜测能力；实际动作会再次解析和校验。 */ }
-      finally { if (objectId) await cdpSend(target, 'Runtime.releaseObject', { objectId }).catch(() => {}); }
+      finally { if (objectId) await cdpSend(target, 'Runtime.releaseObject', { objectId }).catch(/** 忽略控件探测结束后的远程对象释放失败。 */ () => {}); }
     }));
   }
   return { built, dpr: trees.devicePixelRatio, jsClickCount: jsClickIds.size };
@@ -1570,6 +1610,7 @@ async function resolveChildTarget(tabId, frameId) {
 
 
 const MAX_IFRAME_DEPTH = 5, MAX_IFRAMES = 100;
+/** 读取 URL、滚动位置及视口尺寸的组合，用于确认截图与 DOM 对应同一页面状态。 */
 async function observationPosition(target) {
   return runtimeValue(await cdpSend(target, 'Runtime.evaluate', {
     expression: 'JSON.stringify([location.href,scrollX,scrollY,innerWidth,innerHeight,devicePixelRatio])',
@@ -1577,17 +1618,20 @@ async function observationPosition(target) {
   }));
 }
 
+/** 为请求创建受会话管理的观察令牌，再执行页面采集。 */
 async function managedAgentObserve(request) {
   if (!request.observationId) throw new Error('缺少观察版本，请重新加载扩展');
   const token = agentExecution.observeToken(request.tabId, request.sessionId, request.observationId);
   return handleAgentObserve(request.tabId, !!request.includeScreenshot, 0, token);
 }
 
+/** 计算完整字段值的 SHA-256 摘要，用于检测观察后的内容变化。 */
 async function fieldValueDigest(value) {
   const bytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
-  return Array.from(new Uint8Array(bytes), b => b.toString(16).padStart(2, '0')).join('');
+  return Array.from(new Uint8Array(bytes), /** 将摘要字节转换为固定两位十六进制文本。 */ b => b.toString(16).padStart(2, '0')).join('');
 }
 
+/** 组合主框架与加载器标识，识别导航或重载后的文档版本。 */
 async function documentIdentity(target) {
   const tree = await cdpSend(target, 'Page.getFrameTree', {});
   const frame = tree?.frameTree?.frame;
@@ -1595,6 +1639,7 @@ async function documentIdentity(target) {
   return `${frame.id}:${frame.loaderId}`;
 }
 
+/** 采集主页面和跨源子页面，生成交互元素与截图，并在版本校验后发布观察映射。 */
 async function handleAgentObserve(tabId, includeScreenshot = false, retry = 0, token = null) {
   token?.check();
   await debuggerEnsureAttached(tabId);
@@ -1642,7 +1687,7 @@ async function handleAgentObserve(tabId, includeScreenshot = false, retry = 0, t
   applyBoundingBoxFilter(allNodes);   // 先剔除被父按钮包含的冗余后代
   applyPaintOrderFilter(allNodes);
   const { elements, indexMap } = serializeInteractive(allNodes, { sessionId: null, targetId: null });
-  const byRef = new Map(allNodes.map(n => [AgentVerification.nodeRef(n), n]));
+  const byRef = new Map(allNodes.map(/** 建立观察节点引用到完整节点对象的映射。 */ n => [AgentVerification.nodeRef(n), n]));
   const previousMap = await loadTabState(STATE_KEYS.indexMap, tabId);
   const previousPopups = new Set(previousMap?.epoch === epoch && previousMap.documentEpoch === documentEpoch
     ? previousMap.layoutPopupRefs || [] : []);
@@ -1651,17 +1696,17 @@ async function handleAgentObserve(tabId, includeScreenshot = false, retry = 0, t
       node.overlay = { detection: 'layout_history', inferred: true };
     }
   }
-  const overlayCandidates = allNodes.filter(n => n.isVisible && n.nodeType === NODE_TYPE.ELEMENT &&
+  const overlayCandidates = allNodes.filter(/** 筛选可见且包含独立交互后代的定位容器作为浮层候选。 */ n => n.isVisible && n.nodeType === NODE_TYPE.ELEMENT &&
     !['HTML', 'BODY', 'INPUT', 'BUTTON', 'SELECT', 'TEXTAREA', 'IFRAME'].includes(n.nodeName) &&
     ['fixed', 'absolute'].includes(n.snapshot?.computedStyles?.position) &&
-    elements.some(e => { const child = byRef.get(e.node_ref); return child !== n && isAncestorOrSelf(n, child); }))
-    .sort((a, b) => (b.snapshot?.paintOrder || 0) - (a.snapshot?.paintOrder || 0)).slice(0, 64);
+    elements.some(/** 确认候选浮层内包含独立的交互后代。 */ e => { const child = byRef.get(e.node_ref); return child !== n && isAncestorOrSelf(n, child); }))
+    .sort(/** 优先探测绘制顺序较高的浮层候选。 */ (a, b) => (b.snapshot?.paintOrder || 0) - (a.snapshot?.paintOrder || 0)).slice(0, 64);
   for (let i = 0; i < overlayCandidates.length; i += 8) {
-    await Promise.all(overlayCandidates.slice(i, i + 8).map(async node => {
+    await Promise.all(overlayCandidates.slice(i, i + 8).map(/** 在候选浮层中执行实时命中探测，并保存本轮取得的证据。 */ async node => {
       token?.check();
       const probeTarget = { tabId, ...(node.sessionId ? { sessionId: node.sessionId } : {}) };
       const r = node.viewportRect;
-      const probes = elements.flatMap(el => {
+      const probes = elements.flatMap(/** 选择可能被浮层遮挡的同框架元素中心作为采样点。 */ el => {
         const child = byRef.get(el.node_ref), box = child?.viewportRect;
         if (!box || child.frameId !== node.frameId || isAncestorOrSelf(node, child) || isAncestorOrSelf(child, node)) return [];
         const x = box.x + box.width / 2, y = box.y + box.height / 2;
@@ -1674,11 +1719,11 @@ async function handleAgentObserve(tabId, includeScreenshot = false, retry = 0, t
           objectId, functionDeclaration: AgentVerification.inspectOverlay.toString(), arguments: [{ value: probes }], returnByValue: true,
         })) || node.overlay;
       } catch { /* 只添加本轮已获得的候选证据，探测失败不改变动作权限。 */ }
-      finally { if (objectId) await cdpSend(probeTarget, 'Runtime.releaseObject', { objectId }).catch(() => {}); }
+      finally { if (objectId) await cdpSend(probeTarget, 'Runtime.releaseObject', { objectId }).catch(/** 忽略浮层探测结束后的远程引用释放失败。 */ () => {}); }
     }));
   }
   const popups = AgentVerification.collectPopups(allNodes, elements);
-  const layoutPopupRefs = popups.filter(p => p.detection.startsWith('layout_')).map(p => p.ref);
+  const layoutPopupRefs = popups.filter(/** 保留通过布局证据识别的弹层。 */ p => p.detection.startsWith('layout_')).map(/** 提取布局弹层的节点引用供下一轮比较。 */ p => p.ref);
   const extras = await pageExtrasProbe(target);
   token?.check();
   if (token && (!extras.url || !extras.viewport)) throw new Error('页面基本信息暂不可用，请重新观察');
@@ -1690,6 +1735,7 @@ async function handleAgentObserve(tabId, includeScreenshot = false, retry = 0, t
       });
       if (capture?.data) screenshot = 'data:image/jpeg;base64,' + capture.data;
     } catch { /* 截图不可用时仍可使用本轮文字观察。 */ }
+    // DOM 坐标与截图必须对应同一视口；采集期间导航或滚动后需要重做整轮观察。
     if (position !== await observationPosition(target)) {
       token?.check();
       if (!token) await saveTabState(STATE_KEYS.indexMap, tabId, null);
@@ -1702,7 +1748,7 @@ async function handleAgentObserve(tabId, includeScreenshot = false, retry = 0, t
   if (token) {
     token.check();
     if (documentEpoch !== await documentIdentity(target)) throw new Error('页面已重载，请重新观察');
-    await agentExecution.publishObservation(token, () => saveTabState(STATE_KEYS.indexMap, tabId,
+    await agentExecution.publishObservation(token, /** 将通过令牌检查的观察编号映射持久化。 */ () => saveTabState(STATE_KEYS.indexMap, tabId,
       { epoch, map: indexMap, observationId: token.id, documentEpoch, layoutPopupRefs }, true));
   } else {
     await saveTabState(STATE_KEYS.indexMap, tabId, { epoch, map: indexMap, documentEpoch, layoutPopupRefs });
@@ -1722,7 +1768,7 @@ async function handleAgentObserve(tabId, includeScreenshot = false, retry = 0, t
     scroll_position: extras.scroll_position || {},
     document_height: extras.document_height || 0,
     is_loading: !!extras.is_loading,
-    focused_element: elements.filter(e => e.focused).map(e =>
+    focused_element: elements.filter(/** 筛选当前持有焦点的编辑元素。 */ e => e.focused).map(/** 生成带元素编号、编辑器类型及框架信息的焦点描述。 */ e =>
       `[${e.id}] ${e.editor_type}${e.frame_id ? ' frame=' + e.frame_id : ''}`).join('; ') || extras.focused_element || null,
     interactive_elements: elements,
     element_count_truncated: false,
@@ -1731,7 +1777,7 @@ async function handleAgentObserve(tabId, includeScreenshot = false, retry = 0, t
     device_pixel_ratio: dpr,
     popups,
     observation_complete: observationComplete && pending.length === 0,
-    active_popup: popups.filter(p => p.visible).sort((a, b) => (b.paint_order || 0) - (a.paint_order || 0))[0] || extras.active_popup || null,
+    active_popup: popups.filter(/** 保留当前可见的弹层。 */ p => p.visible).sort(/** 按绘制顺序选择最上层可见弹层。 */ (a, b) => (b.paint_order || 0) - (a.paint_order || 0))[0] || extras.active_popup || null,
   };
   return { pageState };
 }
@@ -1750,11 +1796,13 @@ async function resolveIndex(tabId, index) {
   return { entry };
 }
 
+/** 提取页面脚本返回值，遇到脚本异常则拒绝使用该结果。 */
 function runtimeValue(result) {
   if (result && result.exceptionDetails) throw new Error('页面脚本执行异常（Runtime）');
   return result && result.result && result.result.value;
 }
 
+/** 解析实时 DOM 节点并读取边界矩形，最后释放远程对象引用。 */
 async function readElementRect(target, backendNodeId) {
   const rn = await cdpSend(target, 'DOM.resolveNode', { backendNodeId });
   const objectId = rn?.object?.objectId;
@@ -1766,7 +1814,7 @@ async function readElementRect(target, backendNodeId) {
           topLevel:this.ownerDocument.defaultView===this.ownerDocument.defaultView.top};}`,
       returnByValue: true,
     }));
-  } finally { await cdpSend(target, 'Runtime.releaseObject', { objectId }).catch(() => {}); }
+  } finally { await cdpSend(target, 'Runtime.releaseObject', { objectId }).catch(/** 忽略矩形读取结束后的远程对象释放失败。 */ () => {}); }
 }
 
 // 无几何时不执行 JS 点击；后备矩形需转换到当前 CDP target 的视口。
@@ -1791,6 +1839,7 @@ async function getElementCoordinates(target, backendNodeId) {
   return null;
 }
 
+/** 将元素四边形裁剪到视口内，按可见面积选取中心和边角候选点击点。 */
 function clickPointsFromQuads(quads, vw, vh) {
   const regions = [];
   for (const q of quads) {
@@ -1801,15 +1850,17 @@ function clickPointsFromQuads(quads, vw, vh) {
     const width = Math.min(vw, maxX) - left, height = Math.min(vh, maxY) - top;
     if (width > 0 && height > 0) regions.push({ left, top, width, height });
   }
-  regions.sort((a, b) => b.width * b.height - a.width * a.height);
-  return regions.slice(0, 8).flatMap(r => [[.5, .5], [.1, .1], [.9, .1], [.1, .9], [.9, .9]]
-    .map(([x, y]) => ({ x: r.left + x * r.width, y: r.top + y * r.height })));
+  regions.sort(/** 优先使用视口内可见面积更大的区域。 */ (a, b) => b.width * b.height - a.width * a.height);
+  return regions.slice(0, 8).flatMap(/** 为每个可见区域生成中心及四个边角采样点。 */ r => [[.5, .5], [.1, .1], [.9, .1], [.1, .9], [.9, .9]]
+    .map(/** 把区域内比例位置换算为具体视口坐标。 */ ([x, y]) => ({ x: r.left + x * r.width, y: r.top + y * r.height })));
 }
 
+/** 返回当前几何信息中优先级最高的可见点击点。 */
 function quadsToClickPoint(quads, vw, vh) {
   return clickPointsFromQuads(quads, vw, vh)[0] || null;
 }
 
+/** 沿 iframe 链计算位移与缩放，将目标几何统一到顶层视口坐标。 */
 async function getActionGeometry(target, backendNodeId, entry) {
   const offsets = new Map([[null, { x: 0, y: 0, sx: 1, sy: 1 }]]);
   const frames = [];
@@ -1836,7 +1887,7 @@ async function getActionGeometry(target, backendNodeId, entry) {
             width:this.clientWidth-parseFloat(s.paddingLeft)-parseFloat(s.paddingRight),
             height:this.clientHeight-parseFloat(s.paddingTop)-parseFloat(s.paddingBottom)};}`, returnByValue: true,
         }));
-      } finally { await cdpSend(frameTarget, 'Runtime.releaseObject', { objectId }).catch(() => {}); }
+      } finally { await cdpSend(frameTarget, 'Runtime.releaseObject', { objectId }).catch(/** 忽略 iframe 尺寸读取后的远程对象释放失败。 */ () => {}); }
       if (!size || size.width <= 0 || size.height <= 0) throw new Error('iframe 没有可点击区域');
       offsets.set(frame.childSessionId, { x: offset.x + q[0] * offset.sx, y: offset.y + q[1] * offset.sy,
         sx: offset.sx * (q[2] - q[0]) / size.width, sy: offset.sy * (q[7] - q[1]) / size.height });
@@ -1845,7 +1896,7 @@ async function getActionGeometry(target, backendNodeId, entry) {
   const offset = offsets.get(target.sessionId || null);
   if (!offset) throw new Error('子页面定位信息失效，请重新观察');
   const coords = await getElementCoordinates(target, backendNodeId);
-  return coords ? { frames, offset, quads: coords.quads.map(q => q.map((v, i) =>
+  return coords ? { frames, offset, quads: coords.quads.map(/** 把各四边形的所有坐标转换到顶层视口。 */ q => q.map(/** 按横纵轴分别应用框架累积缩放和位移。 */ (v, i) =>
     i % 2 === 0 ? offset.x + v * offset.sx : offset.y + v * offset.sy)) } : null;
 }
 
@@ -1865,7 +1916,8 @@ async function dispatchRealClick(target, x, y) {
   if (failure) throw new Error('鼠标点击未能完整确认，可能已部分执行；请先观察结果，不要直接重试');
 }
 
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+/** 异步等待指定毫秒数，为浏览器事件处理留出间隔。 */
+function sleep(ms) { return new Promise(/** 在指定时间后完成异步等待。 */ r => setTimeout(r, ms)); }
 
 // ── VK 映射（actor/utils.py + daw.py _get_char_modifiers_and_vk / _get_key_code_for_char）──
 // modifier 位掩码：Alt=1 Control=2 Meta=4 Shift=8。
@@ -1886,6 +1938,7 @@ const SPECIAL_KEYS = {
   PageUp: ['PageUp', 33], PageDown: ['PageDown', 34], Space: ['Space', 32],
 };
 
+/** 把字符映射为修饰键、虚拟键码和基础键字符。 */
 function charModifiersAndVk(ch) {
   if (SHIFT_CHARS[ch]) { const [base, vk] = SHIFT_CHARS[ch]; return { mod: 8, vk, base }; }
   if (ch >= 'A' && ch <= 'Z') return { mod: 8, vk: ch.charCodeAt(0), base: ch.toLowerCase() };
@@ -1895,6 +1948,7 @@ function charModifiersAndVk(ch) {
   return { mod: 0, vk: ch.length === 1 ? ch.charCodeAt(0) : 0, base: ch };
 }
 
+/** 将基础字符转换为浏览器键盘事件使用的物理键代码。 */
 function keyCodeForChar(base) {
   if (base >= 'a' && base <= 'z') return 'Key' + base.toUpperCase();
   if (base >= 'A' && base <= 'Z') return 'Key' + base;
@@ -1923,7 +1977,7 @@ async function dispatchSpecialKey(target, key, modifiers, guard = null) {
     code = keyCodeForChar(info.base); vk = info.vk;
     if (!(mod & 7)) {
       mod |= info.mod;
-      if (mod & 8) key = Object.keys(SHIFT_CHARS).find(k => SHIFT_CHARS[k][0] === info.base) || key.toUpperCase();
+      if (mod & 8) key = Object.keys(SHIFT_CHARS).find(/** 查找基础键在按住 Shift 时对应的字符。 */ k => SHIFT_CHARS[k][0] === info.base) || key.toUpperCase();
       text = key;
     }
   } else throw new Error('不支持的按键；文字请使用 type，组合键请使用 modifiers');
@@ -1980,20 +2034,22 @@ async function inspectClickTarget(target, backendNodeId, x, y, independentDescen
     if (!q || q.length !== 8) throw new Error('无法确认点击目标的命中区域');
     const value = runtimeValue(await cdpSend(target, 'Runtime.callFunctionOn', {
       objectId, functionDeclaration: AgentClick.inspectPoint.toString(),
-      arguments: [{ value: x }, { value: y }, { value: q }, ...childObjects.map(objectId => ({ objectId }))], returnByValue: true,
+      arguments: [{ value: x }, { value: y }, { value: q }, ...childObjects.map(/** 将独立子控件引用转换为页面函数的远程对象参数。 */ objectId => ({ objectId }))], returnByValue: true,
     }));
     if (typeof value?.ok !== 'boolean') return { ok: false, reason: 'unsupported_hit_test' };
     return value;
   } finally {
-    await Promise.all([objectId, ...childObjects].map(objectId =>
-      cdpSend(target, 'Runtime.releaseObject', { objectId }).catch(() => {})));
+    await Promise.all([objectId, ...childObjects].map(/** 并行释放点击检查中创建的远程对象引用。 */ objectId =>
+      cdpSend(target, 'Runtime.releaseObject', { objectId }).catch(/** 忽略单个远程引用释放失败，使其他引用继续释放。 */ () => {})));
   }
 }
 
+/** 通过实时命中检查判断目标点击点是否被遮挡或命中其他控件。 */
 async function checkOcclusion(target, backendNodeId, x, y, independentDescendants = []) {
   return !(await inspectClickTarget(target, backendNodeId, x, y, independentDescendants)).ok;
 }
 
+/** 读取目标选择控件的实时状态，并在结束后释放远程对象。 */
 async function readCheckableState(target, backendNodeId) {
   let objectId;
   try {
@@ -2003,7 +2059,7 @@ async function readCheckableState(target, backendNodeId) {
       objectId, functionDeclaration: AgentClick.describeCheckable.toString(), returnByValue: true,
     }));
   } catch { return null; }
-  finally { if (objectId) await cdpSend(target, 'Runtime.releaseObject', { objectId }).catch(() => {}); }
+  finally { if (objectId) await cdpSend(target, 'Runtime.releaseObject', { objectId }).catch(/** 忽略选择状态读取后的远程对象释放失败。 */ () => {}); }
 }
 
 // finally 重聚焦顶层（防点击开了新 tab/dialog 卡住）。daw.py:1026。
@@ -2054,14 +2110,14 @@ async function handleAgentExecute(tabId, action, ctx = null) {
   }
 
   // 视口取根 target（顶层坐标系）。
-  const metrics = await cdpSend(rootTarget, 'Page.getLayoutMetrics', {}).catch(() => null);
+  const metrics = await cdpSend(rootTarget, 'Page.getLayoutMetrics', {}).catch(/** 视口指标读取失败时返回空值，由调用方使用默认尺寸。 */ () => null);
   const vw = (metrics && metrics.cssLayoutViewport && metrics.cssLayoutViewport.clientWidth) || 1920;
   const vh = (metrics && metrics.cssLayoutViewport && metrics.cssLayoutViewport.clientHeight) || 1080;
 
   try {
     // 元素点击/悬停走目标 session；页面级动作仍走根 session。
     if (action.params?.material_id || type === 'read_field') {
-      if (action.params.field_snapshot && ['id', 'digest', 'length', 'format'].some(k => action.params.field_snapshot[k] !== elementEntry?.fieldSnapshot?.[k])) {
+      if (action.params.field_snapshot && ['id', 'digest', 'length', 'format'].some(/** 比较动作携带的字段快照与当前观察中的快照。 */ k => action.params.field_snapshot[k] !== elementEntry?.fieldSnapshot?.[k])) {
         return { success: false, stale: true, action_type: type, error: '字段快照与当前观察不匹配，请重新观察' };
       }
       let materialObject;
@@ -2073,7 +2129,7 @@ async function handleAgentExecute(tabId, action, ctx = null) {
           arguments: [{ value: true }], returnByValue: true,
         }));
         if (!live?.success || !action.params.material_identity ||
-            Object.entries(action.params.material_identity).some(([key, value]) => (live[key] || '') !== value))
+            Object.entries(action.params.material_identity).some(/** 核对字段的实时语义身份是否仍与物料绑定一致。 */ ([key, value]) => (live[key] || '') !== value))
           return { success: false, stale: true, action_type: type, error: '字段名称或分组已变化，未写入旧物料，请重新观察' };
         if (type === 'select' && action.params.field_snapshot) {
           const snapshot = action.params.field_snapshot;
@@ -2083,7 +2139,7 @@ async function handleAgentExecute(tabId, action, ctx = null) {
           action = { ...action, params: { ...action.params, expected_prior: live.snapshot_value } };
         }
       } finally {
-        if (materialObject) await cdpSend(domTarget, 'Runtime.releaseObject', { objectId: materialObject }).catch(() => {});
+        if (materialObject) await cdpSend(domTarget, 'Runtime.releaseObject', { objectId: materialObject }).catch(/** 忽略物料身份检查结束后的远程对象释放失败。 */ () => {});
       }
     }
     if (['type', 'clear', 'focus', 'press_key'].includes(type)) await refocusTop(rootTarget);
@@ -2095,25 +2151,25 @@ async function handleAgentExecute(tabId, action, ctx = null) {
     if (type === 'clear') return { __via: 'cdp', ...(await doClear(domTarget, backendNodeId, action.index)) };
     if (type === 'select') return { __via: 'cdp', ...(await doSelect(domTarget, rootTarget, backendNodeId, action, vw, vh, elementEntry)) };
     if (type === 'hover') return { __via: 'cdp', ...(await doHover(domTarget, rootTarget, backendNodeId, vw, vh, elementEntry)) };
-    if (type === 'focus') return { __via: 'cdp', ...(await withEditingTarget(domTarget, backendNodeId, type, async editor => {
+    if (type === 'focus') return { __via: 'cdp', ...(await withEditingTarget(domTarget, backendNodeId, type, /** 聚焦已解析的编辑目标并返回确认结果。 */ async editor => {
       await editor.call('focus');
       return { success: true, action_type: type, details: `已确认[${action.index}]获得焦点` };
     })) };
     if (type === 'press_key') {
       const key = (action.params && action.params.key) || 'Enter';
       const mods = (action.params && action.params.modifiers) || [];
-      return { __via: 'cdp', ...(await withEditingTarget(domTarget, backendNodeId, type, async editor => {
+      return { __via: 'cdp', ...(await withEditingTarget(domTarget, backendNodeId, type, /** 确认焦点和编辑约束后派发按键，保留动作后的观察要求。 */ async editor => {
         const state = await editor.call(backendNodeId == null ? 'state' : 'focus');
         if (!state.focused) throw new Error('未能确认按键目标焦点');
         if (/^[\x20-\x7e]$/.test(key) || key === 'Space' || ['Backspace', 'Delete'].includes(key)) await editor.call('guard');
-        await dispatchSpecialKey(domTarget, key, mods, async () => {
+        await dispatchSpecialKey(domTarget, key, mods, /** 派发字符前再次检查焦点是否仍属于目标。 */ async () => {
           if (!(await editor.call('state')).focused) throw new Error('按键期间焦点转移，未继续派发字符');
         });
         return { success: true, action_type: type, details: `已派发按键 ${key}，请结合新观察确认结果` };
       })) };
     }
     if (type === 'scroll_to_element') {
-      await cdpSend(domTarget, 'DOM.scrollIntoViewIfNeeded', { backendNodeId }).catch(() => {});
+      await cdpSend(domTarget, 'DOM.scrollIntoViewIfNeeded', { backendNodeId }).catch(/** 滚动请求失败时继续由后续观察确认页面状态。 */ () => {});
       return { __via: 'cdp', success: true, action_type: type, details: `滚动到[${action.index}]` };
     }
     if (type === 'scroll') {
@@ -2209,6 +2265,7 @@ async function doClick(domTarget, rootTarget, backendNodeId, index, vw, vh, entr
     error: `${errors[code] || '无法确认点击目标'}；未派发点击，请重新观察` };
 }
 
+/** 只读采样目标及各级框架的命中状态，返回可命中性和诊断信息。 */
 async function inspectTarget(domTarget, backendNodeId, index, vw, vh, entry) {
   const geometry = await getActionGeometry(domTarget, backendNodeId, entry);
   const checks = geometry ? [...geometry.frames, { target: domTarget, backendNodeId, offset: geometry.offset,
@@ -2232,6 +2289,7 @@ async function inspectTarget(domTarget, backendNodeId, index, vw, vh, entry) {
     details: `只读检查已完成：[${index}]${unknown ? '当前命中状态未知' : '当前采样位置未命中目标'}（${reason}）；未执行任何输入` };
 }
 
+/** 解析指定节点或当前焦点为编辑接口，执行回调并统一释放远程对象。 */
 async function withEditingTarget(target, backendNodeId, actionType, perform) {
   let nodeId, descriptorId;
   try {
@@ -2248,7 +2306,7 @@ async function withEditingTarget(target, backendNodeId, actionType, perform) {
     runtimeValue(descriptor);
     descriptorId = descriptor.result?.objectId;
     if (!descriptorId) throw new Error('无法解析编辑目标');
-    const editor = { call: async (operation, value = null) => {
+    const editor = { /** 调用页面中的编辑接口，标记相关副作用并拒绝未确认成功的操作。 */ call: async (operation, value = null) => {
       const effect = ['focus', 'select_all', 'set_native', 'insert_cm'].includes(operation);
       const result = runtimeValue(await cdpSend({ ...target, _agentEffect: effect }, 'Runtime.callFunctionOn', {
         objectId: descriptorId, functionDeclaration: 'function(op,arg){return this.call(op,arg);}',
@@ -2262,10 +2320,11 @@ async function withEditingTarget(target, backendNodeId, actionType, perform) {
     return { success: false, action_type: actionType, stale: !!error.stale, error: error.message };
   } finally {
     for (const objectId of [descriptorId, nodeId].filter(Boolean))
-      await cdpSend(target, 'Runtime.releaseObject', { objectId }).catch(() => {});
+      await cdpSend(target, 'Runtime.releaseObject', { objectId }).catch(/** 忽略编辑操作收尾时的远程对象释放失败。 */ () => {});
   }
 }
 
+/** 短暂轮询完整字段值与预期是否一致，只回读而不重复写入。 */
 async function verifyEditorValue(editor, expected) {
   // 只等待编辑器处理 input，不重写内容，也不把代理 textarea 当作完整文档。
   for (let i = 0; i < 6; i++) {
@@ -2276,6 +2335,7 @@ async function verifyEditorValue(editor, expected) {
   throw new Error('回读内容与预期不符，未重放输入；请依据新观察确认已写入的内容');
 }
 
+/** 将字段或选项回读结果关联到物料及成果标识，供后端核验填写结果。 */
 function materialVerification(action, result) {
   return action.params?.material_id ? { material_verification: {
     material_id: action.params.material_id, artifact_id: action.params.artifact_id,
@@ -2284,10 +2344,11 @@ function materialVerification(action, result) {
   } } : {};
 }
 
+/** 只读核验绑定物料与当前字段值、原值和有效性是否一致。 */
 async function doVerifyField(domTarget, rootTarget, backendNodeId, action, vw, vh, entry) {
   if (!action.params?.material_id) return { success: false, error: '只读核实需要有效物料绑定' };
   if (action.params.expected_option) return doSelect(domTarget, rootTarget, backendNodeId, action, vw, vh, entry);
-  return withEditingTarget(domTarget, backendNodeId, 'verify_field', async editor => {
+  return withEditingTarget(domTarget, backendNodeId, 'verify_field', /** 只读比较字段现值、物料预期及原值，并返回有效性核验。 */ async editor => {
     const result = await editor.call('read');
     const expected = String(action.params.text ?? '').replace(/\r\n?/g, '\n');
     const priorMatches = action.params.expected_prior_complete === false ||
@@ -2300,8 +2361,9 @@ async function doVerifyField(domTarget, rootTarget, backendNodeId, action, vw, v
   });
 }
 
+/** 校验字段快照未变化后按 Unicode 字符分页回读，返回精确范围及续读位置。 */
 async function doReadField(target, backendNodeId, action) {
-  return withEditingTarget(target, backendNodeId, 'read_field', async editor => {
+  return withEditingTarget(target, backendNodeId, 'read_field', /** 校验字段完整快照后按请求范围返回原文片段和续读位置。 */ async editor => {
     const result = await editor.call('read'), snapshot = action.params.field_snapshot;
     if (!snapshot || result.value.length !== snapshot.length || await fieldValueDigest(result.value) !== snapshot.digest)
       return { success: false, stale: true, error: '字段在观察后已变化，未返回混合版本，请重新观察' };
@@ -2315,6 +2377,7 @@ async function doReadField(target, backendNodeId, action) {
   });
 }
 
+/** 根据编辑器类型清空内容，必要时核对原值，并回读确认结果为空。 */
 async function clearEditor(target, editor, prior = null) {
   const state = await editor.call('guard');
   if ((await editor.call('read')).value === '') return;
@@ -2328,8 +2391,9 @@ async function clearEditor(target, editor, prior = null) {
   await verifyEditorValue(editor, '');
 }
 
+/** 校验内容、字段约束和物料快照，执行替换或插入，再回读确认完整结果。 */
 async function doType(domTarget, rootTarget, backendNodeId, action) {
-  return withEditingTarget(domTarget, backendNodeId, 'type', async editor => {
+  return withEditingTarget(domTarget, backendNodeId, 'type', /** 检查目标能力与内容约束，执行受保护的写入并回读确认。 */ async editor => {
     const text = String(action.params?.text ?? '').replace(/\r\n?/g, '\n');
     const state = await editor.call('state');
     if (!state.editable) throw new Error('目标不是可编辑区域或处于只读状态，请选择可输入的元素');
@@ -2373,7 +2437,7 @@ async function doType(domTarget, rootTarget, backendNodeId, action) {
         await editor.call('guard');
         await cdpSend(domTarget, 'Input.insertText', { text });
       }
-      else await typeChars(domTarget, text, () => editor.call('guard'));
+      else await typeChars(domTarget, text, /** 在每次字符输入前确认编辑目标仍可安全修改。 */ () => editor.call('guard'));
     }
     const result = await verifyEditorValue(editor, expected);
     return { success: result.valid, action_type: 'type',
@@ -2383,8 +2447,9 @@ async function doType(domTarget, rootTarget, backendNodeId, action) {
   });
 }
 
+/** 聚焦目标编辑区域，清空并确认内容后返回动作结果。 */
 async function doClear(target, backendNodeId, index) {
-  return withEditingTarget(target, backendNodeId, 'clear', async editor => {
+  return withEditingTarget(target, backendNodeId, 'clear', /** 聚焦并清空编辑区域，返回确认内容为空的结果。 */ async editor => {
     await editor.call('focus');
     await clearEditor(target, editor);
     return { success: true, action_type: 'clear', details: `已确认[${index}]内容为空` };
@@ -2399,7 +2464,7 @@ async function doSelect(domTarget, rootTarget, backendNodeId, action, vw, vh, en
   const objectId = rn && rn.object && rn.object.objectId;
   if (!objectId) return { success: false, stale: true, action_type: 'select', error: '选择目标已失效，请重新观察' };
   try {
-    const isNative = await cdpSend(target, 'Runtime.callFunctionOn', { objectId, functionDeclaration: 'function(){return this.tagName==="SELECT";}', returnByValue: true }).then(r => r?.result?.value);
+    const isNative = await cdpSend(target, 'Runtime.callFunctionOn', { objectId, functionDeclaration: 'function(){return this.tagName==="SELECT";}', returnByValue: true }).then(/** 提取页面脚本返回的原生下拉框判定。 */ r => r?.result?.value);
     if (typeof isNative !== 'boolean') return { success: false, action_type: 'select', error: '无法确认下拉控件类型' };
     if (isNative) {
       const response = await cdpSend({ ...target, _agentEffect: action.type !== 'verify_field' }, 'Runtime.callFunctionOn', {
@@ -2413,7 +2478,7 @@ async function doSelect(domTarget, rootTarget, backendNodeId, action, vw, vh, en
         ...(result.success ? { details: `${action.type === 'verify_field' ? '只读核实' : '已确认选择'} ${JSON.stringify(result.option)}；字段校验通过` } : {}) };
     }
   } finally {
-    await cdpSend(target, 'Runtime.releaseObject', { objectId }).catch(() => {});
+    await cdpSend(target, 'Runtime.releaseObject', { objectId }).catch(/** 忽略下拉框处理后的远程对象释放失败。 */ () => {});
   }
   if (action.type === 'verify_field') return { success: false, error: '只读选项核实只支持原生下拉' };
   // 自定义下拉:点触发器展开,等,再在弹层里精确文本匹配点击(不用子串,防 wrong-click)
@@ -2423,14 +2488,14 @@ async function doSelect(domTarget, rootTarget, backendNodeId, action, vw, vh, en
   const found = await cdpSend({ ...target, _agentEffect: true }, 'Runtime.evaluate', {
     expression: `(()=>{const t=${JSON.stringify(optText)};const items=[...document.querySelectorAll('[role="option"],[role="listbox"] li,.ant-select-item,.el-select-dropdown__item,[class*="option"],[class*="menu-item"],[class*="dropdown"] li')].filter(it=>(it.textContent||'').trim()===t&&it.getBoundingClientRect().width>0&&it.getBoundingClientRect().height>0);if(items.length!==1)return null;const it=items[0],r=it.getBoundingClientRect();it.click();return {x:r.x+r.width/2,y:r.y+r.height/2};})()`,
     returnByValue: true,
-  }).then(r => r && r.result && r.result.value).catch(() => null);
+  }).then(/** 提取自定义选项脚本返回的点击位置。 */ r => r && r.result && r.result.value).catch(/** 自定义选项脚本失败时返回未找到的结果。 */ () => null);
   if (found) return { success: true, action_type: 'select', details: `已向选项"${optText}"派发点击，请结合新观察确认选择结果` };
   return { success: false, action_type: 'select', error: `下拉项未找到:"${optText}"` };
 }
 
 // 悬停:取坐标→真实鼠标移动(触发 CSS :hover / JS mouseenter)。
 async function doHover(domTarget, rootTarget, backendNodeId, vw, vh, entry) {
-  await cdpSend(domTarget, 'DOM.scrollIntoViewIfNeeded', { backendNodeId }).catch(() => {});
+  await cdpSend(domTarget, 'DOM.scrollIntoViewIfNeeded', { backendNodeId }).catch(/** 悬停前滚动失败时仍尝试读取当前有效几何。 */ () => {});
   await sleep(50);
   const coords = await getActionGeometry(domTarget, backendNodeId, entry);
   if (!coords || !coords.quads) return { success: false, action_type: 'hover', error: '无法定位坐标' };

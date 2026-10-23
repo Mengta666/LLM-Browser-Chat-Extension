@@ -93,6 +93,7 @@ A编号只在当前任务有效。目录有编号不代表内容已读，已经�
 
 
 def guidance(kb_id):
+    """生成当前任务可用的知识库和成果工具说明，指导模型引用实际取得的资料。"""
     text = GUIDANCE
     if kb_id:
         from search.tools import KB_SEARCH_TOOL, KB_LIST_DOCUMENTS_TOOL
@@ -107,11 +108,13 @@ def guidance(kb_id):
 
 
 def counter_for(session):
+    """为当前自动化模型创建受决策截止时间约束的 token 计数器。"""
     return RequestTokenCounter(session.model, deadline=session.decision_deadline,
         chat_template_kwargs=(session.llm_params.get('extra_body') or {}).get('chat_template_kwargs'))
 
 
 def input_limit(session, counter):
+    """从模型上下文窗口扣除输出和安全预留，计算本步可用输入预算。"""
     from agent.memory import config as C
     from agent.materials import OUTPUT_TOKENS
     reserve = int(session.llm_params.get('max_completion_tokens') or session.llm_params.get('max_tokens') or OUTPUT_TOKENS)
@@ -119,15 +122,18 @@ def input_limit(session, counter):
 
 
 def _save_key(arguments):
+    """按成果对象和用途生成保存操作的归类键。"""
     return json.dumps([arguments.get('subject'), arguments.get('purpose')], ensure_ascii=False, sort_keys=True)
 
 
 def _save_signature(session, arguments):
+    """计算成果保存输入的摘要，用于识别相同内容的重复失败。"""
     payload = [arguments, session.task_state['sources'], session.task_state['artifacts']]
     return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode('utf-8')).hexdigest()
 
 
 def record_error(session, name, arguments, exc, *, page=None):
+    """将工具错误转换为任务反馈，保留已有资料并记录相关修复状态。"""
     state = session.task_state
     feedback = copy.deepcopy(getattr(exc, 'feedback', {'code': 'invalid_tool_arguments', 'error': str(exc)[:300],
         'hint': '修正工具参数后继续；已经取得的来源和成果保留。'}))
@@ -167,6 +173,7 @@ def record_error(session, name, arguments, exc, *, page=None):
 
 
 def record_length_error(session, exc):
+    """登记字段长度超限及目标约束，供后续基于原成果精简稿件。"""
     state = session.task_state
     feedback = copy.deepcopy(exc.feedback)
     key = json.dumps([feedback['artifact_id'], feedback['field_signature'], feedback['max_length']], sort_keys=True)
@@ -191,6 +198,7 @@ def record_length_error(session, exc):
 
 
 def run(session, name, arguments, counter, context_tokens, *, page=None):
+    """在任务预算内执行知识库或成果工具，并更新证据、执行记录及修复状态。"""
     from search.tools import parse_tool_arguments
     from search.kb_task import progress_snapshot
     state = session.task_state
@@ -314,6 +322,7 @@ def run(session, name, arguments, counter, context_tokens, *, page=None):
 
 
 def assemble(session, messages, counter, *, compact=None):
+    """将任务成果、字段反馈和证据视图装入上下文，必要时整理证据以满足输入预算。"""
     from agent.field_review import public as public_reviews
     state = session.task_state
     limit = input_limit(session, counter)
@@ -379,6 +388,7 @@ def assemble(session, messages, counter, *, compact=None):
         base = kb_workspace.strip_view(result)
         visible = kb_workspace.view_rows(rows, budget.state)
         def view(selected):
+            """用选定证据生成工作区消息，并保留归档证据总数。"""
             return [*base, {'role':'user','content':kb_workspace.MARKER + json.dumps(
                 kb_workspace.payload(selected,len(rows)),ensure_ascii=False)}]
         result = view(visible)

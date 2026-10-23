@@ -24,10 +24,12 @@ CACHE_TTL_SEC = 300  # 5 分钟兜底
 def cache_key(memory_type: Optional[str],
               include_invalid: bool,
               include_episodic: bool) -> tuple:
+    """将记忆类型和显示选项归一为缓存键。"""
     return (memory_type or "", bool(include_invalid), bool(include_episodic))
 
 
 def get(key: tuple) -> Optional[dict]:
+    """返回未过期的记忆列表缓存，过期时移除记录并返回空值。"""
     with _lock:
         entry = _cache.get(key)
         if not entry:
@@ -39,6 +41,7 @@ def get(key: tuple) -> Optional[dict]:
 
 
 def set(key: tuple, payload: dict) -> None:
+    """保存记忆列表及缓存时间，供后续查询复用。"""
     with _lock:
         _cache[key] = {"payload": payload, "expiry": time.time() + CACHE_TTL_SEC}
 

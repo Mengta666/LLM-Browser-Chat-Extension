@@ -10,6 +10,7 @@ from storage import kb_store as KS, kb_document_store as DS, kb_structure_store 
 
 
 def get(kb_id, doc_id, review_id):
+    """查询结构建议的发布进度，并判断发布版本是否仍是文档当前版本。"""
     with KS._transaction() as conn:
         doc = DS.owned(conn, kb_id, doc_id)
         RS.owned(conn, kb_id, doc_id, review_id)
@@ -26,6 +27,7 @@ def get(kb_id, doc_id, review_id):
 
 
 def start(kb_id, doc_id, review_id, expected_run_id):
+    """检查审阅结果和预期发布基线，登记发布任务并启动后台索引。"""
     from rag import kb as KB
     with KB._kb_lock(kb_id):
         if KB._has_worker(kb_id, doc_id):
@@ -46,6 +48,7 @@ def start(kb_id, doc_id, review_id, expected_run_id):
             if old and old['status'] == 'published':
                 pass
             else:
+                # 审阅结果只适用于当时的解析和结构基线，不能覆盖审阅期间发布的新版本。
                 if (doc['published_run_id'] != expected_run_id or doc['published_parse_id'] != review['parse_id']
                         or doc['active_parse_id'] != review['parse_id'] or doc['published_structure_id'] != review['structure_id']):
                     raise KS.KBConflict('发布基线已变化，请重新审阅当前版本，不能覆盖其他更新')
@@ -69,6 +72,7 @@ def start(kb_id, doc_id, review_id, expected_run_id):
 
 
 def run(kb_id, doc_id, parse_id, finish, publish_lock, *, review_id):
+    """根据审阅建议构建新结构及向量索引，通过基线校验后发布。"""
     from rag.document_worker import _slots, publish_index
     from observability.logger import get_logger
     lease = None
@@ -80,6 +84,7 @@ def run(kb_id, doc_id, parse_id, finish, publish_lock, *, review_id):
             deadline = time.monotonic() + C.TASK_TIMEOUT
 
             def check():
+                """确认发布租约、任务期限和预期旧版本仍有效，阻止覆盖其他更新。"""
                 if time.monotonic() >= deadline:
                     raise TimeoutError('structure_publication_timeout')
                 with KS._transaction() as conn:

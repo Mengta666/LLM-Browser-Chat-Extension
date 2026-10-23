@@ -13,6 +13,7 @@ READ_TOOLS = {'kb_search', 'kb_read_document'}
 
 
 def settings(state):
+    """初始化并复用请求级证据工作区策略，避免执行中随配置变化漂移。"""
     snapshot = state.setdefault('settings', {})
     for key,value in C.budget_settings().items():
         if key.startswith('WORKSPACE_'):
@@ -21,6 +22,7 @@ def settings(state):
 
 
 def collect(records, state=None):
+    """从工具档案和请求状态收集证据，去重并补齐需求关联。"""
     rows = []
     for record in records:
         if record.get('name') not in READ_TOOLS:
@@ -52,6 +54,7 @@ def collect(records, state=None):
 
 
 def wire_row(row):
+    """提取工作区证据允许传给模型的字段。"""
     return {k:v for k,v in row.items() if k in (
         'citation', 'kb_id', 'doc_id', 'parse_id', 'index_run_id', 'document', 'content', 'locations',
         'need_ids', 'bundle_id', 'bundle_role', 'evidence_role', 'read_kind', 'warnings',
@@ -60,11 +63,13 @@ def wire_row(row):
 
 
 def identity(row):
+    """根据文档版本、来源范围和正文计算证据身份。"""
     return hashlib.sha256(json.dumps([row.get('kb_id') or '', row.get('doc_id') or '', row.get('parse_id') or '', row.get('index_run_id') or '',
         row.get('locations'), row.get('content')], ensure_ascii=False, sort_keys=True).encode()).hexdigest()
 
 
 def units(rows):
+    """按证据包或独立来源身份分组，供完整保留或压缩处理。"""
     groups = {}
     for row in rows:
         key = (row.get('doc_id'), row.get('parse_id') or '', row.get('bundle_id') or identity(row))
@@ -73,12 +78,14 @@ def units(rows):
 
 
 def payload(rows, total):
+    """构造证据视图载荷，区分已归档总量和本次实际可见数量。"""
     return {'kind': 'kb_workspace', 'version': 1, 'evidence': [wire_row(r) for r in rows],
         'archived_unit_count': total, 'visible_unit_count': len(rows),
         'notice': '这里仅列本次可见资料；曾经取得不代表当前可见。需要原句、条件或核对时使用 kb_read_document 重新读取已知位置，允许复查。摘要不是逐字原文，也不是核实结论。'}
 
 
 def strip_view(messages):
+    """移除旧工作区视图和重复证据正文，为构建当前证据视图准备基础消息。"""
     names = {c['id']:c['function']['name'] for m in messages for c in m.get('tool_calls', [])}
     completed = {m.get('tool_call_id') for m in messages if m['role']=='tool'}
     removable = {c['id'] for m in messages if m.get('tool_calls') and not m.get('content')
@@ -108,6 +115,7 @@ def strip_view(messages):
 
 
 def record_view(state, rows, selected, *, phase):
+    """保存本次证据视图的版本、阶段及省略情况。"""
     workspace = state.setdefault('workspace', {'version': 0})
     refs = [r['citation'] for r in selected]
     digest = hashlib.sha256(json.dumps([phase, [identity(r) for r in selected]]).encode()).hexdigest()
@@ -122,6 +130,7 @@ def record_view(state, rows, selected, *, phase):
 
 
 def decision_view(messages, tools, records, state, counter, limit):
+    """按上下文预算选择原文或已校验压缩证据，生成当前决策可见的工作区。"""
     config = settings(state)
     rows = collect(records, state)
     if not rows or not config['WORKSPACE_ENABLED']:
@@ -132,6 +141,7 @@ def decision_view(messages, tools, records, state, counter, limit):
         return messages, None
     base = strip_view(messages)
     def assemble(selected):
+        """把选中证据附加到基础消息，形成可测量预算的候选请求。"""
         return [*base, {'role':'user', 'content':MARKER+json.dumps(payload(selected, len(rows)), ensure_ascii=False)}]
     target = max(0, limit-reserve)
     selected = []
@@ -156,6 +166,7 @@ def decision_view(messages, tools, records, state, counter, limit):
 
 
 def sentences(row):
+    """将原文分割为带字符范围和编号的句子，供压缩结果逐句引用。"""
     text = row['content']
     spans = []
     start = 0
@@ -169,12 +180,14 @@ def sentences(row):
 
 
 def pack_key(group, state):
+    """结合证据身份、原问题和需求计算压缩包键，防止错误复用不同任务的摘要。"""
     return hashlib.sha256(json.dumps([2, state.get('workspace_policy',{}), state.get('original_question',''),
         [(n['id'],n['question']) for n in state.get('needs',[])],
         sorted(identity(r) for r in group)],ensure_ascii=False).encode()).hexdigest()
 
 
 def view_rows(rows, state, *, keep_recent=True):
+    """用已完成的压缩包替换对应证据组，并按策略保留最近原文。"""
     packs = state.get('workspace',{}).get('packs',{})
     result = []
     groups = units(rows)
@@ -188,6 +201,7 @@ def view_rows(rows, state, *, keep_recent=True):
 
 
 def validate_pack(group, answer, state):
+    """校验模型压缩内容及原文引用，返回可以追溯来源的派生证据。"""
     raw=answer.strip()
     if raw.startswith('```') and raw.endswith('```'):
         raw=raw.split('\n',1)[-1].rsplit('```',1)[0]

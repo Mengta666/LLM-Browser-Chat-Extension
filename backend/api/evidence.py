@@ -7,6 +7,7 @@ from search.excerpts import history_excerpt
 
 
 def kb_evidence_rows(payload):
+    """从知识库工具结果展开证据行，补齐所属文档及定位信息。"""
     documents = {d['ref']: d for d in payload.get('documents', [])}
     for row in payload.get('evidence', []):
         document = documents.get(row.get('doc_ref'), {})
@@ -17,6 +18,7 @@ def kb_evidence_rows(payload):
 
 class EvidenceLedger:
     def __init__(self, start_index=1, initial_sources=None):
+        """初始化本轮证据和引用编号，按需恢复已有来源以维持编号稳定。"""
         self.next_index = start_index
         self.sources = {s["index"]: dict(s) for s in (initial_sources or [])}
         self.keys = {}
@@ -30,6 +32,7 @@ class EvidenceLedger:
                         self.keys[('web', identity)] = index
 
     def register(self, tool_name, kb_id, results, query):
+        """按来源身份去重并分配引用编号，返回编号后的结果和本次关联来源。"""
         numbered, sources = [], {}
         for result in results:
             row = result if isinstance(result, dict) else vars(result)

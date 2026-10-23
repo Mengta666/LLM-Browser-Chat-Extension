@@ -207,6 +207,7 @@ if CHAT_REASONING_EFFORT and (not CHAT_REASONING_MODEL or CHAT_REASONING_EFFORT 
 
 
 def chat_reasoning_kwargs(model):
+    """仅为配置匹配的模型附加推理强度参数。"""
     return {'reasoning_effort': CHAT_REASONING_EFFORT} if CHAT_REASONING_EFFORT and model == CHAT_REASONING_MODEL else {}
 
 
@@ -229,6 +230,7 @@ if (KB_ANSWER_REASONING_EFFORT not in ('', 'low', 'medium', 'xhigh')
 
 
 def kb_answer_settings(model):
+    """返回指定模型适用的知识库回答推理和输出额度配置。"""
     if model == KB_ANSWER_REASONING_MODEL and (KB_ANSWER_REASONING_EFFORT or KB_ANSWER_MAX_OUTPUT_TOKENS):
         return {'reasoning_effort': KB_ANSWER_REASONING_EFFORT,
                 'max_tokens': KB_ANSWER_MAX_OUTPUT_TOKENS or CHAT_MAX_OUTPUT_TOKENS}
@@ -236,6 +238,7 @@ def kb_answer_settings(model):
 
 
 def chat_generation_extra(model, phase, *, kb_answer=False):
+    """按生成阶段和模型选择附加推理参数，兼顾知识库收尾与压缩场景。"""
     template = chat_reasoning_kwargs(model)
     extra = {}
     if phase == 'kb_compact':

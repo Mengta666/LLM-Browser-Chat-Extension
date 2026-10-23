@@ -8,6 +8,7 @@ from pathlib import Path
 
 
 def decode(data):
+    """按字节标记和配置解码文本，校验内容可用性且不改写原始换行。"""
     if data.startswith(codecs.BOM_UTF8):
         encoding = 'utf-8-sig'
     elif data.startswith((codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)):
@@ -36,10 +37,12 @@ def decode(data):
 
 
 def line_starts(text):
+    """返回每行在原文中的起始字符偏移，兼容不同换行格式。"""
     return [0, *[m.end() for m in re.finditer(r'\r\n|\r|\n', text)]]
 
 
 def original(doc):
+    """核对源文件路径和内容摘要后，返回原始文本及其编码。"""
     from rag.document_config import document_path
     path = document_path(doc['doc_id'], 'original.' + doc['file_type'])
     if not doc['original_path'] or Path(doc['original_path']).resolve() != path or not path.is_file():

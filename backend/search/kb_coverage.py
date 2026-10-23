@@ -6,6 +6,7 @@ import json
 
 
 def missing(span, ranges):
+    """从一个来源范围中扣除已经交付的区间，返回尚未覆盖的部分。"""
     start, end = span[3:]
     result = []
     for a,b in sorted((r[3],r[4]) for r in ranges if r[:3]==span[:3]):
@@ -22,10 +23,12 @@ def missing(span, ranges):
 
 
 def row_ranges(row):
+    """把证据行的定位转换为带文档和解析版本的统一范围表示。"""
     return [[row['doc_id'],row['parse_id'],s['block_id'],s['start'],s['end']] for s in row.get('locations',[]) if row.get('parse_id')]
 
 
 def covered_chars(ranges):
+    """合并同一原文块中的重叠区间，计算实际覆盖的字符数。"""
     groups = {}
     for doc, parse, block, start, end in ranges:
         groups.setdefault((doc, parse, block), []).append((start, end))
@@ -81,6 +84,7 @@ def reconcile_pending(state):
 
 
 def novel_rows(rows, delivered):
+    """从候选证据中选取尚未交付的内容，保留不可拆分单元的完整性。"""
     kept, seen = [], list(delivered)
     for original in rows:
         spans = row_ranges(original)
@@ -100,6 +104,7 @@ def novel_rows(rows, delivered):
 
 
 def register_goals(state, rows):
+    """将检索发现的证据包要求登记为本轮需要补齐的读取目标。"""
     goals = state.setdefault('goals',[])
     for row in rows:
         if not row.get('bundle_id') or row.get('bundle_role')!='core' or not row.get('required_ranges'):
@@ -117,6 +122,7 @@ def register_goals(state, rows):
 
 
 def update_goals(state, kb_id):
+    """依据实际交付范围更新目标状态，并生成尚缺原文的读取入口。"""
     from rag.document_config import READ_MAX_TARGETS
     pending = [p for p in state['pending'] if p.get('reason')!='goal_unread']
     for goal in state.get('goals',[]):
@@ -141,10 +147,12 @@ def update_goals(state, kb_id):
 
 
 def public_goals(state):
+    """返回可展示的知识库目标身份、问题和覆盖状态。"""
     return [{k:g[k] for k in ('id','doc_id','node_id','label','question','status')} for g in state.get('goals',[])]
 
 
 def contained_index(rows):
+    """查找范围被其他证据完全包含的候选行。"""
     for i,row in enumerate(rows):
         spans = row.get('locations',[])
         if not spans:
@@ -166,6 +174,7 @@ def contained_index(rows):
 
 
 def coalesce_evidence(rows):
+    """合并被包含的重复证据，并保留相关需求及来源关联。"""
     result = copy.deepcopy(rows)
     while (index := contained_index(result)) is not None:
         removed = result.pop(index)
@@ -195,6 +204,7 @@ def prune_evidence(rows, needs=()):
         required = {n['id']:set(n.get('citations', [])) for n in needs}
         pinned = {ref for n in needs for ref in n.get('required_citations', [])}
         def owners(row):
+            """确定证据行支撑的需求及文档版本，用于裁减时保护必要依据。"""
             return {(n['id'], row.get('doc_id') or row.get('doc_ref'), row.get('parse_id'))
                     for n in needs if row.get('citation') in required[n['id']]
                     or not required[n['id']] and n['id'] in row.get('need_ids', [])}

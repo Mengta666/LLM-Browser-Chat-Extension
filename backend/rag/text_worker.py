@@ -18,6 +18,7 @@ _slots=threading.BoundedSemaphore(C.TEXT_CONCURRENCY)
 
 
 def run(kb_id,doc_id,parse_id,finish,publish_lock):
+    """恢复或执行文本解析、结构构建和分批索引，完整校验后发布版本。"""
     from rag import kb_vectors as V
     lease,run_id,published=None,None,False
     _slots.acquire()
@@ -27,6 +28,7 @@ def run(kb_id,doc_id,parse_id,finish,publish_lock):
             return
         deadline=time.monotonic()+C.TASK_TIMEOUT
         def check():
+            """确认文本任务未超时且当前租约仍有效。"""
             if time.monotonic()>=deadline:
                 raise TimeoutError('document_task_timeout')
             return DS.check(kb_id,doc_id,parse_id,lease)
@@ -34,6 +36,7 @@ def run(kb_id,doc_id,parse_id,finish,publish_lock):
         parse_config=json.loads(job['config_json'])
         blocks=DS.blocks(parse_id)
         if not blocks:
+            # 没有可复用的块时需重新解析；配置指纹必须匹配，防止恢复任务时混用新旧规则。
             if fingerprint(text_structure.config(doc['file_type']))!=job['fingerprint']:
                 raise ValueError('text_parser_changed_reparse_required')
             text,encoding=original(doc)
@@ -71,6 +74,7 @@ def run(kb_id,doc_id,parse_id,finish,publish_lock):
             count+=len(batch)
             DS.advance_index(kb_id,doc_id,parse_id,lease,run_id,count)
         with publish_lock:
+            # 分批索引期间旧版本仍可用，完成性校验通过后才在发布锁内切换可检索版本。
             check()
             if not V.kb_index_complete(user_id=CHAT_USER_ID,kb_id=kb_id,doc_id=doc_id,index_run_id=run_id,expected=count):
                 raise ValueError('incomplete_vector_index')

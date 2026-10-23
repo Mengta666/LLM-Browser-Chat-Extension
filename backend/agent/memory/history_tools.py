@@ -23,6 +23,7 @@ HISTORY_GUIDANCE = (
 
 
 def _tool(name, description, properties, required=()):
+    """构造参数字段受限的历史原文工具定义。"""
     return {'type': 'function', 'function': {'name': name, 'description': description,
         'parameters': {'type': 'object', 'additionalProperties': False, 'properties': properties, 'required': list(required)}}}
 
@@ -42,6 +43,7 @@ HISTORY_TOOLS = [
 
 
 def parse_history_arguments(name, arguments):
+    """按历史工具类型验证检索、分页或续读参数。"""
     try:
         args = json.loads(arguments) if isinstance(arguments, str) else arguments
     except (ValueError, TypeError):
@@ -89,6 +91,7 @@ class TurnHistoryBudget:
     max_calls = 4
 
     def __init__(self, chat_id, upto_seq, *, request_id='', attempt=0, counter=None):
+        """恢复本次提问的历史回查额度、已读范围和持久化预算。"""
         self.chat_id, self.upto_seq = chat_id, upto_seq
         self.request_id, self.attempt, self.counter = request_id, attempt, counter
         saved = index.load_budget(chat_id, request_id) if request_id else None
@@ -98,13 +101,16 @@ class TurnHistoryBudget:
         self.initial_text = saved['initial_text'] if saved else None
 
     def count(self, text):
+        """使用请求计数器计算工具文本额度，未配置时采用保守估算。"""
         return self.counter.count_text(text) if self.counter else request_tokens([{'role': 'tool', 'content': text}])
 
     @property
     def available(self):
+        """判断本轮是否还有历史工具调用次数和最小可用结果额度。"""
         return self.calls < self.max_calls and self.limit - self.used >= 128
 
     def initial_catalog(self, *, max_tokens=400, query=''):
+        """生成受 token 预算约束的历史目录，并保存本轮目录和额度记录。"""
         if self.initial_text is not None:
             return self.initial_text
         blocks, _ = index.list_blocks(self.chat_id, self.upto_seq, self.request_id, limit=100000)
@@ -132,6 +138,7 @@ class TurnHistoryBudget:
         return text
 
     def _entry(self, row, start, content, end=None):
+        """包装单条历史原文片段，标明实际字符范围及可续读位置。"""
         length = len(row['content'])
         actual_end = start + len(content)
         target = min(length, end) if end is not None else length
@@ -147,6 +154,7 @@ class TurnHistoryBudget:
                 'next': next_args if actual_end < target else None}
 
     def execute(self, name, args, *, max_tokens):
+        """执行历史目录、搜索或原文读取工具，扣除实际额度并记录交付范围。"""
         if not self.available:
             raise ValueError('本轮历史回查预算已用尽；未读部分不代表不存在')
         cap = min(2000 if name == 'read_session_history' else 600, self.limit - self.used, max(0, max_tokens))

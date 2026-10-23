@@ -7,11 +7,13 @@ import re
 
 class FieldContentRequired(ValueError):
     def __init__(self, feedback):
+        """携带字段整理所需的结构化反馈，供决策层解释未执行填写的原因。"""
         super().__init__(feedback['error'])
         self.feedback = feedback
 
 
 def target(page, element):
+    """提取标签页、文档、节点和字段描述，构成待填稿绑定的目标身份。"""
     return {'tab_id': page.tab_id, 'document_epoch': page.document_epoch,
             'frame_id': element.get('frame_id', ''),
             'node_id': element.get('backend_node_id', element.get('id')),
@@ -20,12 +22,14 @@ def target(page, element):
 
 
 def target_key(subject, identity):
+    """根据字段身份生成稳定的修稿记录键，避免更换成果编号绕过同一字段的限制。"""
     return 'C' + hashlib.sha256(json.dumps(identity, sort_keys=True,
                                           ensure_ascii=False).encode()).hexdigest()[:12]
 
 
 def duplicates(content, field_basis=None):
     # 先按段落/行检测，再补充完整句子；只忽略列表标记与空白，不折叠数字或否定词。
+    """定位重复段落或句子的字符范围；局部修改时仅报告涉及修改区域的重复。"""
     units = {}
     for match in re.finditer(r'[^\r\n]+', content):
         line = match.group()
@@ -49,6 +53,7 @@ def duplicates(content, field_basis=None):
         if any(all(any(a <= left and right <= b for a, b in g['ranges']) for left, right in spans)
                for g in groups):
             continue
+        # 局部修改仅检查与替换区域相交的重复，保留区域中原有的重复不归入本次修稿问题。
         if field_basis and not any(left < edit['end'] and right > edit['start']
                                    for left, right in spans for edit in field_basis.get('output_edits', [])):
             continue
@@ -59,6 +64,7 @@ def duplicates(content, field_basis=None):
 
 
 def prepare(session, content, intent, page, subject, field_basis=None):
+    """校验待填稿的目标、用途和重复内容，返回与当前字段绑定的填写意图。"""
     from agent.task_workspace import ArtifactError
     if (not isinstance(intent, dict) or set(intent) - {'index', 'scope', 'exclude', 'keep_repetitions'}
             or type(intent.get('index')) is not int or not isinstance(intent.get('scope'), str)
@@ -103,6 +109,7 @@ def prepare(session, content, intent, page, subject, field_basis=None):
 
 
 def check(session, page, element, artifact):
+    """确认叙述性成果已按当前字段整理，否则抛出可用于修稿的反馈。"""
     text = artifact['content']
     intent = artifact.get('field_intent')
     narrative = (element.get('tag') == 'textarea' or element.get('editor_type') in ('contenteditable', 'codemirror5')
@@ -132,6 +139,7 @@ def check(session, page, element, artifact):
 
 
 def record_error(session, feedback, *, revision=False):
+    """累计字段修稿失败次数，更新阻塞状态并保存下一步所需的反馈。"""
     state = session.task_state
     feedback = copy.deepcopy(feedback)
     key = feedback['content_repair_id']

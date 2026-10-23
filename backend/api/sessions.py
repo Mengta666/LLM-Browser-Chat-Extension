@@ -33,6 +33,7 @@ def list_sessions() -> dict[str, Any]:
 
 @router.get('/capabilities')
 def capabilities():
+    """返回服务端会话、历史、知识库和附件协议的支持版本。"""
     from storage.chat_attachments import capabilities as attachment_capabilities
     return {'server_context': True, 'protocol_version': 1, 'resumable_compaction': True,
             'chat_background_tasks_version': 1, 'chat_event_stream_version': 1,
@@ -67,6 +68,7 @@ def capabilities():
 
 @router.post('/{chat_id}/requests/{request_id}/cancel')
 def cancel_request(chat_id: str, request_id: str):
+    """取消指定聊天请求并返回更新后的持久化状态。"""
     try:
         CS.cancel_turn(chat_id, request_id)
         return CS.get_request(chat_id, request_id)
@@ -76,6 +78,7 @@ def cancel_request(chat_id: str, request_id: str):
 
 @router.get('/{chat_id}/requests/{request_id}')
 def get_request(chat_id: str, request_id: str):
+    """验证会话存在后返回指定提问的状态及恢复信息。"""
     try:
         session = CS.get_session(chat_id)
         result = CS.get_request(chat_id, request_id) if session and not session['deleted_at'] else None
@@ -90,6 +93,7 @@ def get_request(chat_id: str, request_id: str):
 
 @router.get('/{chat_id}/requests/{request_id}/events')
 def request_events(chat_id: str, request_id: str, attempt: int = Query(ge=1), after: int = Query(0, ge=0)):
+    """按执行尝试和事件游标建立可恢复的聊天事件订阅。"""
     from api import chat_tasks
     try:
         return chat_tasks.subscribe(chat_id, request_id, attempt, after)

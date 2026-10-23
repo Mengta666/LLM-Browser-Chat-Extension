@@ -62,11 +62,13 @@ class AgentStatusRequest(AgentCancelRequest):
 
 
 def _processing(session, request_id):
+    """构造指定决策仍在处理中的协议响应，不重复提供动作。"""
     return {'protocol_version': 2, 'session_id': session.session_id,
             'request_id': request_id, 'status': 'processing', 'action': None}
 
 
 def _decide(item, initial=False, resume=False):
+    """统一处理启动、续步和物料续接，校验请求幂等性与观察版本后发布决策结果。"""
     if item.protocol_version != 2:
         raise HTTPException(409, '自动化协议不匹配，请同时更新后端和扩展')
     try:
@@ -89,6 +91,7 @@ def _decide(item, initial=False, resume=False):
             raise HTTPException(404, '绑定知识库不存在或不可访问') from exc
         except KBConflict as exc:
             raise HTTPException(409, '绑定知识库暂不可用') from exc
+    # 将请求内容与标识绑定，重试可复用结果，但不能借旧标识提交不同的观察或动作结果。
     digest = hashlib.sha256(json.dumps(item.model_dump(), sort_keys=True, ensure_ascii=False).encode()).hexdigest()
     with loop._sessions_lock:
         session = loop.get_session(item.session_id)
@@ -131,6 +134,7 @@ def _decide(item, initial=False, resume=False):
                 raise HTTPException(409, '旧动作尚未结束，不能推进下一步')
             if page.observation_id == session.pending_action.observation_id:
                 raise HTTPException(409, '必须提交动作后的新观察')
+        # 在释放全局锁前登记处理中状态，让耗时决策期间的重试转为状态查询。
         session.in_flight = True
         session.active_request_id = item.request_id
         session.request_digests[item.request_id] = digest
@@ -146,6 +150,7 @@ def _decide(item, initial=False, resume=False):
                 session.error = f'自动化决策失败（{type(exc).__name__}）'
             response = loop._build_response(session)
     with loop._sessions_lock:
+        # 模型返回时任务可能已被取消，取消终态必须覆盖迟到的决策结果。
         if session.cancel_event.is_set():
             response = loop._build_response(session)
         session.request_results[item.request_id] = response
@@ -156,12 +161,14 @@ def _decide(item, initial=False, resume=False):
 
 @router.post('/execute')
 def agent_execute(item: AgentExecuteRequest):
+    """验证初始任务请求并启动一次自动化决策。"""
     return _decide(item, initial=True)
 
 
 @router.get('/capabilities')
 @router.post('/capabilities')
 def agent_capabilities():
+    """公开后端支持的自动化协议及字段、物料和验证能力版本。"""
     return {'protocol_version': 2, 'materials_version': 1, 'material_fill_version': 1,
             'task_workspace_version': 2,
             'field_verification_version': 1,
@@ -180,11 +187,13 @@ def agent_capabilities():
 
 @router.post('/resume')
 def agent_resume(item: AgentResumeRequest):
+    """在取材结束后以新的页面观察恢复自动化决策。"""
     return _decide(item, resume=True)
 
 
 @router.post('/material-check')
 def agent_material_check(item: MaterialCheckRequest):
+    """在填写派发前重新验证物料来源和当前待执行动作是否仍有效。"""
     from agent.materials import revalidate
     with loop._sessions_lock:
         session = loop.get_session(item.session_id)
@@ -205,11 +214,13 @@ def agent_material_check(item: MaterialCheckRequest):
 
 @router.post('/step')
 def agent_step(item: AgentStepRequest):
+    """接收上一步执行结果和新观察，推进下一次决策。"""
     return _decide(item)
 
 
 @router.post('/status')
 def agent_status(item: AgentStatusRequest):
+    """返回指定请求的已缓存结果或处理中状态，缺失时报告未接收。"""
     with loop._sessions_lock:
         session = loop.get_session(item.session_id)
         if not session:
@@ -226,6 +237,7 @@ def agent_status(item: AgentStatusRequest):
 
 @router.post('/cancel')
 def agent_cancel(item: AgentCancelRequest):
+    """将会话置为取消终态，并返回当前停止状态。"""
     try:
         with loop._sessions_lock:
             loop.cancel_session(item.session_id)

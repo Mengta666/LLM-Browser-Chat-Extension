@@ -7,6 +7,7 @@ import secrets
 
 
 def initialize(directory: Path, with_search=False):
+    """仅创建缺失的部署配置，生成随机密钥并避免覆盖已有文件。"""
     created = []
     env = directory / ".env"
     if not env.exists():

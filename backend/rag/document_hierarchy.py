@@ -22,6 +22,7 @@ STATEMENT_REF = re.compile(r'(?:命题|定理|引理|推论|proposition|theorem|
 
 
 def statement_key(text):
+    """规范化定理、引理等陈述名称及编号，供跨表述的精确匹配使用。"""
     text = unicodedata.normalize('NFKC',text)
     match = re.search(r'(命题|定理|引理|推论|proposition|theorem|lemma|corollary)\s*([IVXLCDM]+|\d+(?:\.\d+)*|[一二三四五六七八九十百]+)',text,re.I)
     if not match:
@@ -44,6 +45,7 @@ def statement_key(text):
 
 
 def build(blocks, *, title, bookmarks=(), max_chars=4000, preview_chars=120, proof_passage_chars=600, check=lambda: None, review=None):
+    """从不可变原文块构建章节、陈述和证明等结构节点、来源关系及质量信息。"""
     from rag import document_sections as S
     if review is None and any(b.get('structure', {}).get('hierarchy_version') != S.VERSION for b in blocks):
         blocks = S.assign(deepcopy(blocks), bookmarks)
@@ -65,6 +67,7 @@ def build(blocks, *, title, bookmarks=(), max_chars=4000, preview_chars=120, pro
             atoms.append({'block': block, 'start': start, 'end': end, 'text': block['text'][start:end]})
     nodes, relations = [], []
     def add(kind, parent, start, end, label, basis, **attrs):
+        """创建带父节点、正文范围和来源定位的结构节点，并加入构建结果。"""
         node_id = 'N' + hashlib.sha256(json.dumps([kind, parent, atoms[start]['block']['block_id'],
             atoms[start]['start'], end, label], ensure_ascii=False).encode()).hexdigest()[:16]
         source = [{'block_id': a['block']['block_id'], 'start': a['start'], 'end': a['end']} for k, a in enumerate(atoms[start:end], start)
@@ -120,6 +123,7 @@ def build(blocks, *, title, bookmarks=(), max_chars=4000, preview_chars=120, pro
             node['sources'] = deepcopy(material['sources'])
         root['attributes'].update(review_range_version=1, semantics_verified=False)
     def parent_at(i):
+        """找出包含指定原文位置的最深章节，未命中时使用文档根节点。"""
         matching = [n for n in sections.values() if n['start_order'] <= i < n['end_order']
                     and (review is None or contains(n['sources'], atoms[i]))]
         return max(matching, key=lambda n: n['depth']) if matching else root
@@ -263,6 +267,7 @@ def build(blocks, *, title, bookmarks=(), max_chars=4000, preview_chars=120, pro
 
 
 def validate(nodes, relations, blocks):
+    """检查结构节点、父子关系和原文覆盖是否合法，拒绝悬空引用及不一致范围。"""
     source = {b['block_id']: b for b in blocks}
     known = {n['node_id']: n for n in nodes}
     if len(known) != len(nodes):

@@ -16,17 +16,20 @@ HEADINGS = {'title', 'doc_title', 'paragraph_title', 'section_title'}
 
 
 def identifiers(text):
+    """提取同时包含字母和数字的标识符，保留原文拼写和字符范围。"""
     return [(m.group().casefold(), m.group(), m.start(), m.end()) for m in IDENTIFIER.finditer(text)
             if any(c.isdigit() for c in m.group()) and any(c.isalpha() for c in m.group())]
 
 
 class TableParser(HTMLParser):
     def __init__(self):
+        """初始化 HTML 表格解析器的行、单元格和嵌套状态。"""
         super().__init__(convert_charrefs=True)
         self.rows, self.row, self.cell = [], None, None
         self.ignore = 0
 
     def handle_starttag(self, tag, attrs):
+        """识别表格行及单元格起始标签，保存行列跨度等属性。"""
         if tag in ('script', 'style'):
             self.ignore += 1
         if tag == 'tr':
@@ -39,10 +42,12 @@ class TableParser(HTMLParser):
             self.cell['text'] += '\n'
 
     def handle_data(self, data):
+        """把当前文本追加到正在解析的表格单元格。"""
         if self.cell is not None and not self.ignore:
             self.cell['text'] += data
 
     def handle_endtag(self, tag):
+        """在单元格或行结束时收集结果，并更新表格嵌套状态。"""
         if tag in ('script', 'style'):
             self.ignore = max(0, self.ignore - 1)
         if tag in ('td', 'th') and self.cell is not None:
@@ -54,6 +59,7 @@ class TableParser(HTMLParser):
 
 
 def normalize_page(result):
+    """把单页解析结果规范为带位置和结构的原文块，并提取可检索标识符。"""
     page, blocks, found = result['page_number'], [], []
     section, anchor, labels, families = '', '', set(), set()
     for i, item in enumerate(result['blocks']):
@@ -130,6 +136,7 @@ def normalize_page(result):
 
 class EmbeddingCounter:
     def __init__(self, check=None):
+        """初始化向量模型分词客户端、计数缓存和任务有效性检查回调。"""
         base = os.getenv('EMBEDDING_BASE_URL', '').rstrip('/')
         self.url = C.TOKENIZER_URL or (base.removesuffix('/v1') + '/tokenize' if base else '')
         self.model = os.getenv('EMBEDDING_MODEL', '')
@@ -139,6 +146,7 @@ class EmbeddingCounter:
         self.check = check
 
     def count(self, text):
+        """通过向量模型分词接口准确计数并缓存结果，期间检查任务是否仍有效。"""
         if self.check:
             self.check()
         key = hashlib.sha256(text.encode()).digest()
@@ -159,6 +167,7 @@ class EmbeddingCounter:
 
 
 def build_chunks(blocks, filename, counter):
+    """按向量输入额度构造检索片段，维护表格、公式和原文范围的对应关系。"""
     by_id = {b['block_id']: b for b in blocks}
     formula_links = {}
     for number in (b for b in blocks if b['kind'] == 'formula_number'):
@@ -310,4 +319,5 @@ def build_chunks(blocks, filename, counter):
 
 
 def fingerprint(config):
+    """计算配置的稳定摘要，用于判断解析或索引检查点能否复用。"""
     return hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()

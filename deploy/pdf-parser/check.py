@@ -18,10 +18,12 @@ class CheckError(Exception):
 
 class NoRedirect(request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        """拒绝自动重定向，确保鉴权请求只发送到指定服务。"""
         return None
 
 
 def fetch_json(url, key, payload=None, timeout=10, content_type=None):
+    """在协议、响应大小和重定向限制下获取鉴权接口的 JSON 响应。"""
     parts = urlsplit(url)
     if (parts.scheme not in ("http", "https") or not parts.hostname or parts.username
             or parts.password or parts.fragment):
@@ -42,6 +44,7 @@ def fetch_json(url, key, payload=None, timeout=10, content_type=None):
 
 
 def page_image(image, pdf, page, dpi, max_bytes, max_pixels):
+    """从图片或 PDF 页面生成待检查的页面图像，并校验尺寸限制。"""
     if pdf:
         import pymupdf
 
@@ -76,6 +79,7 @@ def page_image(image, pdf, page, dpi, max_bytes, max_pixels):
 
 
 def validate_page(result, content, dimensions, page, expected):
+    """校验解析响应协议、页面标识和结构块，并检查要求出现的文本。"""
     if (result.get("status") != "ok" or result.get("service") != "pdf-parser"
             or result.get("schema_version") != 1 or result.get("page_number") != page
             or (result.get("width"), result.get("height")) != dimensions
@@ -103,6 +107,7 @@ def validate_page(result, content, dimensions, page, expected):
 
 
 def main():
+    """解析检查参数，验证服务就绪，并按显式选项执行页面推理检查。"""
     parser = argparse.ArgumentParser(description="Explicit single-page OCR smoke test; no KB writes")
     parser.add_argument("--env-file", type=Path, default=DEPLOY / ".env")
     parser.add_argument("--from-environment", action="store_true", help="Read container environment, not .env")

@@ -7,10 +7,12 @@ from rag.document_sections import marker
 
 
 def title_key(text):
+    """规范化标题文字，供目录与结构候选进行字面匹配。"""
     return re.sub(r'\s+','',unicodedata.normalize('NFKC',text)).casefold()
 
 
 def catalog(anchors):
+    """聚合锚点的编号和样式特征，形成供模型参考的观测分组。"""
     groups=[]; numbering={};styles=[]
     for a in anchors:
         a['group_refs']=[]
@@ -39,6 +41,7 @@ def catalog(anchors):
 
 
 def window_evidence(groups, anchors, window):
+    """提取当前窗口相关的文档级特征组，并注明这些观测不代表预设章节层级。"""
     lookup={a['id']:a for a in anchors}
     relevant={g for a in window for g in a.get('group_refs',[])}
     # 同批相关组给代表样本，其余只给实际观测的编号体系；均无预设 level。
@@ -55,6 +58,7 @@ def window_evidence(groups, anchors, window):
 
 
 def attach(result, anchors, groups, pages):
+    """为审阅结果补充样式、编号及目录关联证据。"""
     lookup={a['id']:a for a in anchors};nodes=result['nodes']
     by_anchor={n['heading_anchor']:n for n in nodes}
     profiles=[]
@@ -77,6 +81,7 @@ def attach(result, anchors, groups, pages):
 
 
 def toc_links(result, anchors, pages):
+    """依据标题和印刷页码建立目录项与候选节点的来源关联。"""
     lookup={a['id']:a for a in anchors};positions={a['id']:i for i,a in enumerate(anchors)}
     titles=defaultdict(list)
     for node in result['nodes']:

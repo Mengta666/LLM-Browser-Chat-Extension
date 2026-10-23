@@ -10,11 +10,13 @@ from storage import kb_store as KS, kb_structure_store as HS
 
 
 def intentions(query):
+    """识别查询中的证明解释和全文概览意图，供结构候选排序使用。"""
     return {'proof': bool(re.search(r'证明|推导|推理|论证|解释|如何得到|为什么|\bproof|\bprove|\bderiv|\bexplain|\bwhy|\bargument', query, re.I)),
             'overview': bool(re.search(r'概述|概括|总结|主要内容|核心结果|讲了什么|贡献|\boverview|\bsummari|main results?|contributions?',query,re.I))}
 
 
 def path_for(node, known):
+    """沿父节点回溯并返回从文档根到当前节点的标题路径。"""
     result = []
     while node:
         result.append(node['title'])
@@ -23,6 +25,7 @@ def path_for(node, known):
 
 
 def bundles(kb_id, doc_id, snapshot, node_id, *, query='', sequential=False, cursor=0, block_offset=0):
+    """为结构节点组装可追溯证据包，顺序读取时严格按原文游标推进。"""
     from rag.document_retrieval import read
     nodes, relations = HS.load(snapshot['structure_id'])
     known = {n['node_id']: n for n in nodes}
@@ -47,6 +50,7 @@ def bundles(kb_id, doc_id, snapshot, node_id, *, query='', sequential=False, cur
     output = []
     cache = {}
     def segment(span):
+        """缓存原文块读取结果，再按给定范围提取带定位的片段。"""
         bid = span['block_id']
         if bid not in cache:
             cache[bid] = read(kb_id,doc_id,**snapshot,block_id=bid)
@@ -69,6 +73,7 @@ def bundles(kb_id, doc_id, snapshot, node_id, *, query='', sequential=False, cur
                 raise ValueError('节点内字符偏移超出范围')
             groups = [[{**span,'start':span['start'] + (block_offset if i == cursor else 0)}] for i,span in enumerate(sources) if i >= cursor]
         elif target['kind'] == 'formula':
+            # 公式与适用条件打包为同一证据单元，避免截取公式后丢失成立前提。
             conditions = [s for r in relations if r['target_id'] == target['node_id'] and r['kind'] == 'condition_of' for s in r['evidence']]
             groups = [[*conditions, *sources]]
         elif target['kind'] == 'proof' and guide:
@@ -156,6 +161,7 @@ def bundles(kb_id, doc_id, snapshot, node_id, *, query='', sequential=False, cur
 
 
 def route(kb_id, query, snapshots, *, doc_id=None, node_id=None, page=None, section_id=None, vector_nodes=(), expand=True):
+    """根据查询、显式范围和向量命中选择结构节点，并交错输出各节点证据。"""
     intent = intentions(query)
     terms = list(dict.fromkeys(t.casefold() for t in jieba.cut_for_search(query) if len(t.strip())>1))
     label = statement_key(query)
@@ -222,6 +228,7 @@ def route(kb_id, query, snapshots, *, doc_id=None, node_id=None, page=None, sect
         if len(chosen)>=C.ROUTE_NODE_TOP_K:
             break
     ordered = []
+    # 各命中节点轮流贡献证据，防止一个长节点先耗尽下游的上下文预算。
     while any(groups):
         ordered.extend(g.pop(0) for g in groups if g)
     return ordered, chosen

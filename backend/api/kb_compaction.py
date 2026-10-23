@@ -23,6 +23,7 @@ INSTRUCTION = (
 
 
 def prompt_for(group, state):
+    """把证据分解为带来源范围的句子，构造仅整理已有资料的压缩请求。"""
     return [{'role': 'system', 'content': INSTRUCTION}, {'role': 'user', 'content': json.dumps({
         'question': state.get('original_question', ''),
         'needs': [{'id': n['id'], 'question': n['question']} for n in state.get('needs', [])],
@@ -33,6 +34,7 @@ def prompt_for(group, state):
 
 
 def partition(group, state, counter, bound, max_items):
+    """按模型输入预算和片段数上限拆分证据组，拒绝无法安全拆分的超大单元。"""
     if len(group) <= max_items and counter(prompt_for(group, state)) <= bound:
         return [group]
     parts = []
@@ -62,6 +64,7 @@ def partition(group, state, counter, bound, max_items):
 
 
 def merge_parts(group, completed, key):
+    """按原文位置合并各片段的校验结果，生成带归档定位的压缩证据。"""
     rows = []
     for original in group:
         parts = [r for part in completed for r in part['rows'] if r['citation'] == original['citation']]
@@ -81,6 +84,7 @@ def merge_parts(group, completed, key):
 
 def prepare(client, model, messages, tools, records, state, counter, limit, *, deadline,
             checkpoint, check_active=None, chat_id='', request_id='', before_call=None, force=False):
+    """在知识库工作区超预算时分批整理证据，保存进度并仅发布校验通过的压缩结果。"""
     settings = W.settings(state)
     if not settings['WORKSPACE_ENABLED'] or not settings['WORKSPACE_COMPACT']:
         return
@@ -93,6 +97,7 @@ def prepare(client, model, messages, tools, records, state, counter, limit, *, d
     base = W.strip_view(messages)
 
     def size():
+        """测量当前证据视图连同消息和工具定义的完整输入 token 数。"""
         return counter([*base, {'role': 'user', 'content': W.MARKER + json.dumps(
             W.payload(W.view_rows(rows, state, keep_recent=not force), len(rows)), ensure_ascii=False)}], tools)
 

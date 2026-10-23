@@ -5,12 +5,14 @@ from storage import chat_store as store
 
 
 def init_schema(conn):
+    """建立请求级知识库运行状态表。"""
     conn.execute('''CREATE TABLE IF NOT EXISTS chat_kb_runtime (
         chat_id TEXT NOT NULL, request_id TEXT NOT NULL, state_json TEXT NOT NULL,
         PRIMARY KEY(chat_id,request_id))''')
 
 
 def load(chat_id, request_id):
+    """读取并解码某次提问的知识库状态快照。"""
     conn = store._get_conn()
     with store._lock:
         row = conn.execute('SELECT state_json FROM chat_kb_runtime WHERE chat_id=? AND request_id=?',
@@ -19,11 +21,13 @@ def load(chat_id, request_id):
 
 
 def save(conn, chat_id, request_id, state):
+    """在调用方事务内保存或更新知识库运行状态。"""
     conn.execute('''INSERT INTO chat_kb_runtime VALUES(?,?,?) ON CONFLICT(chat_id,request_id)
         DO UPDATE SET state_json=excluded.state_json''', (chat_id, request_id, json.dumps(state, ensure_ascii=False)))
 
 
 def checkpoint(chat_id, request_id, attempt, state):
+    """确认执行尝试仍活动后保存知识库预算和读取检查点。"""
     conn = store._get_conn()
     with store._lock, conn:
         store.ensure_turn_active(chat_id, request_id, attempt)
@@ -31,6 +35,7 @@ def checkpoint(chat_id, request_id, attempt, state):
 
 
 def workspace_progress(state):
+    """汇总证据工作区的视图信息及压缩包处理进度。"""
     workspace=state.get('workspace', {})
     packs=list(workspace.get('packs',{}).values())
     return {k:v for k,v in workspace.items() if k in
@@ -42,6 +47,7 @@ def workspace_progress(state):
 
 
 def progress(chat_id, request_id):
+    """恢复知识库读取账本并生成与当前聊天阶段关联的进度事件。"""
     from search import kb_coverage, kb_read_queue
     state = load(chat_id, request_id)
     if state is None:

@@ -4,6 +4,7 @@ import json
 
 
 def describe(action, page):
+    """提取动作目标、相关页面状态和输入摘要，作为比较失败与进展的依据。"""
     target = next((e for e in page.interactive_elements if e.get('id') == action.index), {})
     identity = target.get('control_key') or target.get('target_key') or target.get('node_ref') or f'legacy:{action.index}'
     if target.get('control_key'):
@@ -19,6 +20,7 @@ def describe(action, page):
 
 
 def record(session, action, result, page):
+    """结合执行回执和新观察更新失败账本，合并相同阻挡并保留局部验证结果。"""
     state = session.recovery_state
     pending = state.pop('pending', None)
     if not pending:
@@ -68,6 +70,7 @@ def record(session, action, result, page):
 
 
 def context(session):
+    """渲染最近的失败尝试和执行反馈，供模型据新证据调整后续操作。"""
     state = session.recovery_state
     if not state.get('attempts') and not state.get('last'):
         return ''

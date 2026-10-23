@@ -2,6 +2,7 @@
 
 
 def migrate(conn):
+    """在既有迁移事务内创建或升级文档版本、页块、结构和索引检查点表。"""
     statements = [
         """CREATE TABLE IF NOT EXISTS kb_structure_publications (
             review_id TEXT PRIMARY KEY, kb_id TEXT NOT NULL, doc_id TEXT NOT NULL, parse_id TEXT NOT NULL,

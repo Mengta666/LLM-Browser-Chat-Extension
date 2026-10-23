@@ -7,9 +7,11 @@ from search import kb_coverage as coverage
 
 
 def record(state, kb_id, items):
+    """登记显式选择的读取范围及交付定位，分页请求合并到同一范围任务。"""
     scopes = state.setdefault('read_scopes', [])
     for item in items:
         target = item.get('scope_target', item['target'])
+        # 续读位置不参与范围身份，同一目标的多次分页读取归入同一覆盖记录。
         base = {k:v for k,v in target.items() if k not in ('cursor','block_offset','intent')}
         key = hashlib.sha256(json.dumps(base, sort_keys=True).encode()).hexdigest()[:16]
         scope = next((s for s in scopes if s['id'] == key), None)
@@ -34,6 +36,7 @@ def record(state, kb_id, items):
 
 
 def reconcile(state):
+    """根据实际已读范围重算缺口，并区分定位失效、读取失败及完成状态。"""
     for scope in state.get('read_scopes', []):
         if scope.get('error') in ('字符范围超出边界', '表格行范围超出边界'):
             scope['error_kind'] = 'invalid_location'
@@ -48,11 +51,13 @@ def reconcile(state):
 
 
 def pending(state):
+    """返回仍需要补齐且定位有效的显式通读范围。"""
     reconcile(state)
     return [s for s in state.get('read_scopes', []) if s['required'] and s['status'] not in ('complete','invalid','resolved')]
 
 
 def next_read(state, kb_id, limit):
+    """为待补齐范围生成下一批精确读取目标，沿用原有节点或块内定位。"""
     targets, ids = [], []
     for scope in pending(state):
         if scope['kb_id'] != kb_id or scope['error']:
@@ -82,6 +87,7 @@ def next_read(state, kb_id, limit):
 
 
 def report(state):
+    """汇总读取范围的客观覆盖状态，不把已交付等同于语义核验。"""
     gaps = pending(state)
     scopes = sorted(state.get('read_scopes', []), key=lambda s:not (s['required'] and s['status']!='complete'))
     invalid = [s for s in scopes if s['status'] == 'invalid']

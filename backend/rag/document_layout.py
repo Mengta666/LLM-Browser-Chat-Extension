@@ -11,6 +11,7 @@ STATEMENT = re.compile(r'^\s*(?:命题|定理|引理|推论|Proposition|Theorem|
 
 
 def statement_context(blocks, block_id):
+    """提取包含目标块的陈述上下文，供公式或证明关联使用。"""
     current = []
     for block in blocks:
         if block['kind'] in MARGINS:
@@ -25,6 +26,7 @@ def statement_context(blocks, block_id):
 
 
 def printed_page(blocks):
+    """从页块中识别唯一可信的印刷页码，出现歧义时不作判断。"""
     values = set()
     for b in blocks:
         if b.get('type', b.get('kind')) not in ('page_number', 'number'):
@@ -37,6 +39,7 @@ def printed_page(blocks):
 
 
 def table_structure(rows):
+    """展开表格单元格的行列跨度，返回列数、表头和单元格结构。"""
     occupied, cells, columns = {}, [], 0
     for ri, row in enumerate(rows):
         ci = 0
@@ -81,6 +84,7 @@ def table_structure(rows):
 
 
 def link_document(blocks, pages, bookmarks=(), features=None):
+    """补充阅读顺序、章节及跨页表格等结构关联，同时保留原块正文。"""
     from rag.document_features import enrich, reading_order
     blocks = reading_order(enrich(blocks, features or {}), pages)
     dimensions = {p['page']: (p['width'], p['height']) for p in pages}

@@ -97,6 +97,7 @@ class HistoryItem:
     result: str = ""            # 动作结果摘要（成功/失败 + 关键变化）
 
     def to_string(self) -> str:
+        """将单步执行历史或前情摘要格式化为供模型阅读的一行记录。"""
         if self.step == -1:                       # compacted 摘要项
             return f"[前序步骤摘要] {self.memory}"
         parts = []

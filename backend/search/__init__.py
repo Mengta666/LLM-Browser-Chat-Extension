@@ -16,6 +16,7 @@ from search.searxng import search_searxng, SearchResult  # noqa: E402
 
 
 def search_web(query: str, count: int = SEARCH_RESULT_COUNT) -> list[SearchResult]:
+    """根据搜索开关调用当前配置的联网搜索实现。"""
     if not SEARCH_ENABLED:
         return []
     return search_searxng(query, count)

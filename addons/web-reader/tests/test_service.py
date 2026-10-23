@@ -15,10 +15,12 @@ AUTH = {"Authorization": "Bearer test-only-" + "a" * 40}
 
 
 def slow_worker(*args):
+    """模拟长时间不返回结果的子进程，用于验证任务回收。"""
     time.sleep(30)
 
 
 def test_health_does_not_need_network_or_key():
+    """验证存活检查不依赖网络访问或请求密钥。"""
     with TestClient(main.app) as client:
         response = client.get('/health')
         assert response.json()['api_version'] == 'v1'
@@ -28,6 +30,7 @@ def test_health_does_not_need_network_or_key():
 @pytest.mark.parametrize('payload', [{'url': 1}, {'url': ''}, {'url': 'https://example.org', 'headers': {}},
                                     {'url': 'https://example.org', 'timeout_seconds': 100}])
 def test_validation_does_not_echo_input(payload):
+    """验证参数校验失败时不会回显请求中的原始输入。"""
     with TestClient(main.app) as client:
         response = client.post('/v1/extract', json=payload, headers=AUTH)
         assert response.status_code == 422 and response.json()['error_code'] == 'invalid_request'
@@ -35,12 +38,14 @@ def test_validation_does_not_echo_input(payload):
 
 
 def test_auth_and_body_limit():
+    """验证请求鉴权和请求体大小限制。"""
     with TestClient(main.app) as client:
         assert client.post('/v1/extract', json={'url': 'https://example.org'}).status_code == 401
         assert client.post('/v1/extract', content='x' * 9000, headers=AUTH).status_code == 413
 
 
 def test_missing_secret_fails_closed(monkeypatch):
+    """验证缺少服务密钥时服务拒绝启动。"""
     monkeypatch.setenv('WEB_READER_API_KEY', '')
     with pytest.raises(RuntimeError, match='WEB_READER_API_KEY'):
         with TestClient(main.app):
@@ -48,7 +53,9 @@ def test_missing_secret_fails_closed(monkeypatch):
 
 
 def test_api_success_and_slot_release(monkeypatch):
+    """验证成功请求返回提取结果，并在结束后释放并发名额。"""
     async def fake_job(request, args):
+        """返回固定提取结果，隔离接口测试与真实网页读取。"""
         return {'status': 'ok', 'content': 'synthetic text'}
     monkeypatch.setattr(main, 'run_job', fake_job)
     with TestClient(main.app) as client:
@@ -57,6 +64,7 @@ def test_api_success_and_slot_release(monkeypatch):
 
 
 def test_real_child_is_terminated_on_timeout(monkeypatch):
+    """验证任务超时后实际子进程被终止。"""
     monkeypatch.setattr(main, 'worker', slow_worker)
     previous = {child.pid for child in multiprocessing.active_children()}
     started = time.monotonic()
@@ -68,9 +76,11 @@ def test_real_child_is_terminated_on_timeout(monkeypatch):
 
 
 def test_real_child_is_terminated_on_disconnect(monkeypatch):
+    """验证客户端断开后实际子进程被终止。"""
     monkeypatch.setattr(main, 'worker', slow_worker)
     previous = {child.pid for child in multiprocessing.active_children()}
     async def disconnected():
+        """模拟客户端已经断开连接。"""
         return True
     request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(max_bytes=65536)),
                               is_disconnected=disconnected)
@@ -80,6 +90,7 @@ def test_real_child_is_terminated_on_disconnect(monkeypatch):
 
 
 def test_busy_rejected_without_starting_worker(monkeypatch):
+    """验证并发名额用尽时直接拒绝请求且不启动工作进程。"""
     with TestClient(main.app) as client:
         main.app.state.slots = asyncio.Semaphore(0)
         response = client.post('/v1/extract', json={'url': 'https://example.org'}, headers=AUTH)
@@ -87,6 +98,7 @@ def test_busy_rejected_without_starting_worker(monkeypatch):
 
 
 def test_initializer_is_non_destructive_and_private(tmp_path):
+    """验证初始化不会覆盖已有配置，且新建配置具有受限权限。"""
     root = Path(__file__).resolve().parents[3]
     spec = importlib.util.spec_from_file_location('deploy_init', root / 'deploy' / 'init.py')
     module = importlib.util.module_from_spec(spec)

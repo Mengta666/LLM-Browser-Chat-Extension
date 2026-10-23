@@ -7,11 +7,13 @@ import re
 
 class ArtifactError(ValueError):
     def __init__(self, code, message, *, hint, **details):
+        """构造带错误码、定位信息和修正建议的成果校验异常。"""
         super().__init__(message)
         self.feedback = {'code': code, 'error': message, 'hint': hint, **details}
 
 
 def _resolve_part(sources, part, position):
+    """从指定来源解析完整片段或精确引文，返回正文及可追溯的字符范围。"""
     hint = '复用已有来源，修正此片段；整段只传 citation，局部传 quote，重复引文需明确 offset/end。'
     if not isinstance(part, dict) or set(part) - {'citation', 'quote', 'offset', 'end'}:
         raise ArtifactError('invalid_part', '来源片段参数无效', hint=hint, part=position)
@@ -50,6 +52,7 @@ def _resolve_part(sources, part, position):
     selected = text[start:end]
     if not selected.strip():
         raise ArtifactError('empty_part', '所选片段为空', hint=hint, part=position, citation=citation)
+    # 短数字和标识符需要完整边界，仅仅是原文子串不足以证明摘取后仍保留原值。
     if re.fullmatch(r'[A-Za-z0-9_.+%-]+', selected) and (
         start > 0 and re.match(r'[A-Za-z0-9_.]', text[start-1]) or
         end < len(text) and re.match(r'[A-Za-z0-9_.]', text[end])
@@ -63,6 +66,7 @@ def _resolve_part(sources, part, position):
 
 
 def initial_state():
+    """初始化任务证据、成果、绑定、执行回执及各类编号。"""
     return {'sources': [], 'budget': None, 'records': [], 'seen': {},
             'artifacts': {}, 'bindings': {}, 'receipts': [], 'next_artifact': 1,
             'next_citation': 1, 'invalidations': [], 'error': ''}
@@ -71,6 +75,7 @@ def initial_state():
 def save_artifact(session, *, kind, subject, purpose, content=None, citations=(), dependencies=(),
                   artifact_id=None, origin=None, missing=(), source_parts=None, separator=None,
                   field_ref=None, field_edits=None, length_repair_id=None, field_intent=None, page=None):
+    """校验来源和依赖后保存不可变成果版本，支持原文组合、派生稿及受保护的字段编辑。"""
     state = session.task_state
     sources = {s['index']: s for s in state['sources']}
     if kind not in ('extraction', 'comparison', 'draft', 'answer'):
@@ -152,6 +157,7 @@ def save_artifact(session, *, kind, subject, purpose, content=None, citations=()
                 or repair['artifact_id'] not in dependencies or subject != repair['subject']
                 or not parent or parent.get('field_basis') or missing):
             raise ValueError('限长稿须为同对象的完整 derived 正文，dependencies 引用原超长成果；不能改写受保护的局部字段')
+        # 浏览器的 maxlength 按 UTF-16 代码单元计数，不能直接使用 Python 的字符数。
         actual = len(content.encode('utf-16-le')) // 2
         maximum = repair['max_length']
         if actual > maximum:
@@ -216,6 +222,7 @@ def save_artifact(session, *, kind, subject, purpose, content=None, citations=()
 
 
 def record_tool(session, name, args, text, meta, ledger):
+    """归档工具执行结果和证据编号，仅将成功取得的资料纳入可复用记录。"""
     state = session.task_state
     state['sources'] = list(ledger.sources.values())
     state['next_citation'] = max(state['next_citation'], ledger.next_index)
@@ -230,6 +237,7 @@ def record_tool(session, name, args, text, meta, ledger):
 
 
 def _references(value, docs, citations=()):
+    """递归检查结构化数据是否引用指定文档或引用编号。"""
     if isinstance(value, dict):
         return (isinstance(value.get('doc_id'), str) and value['doc_id'] in docs or
                 type(value.get('citation')) is int and value['citation'] in citations or
@@ -244,6 +252,7 @@ def _references(value, docs, citations=()):
 
 
 def revalidate(session):
+    """检查知识库来源版本，把失效传播到相关成果、绑定及缓存结果。"""
     from storage import kb_store as KS, kb_document_store as DS
     state = session.task_state
     if not session.kb_id:
@@ -308,6 +317,7 @@ def revalidate(session):
 
 
 def history_for_context(session):
+    """在来源失效后弱化旧步骤结论，保留仍可供模型参考的执行历史。"""
     from agent.state import HistoryItem
     cutoff = session.task_state.get('history_facts_invalid_through')
     if cutoff is None:
@@ -320,6 +330,7 @@ def history_for_context(session):
 
 
 def record_receipt(session, action, result):
+    """保存已绑定成果动作的执行回执，区分派发成功与回读验证成功。"""
     state = session.task_state
     if any(r['action_id'] == action.action_id for r in state['receipts']):
         return
@@ -338,6 +349,7 @@ def record_receipt(session, action, result):
 
 
 def public_state(session):
+    """汇总任务成果、字段修复和证据处理进度，供前端展示工作区状态。"""
     from agent.field_review import public as public_reviews
     state = session.task_state
     return {'version': 2, 'source_count': len(state['sources']),

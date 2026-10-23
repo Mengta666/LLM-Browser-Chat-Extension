@@ -131,6 +131,7 @@ def list_memories(memory_type: Optional[str] = Query(None),
 
 @router.get("/{memory_id}")
 def get_memory(memory_id: str) -> dict[str, Any]:
+    """按记忆编号查询载荷并返回前端视图，存储失败或缺失时返回 HTTP 错误。"""
     try:
         payload = V.get_memory(memory_id)
     except Exception as exc:
@@ -242,6 +243,7 @@ def rethink_memory() -> StreamingResponse:
     existing = R.try_acquire(user_id)
 
     def _gen():
+        """把记忆整理过程转为 SSE 事件，并在流结束时释放整理占用。"""
         try:
             if existing:
                 # 已在进行中,首事件报错

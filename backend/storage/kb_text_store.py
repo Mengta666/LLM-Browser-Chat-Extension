@@ -10,6 +10,7 @@ from rag.text_source import line_starts
 
 
 def save(kb_id,doc_id,parse_id,lease,text,encoding,blocks):
+    """核对解析租约后保存不可变 UTF-8 原文、行起点及文本块。"""
     from rag.document_config import document_path
     from rag.document_structure import identifiers
     path=document_path(doc_id,parse_id,'source.txt')
@@ -35,6 +36,7 @@ def save(kb_id,doc_id,parse_id,lease,text,encoding,blocks):
 
 
 def source(parse_id):
+    """校验文本归档路径和摘要，返回原文及行起点索引。"""
     from rag.document_config import document_path
     with KS._transaction() as conn:
         row=conn.execute('SELECT s.*,p.doc_id FROM kb_text_sources s JOIN kb_parse_versions p ON p.parse_id=s.parse_id WHERE s.parse_id=?',(parse_id,)).fetchone()
@@ -50,6 +52,7 @@ def source(parse_id):
 
 
 def location(starts,structure,start,end):
+    """把块内字符范围转换为全文字符偏移及起止行号。"""
     a=structure['source_start']+start; b=structure['source_start']+end
     return {'location_kind':'text_span','source_start':a,'source_end':b,
             'line_start':bisect.bisect_right(starts,a),

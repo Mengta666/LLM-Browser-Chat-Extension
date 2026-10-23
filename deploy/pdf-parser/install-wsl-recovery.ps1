@@ -1,6 +1,14 @@
+﻿<#
+.SYNOPSIS
+为当前 Windows 用户拥有的 WSL 发行版安装 OCR 服务恢复计划任务。
+.DESCRIPTION
+检查管理员身份与发行版归属，创建受限目录；已有任务或目录存在时停止，避免覆盖部署。
+#>
 param(
     [string]$Distribution = 'Ubuntu-24.04',
-    [string]$DeploymentRoot = '/opt/docker/vllm/ocr-server'
+    [string]$DeploymentRoot = '/opt/docker/vllm/ocr-server',
+    [string]$ListenAddress = '',
+    [ValidateRange(1, 65535)][int]$ListenPort = 19082
 )
 
 $ErrorActionPreference = 'Stop'
@@ -9,6 +17,14 @@ $principal = New-Object Security.Principal.WindowsPrincipal($identity)
 if (!$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Run elevated as the WSL distribution owner, not SYSTEM' }
 if ($identity.User.Value -eq 'S-1-5-18') { throw 'SYSTEM does not own this WSL distribution' }
 if ($Distribution -notmatch '^[a-zA-Z0-9._-]+$' -or $DeploymentRoot -notmatch '^/opt/[a-zA-Z0-9/_-]+$') { throw 'Invalid recovery target' }
+if ($ListenAddress) {
+    $address = $null
+    if (![Net.IPAddress]::TryParse($ListenAddress, [ref]$address) -or
+        $address.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork -or
+        $ListenAddress -eq '0.0.0.0' -or [Net.IPAddress]::IsLoopback($address)) {
+        throw 'ListenAddress must be a specific non-loopback IPv4 address'
+    }
+}
 $installed = @(& "$env:SystemRoot\System32\wsl.exe" --list --quiet | ForEach-Object { ($_ -replace "`0", '').Trim() })
 if ($LASTEXITCODE -ne 0 -or $Distribution -notin $installed) { throw 'Distribution not registered for this Windows account' }
 
@@ -24,10 +40,12 @@ if ($LASTEXITCODE -ne 0) { throw 'Recovery directory ACL failed' }
 Copy-Item -LiteralPath $source -Destination (Join-Path $destination 'recover-wsl.ps1')
 
 $arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}\recover-wsl.ps1" -Distribution "{1}" -DeploymentRoot "{2}"' -f $destination, $Distribution, $DeploymentRoot
+if ($ListenAddress) { $arguments += ' -ListenAddress "{0}" -ListenPort {1}' -f $ListenAddress, $ListenPort }
 $action = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -Argument $arguments
 $boot = New-ScheduledTaskTrigger -AtStartup
 $boot.Delay = 'PT30S'
 $periodic = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 2)
+# 使用发行版所有者的身份执行；SYSTEM 无法访问该用户注册的 WSL，S4U 无需保存密码。
 $taskPrincipal = New-ScheduledTaskPrincipal -UserId $identity.User.Value -LogonType S4U -RunLevel Highest
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 20) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($boot, $periodic) -Principal $taskPrincipal -Settings $settings -Description 'Recover the existing browser-agent OCR containers in this user-owned WSL distribution; no image/model updates.' | Out-Null

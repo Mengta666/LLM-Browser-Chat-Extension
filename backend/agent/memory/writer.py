@@ -507,6 +507,7 @@ def write_chat_memory(user_msg: str, assistant_msg: str,
 
 
 def _count_actions(applied: list[str]) -> dict[str, int]:
+    """汇总记忆写入结果中的动作类型及执行次数。"""
     counts: dict[str, int] = {}
     for a in applied:
         key = a.split()[0].upper() if a else "UNKNOWN"
